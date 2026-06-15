@@ -130,3 +130,19 @@ func unfilled(s string) bool {
 	s = strings.TrimSpace(s)
 	return s == "" || strings.HasPrefix(strings.ToUpper(s), "TODO")
 }
+
+// SplitFrontmatter separates a leading YAML frontmatter block from the body. It
+// returns the inner YAML (no --- markers), the body after the closing marker,
+// and whether a block was present.
+func SplitFrontmatter(content string) (fm string, body string, had bool) {
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 || strings.TrimRight(lines[0], "\r") != "---" {
+		return "", content, false
+	}
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimRight(lines[i], "\r") == "---" {
+			return strings.Join(lines[1:i], "\n"), strings.Join(lines[i+1:], "\n"), true
+		}
+	}
+	return "", content, false
+}
