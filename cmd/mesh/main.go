@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -30,6 +31,7 @@ func rootCmd() *cobra.Command {
 	root.AddCommand(
 		newCmd(),
 		indexCmd(),
+		statusCmd(),
 		migrateCmd(),
 		lintCmd(),
 		mcpCmd(),
@@ -38,6 +40,43 @@ func rootCmd() *cobra.Command {
 		doctorCmd(),
 	)
 	return root
+}
+
+func statusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status [vault]",
+		Short: "Show index stats from .mesh/mesh.db",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := "."
+			if len(args) == 1 {
+				root = args[0]
+			}
+			dbPath := filepath.Join(root, ".mesh", "mesh.db")
+			if _, err := os.Stat(dbPath); err != nil {
+				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, root)
+			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			fmt.Printf("index:  %s\n", dbPath)
+			for _, t := range []struct{ label, table string }{
+				{"notes", "notes"},
+				{"nodes", "nodes"},
+				{"edges", "edges"},
+				{"fts rows", "search_index"},
+			} {
+				n, err := store.Count(t.table)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("  %-9s %d\n", t.label, n)
+			}
+			return nil
+		},
+	}
 }
 
 func newCmd() *cobra.Command {
@@ -126,13 +165,23 @@ func indexCmd() *cobra.Command {
 			}
 			g, issues := index.BuildGraph(notes)
 			printStats(root, len(files), len(ferrs), parseDur, w, notes, g, issues)
-			if !dryRun {
-				return fmt.Errorf("writing .mesh/mesh.db is not implemented yet (next M0 step); run with --dry-run")
+			if dryRun {
+				return nil
 			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			n, err := store.IndexVault(notes, g)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("wrote:  %d notes to %s\n", n, store.Path())
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&dryRun, "dry-run", true, "parse and report without writing .mesh/mesh.db")
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "parse and report without writing .mesh/mesh.db")
 	c.Flags().IntVar(&workers, "workers", 0, "parse workers (0 = NumCPU)")
 	return c
 }
