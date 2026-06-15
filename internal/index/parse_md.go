@@ -78,7 +78,7 @@ func ParseFile(path string) (*ParsedNote, error) {
 // Parse extracts the deterministic structure of a markdown document. Wikilinks
 // and tags inside fenced code blocks and inline code spans are ignored.
 func Parse(path string, data []byte) (*ParsedNote, error) {
-	fmText, body := splitFrontmatter(string(data))
+	fmText, body, _ := vault.SplitFrontmatter(string(data))
 	fm, raw, err := vault.ParseFrontmatter([]byte(fmText))
 	if err != nil {
 		return nil, err
@@ -164,19 +164,6 @@ func parseHeading(line string) (Heading, bool) {
 		return Heading{}, false
 	}
 	return Heading{Level: i, Text: text, Anchor: vault.Slugify(text)}, true
-}
-
-func splitFrontmatter(content string) (fm string, body string) {
-	lines := strings.Split(content, "\n")
-	if len(lines) == 0 || strings.TrimRight(lines[0], "\r") != "---" {
-		return "", content
-	}
-	for i := 1; i < len(lines); i++ {
-		if strings.TrimRight(lines[i], "\r") == "---" {
-			return strings.Join(lines[1:i], "\n"), strings.Join(lines[i+1:], "\n")
-		}
-	}
-	return "", content
 }
 
 func stripInlineCode(line string) string {

@@ -245,9 +245,120 @@ func stub(use, short, milestone string) *cobra.Command {
 	}
 }
 
-func migrateCmd() *cobra.Command { return stub("migrate [vault]", "Migrate a Hive-style vault to the Mesh schema", "Milestone 0 (next step)") }
-func lintCmd() *cobra.Command    { return stub("lint [vault]", "Check vault health (links, frontmatter, orphans)", "Milestone 0") }
-func mcpCmd() *cobra.Command     { return stub("mcp", "Serve the agent retrieval contract over MCP", "Milestone 1") }
+func migrateCmd() *cobra.Command {
+	var dryRun bool
+	c := &cobra.Command{
+		Use:   "migrate [vault]",
+		Short: "Bring a Hive-style vault up to the Mesh schema (idempotent)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := vaultArg(args)
+			files, err := vault.Walk(root)
+			if err != nil {
+				return err
+			}
+			var changed, flywheel, errored int
+			for _, f := range files {
+				res, err := vault.MigrateFile(f, dryRun)
+				if err != nil {
+					errored++
+					fmt.Fprintf(os.Stderr, "migrate %s: %v\n", f, err)
+					continue
+				}
+				if res.Changed {
+					changed++
+				}
+				if len(res.Issues) > 0 {
+					flywheel++
+				}
+			}
+			verb := "migrated"
+			if dryRun {
+				verb = "would migrate"
+			}
+			fmt.Printf("%s %d of %d files (%d already clean, %d errored)\n", verb, changed, len(files), len(files)-changed-errored, errored)
+			if flywheel > 0 {
+				fmt.Printf("note:   %d flywheel notes still need do/dont/why (author them; never auto-filled)\n", flywheel)
+			}
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without writing")
+	return c
+}
+
+func lintCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "lint [vault]",
+		Short: "Check vault health (frontmatter, links, ids, filenames)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := vaultArg(args)
+			files, err := vault.Walk(root)
+			if err != nil {
+				return err
+			}
+			notes, ferrs := index.ParseFiles(files, 0)
+			_, issues := index.BuildGraph(notes)
+
+			byKind := map[string]int{}
+			for _, is := range issues {
+				byKind[is.Kind]++
+			}
+			for _, fe := range ferrs {
+				_ = fe
+				byKind["parse-error"]++
+			}
+			for _, pn := range notes {
+				for _, e := range pn.FM.Validate() {
+					if e == "missing id" {
+						continue // already counted via BuildGraph issues
+					}
+					byKind["frontmatter"]++
+				}
+				if !isKebab(filepath.Base(pn.Path)) {
+					byKind["filename"]++
+				}
+			}
+
+			total := 0
+			for _, n := range byKind {
+				total += n
+			}
+			fmt.Printf("lint %s: %d files, %d problems\n", root, len(files), total)
+			for _, kv := range sortedCounts(byKind) {
+				fmt.Printf("  %-14s %d\n", kv.k, kv.v)
+			}
+			if total > 0 {
+				return fmt.Errorf("%d lint problems", total)
+			}
+			fmt.Println("clean")
+			return nil
+		},
+	}
+}
+
+func vaultArg(args []string) string {
+	if len(args) == 1 {
+		return args[0]
+	}
+	return "."
+}
+
+func isKebab(filename string) bool {
+	name := strings.TrimSuffix(filename, filepath.Ext(filename))
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func mcpCmd() *cobra.Command { return stub("mcp", "Serve the agent retrieval contract over MCP", "Milestone 1") }
 func tuiCmd() *cobra.Command     { return stub("tui", "Open the terminal UI", "Milestone 3") }
 func uiCmd() *cobra.Command      { return stub("ui", "Serve the localhost graph viewer", "Milestone 3") }
 func doctorCmd() *cobra.Command  { return stub("doctor", "Diagnose index drift and config", "Milestone 0") }
