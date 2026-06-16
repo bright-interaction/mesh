@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/bright-interaction/mesh/internal/merge"
 	"github.com/bright-interaction/mesh/internal/syncproto"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
@@ -71,7 +73,8 @@ type Summary struct {
 	Pulled           int
 	Conflicts        int
 	Head             string
-	ConflictSiblings []string
+	ConflictSiblings []string // merge conflicts: our pushed version parked here
+	Protected        []string // external-editor race: incoming hub version parked here
 }
 
 func contentHash(b []byte) string {
@@ -112,27 +115,75 @@ func computeOutbox(vaultDir string, prev map[string]string) ([]syncproto.OutboxI
 	return outbox, current, nil
 }
 
-// applyDeltas writes or removes files per the hub's response. Each write is
-// atomic (temp + rename) so a crash mid-sync never leaves a torn note. Whole-
-// batch atomicity + the external-editor re-stat guard land in S1.4.
-func applyDeltas(vaultDir string, deltas []syncproto.Delta) error {
+// park records a path whose incoming hub version was set aside (sibling) because
+// the local file changed during the sync window.
+type park struct {
+	note    string // the original path whose local change we kept
+	sibling string // where the incoming hub version was parked
+}
+
+// applyDeltas writes or removes files per the hub's response, guarding against
+// the external-editor race (SPEC 6.6): sentHashes is the on-disk state captured
+// when the outbox was computed, so if a path changed on disk SINCE then a local
+// edit OR delete landed during the sync window. In that case the incoming hub
+// version is parked in a sibling and the local change is kept; SyncVault then
+// keeps the path "dirty" so the local change re-pushes next sync (it is not
+// silently dropped). Each write is atomic (temp + rename); a partial-batch
+// failure self-heals because the base is not advanced. Returns the parked paths.
+func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[string]string) ([]park, error) {
+	var parked []park
 	for _, d := range deltas {
 		abs := filepath.Join(vaultDir, filepath.FromSlash(d.Path))
+		onDisk, readErr := os.ReadFile(abs)
+		sentHash, wasSent := sentHashes[d.Path]
+		// A local change during the window is either an edit (present but
+		// different) or a delete (absent now, but present at send time).
+		locallyChanged := (readErr == nil && contentHash(onDisk) != sentHash) ||
+			(readErr != nil && wasSent)
+
 		if d.Op == "delete" {
+			if locallyChanged {
+				continue // local edit/recreate after send: keep it, skip the delete
+			}
 			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
-				return err
+				return parked, err
 			}
 			continue
 		}
+
 		b, err := base64.StdEncoding.DecodeString(d.ContentB64)
 		if err != nil {
-			return err
+			return parked, err
+		}
+		if locallyChanged && contentHash(onDisk) != contentHash(b) {
+			// External-editor race: park the incoming version, keep the local
+			// change (a local delete keeps the path absent; a local edit keeps it).
+			sib := merge.SiblingPath(d.Path, time.Now(), "hub", b)
+			if err := writeFileAtomic(filepath.Join(vaultDir, filepath.FromSlash(sib)), b); err != nil {
+				return parked, err
+			}
+			parked = append(parked, park{note: d.Path, sibling: sib})
+			continue
 		}
 		if err := writeFileAtomic(abs, b); err != nil {
-			return err
+			return parked, err
 		}
 	}
-	return nil
+	return parked, nil
+}
+
+// keepParkedDirty rewrites current so each guard-parked path keeps its pre-sync
+// base hash instead of its (just-applied) disk hash, so the next computeOutbox
+// detects the kept local change and re-pushes it (SPEC 6.6: enqueue the local
+// change). Without this the local change would be recorded as synced and lost.
+func keepParkedDirty(current, base map[string]string, parked []park) {
+	for _, p := range parked {
+		if old, ok := base[p.note]; ok {
+			current[p.note] = old
+		} else {
+			delete(current, p.note)
+		}
+	}
 }
 
 // writeConflictSiblings preserves the client's losing version of each conflicted
@@ -189,7 +240,7 @@ func SyncVault(vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	state := readState(vaultDir)
-	outbox, _, err := computeOutbox(vaultDir, state.Hashes)
+	outbox, sentHashes, err := computeOutbox(vaultDir, state.Hashes)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -201,21 +252,27 @@ func SyncVault(vaultDir string) (Summary, error) {
 	if err := writeConflictSiblings(vaultDir, resp.Conflicts); err != nil {
 		return Summary{}, err
 	}
-	if err := applyDeltas(vaultDir, resp.Deltas); err != nil {
+	parked, err := applyDeltas(vaultDir, resp.Deltas, sentHashes)
+	if err != nil {
 		return Summary{}, err
 	}
 	// Recompute hashes from disk so the next outbox reflects the canonical (post-
-	// merge) hub state, not what we optimistically pushed.
+	// merge) hub state, not what we optimistically pushed; then keep any
+	// guard-parked path dirty so its kept local change re-pushes next sync.
 	_, current, err := computeOutbox(vaultDir, map[string]string{})
 	if err != nil {
 		return Summary{}, err
 	}
+	keepParkedDirty(current, state.Hashes, parked)
 	if err := writeState(vaultDir, syncState{HeadSHA: resp.HeadSHA, Hashes: current}); err != nil {
 		return Summary{}, err
 	}
 	sum := Summary{Pushed: len(outbox), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA}
 	for _, c := range resp.Conflicts {
 		sum.ConflictSiblings = append(sum.ConflictSiblings, c.SiblingPath)
+	}
+	for _, p := range parked {
+		sum.Protected = append(sum.Protected, p.sibling)
 	}
 	return sum, nil
 }

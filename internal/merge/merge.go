@@ -141,7 +141,7 @@ func SiblingPath(path string, now time.Time, user string, losing []byte) string 
 	ext := filepath.Ext(path)
 	stem := strings.TrimSuffix(path, ext)
 	sum := sha256.Sum256([]byte(normalize(losing)))
-	short := hex.EncodeToString(sum[:])[:8]
+	short := hex.EncodeToString(sum[:])[:16] // 64-bit: collisions cryptographically implausible
 	return fmt.Sprintf("%s.sync-conflict-%s-%s-%s%s", stem, now.Format("20060102"), sanitizeUser(user), short, ext)
 }
 
