@@ -1,0 +1,37 @@
+# Build + run the Mesh team-sync hub (mesh-hub).
+#
+# Only the HUB is containerized. It authors the team's git history via os/exec,
+# so git ships in the runtime image (the locked S1 decision). The CLIENT binary
+# (mesh) stays a separate single static binary teammates install on their
+# laptops; it never runs here and never needs git.
+
+# ---------- build stage ----------
+FROM golang:1.26.4-alpine AS builder
+RUN apk add --no-cache git
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -o /mesh-hub ./cmd/mesh-hub
+
+# ---------- runtime stage ----------
+FROM alpine:3.21
+# git: the hub commits via os/exec. ca-certificates + wget for the healthcheck.
+RUN apk add --no-cache ca-certificates git wget && \
+    adduser -D -u 1000 mesh && \
+    mkdir -p /var/lib/mesh-hub && chown -R mesh:mesh /var/lib/mesh-hub
+
+COPY --from=builder /mesh-hub /usr/local/bin/mesh-hub
+COPY deploy/entrypoint.sh /usr/local/bin/mesh-hub-entrypoint
+RUN chmod +x /usr/local/bin/mesh-hub-entrypoint
+
+USER mesh
+ENV MESH_HUB_REPO=/var/lib/mesh-hub/vault \
+    MESH_HUB_ADDR=:8848 \
+    MESH_HUB_GC_HORIZON=90
+EXPOSE 8848
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -qO- http://localhost:8848/healthz || exit 1
+ENTRYPOINT ["mesh-hub-entrypoint"]
