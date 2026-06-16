@@ -3,6 +3,7 @@ package retrieve
 import (
 	"testing"
 
+	"github.com/brightinteraction/mesh/internal/embed"
 	"github.com/brightinteraction/mesh/internal/index"
 )
 
@@ -80,6 +81,25 @@ func TestRetrieveExpandsAlongReferences(t *testing.T) {
 	}
 	if !foundB {
 		t.Errorf("expected note:b via 1-hop expansion from note:a; got %+v", cards)
+	}
+}
+
+func TestEnableVectorsHomogeneityGuard(t *testing.T) {
+	r := buildVault(t)
+	vecs := map[string][]float32{"note:a": {1, 0}, "note:b": {0, 1}}
+	if r.EnableVectors(embed.Stub{D: 2}, "different-model", vecs) {
+		t.Error("guard must reject when the query embedder's model != the vault's stored model")
+	}
+	if r.EnableVectors(embed.Stub{D: 2}, "stub-bow", vecs) != true {
+		t.Error("should enable when the model matches")
+	}
+	if r.EnableVectors(embed.Stub{D: 2}, "stub-bow", nil) {
+		t.Error("guard must reject when there are no stored vectors")
+	}
+	// With vectors enabled, retrieval still works end to end.
+	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	if err != nil || len(cards) == 0 {
+		t.Fatalf("retrieve with vectors enabled failed: err=%v cards=%d", err, len(cards))
 	}
 }
 
