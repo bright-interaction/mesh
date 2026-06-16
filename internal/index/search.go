@@ -8,7 +8,7 @@ import (
 
 // SearchHit is one FTS5 result over the note corpus.
 type SearchHit struct {
-	NodeID  string  // note:<id>
+	NodeID  string // note:<id>
 	Title   string
 	Path    string  // vault-relative path of the owning note
 	Snippet string  // bracketed match excerpt from the body

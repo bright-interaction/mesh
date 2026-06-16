@@ -22,6 +22,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/bright-interaction/mesh/internal/watch"
+	"github.com/bright-interaction/mesh/pkg/meshclient"
 	"github.com/spf13/cobra"
 )
 
@@ -51,6 +52,8 @@ func rootCmd() *cobra.Command {
 		lintCmd(),
 		mcpCmd(),
 		watchCmd(),
+		joinCmd(),
+		syncCmd(),
 		tuiCmd(),
 		uiCmd(),
 		doctorCmd(),
@@ -939,5 +942,80 @@ func watchCmd() *cobra.Command {
 	c.Flags().DurationVar(&reconcile, "reconcile", 30*time.Second, "periodic full-reconcile safety net (0 to disable)")
 	return c
 }
+func joinCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "join <hub-url> <invite-token> [vault]",
+		Short: "Join a team vault: redeem an invite and clone it, no git needed",
+		Long:  "Redeem a one-time invite from a mesh-hub, store the client token under <vault>/.mesh, fail closed if the team embedding config conflicts with yours, then clone the vault via a reconcile. After this, edit locally and run mesh sync.",
+		Args:  cobra.RangeArgs(2, 3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hubURL, invite := args[0], args[1]
+			vaultDir := "."
+			if len(args) == 3 {
+				vaultDir = args[2]
+			}
+			sum, err := meshclient.JoinVault(hubURL, invite, vaultDir)
+			if err != nil {
+				return err
+			}
+			store, err := index.Open(vaultDir)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			if _, err := index.Reconcile(store, vaultDir); err != nil {
+				return err
+			}
+			abs, _ := filepath.Abs(vaultDir)
+			fmt.Printf("joined and cloned %s (HEAD %s, %d files pulled)\n", abs, short8(sum.Head), sum.Pulled)
+			fmt.Println("next:")
+			fmt.Println("  mesh sync " + vaultDir + "                       # push your edits, pull teammates'")
+			fmt.Printf("  mesh mcp --vault %s --watch       # point your agent at the vault\n", vaultDir)
+			return nil
+		},
+	}
+	return c
+}
+
+func syncCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "sync [vault]",
+		Short: "Reconcile the vault with the hub (push local edits, pull teammates', no git)",
+		Long:  "One pull-based reconcile round: pushes your changed notes, applies the hub's merged result and any teammates' changes, and reindexes. Additive edits to a shared page auto-merge; a true overwrite keeps the hub version and saves yours to a *.sync-conflict sibling.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			vaultDir := vaultArg(args)
+			sum, err := meshclient.SyncVault(vaultDir)
+			if err != nil {
+				return err
+			}
+			store, err := index.Open(vaultDir)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			if _, err := index.Reconcile(store, vaultDir); err != nil {
+				return err
+			}
+			fmt.Printf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)\n", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
+			for _, sib := range sum.ConflictSiblings {
+				fmt.Printf("  conflict: hub version kept; your version saved at %s (resolve, then sync)\n", sib)
+			}
+			return nil
+		},
+	}
+	return c
+}
+
+func short8(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	if s == "" {
+		return "(none)"
+	}
+	return s
+}
+
 func tuiCmd() *cobra.Command { return stub("tui", "Open the terminal UI", "Milestone 3") }
 func uiCmd() *cobra.Command  { return stub("ui", "Serve the localhost graph viewer", "Milestone 3") }

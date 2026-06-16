@@ -26,10 +26,10 @@ func (s *Server) handleResourcesRead(params json.RawMessage) (any, *rpcError) {
 		nodes, _ := s.store.Count("nodes")
 		edges, _ := s.store.Count("edges")
 		b, _ := json.Marshal(map[string]any{
-			"server":  map[string]any{"name": serverName, "version": serverVersion},
-			"vault":   s.vaultRoot,
-			"counts":  map[string]any{"notes": notes, "nodes": nodes, "edges": edges},
-			"tools":   []string{"mesh_search", "mesh_fetch", "mesh_god_nodes", "mesh_changed_since", "mesh_append_note", "mesh_write_entity"},
+			"server":   map[string]any{"name": serverName, "version": serverVersion},
+			"vault":    s.vaultRoot,
+			"counts":   map[string]any{"notes": notes, "nodes": nodes, "edges": edges},
+			"tools":    []string{"mesh_search", "mesh_fetch", "mesh_god_nodes", "mesh_changed_since", "mesh_append_note", "mesh_write_entity"},
 			"contract": "mesh://contract",
 		})
 		return contents(p.URI, "application/json", string(b)), nil
