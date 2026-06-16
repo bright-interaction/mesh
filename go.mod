@@ -1,4 +1,4 @@
-module github.com/brightinteraction/mesh
+module github.com/bright-interaction/mesh
 
 go 1.26
 

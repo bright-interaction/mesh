@@ -3,7 +3,7 @@ package index
 import (
 	"testing"
 
-	"github.com/brightinteraction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/graph"
 )
 
 const sample = "---\n" +

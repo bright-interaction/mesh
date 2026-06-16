@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/brightinteraction/mesh/internal/graph"
-	"github.com/brightinteraction/mesh/internal/vault"
+	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 type Heading struct {

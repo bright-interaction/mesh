@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/mesh/internal/embed"
-	"github.com/brightinteraction/mesh/internal/index"
-	"github.com/brightinteraction/mesh/internal/rerank"
+	"github.com/bright-interaction/mesh/internal/embed"
+	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/rerank"
 )
 
 // fakeReranker scores a document 10 when it contains needle, else 0, so a test

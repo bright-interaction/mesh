@@ -10,10 +10,10 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/brightinteraction/mesh/internal/embed"
-	"github.com/brightinteraction/mesh/internal/graph"
-	"github.com/brightinteraction/mesh/internal/index"
-	"github.com/brightinteraction/mesh/internal/rerank"
+	"github.com/bright-interaction/mesh/internal/embed"
+	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/rerank"
 )
 
 const (

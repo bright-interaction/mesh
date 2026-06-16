@@ -3,7 +3,7 @@ package eval
 import (
 	"math"
 
-	"github.com/brightinteraction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/retrieve"
 )
 
 // WeightSet is one fusion-weight triple (FTS, graph-BM25, vector cosine).

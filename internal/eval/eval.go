@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/brightinteraction/mesh/internal/index"
-	"github.com/brightinteraction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/retrieve"
 )
 
 // Case is one labelled query: the relevant note ids the answer should come from.

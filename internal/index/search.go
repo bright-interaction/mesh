@@ -3,7 +3,7 @@ package index
 import (
 	"strings"
 
-	"github.com/brightinteraction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/graph"
 )
 
 // SearchHit is one FTS5 result over the note corpus.
