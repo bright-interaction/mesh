@@ -11,6 +11,7 @@ import (
 
 	"github.com/brightinteraction/mesh/internal/graph"
 	"github.com/brightinteraction/mesh/internal/index"
+	"github.com/brightinteraction/mesh/internal/retrieve"
 	"github.com/brightinteraction/mesh/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -45,10 +46,10 @@ func rootCmd() *cobra.Command {
 
 func searchCmd() *cobra.Command {
 	var vaultDir string
-	var limit int
+	var limit, budget int
 	c := &cobra.Command{
 		Use:   "search <query>",
-		Short: "Full-text search the indexed vault",
+		Short: "Fused retrieval over the indexed vault (FTS + graph, tier-0 boosted, budget-packed)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dbPath := filepath.Join(vaultDir, ".mesh", "mesh.db")
@@ -60,25 +61,40 @@ func searchCmd() *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			hits, err := store.Search(strings.Join(args, " "), limit)
+			g, err := store.LoadGraph()
 			if err != nil {
 				return err
 			}
-			if len(hits) == 0 {
+			cards, err := retrieve.New(store, g).Retrieve(strings.Join(args, " "), retrieve.Options{Limit: limit, Budget: budget})
+			if err != nil {
+				return err
+			}
+			if len(cards) == 0 {
 				fmt.Println("no matches")
 				return nil
 			}
-			for i, h := range hits {
-				fmt.Printf("%d. %s  (%s)\n", i+1, h.Title, h.Path)
-				if sn := strings.TrimSpace(h.Snippet); sn != "" {
+			for i, c := range cards {
+				tier := ""
+				if c.Tier0 {
+					tier = " [tier-0]"
+				}
+				fmt.Printf("%d. %s%s  (%s)\n", i+1, c.Title, tier, c.Path)
+				if sn := strings.TrimSpace(c.Snippet); sn != "" {
 					fmt.Printf("   %s\n", sn)
 				}
+				if c.Reason != "" {
+					fmt.Printf("   ~ %s\n", c.Reason)
+				}
+			}
+			if budget > 0 {
+				fmt.Printf("packed %d cards, ~%d tokens (budget %d)\n", len(cards), retrieve.TotalTokens(cards), budget)
 			}
 			return nil
 		},
 	}
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
-	c.Flags().IntVar(&limit, "limit", 10, "max results")
+	c.Flags().IntVar(&limit, "limit", 20, "candidates per signal")
+	c.Flags().IntVar(&budget, "budget", 0, "token budget for packing (0 = all ranked)")
 	return c
 }
 
@@ -199,6 +215,13 @@ func indexCmd() *cobra.Command {
 			}
 			start := time.Now()
 			notes, ferrs := index.ParseFiles(files, workers)
+			// Store vault-relative paths: portable across machines and far
+			// cheaper to carry in a token-budgeted card than an absolute path.
+			for _, pn := range notes {
+				if rel, err := filepath.Rel(root, pn.Path); err == nil {
+					pn.Path = rel
+				}
+			}
 			parseDur := time.Since(start)
 			for _, fe := range ferrs {
 				fmt.Fprintf(os.Stderr, "parse %s: %v\n", fe.Path, fe.Err)

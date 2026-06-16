@@ -25,7 +25,9 @@ func searchText(pn *ParsedNote) string {
 		}
 	}
 	parts = append(parts, pn.FM.Tags...)
-	return strings.Join(parts, "\n")
+	// Collapse whitespace so snippets are not padded with skeleton blank lines,
+	// which keeps budget-packed cards cheap.
+	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ")
 }
 
 // IndexVault writes the parsed notes and graph into the store as a full reindex
