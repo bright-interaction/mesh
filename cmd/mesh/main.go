@@ -1001,6 +1001,9 @@ func syncCmd() *cobra.Command {
 			for _, sib := range sum.ConflictSiblings {
 				fmt.Printf("  conflict: hub version kept; your version saved at %s (resolve, then sync)\n", sib)
 			}
+			for _, sib := range sum.Protected {
+				fmt.Printf("  protected your unsaved local edit; incoming hub version saved at %s\n", sib)
+			}
 			return nil
 		},
 	}
