@@ -33,6 +33,7 @@ func rootCmd() *cobra.Command {
 		SilenceErrors: false,
 	}
 	root.AddCommand(
+		initCmd(),
 		newCmd(),
 		indexCmd(),
 		searchCmd(),
@@ -46,6 +47,107 @@ func rootCmd() *cobra.Command {
 		doctorCmd(),
 	)
 	return root
+}
+
+func initCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "init [path]",
+		Short: "Bootstrap a new Mesh vault (starter index + first build)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := vaultArg(args)
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				return err
+			}
+			files, err := vault.Walk(root)
+			if err != nil {
+				return err
+			}
+			if len(files) == 0 {
+				date := vault.Now().Format("2006-01-02")
+				starter := "---\nid: index\ntype: map\ntitle: Vault index\nwhen: \"" + date + "\"\n---\n\n" +
+					"# Vault index\n\nA Mesh vault. Add notes with `mesh new <type> \"<title>\"`, then `mesh index`.\n"
+				if err := os.WriteFile(filepath.Join(root, "index.md"), []byte(starter), 0o644); err != nil {
+					return err
+				}
+			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			g, err := index.Reindex(store, root)
+			if err != nil {
+				return err
+			}
+			abs, _ := filepath.Abs(root)
+			fmt.Printf("initialized Mesh vault at %s (%d notes, %d nodes, %d edges)\n", root, g.CountByKind()["note"], g.NodeCount(), g.EdgeCount())
+			fmt.Println("next:")
+			fmt.Println("  mesh new decision \"<title>\" --vault " + root + "   # capture a decision/gotcha")
+			fmt.Println("  mesh index " + root + "                          # rebuild after edits")
+			fmt.Println("  point your coding agent at the MCP server:")
+			fmt.Printf("    {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"%s\"]}\n", abs)
+			return nil
+		},
+	}
+	return c
+}
+
+func doctorCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "doctor [vault]",
+		Short: "Diagnose index freshness (drift), counts, and vault health",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := vaultArg(args)
+			dbPath := filepath.Join(root, ".mesh", "mesh.db")
+			if _, err := os.Stat(dbPath); err != nil {
+				fmt.Printf("no index at %s\n  fix: mesh index %s\n", dbPath, root)
+				return fmt.Errorf("no index")
+			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			notes, _ := store.Count("notes")
+			nodes, _ := store.Count("nodes")
+			edges, _ := store.Count("edges")
+			fmt.Printf("index:  %s\n  notes %d  nodes %d  edges %d\n", dbPath, notes, nodes, edges)
+
+			drift, err := store.DriftReport(root)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("drift:  +%d new  ~%d changed  -%d removed\n", len(drift.Added), len(drift.Changed), len(drift.Removed))
+
+			files, _ := vault.Walk(root)
+			parsed, _ := index.ParseFiles(files, 0)
+			_, issues := index.BuildGraph(parsed)
+			lintProblems := 0
+			for _, pn := range parsed {
+				for _, e := range pn.FM.Validate() {
+					if e != "missing id" {
+						lintProblems++
+					}
+				}
+			}
+			lintProblems += len(issues)
+			fmt.Printf("lint:   %d problems (run mesh lint for detail)\n", lintProblems)
+
+			switch {
+			case drift.Any():
+				fmt.Println("status: STALE - run mesh index")
+				return fmt.Errorf("index stale")
+			case lintProblems > 0:
+				fmt.Println("status: OK (index fresh; lint problems exist)")
+			default:
+				fmt.Println("status: healthy")
+			}
+			return nil
+		},
+	}
 }
 
 func searchCmd() *cobra.Command {
@@ -504,6 +606,5 @@ func mcpCmd() *cobra.Command {
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
 	return c
 }
-func tuiCmd() *cobra.Command     { return stub("tui", "Open the terminal UI", "Milestone 3") }
-func uiCmd() *cobra.Command      { return stub("ui", "Serve the localhost graph viewer", "Milestone 3") }
-func doctorCmd() *cobra.Command  { return stub("doctor", "Diagnose index drift and config", "Milestone 0") }
+func tuiCmd() *cobra.Command { return stub("tui", "Open the terminal UI", "Milestone 3") }
+func uiCmd() *cobra.Command  { return stub("ui", "Serve the localhost graph viewer", "Milestone 3") }
