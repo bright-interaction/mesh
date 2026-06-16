@@ -12,13 +12,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brightinteraction/mesh/internal/embed"
-	"github.com/brightinteraction/mesh/internal/eval"
-	"github.com/brightinteraction/mesh/internal/graph"
-	"github.com/brightinteraction/mesh/internal/index"
-	"github.com/brightinteraction/mesh/internal/mcp"
-	"github.com/brightinteraction/mesh/internal/retrieve"
-	"github.com/brightinteraction/mesh/internal/vault"
+	"github.com/bright-interaction/mesh/internal/embed"
+	"github.com/bright-interaction/mesh/internal/eval"
+	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/mcp"
+	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/spf13/cobra"
 )
 

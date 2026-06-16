@@ -3,8 +3,8 @@ package index
 import (
 	"path/filepath"
 
-	"github.com/brightinteraction/mesh/internal/graph"
-	"github.com/brightinteraction/mesh/internal/vault"
+	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // Reindex walks the vault, parses it, builds the graph + communities, persists

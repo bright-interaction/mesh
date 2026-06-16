@@ -3,7 +3,7 @@ package index
 import (
 	"encoding/json"
 
-	"github.com/brightinteraction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/graph"
 )
 
 // LoadGraph reconstructs the in-memory graph from the persisted nodes + edges

@@ -16,15 +16,22 @@ It is one Go binary, no cgo, no external services. Retrieving from Mesh is cheap
 
 ## Install
 
-Mesh currently lives in the `bright-interaction/automations` monorepo, so build it from a checkout:
+Mesh is a self-contained Go module (`github.com/bright-interaction/mesh`, no cgo)
+living in the `bright-interaction/automations` monorepo. Since that repo is
+private, the sovereign install path is one command from a checkout, no published
+repo, no public exposure:
 
 ```
 cd automations/mesh
-go build -o mesh ./cmd/mesh
-cp mesh ~/.local/bin/   # or anywhere on your PATH
+make install            # builds a static binary to ~/.local/bin/mesh
 ```
 
-(A `go install ...@latest` path lands once Mesh is split into its own public module.)
+`go install` works too, once the module is published at its path:
+- **private repo** (sovereign): `GOPRIVATE=github.com/bright-interaction/* go install github.com/bright-interaction/mesh/cmd/mesh@latest` (needs org git auth)
+- **public repo**: plain `go install github.com/bright-interaction/mesh/cmd/mesh@latest`
+
+Publishing Mesh as its own repo is a deliberate step (it exposes the source if
+public), so it stays a checkout-built tool until that call is made.
 
 ## Quickstart
 

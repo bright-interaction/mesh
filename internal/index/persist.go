@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/brightinteraction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/graph"
 )
 
 var htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)

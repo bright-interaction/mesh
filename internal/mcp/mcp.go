@@ -10,9 +10,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/brightinteraction/mesh/internal/graph"
-	"github.com/brightinteraction/mesh/internal/index"
-	"github.com/brightinteraction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/retrieve"
 )
 
 const (

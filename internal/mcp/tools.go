@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/brightinteraction/mesh/internal/retrieve"
-	"github.com/brightinteraction/mesh/internal/vault"
+	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 func obj(m map[string]any) map[string]any { return m }

@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/brightinteraction/mesh/internal/vault"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // Drift describes how the vault on disk has diverged from the persisted index.

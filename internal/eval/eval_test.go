@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/brightinteraction/mesh/internal/index"
-	"github.com/brightinteraction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/retrieve"
 )
 
 func TestRunGateBeatsBaselineOnLongNotes(t *testing.T) {
