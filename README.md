@@ -40,9 +40,15 @@ mesh init my-vault                 # bootstrap a vault (starter index + first bu
 mesh new decision "Use Postgres over Mongo" \
   --do "..." --dont "..." --why "..." --vault my-vault   # capture judgment; Mesh fills id/date/placement
 mesh index my-vault                # rebuild the index after edits
+mesh watch my-vault                # live-reindex as you edit (no manual index; Ctrl-C to stop)
 mesh search "datastore choice" --vault my-vault --budget 4000
 mesh doctor my-vault               # is the index fresh? any drift or lint problems?
 ```
+
+`mesh watch` is the local-first, Obsidian-like immediacy: edit a note in your
+editor and it is searchable at once, no commit, no manual `mesh index`. It
+reconciles at startup, on every change (debounced), and on a periodic safety
+tick that always converges, so a missed file event never leaves the index stale.
 
 Already have a Foam / Obsidian-style vault? Bring it up to the Mesh schema in one idempotent pass:
 
@@ -92,10 +98,16 @@ queries you report on is how you fool yourself.
 Mesh speaks MCP (JSON-RPC) over stdio. Point your agent at:
 
 ```json
-{ "command": "mesh", "args": ["mcp", "--vault", "/abs/path/to/my-vault"] }
+{ "command": "mesh", "args": ["mcp", "--vault", "/abs/path/to/my-vault", "--watch"] }
 ```
 
 The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note or one heading by anchor), `mesh_god_nodes` (the hub map to orient), `mesh_changed_since` (deltas on resume), and the write-back tools `mesh_append_note` / `mesh_write_entity`. The retrieval contract (how to query cheaply, and to write back when done) is served as the MCP `initialize` instructions and the `mesh://contract` resource, so any agent uses it well without extra prompting.
+
+The `--watch` flag runs the live reindexer inside the server, so notes you (or a
+teammate) edit in your editor become searchable in the same session without a
+restart. Watch progress goes to stderr; stdout stays the pure JSON-RPC stream.
+Omit it for the classic behavior where the index only refreshes on the agent's
+own write-backs.
 
 ## Commands
 
@@ -105,6 +117,7 @@ The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note o
 | `mesh new <type> "<title>"` | Scaffold a note (id, date, placement, skeleton auto-filled) |
 | `mesh migrate [vault]` | Bring a Hive/Foam-style vault up to the Mesh schema |
 | `mesh index [vault]` | Parse + persist the index (`.mesh/mesh.db`) |
+| `mesh watch [vault]` | Live-reindex on every change (debounced + periodic reconcile) |
 | `mesh embed [vault]` | Embed notes via a BYOAI endpoint (turns on semantic search) |
 | `mesh search "<query>"` | Fused, budget-packed retrieval (semantic + rerank when configured) |
 | `mesh status [vault]` | Index row counts + which retrieval signals are active |
@@ -112,7 +125,7 @@ The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note o
 | `mesh doctor [vault]` | Index freshness (drift), counts, health |
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |
 | `mesh tune <cases.json>` | Learn fusion weights from labelled queries (validated on held-out) |
-| `mesh mcp [--vault]` | Serve the agent retrieval + write-back surface |
+| `mesh mcp [--vault] [--watch]` | Serve the agent retrieval + write-back surface (live-reindex with `--watch`) |
 
 ## Build
 

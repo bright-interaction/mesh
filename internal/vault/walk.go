@@ -11,6 +11,16 @@ var skipDirs = map[string]bool{
 	"graphify-out": true, "_archive": true,
 }
 
+// skipDir reports whether a directory (by name, relative to root) should be
+// pruned from a vault traversal. Shared by Walk and Dirs so the watcher watches
+// exactly the directories the indexer reads.
+func skipDir(path, root, name string) bool {
+	if path != root && strings.HasPrefix(name, ".") {
+		return true
+	}
+	return skipDirs[name]
+}
+
 // Walk returns every markdown file under root, skipping noise and hidden dirs.
 // This is the M0 walker; .meshignore support lands with the index step.
 func Walk(root string) ([]string, error) {
@@ -20,11 +30,7 @@ func Walk(root string) ([]string, error) {
 			return err
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if path != root && strings.HasPrefix(name, ".") {
-				return fs.SkipDir
-			}
-			if skipDirs[name] {
+			if skipDir(path, root, d.Name()) {
 				return fs.SkipDir
 			}
 			return nil
@@ -32,6 +38,28 @@ func Walk(root string) ([]string, error) {
 		if strings.EqualFold(filepath.Ext(path), ".md") {
 			out = append(out, path)
 		}
+		return nil
+	})
+	return out, err
+}
+
+// Dirs returns every directory under root that Walk traverses (root included,
+// skipped/hidden dirs pruned). The fsnotify watcher needs these because kqueue
+// and inotify watch a single directory at a time, not a tree, so it adds one
+// watch per indexed directory and skips the same noise Walk does.
+func Dirs(root string) ([]string, error) {
+	var out []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if skipDir(path, root, d.Name()) {
+			return fs.SkipDir
+		}
+		out = append(out, path)
 		return nil
 	})
 	return out, err

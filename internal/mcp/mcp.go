@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/watch"
 )
 
 const (
@@ -22,11 +25,21 @@ const (
 )
 
 // Server holds the live index, graph, and retriever for one vault.
+//
+// Concurrency: tool calls run on the ServeStdio goroutine while the optional
+// background watcher (Watch) rebuilds on file changes. mu guards the graph +
+// retriever pointers so a reader always sees a consistent pair; reloadMu makes a
+// rebuild single-flight so the dispatch goroutine (a write-back) and the watcher
+// never reindex at the same time.
 type Server struct {
 	vaultRoot string
 	store     *index.Store
+
+	mu        sync.RWMutex // guards graph + retriever
 	graph     *graph.Graph
 	retriever *retrieve.Retriever
+
+	reloadMu sync.Mutex // serializes rebuilds across dispatch + watcher
 }
 
 // NewServer opens the vault's index and loads it into memory.
@@ -45,16 +58,75 @@ func NewServer(vaultRoot string) (*Server, error) {
 
 func (s *Server) Close() error { return s.store.Close() }
 
-// reload re-indexes the vault and rebuilds the in-memory graph + retriever. Run
-// after a write-back so new notes are immediately retrievable.
+// snapshot returns the current graph + retriever under a read lock, so a
+// concurrent rebuild swapping them in never tears a reader's view.
+func (s *Server) snapshot() (*graph.Graph, *retrieve.Retriever) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.graph, s.retriever
+}
+
+// swap atomically replaces the in-memory graph + retriever.
+func (s *Server) swap(g *graph.Graph) {
+	r := retrieve.NewFromEnv(s.store, g)
+	s.mu.Lock()
+	s.graph = g
+	s.retriever = r
+	s.mu.Unlock()
+}
+
+// reload fully re-indexes the vault and rebuilds the in-memory graph +
+// retriever. Run at startup and after a write-back so new notes are immediately
+// retrievable.
 func (s *Server) reload() error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
 	g, err := index.Reindex(s.store, s.vaultRoot)
 	if err != nil {
 		return err
 	}
-	s.graph = g
-	s.retriever = retrieve.NewFromEnv(s.store, g)
+	s.swap(g)
 	return nil
+}
+
+// reconcileOnce reindexes only when the vault has drifted, swapping in the fresh
+// graph when it did. It is the watcher's reindex callback.
+func (s *Server) reconcileOnce() (index.Reconciliation, error) {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	rec, err := index.Reconcile(s.store, s.vaultRoot)
+	if err != nil {
+		return rec, err
+	}
+	if rec.Reindexed {
+		s.swap(rec.Graph)
+	}
+	return rec, nil
+}
+
+// Watch live-reindexes the vault in the background until ctx is cancelled, so a
+// long-running agent session sees notes a human edits in their editor without a
+// restart. logf must write to stderr: stdout carries the JSON-RPC stream.
+func (s *Server) Watch(ctx context.Context, debounce, reconcile time.Duration, logf func(string, ...any)) error {
+	return watch.Run(ctx, watch.Options{
+		Root:      s.vaultRoot,
+		Debounce:  debounce,
+		Reconcile: reconcile,
+		Logf:      logf,
+		OnReindex: func() (watch.Result, error) {
+			rec, err := s.reconcileOnce()
+			if err != nil {
+				return watch.Result{}, err
+			}
+			return watch.Result{
+				Added:     rec.Added,
+				Changed:   rec.Changed,
+				Removed:   rec.Removed,
+				Reindexed: rec.Reindexed,
+				Dur:       rec.Dur,
+			}, nil
+		},
+	})
 }
 
 // ServeStdio reads newline-delimited JSON-RPC requests from stdin and writes

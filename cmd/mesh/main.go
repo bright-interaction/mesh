@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/embed"
@@ -19,6 +21,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
+	"github.com/bright-interaction/mesh/internal/watch"
 	"github.com/spf13/cobra"
 )
 
@@ -47,6 +50,7 @@ func rootCmd() *cobra.Command {
 		migrateCmd(),
 		lintCmd(),
 		mcpCmd(),
+		watchCmd(),
 		tuiCmd(),
 		uiCmd(),
 		doctorCmd(),
@@ -841,20 +845,98 @@ func isKebab(filename string) bool {
 
 func mcpCmd() *cobra.Command {
 	var vaultDir string
+	var doWatch bool
+	var debounce, reconcile time.Duration
 	c := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve the agent retrieval contract over MCP (JSON-RPC on stdio)",
-		Long:  "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Configure your agent with: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}.",
+		Long:  "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Configure your agent with: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}. Add --watch so notes edited in your editor are searchable in the same session without a restart.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			srv, err := mcp.NewServer(vaultDir)
 			if err != nil {
 				return err
 			}
 			defer srv.Close()
-			return srv.ServeStdio()
+			if !doWatch {
+				return srv.ServeStdio()
+			}
+			// Background watcher keeps the in-memory index fresh while the stdio
+			// loop serves the agent. On stdin EOF (agent disconnect) ServeStdio
+			// returns; we then stop the watcher and wait for it before Close.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				logf := func(format string, a ...any) {
+					fmt.Fprintf(os.Stderr, "mesh watch: "+format+"\n", a...)
+				}
+				if err := srv.Watch(ctx, debounce, reconcile, logf); err != nil {
+					fmt.Fprintf(os.Stderr, "mesh watch: %v\n", err)
+				}
+			}()
+			serveErr := srv.ServeStdio()
+			cancel()
+			<-done
+			return serveErr
 		},
 	}
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
+	c.Flags().BoolVar(&doWatch, "watch", false, "live-reindex the vault in the background so editor changes are searchable without a restart")
+	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
+	c.Flags().DurationVar(&reconcile, "reconcile", 30*time.Second, "periodic full-reconcile safety net (0 to disable)")
+	return c
+}
+
+func watchCmd() *cobra.Command {
+	var debounce, reconcile time.Duration
+	c := &cobra.Command{
+		Use:   "watch [vault]",
+		Short: "Watch the vault and live-reindex on every change (local-first immediacy)",
+		Long:  "Long-running reindexer: edit a note in your editor and it is searchable at once, no commit, no manual mesh index. A reconcile runs at startup, on every change (debounced), and on a periodic safety tick that always converges. Keeps .mesh/mesh.db fresh for mesh search and any reader; for a live MCP session, run mesh mcp --watch instead so the server hot-reloads its own in-memory index.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := vaultArg(args)
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			abs, _ := filepath.Abs(root)
+			n, _ := store.Count("notes")
+			fmt.Printf("watching %s (%d notes indexed); edits reindex live. Ctrl-C to stop.\n", abs, n)
+			logf := func(format string, a ...any) {
+				fmt.Printf("%s  "+format+"\n", append([]any{time.Now().Format("15:04:05")}, a...)...)
+			}
+			err = watch.Run(ctx, watch.Options{
+				Root:      root,
+				Debounce:  debounce,
+				Reconcile: reconcile,
+				Logf:      logf,
+				OnReindex: func() (watch.Result, error) {
+					rec, err := index.Reconcile(store, root)
+					if err != nil {
+						return watch.Result{}, err
+					}
+					return watch.Result{
+						Added:     rec.Added,
+						Changed:   rec.Changed,
+						Removed:   rec.Removed,
+						Reindexed: rec.Reindexed,
+						Dur:       rec.Dur,
+					}, nil
+				},
+			})
+			fmt.Println("stopped.")
+			return err
+		},
+	}
+	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
+	c.Flags().DurationVar(&reconcile, "reconcile", 30*time.Second, "periodic full-reconcile safety net (0 to disable)")
 	return c
 }
 func tuiCmd() *cobra.Command { return stub("tui", "Open the terminal UI", "Milestone 3") }

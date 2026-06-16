@@ -108,7 +108,8 @@ func (s *Server) toolSearch(raw json.RawMessage) (any, *rpcError) {
 	if strings.TrimSpace(a.Query) == "" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query is required"}
 	}
-	cards, err := s.retriever.Retrieve(a.Query, retrieve.Options{Limit: a.Limit, Budget: a.Budget})
+	_, retriever := s.snapshot()
+	cards, err := retriever.Retrieve(a.Query, retrieve.Options{Limit: a.Limit, Budget: a.Budget})
 	if err != nil {
 		return nil, internalErr(err)
 	}
@@ -151,8 +152,9 @@ func (s *Server) toolGodNodes(raw json.RawMessage) (any, *rpcError) {
 		Degree    int    `json:"degree"`
 		Community int    `json:"community"`
 	}
+	g, _ := s.snapshot()
 	var hubs []hub
-	for _, n := range s.graph.Nodes() {
+	for _, n := range g.Nodes() {
 		if n.Kind != "note" {
 			continue
 		}
