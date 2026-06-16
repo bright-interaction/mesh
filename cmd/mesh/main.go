@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/brightinteraction/mesh/internal/eval"
 	"github.com/brightinteraction/mesh/internal/graph"
 	"github.com/brightinteraction/mesh/internal/index"
 	"github.com/brightinteraction/mesh/internal/mcp"
@@ -34,6 +36,7 @@ func rootCmd() *cobra.Command {
 		newCmd(),
 		indexCmd(),
 		searchCmd(),
+		evalCmd(),
 		statusCmd(),
 		migrateCmd(),
 		lintCmd(),
@@ -97,6 +100,68 @@ func searchCmd() *cobra.Command {
 	c.Flags().IntVar(&limit, "limit", 20, "candidates per signal")
 	c.Flags().IntVar(&budget, "budget", 0, "token budget for packing (0 = all ranked)")
 	return c
+}
+
+func evalCmd() *cobra.Command {
+	var vaultDir, casesFile string
+	var budget int
+	c := &cobra.Command{
+		Use:   "eval <cases.json>",
+		Short: "Gate 1: measure Mesh retrieval vs the read-top-3-FTS baseline on a labelled query set",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				casesFile = args[0]
+			}
+			if casesFile == "" {
+				return fmt.Errorf("provide a cases file: mesh eval <cases.json> --vault <dir>")
+			}
+			raw, err := os.ReadFile(casesFile)
+			if err != nil {
+				return err
+			}
+			var cases []eval.Case
+			if err := json.Unmarshal(raw, &cases); err != nil {
+				return fmt.Errorf("parse cases: %w", err)
+			}
+			store, err := index.Open(vaultDir)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			g, err := store.LoadGraph()
+			if err != nil {
+				return err
+			}
+			rep := eval.RunGate(store, retrieve.New(store, g), vaultDir, cases, budget)
+
+			fmt.Printf("Gate 1: Mesh vs read-top-%d-FTS  (vault: %s, %d cases, budget %d, tokenizer: estimate)\n", 3, vaultDir, rep.N, budget)
+			for _, cr := range rep.Cases {
+				fmt.Printf("  %-34s mesh[hit=%-5v %4dt]  base[hit=%-5v %4dt]\n", truncate(cr.Query, 34), cr.MeshHit, cr.MeshTokens, cr.BaseHit, cr.BaseTokens)
+			}
+			fmt.Printf("  mesh:     recall %d/%d   avg %.0f tok\n", rep.MeshHits, rep.N, rep.MeshAvg)
+			fmt.Printf("  baseline: recall %d/%d   avg %.0f tok\n", rep.BaseHits, rep.N, rep.BaseAvg)
+			if rep.BaseAvg > 0 {
+				fmt.Printf("  token saving: %.0f%%\n", 100*(1-rep.MeshAvg/rep.BaseAvg))
+			}
+			if rep.Pass {
+				fmt.Println("  VERDICT: PASS (>= baseline recall at fewer tokens)")
+				return nil
+			}
+			fmt.Println("  VERDICT: FAIL")
+			return fmt.Errorf("gate 1 not met")
+		},
+	}
+	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
+	c.Flags().IntVar(&budget, "budget", 0, "token budget for the Mesh arm (0 = unbudgeted)")
+	return c
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
 
 func statusCmd() *cobra.Command {
