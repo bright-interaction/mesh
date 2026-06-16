@@ -978,35 +978,107 @@ func joinCmd() *cobra.Command {
 }
 
 func syncCmd() *cobra.Command {
+	var doWatch bool
+	var debounce, reconcile time.Duration
 	c := &cobra.Command{
 		Use:   "sync [vault]",
 		Short: "Reconcile the vault with the hub (push local edits, pull teammates', no git)",
-		Long:  "One pull-based reconcile round: pushes your changed notes, applies the hub's merged result and any teammates' changes, and reindexes. Additive edits to a shared page auto-merge; a true overwrite keeps the hub version and saves yours to a *.sync-conflict sibling.",
+		Long:  "One pull-based reconcile round: pushes your changed notes, applies the hub's merged result and any teammates' changes, and reindexes. Additive edits to a shared page auto-merge; a true overwrite keeps the hub version and saves yours to a *.sync-conflict sibling. Add --watch to stay running: local edits push and the hub's changes pull in real time (SSE), with a periodic reconcile as the safety net.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultDir := vaultArg(args)
-			sum, err := meshclient.SyncVault(vaultDir)
-			if err != nil {
-				return err
-			}
 			store, err := index.Open(vaultDir)
 			if err != nil {
 				return err
 			}
 			defer store.Close()
-			if _, err := index.Reconcile(store, vaultDir); err != nil {
-				return err
+
+			// One sync round: push/pull via the hub, then reindex so search reflects
+			// the merged result. Reused by the one-shot path and the watch loop.
+			syncOnce := func() (meshclient.Summary, error) {
+				sum, err := meshclient.SyncVault(vaultDir)
+				if err != nil {
+					return sum, err
+				}
+				if _, err := index.Reconcile(store, vaultDir); err != nil {
+					return sum, err
+				}
+				return sum, nil
 			}
-			fmt.Printf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)\n", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
-			for _, sib := range sum.ConflictSiblings {
-				fmt.Printf("  conflict: hub version kept; your version saved at %s (resolve, then sync)\n", sib)
+
+			if !doWatch {
+				sum, err := syncOnce()
+				if err != nil {
+					return err
+				}
+				fmt.Printf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)\n", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
+				for _, sib := range sum.ConflictSiblings {
+					fmt.Printf("  conflict: hub version kept; your version saved at %s (resolve, then sync)\n", sib)
+				}
+				for _, sib := range sum.Protected {
+					fmt.Printf("  protected your unsaved local edit; incoming hub version saved at %s\n", sib)
+				}
+				return nil
 			}
-			for _, sib := range sum.Protected {
-				fmt.Printf("  protected your unsaved local edit; incoming hub version saved at %s\n", sib)
+
+			// --watch: continuous reconcile driven by three sources, all funneled
+			// through the watcher's single-flight loop: local .md edits (fsnotify),
+			// the hub's SSE "head changed" nudges (Trigger), and a periodic safety
+			// tick. The startup reconcile does the initial sync.
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			abs, _ := filepath.Abs(vaultDir)
+			fmt.Printf("syncing %s continuously: local edits push, hub changes pull. Ctrl-C to stop.\n", abs)
+			logf := func(format string, a ...any) {
+				fmt.Printf("%s  "+format+"\n", append([]any{time.Now().Format("15:04:05")}, a...)...)
 			}
-			return nil
+			meshclient.Logf = logf // surface non-fatal stream diagnostics (e.g. auth rejections)
+			nudge := make(chan struct{}, 1)
+			go func() {
+				if err := meshclient.StreamEvents(ctx, vaultDir, nudge); err != nil {
+					logf("event stream unavailable, falling back to periodic sync: %v", err)
+				}
+			}()
+			err = watch.Run(ctx, watch.Options{
+				Root:      vaultDir,
+				Debounce:  debounce,
+				Reconcile: reconcile,
+				Trigger:   nudge,
+				Logf:      logf,
+				OnReindex: func() (watch.Result, error) {
+					// Note: applying the hub's deltas writes .md files, which the
+					// watcher sees and debounces into one more reconcile. That follow-up
+					// is a guaranteed no-op (SyncVault re-hashes from disk and persists
+					// the new base, so the next computeOutbox is empty and the hub
+					// fast-forwards without a broadcast), so it converges in one extra
+					// idle round rather than looping. We accept that cheap round instead
+					// of threading self-written paths through the watcher.
+					sum, serr := syncOnce()
+					if serr != nil {
+						return watch.Result{}, serr
+					}
+					// Log a sync-centric line ourselves only when something moved, then
+					// return Reindexed:false so the watcher does not also log its
+					// generic reindex line.
+					if sum.Pushed > 0 || sum.Pulled > 0 || sum.Conflicts > 0 || len(sum.Protected) > 0 {
+						logf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
+						for _, sib := range sum.ConflictSiblings {
+							logf("  conflict: hub version kept; your version saved at %s", sib)
+						}
+						for _, sib := range sum.Protected {
+							logf("  protected your local edit; incoming hub version saved at %s", sib)
+						}
+					}
+					return watch.Result{Reindexed: false}, nil
+				},
+			})
+			fmt.Println("stopped.")
+			return err
 		},
 	}
+	c.Flags().BoolVar(&doWatch, "watch", false, "stay running: push local edits and pull hub changes in real time (SSE) plus a periodic safety reconcile")
+	c.Flags().DurationVar(&debounce, "debounce", 500*time.Millisecond, "quiet window to coalesce a burst of local saves before syncing")
+	c.Flags().DurationVar(&reconcile, "reconcile", 60*time.Second, "periodic safety-net sync interval (0 to disable)")
 	return c
 }
 
