@@ -1,0 +1,12 @@
+[
+  {"query": "how does dockyard store and broker secrets for agents", "relevant": ["dockyard-secrets-vault", "dockyard-secrets-bridge"]},
+  {"query": "what replaced forgejo for ci cd deploys", "relevant": ["hephaestus"]},
+  {"query": "gdpr cookie consent banner platform", "relevant": ["cookieproof"]},
+  {"query": "core security scanning engine chromium", "relevant": ["svar-go"]},
+  {"query": "ai assistant embedded inside the crm", "relevant": ["brightcrm-neo-ai"]},
+  {"query": "knowledge graph builder token reduction for coding agents", "relevant": ["graphify"]},
+  {"query": "agent native document authoring and e-signing", "relevant": ["mithras"]},
+  {"query": "uptime monitoring and grc compliance platform", "relevant": ["sentinel"]},
+  {"query": "reverse proxy routing domains to containers", "relevant": ["dockyard-reverse-proxy"]},
+  {"query": "self hosted sso oidc provider", "relevant": ["zitadel"]}
+]

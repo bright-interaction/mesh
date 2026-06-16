@@ -135,33 +135,30 @@ func evalCmd() *cobra.Command {
 			}
 			rep := eval.RunGate(store, retrieve.New(store, g), vaultDir, cases, budget)
 
-			fmt.Printf("Gate 1: Mesh vs read-top-%d-FTS  (vault: %s, %d cases, budget %d, tokenizer: estimate)\n", 3, vaultDir, rep.N, budget)
-			for _, cr := range rep.Cases {
-				fmt.Printf("  %-34s mesh[hit=%-5v %4dt]  base[hit=%-5v %4dt]\n", truncate(cr.Query, 34), cr.MeshHit, cr.MeshTokens, cr.BaseHit, cr.BaseTokens)
+			pf := func(b bool) string {
+				if b {
+					return "PASS"
+				}
+				return "FAIL"
 			}
-			fmt.Printf("  mesh:     recall %d/%d   avg %.0f tok\n", rep.MeshHits, rep.N, rep.MeshAvg)
-			fmt.Printf("  baseline: recall %d/%d   avg %.0f tok\n", rep.BaseHits, rep.N, rep.BaseAvg)
-			if rep.BaseAvg > 0 {
-				fmt.Printf("  token saving: %.0f%%\n", 100*(1-rep.MeshAvg/rep.BaseAvg))
-			}
+			fmt.Printf("Gate 1: Mesh vs FTS baselines  (vault: %s, %d cases, budget %d, tokenizer: estimate)\n", vaultDir, rep.N, budget)
+			fmt.Printf("  surfacing recall @K=%d:   mesh %d/%d   fts %d/%d\n", 20, rep.MeshSurfaced, rep.N, rep.FTSSurfaced, rep.N)
+			fmt.Printf("  answer@1 (one body read): mesh %d/%d   fts-top1 %d/%d\n", rep.MeshAnswer1, rep.N, rep.FTSAnswer1, rep.N)
+			fmt.Printf("  tokens median:  mesh %.0f   fts-top1 %.0f (matched)   fts-top3 %.0f (naive)\n", rep.MeshMedian, rep.FTSTop1Median, rep.FTSTop3Median)
+			fmt.Printf("  tokens mean:    mesh %.0f   fts-top1 %.0f             fts-top3 %.0f\n", rep.MeshMean, rep.FTSTop1Mean, rep.FTSTop3Mean)
+			fmt.Printf("  sub-claims: surfacing>=fts %s | answer@1>=fts-top1 %s | cheaper-than-naive-top3 %s\n",
+				pf(rep.SurfacingWin), pf(rep.AnswerWin), pf(rep.NaiveCostWin))
 			if rep.Pass {
-				fmt.Println("  VERDICT: PASS (>= baseline recall at fewer tokens)")
+				fmt.Println("  VERDICT: PASS (all three sub-claims hold)")
 				return nil
 			}
-			fmt.Println("  VERDICT: FAIL")
-			return fmt.Errorf("gate 1 not met")
+			fmt.Println("  VERDICT: PARTIAL (see sub-claims; matched fts-top1 cost shows the card overhead honestly)")
+			return fmt.Errorf("gate 1 not fully met")
 		},
 	}
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
 	c.Flags().IntVar(&budget, "budget", 0, "token budget for the Mesh arm (0 = unbudgeted)")
 	return c
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-1] + "…"
 }
 
 func statusCmd() *cobra.Command {
