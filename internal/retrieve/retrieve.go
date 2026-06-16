@@ -11,6 +11,7 @@ import (
 	"github.com/brightinteraction/mesh/internal/embed"
 	"github.com/brightinteraction/mesh/internal/graph"
 	"github.com/brightinteraction/mesh/internal/index"
+	"github.com/brightinteraction/mesh/internal/rerank"
 )
 
 const (
@@ -23,6 +24,8 @@ const (
 	expandK     = 3   // pull at most K strong note-neighbors per seed
 	expandDecay = 0.4 // a neighbor inherits this fraction of the seed's score
 	godDegree   = 24  // skip expansion into hub nodes above this degree
+
+	rerankK = 30 // rerank at most this many top fused candidates
 )
 
 var tier0Types = map[string]bool{"decision": true, "gotcha": true, "post-mortem": true}
@@ -57,29 +60,74 @@ type Retriever struct {
 	vecModel    string
 	vecs        map[string][][]float32 // node id -> per-section chunk vectors
 	queryPrefix string                 // e.g. "search_query: " for nomic-style asymmetric models
+
+	rr         rerank.Reranker // optional cross-encoder; reorders the top-K head
+	rerankName string          // model id, for status/diagnostics
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
 	return &Retriever{store: store, graph: g, ranker: g.NewRanker()}
 }
 
-// NewFromEnv builds a retriever and enables the semantic signal when the vault
-// has stored vectors and MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL are set (BYOAI).
-// Falls back silently to lexical-only when no embedder is configured.
+// NewFromEnv builds a retriever and enables the optional BYOAI stages from the
+// environment. The semantic (vector) and rerank stages are independent: either,
+// both, or neither can be on. Falls back silently to lexical-only when nothing
+// is configured.
 func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 	r := New(store, g)
+	r.enableVectorsFromEnv()
+	r.enableRerankFromEnv()
+	return r
+}
+
+// enableVectorsFromEnv turns on the semantic signal when the vault has stored
+// vectors and MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL are set.
+func (r *Retriever) enableVectorsFromEnv() {
 	endpoint, model := os.Getenv("MESH_EMBED_ENDPOINT"), os.Getenv("MESH_EMBED_MODEL")
 	if endpoint == "" || model == "" {
-		return r
+		return
 	}
-	vm, vecs, err := store.LoadVectors()
+	vm, vecs, err := r.store.LoadVectors()
 	if err != nil || len(vecs) == 0 {
-		return r
+		return
 	}
 	r.queryPrefix = os.Getenv("MESH_EMBED_QUERY_PREFIX")
 	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv("MESH_EMBED_KEY")), vm, vecs)
-	return r
 }
+
+// enableRerankFromEnv turns on the cross-encoder rerank stage when
+// MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL are set (BYOAI, sovereign or cloud).
+func (r *Retriever) enableRerankFromEnv() {
+	endpoint, model := os.Getenv("MESH_RERANK_ENDPOINT"), os.Getenv("MESH_RERANK_MODEL")
+	if endpoint == "" || model == "" {
+		return
+	}
+	r.EnableRerank(rerank.NewHTTP(endpoint, model, os.Getenv("MESH_RERANK_KEY")))
+}
+
+// EnableRerank turns on the cross-encoder rerank stage. The reranker reorders
+// the top-K fused candidates; it never gates retrieval, so a failing endpoint
+// degrades silently to the fused order. Returns false for a nil reranker.
+func (r *Retriever) EnableRerank(rr rerank.Reranker) bool {
+	if rr == nil {
+		return false
+	}
+	r.rr, r.rerankName = rr, rr.Model()
+	return true
+}
+
+// RerankActive reports whether a cross-encoder rerank stage is configured.
+func (r *Retriever) RerankActive() bool { return r.rr != nil }
+
+// RerankModel returns the configured rerank model id (empty when inactive).
+func (r *Retriever) RerankModel() string { return r.rerankName }
+
+// VectorsActive reports whether the semantic signal will fire (an embedder is
+// configured and the vault has stored vectors that match its model).
+func (r *Retriever) VectorsActive() bool { return r.emb != nil && len(r.vecs) > 0 }
+
+// VectorModel returns the active embedding model id (empty when inactive).
+func (r *Retriever) VectorModel() string { return r.vecModel }
 
 // EnableVectors turns on the semantic signal. It is a no-op unless the query
 // embedder's model matches the vault's stored model (homogeneity guard: vectors
@@ -198,17 +246,104 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 		}
 		cards = append(cards, c)
 	}
+	sortCards(cards)
+
+	// Cross-encoder rerank of the top-K head: a model that reads the query and
+	// each candidate jointly reorders the strongest fused results, which is the
+	// lever for top-1 precision. It refines the head only and never gates: any
+	// endpoint error leaves the fused order intact.
+	r.rerankHead(query, cards)
+
+	if opt.Budget > 0 {
+		cards = packToBudget(cards, opt.Budget)
+	}
+	return cards, nil
+}
+
+func sortCards(cards []Card) {
 	sort.Slice(cards, func(i, j int) bool {
 		if cards[i].Score != cards[j].Score {
 			return cards[i].Score > cards[j].Score
 		}
 		return cards[i].NodeID < cards[j].NodeID
 	})
+}
 
-	if opt.Budget > 0 {
-		cards = packToBudget(cards, opt.Budget)
+// rerankHead reorders the top-K cards in place using the configured
+// cross-encoder. Reranked cards are rescored above any fused tail card so the
+// head stays on top after the final sort, with the tier-0 nudge preserved.
+func (r *Retriever) rerankHead(query string, cards []Card) {
+	if r.rr == nil || len(cards) < 2 {
+		return
 	}
-	return cards, nil
+	k := rerankK
+	if k > len(cards) {
+		k = len(cards)
+	}
+	head := cards[:k]
+	ids := make([]string, k)
+	for i := range head {
+		ids[i] = head[i].NodeID
+	}
+	docText, err := r.store.NoteDocs(ids)
+	if err != nil {
+		return
+	}
+	docs := make([]string, k)
+	for i, id := range ids {
+		if d := docText[id]; d != "" {
+			docs[i] = d
+		} else {
+			docs[i] = head[i].Title
+		}
+	}
+	res, err := r.rr.Rerank(context.Background(), query, docs)
+	if err != nil || len(res) != k {
+		return
+	}
+	scores := make([]float64, k)
+	lo, hi := res[0].Score, res[0].Score
+	for _, x := range res {
+		scores[x.Index] = x.Score
+		if x.Score < lo {
+			lo = x.Score
+		}
+		if x.Score > hi {
+			hi = x.Score
+		}
+	}
+	// A flat (uninformative) rerank response carries no ranking signal; leave the
+	// fused head order intact rather than collapsing it to alphabetical via the
+	// constant-score branch of minMax.
+	if hi == lo {
+		return
+	}
+	norm := minMax(scores)
+	// Lift the reranked head above the untouched fused tail. Derive the base from
+	// the actual max tail score (not a fixed constant) so the invariant holds
+	// regardless of edge-weight magnitudes in graph expansion.
+	base := 1.0
+	for _, c := range cards[k:] {
+		if c.Score+1.0 > base {
+			base = c.Score + 1.0
+		}
+	}
+	for i := range head {
+		// The tier-0 nudge multiplies the relevance component only, never the
+		// offset, so institutional-memory notes get a small (<=0.1) tiebreak among
+		// near-equal cross-encoder scores without overriding a clearly better pick.
+		rel := norm[i]
+		if head[i].Tier0 {
+			rel *= tier0Mult
+		}
+		head[i].Score = base + rel
+		if head[i].Reason != "" {
+			head[i].Reason += " +reranked"
+		} else {
+			head[i].Reason = "reranked"
+		}
+	}
+	sortCards(cards)
 }
 
 // card builds a Card from a node id, reading title/path/type/tier-0 from the

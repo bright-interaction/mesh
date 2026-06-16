@@ -8,9 +8,9 @@ It is one Go binary, no cgo, no external services. Retrieving from Mesh is cheap
 
 ## Honest scope
 
-- **What's proven:** cheap card-based retrieval (matches plain full-text search on quality, at a fraction of the tokens of reading files in full) plus the agent write-back flywheel, in a single no-glue binary.
-- **What's not claimed:** Mesh fuses full-text with a graph-BM25 signal and a tier-0 boost for institutional-memory notes. On the vaults measured so far that fusion *matches* full-text search; it does not beat it. It is kept on as a non-harmful re-ranker, not sold as a retrieval-quality win. See `docs/SPEC.md` for the Gate-1 measurement and its adversarial review.
-- **Deferred:** vector embeddings, a TUI + web graph viewer, and team sync (a self-hosted hub). Solo, local v1 first.
+- **What's proven (lexical core):** cheap card-based retrieval (matches plain full-text search on quality, at a fraction of the tokens of reading files in full) plus the agent write-back flywheel, in a single no-glue binary. The FTS + graph-BM25 + tier-0 fusion *matches* full-text search on keyword-friendly queries (a non-harmful re-ranker, not a lexical-quality win).
+- **What's proven (BYOAI semantic + rerank):** with a vector embedder configured, surfacing recall on paraphrase queries (where keyword search breaks) jumps from 13/20 to 20/20. Adding a cross-encoder rerank stage lifts paraphrase top-1 precision (`answer@1`) from 3/20 to 10/20, with a small (-1/25) trade on keyword queries. Both are BYOAI and sovereign by default (run them locally; nothing egresses). See `docs/SPEC.md` for the matched-arm measurements and their adversarial reviews.
+- **Deferred:** a TUI + web graph viewer, and team sync (a self-hosted hub). Solo, local v1 first.
 
 ## Install
 
@@ -42,6 +42,32 @@ mesh migrate my-vault              # synthesize ids, updated->when, lift ## Rela
 mesh index my-vault
 ```
 
+## Semantic search + rerank (BYOAI, sovereign)
+
+Mesh runs no inference itself. Two optional stages call HTTP endpoints **you**
+control, so they stay on your infrastructure:
+
+```
+# 1. Vectors: embed notes via any OpenAI-compatible /embeddings endpoint (Ollama, etc.)
+export MESH_EMBED_ENDPOINT=http://localhost:11434/v1
+export MESH_EMBED_MODEL=nomic-embed-text
+export MESH_EMBED_DOC_PREFIX="search_document: "   # nomic-style asymmetric models
+export MESH_EMBED_QUERY_PREFIX="search_query: "
+mesh embed my-vault                                 # one vector per note
+
+# 2. Rerank: a cross-encoder sharpens top-1 precision (see tools/rerank-server)
+export MESH_RERANK_ENDPOINT=http://127.0.0.1:8787/rerank
+export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
+
+mesh status my-vault    # shows which retrieval signals are active
+```
+
+Once set, `mesh search` / `eval` / `mcp` fuse the semantic signal and apply the
+rerank automatically. Both degrade safely: no embedder means lexical-only, a
+down rerank endpoint falls back to the fused order. Pointing either env var at a
+cloud provider sends note content off-box, so keep them local to stay sovereign.
+A ready-to-run local cross-encoder server lives in `tools/rerank-server/`.
+
 ## Wire it to your coding agent
 
 Mesh speaks MCP (JSON-RPC) over stdio. Point your agent at:
@@ -60,8 +86,9 @@ The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note o
 | `mesh new <type> "<title>"` | Scaffold a note (id, date, placement, skeleton auto-filled) |
 | `mesh migrate [vault]` | Bring a Hive/Foam-style vault up to the Mesh schema |
 | `mesh index [vault]` | Parse + persist the index (`.mesh/mesh.db`) |
-| `mesh search "<query>"` | Fused, budget-packed retrieval |
-| `mesh status [vault]` | Index row counts |
+| `mesh embed [vault]` | Embed notes via a BYOAI endpoint (turns on semantic search) |
+| `mesh search "<query>"` | Fused, budget-packed retrieval (semantic + rerank when configured) |
+| `mesh status [vault]` | Index row counts + which retrieval signals are active |
 | `mesh lint [vault]` | Frontmatter / links / filenames (non-zero exit for CI) |
 | `mesh doctor [vault]` | Index freshness (drift), counts, health |
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |

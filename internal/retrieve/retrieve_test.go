@@ -1,11 +1,51 @@
 package retrieve
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/brightinteraction/mesh/internal/embed"
 	"github.com/brightinteraction/mesh/internal/index"
+	"github.com/brightinteraction/mesh/internal/rerank"
 )
+
+// fakeReranker scores a document 10 when it contains needle, else 0, so a test
+// can force a specific candidate to the top and assert the head reordered.
+type fakeReranker struct{ needle string }
+
+func (f fakeReranker) Model() string { return "fake" }
+func (f fakeReranker) Rerank(_ context.Context, _ string, docs []string) ([]rerank.Result, error) {
+	out := make([]rerank.Result, len(docs))
+	for i, d := range docs {
+		if strings.Contains(strings.ToLower(d), f.needle) {
+			out[i] = rerank.Result{Index: i, Score: 10}
+		} else {
+			out[i] = rerank.Result{Index: i, Score: 0}
+		}
+	}
+	return out, nil
+}
+
+type errReranker struct{}
+
+func (errReranker) Model() string { return "err" }
+func (errReranker) Rerank(context.Context, string, []string) ([]rerank.Result, error) {
+	return nil, fmt.Errorf("boom")
+}
+
+// constReranker returns the same score for every doc (an uninformative response).
+type constReranker struct{}
+
+func (constReranker) Model() string { return "const" }
+func (constReranker) Rerank(_ context.Context, _ string, docs []string) ([]rerank.Result, error) {
+	out := make([]rerank.Result, len(docs))
+	for i := range docs {
+		out[i] = rerank.Result{Index: i, Score: 5}
+	}
+	return out, nil
+}
 
 func buildVault(t *testing.T) *Retriever {
 	t.Helper()
@@ -100,6 +140,56 @@ func TestEnableVectorsHomogeneityGuard(t *testing.T) {
 	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
 	if err != nil || len(cards) == 0 {
 		t.Fatalf("retrieve with vectors enabled failed: err=%v cards=%d", err, len(cards))
+	}
+}
+
+func TestRerankReordersHead(t *testing.T) {
+	r := buildVault(t)
+	base, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	if err != nil || len(base) < 2 {
+		t.Fatalf("precondition: need multiple fused cards, got %d (err %v)", len(base), err)
+	}
+	if base[0].NodeID != "note:a" {
+		t.Fatalf("precondition: fused top should be note:a, got %s", base[0].NodeID)
+	}
+	// The reranker prefers the note whose text mentions "extensions" (note:b).
+	r.EnableRerank(fakeReranker{needle: "extensions"})
+	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cards[0].NodeID != "note:b" {
+		t.Errorf("rerank should lift the 'extensions' note to #1, got %s", cards[0].NodeID)
+	}
+	if !strings.Contains(cards[0].Reason, "rerank") {
+		t.Errorf("reranked card should note rerank in its reason, got %q", cards[0].Reason)
+	}
+}
+
+func TestRerankDegradesOnError(t *testing.T) {
+	r := buildVault(t)
+	base, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	r.EnableRerank(errReranker{})
+	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	if err != nil {
+		t.Fatalf("a failing reranker must not fail retrieval: %v", err)
+	}
+	if len(cards) == 0 || cards[0].NodeID != base[0].NodeID {
+		t.Errorf("failed rerank must leave the fused order intact")
+	}
+}
+
+func TestRerankConstantScoresKeepFusedOrder(t *testing.T) {
+	r := buildVault(t)
+	base, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	r.EnableRerank(constReranker{})
+	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A flat rerank response must be a no-op, not an alphabetical reshuffle.
+	if len(cards) != len(base) || cards[0].NodeID != base[0].NodeID {
+		t.Errorf("uninformative rerank must preserve fused order: base[0]=%s got[0]=%s", base[0].NodeID, cards[0].NodeID)
 	}
 }
 
