@@ -1,0 +1,22 @@
+[
+  {"query": "which tool drives a headless browser to grade how exposed a domain is", "relevant": ["svar-go"]},
+  {"query": "how do we ask visitors for permission before loading marketing pixels", "relevant": ["cookieproof"]},
+  {"query": "what condenses an entire repo into a compact map so the assistant reads fewer characters", "relevant": ["graphify"]},
+  {"query": "where can a counterparty review a contract and apply a legally binding mark", "relevant": ["mithras"]},
+  {"query": "what sits at the edge and forwards incoming requests to the correct container", "relevant": ["proxy"]},
+  {"query": "how do we query the open web through one shared host without leaking each requester", "relevant": ["searxng"]},
+  {"query": "how do we measure visitor traffic without dropping any identifiers on people", "relevant": ["umami"]},
+  {"query": "where do prospects pick an open slot to talk with a sales rep", "relevant": ["calcom"]},
+  {"query": "what turns a won deal into a bill the customer can pay", "relevant": ["invoice-ninja"]},
+  {"query": "which service relays outgoing messages with DKIM signing and bounce handling", "relevant": ["postal"]},
+  {"query": "what gives a familiar grid view on top of a real relational store for staging rows", "relevant": ["nocodb"]},
+  {"query": "how do we harvest prospect contact details off business pages into our pipeline", "relevant": ["leadscraper"]},
+  {"query": "what quietly mines discussion forums for pain points while you browse normally", "relevant": ["reddit-research"]},
+  {"query": "where are sensitive credentials kept locked and unreadable even if the disk leaks", "relevant": ["dockyard-secrets-vault"]},
+  {"query": "what edge function bolts protective response directives onto a site in minutes", "relevant": ["cloudflare-security"]},
+  {"query": "which add-on fills login forms and stashes sign-in details inside the browser", "relevant": ["bright-vault-extension"]},
+  {"query": "what turns a styled HTML template into a polished one-page printable application doc", "relevant": ["cv"]},
+  {"query": "what stands up a locked-down EU-compliant box from scratch with one command", "relevant": ["sovereign-fortress"]},
+  {"query": "how do we author animated promotional clips as composable interface code", "relevant": ["remotion-videos"]},
+  {"query": "how could we send short phone alerts ourselves through physical radio hardware instead of paying per text", "relevant": ["sms-gateway"]}
+]
