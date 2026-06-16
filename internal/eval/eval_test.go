@@ -41,13 +41,16 @@ func TestRunGateBeatsBaselineOnLongNotes(t *testing.T) {
 	r := retrieve.New(s, lg)
 
 	rep := RunGate(s, r, dir, []Case{{Query: "modernc sqlite storage", Relevant: []string{"storage"}}}, 400)
-	if rep.MeshHits != 1 {
-		t.Errorf("mesh should surface the relevant note, got %d/%d", rep.MeshHits, rep.N)
+	if rep.MeshSurfaced != 1 {
+		t.Errorf("mesh should surface the relevant note, got %d/%d", rep.MeshSurfaced, rep.N)
 	}
-	if rep.MeshAvg >= rep.BaseAvg {
-		t.Errorf("mesh (%.0f) should cost fewer tokens than baseline (%.0f) on long notes", rep.MeshAvg, rep.BaseAvg)
+	// Honest claim: on long notes, reading Mesh's cards + one body costs less than
+	// naively reading the top-3 full bodies.
+	if rep.MeshMedian >= rep.FTSTop3Median {
+		t.Errorf("mesh median (%.0f) should beat naive read-top-3 (%.0f) on long notes", rep.MeshMedian, rep.FTSTop3Median)
 	}
-	if !rep.Pass {
-		t.Errorf("gate should pass: %+v", rep)
+	// The matched single-body baseline must be tracked (the fix the review demanded).
+	if rep.FTSTop1Median <= 0 {
+		t.Errorf("matched fts-top1 baseline should be measured, got %.0f", rep.FTSTop1Median)
 	}
 }

@@ -1,12 +1,16 @@
-// Package eval is the Gate-1 measurement harness: it pits Mesh's budget-fitted
-// retrieval against the "read the top-3 FTS notes" baseline on a labelled query
-// set and reports tokens-to-answer and recall. Both arms are counted with the
-// same tokenizer so the comparison is fair.
+// Package eval is the Gate-1 measurement harness. An adversarial review of the
+// first version found two fatal defects: it compared a 1-body Mesh arm against a
+// 3-body baseline (so the "saving" was mostly body-count, not fusion), and it
+// mixed two recall definitions (candidates-surfaced for Mesh vs bodies-read for
+// the baseline). This version fixes both: three arms with matched costs, and
+// surfacing-recall (at equal candidate K) reported separately from answer@1 (the
+// single body each arm actually reads). Both arms use the same tokenizer.
 package eval
 
 import (
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/brightinteraction/mesh/internal/index"
 	"github.com/brightinteraction/mesh/internal/retrieve"
@@ -18,40 +22,45 @@ type Case struct {
 	Relevant []string `json:"relevant"`
 }
 
-// CaseResult is the per-query outcome for both arms.
+// surfaceK is the equal-size candidate pool for the surfacing-recall metric.
+const surfaceK = 20
+
+// CaseResult holds the per-query outcome across the three arms.
 type CaseResult struct {
-	Query      string
-	MeshTokens int
-	BaseTokens int
-	MeshHit    bool
-	BaseHit    bool
+	Query string
+	// Surfacing recall at equal K: does a relevant id appear in the candidate set?
+	MeshSurfaced bool
+	FTSSurfaced  bool
+	// Answer@1: is the single body the arm reads (top card / top FTS hit) relevant?
+	MeshAnswer1 bool
+	FTSAnswer1  bool
+	// Tokens for the body(ies) each arm actually reads, plus Mesh's cards.
+	MeshTokens    int // cards + top-1 body (what Mesh costs)
+	FTSTop1Tokens int // 1 body (matched single-read baseline)
+	FTSTop3Tokens int // 3 bodies (naive baseline)
 }
 
-// Report aggregates the run and renders the Gate-1 verdict.
+// Report aggregates the run.
 type Report struct {
-	Cases     []CaseResult
-	N         int
-	MeshHits  int
-	BaseHits  int
-	MeshAvg   float64
-	BaseAvg   float64
-	Pass      bool
+	Cases []CaseResult
+	N     int
+
+	MeshSurfaced, FTSSurfaced int // surfacing recall (equal K)
+	MeshAnswer1, FTSAnswer1   int // answer@1
+
+	MeshMean, FTSTop1Mean, FTSTop3Mean       float64
+	MeshMedian, FTSTop1Median, FTSTop3Median float64
+
+	// The three defensible sub-claims.
+	SurfacingWin bool // Mesh surfaces relevant at equal K at least as often
+	AnswerWin    bool // Mesh's single read is relevant at least as often
+	NaiveCostWin bool // Mesh median tokens < naive read-top-3 median
+	Pass         bool // all three hold
 }
 
-// baselineTopK is how many FTS notes the baseline agent "reads" in full.
-const baselineTopK = 3
-
-// RunGate models two agent strategies per case:
-//
-//	baseline: FTS, then read the full body of the top-3 hits.
-//	mesh:     fused search returns cheap cards, then read the full body of only
-//	          the top card.
-//
-// Both succeed if a relevant note is surfaced. Gate 1 passes when Mesh matches
-// or beats the baseline's recall at strictly fewer average tokens.
 func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases []Case, budget int) Report {
 	rep := Report{N: len(cases)}
-	var meshSum, baseSum int
+	var mesh, fts1, fts3 []int
 
 	for _, c := range cases {
 		want := map[string]bool{}
@@ -59,45 +68,65 @@ func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases 
 			want["note:"+id] = true
 		}
 
-		// Baseline: read the top-3 FTS bodies.
-		fts, _ := store.Search(c.Query, baselineTopK)
-		baseTok, baseHit := 0, false
-		for _, h := range fts {
-			baseTok += bodyTokens(vaultRoot, h.Path)
+		fts, _ := store.Search(c.Query, surfaceK)
+		cards, _ := r.Retrieve(c.Query, retrieve.Options{Budget: budget})
+
+		cr := CaseResult{Query: c.Query}
+
+		// Surfacing recall at equal K.
+		for i, h := range fts {
+			if i >= surfaceK {
+				break
+			}
 			if want[h.NodeID] {
-				baseHit = true
+				cr.FTSSurfaced = true
 			}
 		}
-
-		// Mesh: cards (cheap) + read the single top card's body.
-		cards, _ := r.Retrieve(c.Query, retrieve.Options{Budget: budget})
-		meshTok := retrieve.TotalTokens(cards)
-		meshHit := false
 		for _, card := range cards {
 			if want[card.NodeID] {
-				meshHit = true
+				cr.MeshSurfaced = true
 			}
 		}
+
+		// Answer@1: the one body each arm reads.
+		if len(fts) > 0 {
+			cr.FTSAnswer1 = want[fts[0].NodeID]
+			cr.FTSTop1Tokens = bodyTokens(vaultRoot, fts[0].Path)
+		}
+		for i := 0; i < 3 && i < len(fts); i++ {
+			cr.FTSTop3Tokens += bodyTokens(vaultRoot, fts[i].Path)
+		}
 		if len(cards) > 0 {
-			meshTok += bodyTokens(vaultRoot, cards[0].Path)
+			cr.MeshAnswer1 = want[cards[0].NodeID]
+			cr.MeshTokens = retrieve.TotalTokens(cards) + bodyTokens(vaultRoot, cards[0].Path)
 		}
 
-		rep.Cases = append(rep.Cases, CaseResult{c.Query, meshTok, baseTok, meshHit, baseHit})
-		meshSum += meshTok
-		baseSum += baseTok
-		if meshHit {
-			rep.MeshHits++
+		rep.Cases = append(rep.Cases, cr)
+		if cr.MeshSurfaced {
+			rep.MeshSurfaced++
 		}
-		if baseHit {
-			rep.BaseHits++
+		if cr.FTSSurfaced {
+			rep.FTSSurfaced++
 		}
+		if cr.MeshAnswer1 {
+			rep.MeshAnswer1++
+		}
+		if cr.FTSAnswer1 {
+			rep.FTSAnswer1++
+		}
+		mesh = append(mesh, cr.MeshTokens)
+		fts1 = append(fts1, cr.FTSTop1Tokens)
+		fts3 = append(fts3, cr.FTSTop3Tokens)
 	}
 
-	if rep.N > 0 {
-		rep.MeshAvg = float64(meshSum) / float64(rep.N)
-		rep.BaseAvg = float64(baseSum) / float64(rep.N)
-	}
-	rep.Pass = rep.MeshHits >= rep.BaseHits && rep.MeshAvg < rep.BaseAvg
+	rep.MeshMean, rep.MeshMedian = mean(mesh), median(mesh)
+	rep.FTSTop1Mean, rep.FTSTop1Median = mean(fts1), median(fts1)
+	rep.FTSTop3Mean, rep.FTSTop3Median = mean(fts3), median(fts3)
+
+	rep.SurfacingWin = rep.MeshSurfaced >= rep.FTSSurfaced
+	rep.AnswerWin = rep.MeshAnswer1 >= rep.FTSAnswer1
+	rep.NaiveCostWin = rep.MeshMedian < rep.FTSTop3Median
+	rep.Pass = rep.SurfacingWin && rep.AnswerWin && rep.NaiveCostWin
 	return rep
 }
 
@@ -110,4 +139,28 @@ func bodyTokens(vaultRoot, relPath string) int {
 		return 0
 	}
 	return retrieve.EstimateTokens(string(data))
+}
+
+func mean(xs []int) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	sum := 0
+	for _, x := range xs {
+		sum += x
+	}
+	return float64(sum) / float64(len(xs))
+}
+
+func median(xs []int) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := append([]int(nil), xs...)
+	sort.Ints(s)
+	n := len(s)
+	if n%2 == 1 {
+		return float64(s[n/2])
+	}
+	return float64(s[n/2-1]+s[n/2]) / 2
 }
