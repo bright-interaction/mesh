@@ -40,6 +40,7 @@ type Options struct {
 	Reconcile time.Duration          // periodic safety-net interval; <=0 disables the tick
 	OnReindex func() (Result, error) // authoritative drift-check + reindex; called single-flight
 	Logf      func(string, ...any)   // progress sink; nil is silent
+	Trigger   <-chan struct{}        // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
 }
 
 const defaultDebounce = 300 * time.Millisecond
@@ -115,6 +116,12 @@ func Run(ctx context.Context, opt Options) error {
 				return nil
 			}
 			logf("watch error: %v", err)
+		case <-opt.Trigger:
+			// An external nudge (a hub SSE "head changed" event). Treat it like a
+			// local change: arm the debounce so a burst of nudges coalesces into one
+			// reconcile. A nil Trigger channel blocks forever, so this case is inert
+			// unless a caller wired one in.
+			resetTimer(debounce, opt.Debounce)
 		case <-debounce.C:
 			reconcile(opt, logf, "change")
 		case <-tick:
