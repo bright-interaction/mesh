@@ -6,10 +6,13 @@ import (
 	"math"
 )
 
-// VectorRow is one stored embedding.
+// VectorRow is one stored chunk embedding (a note can have several: one per
+// heading section, so a query matches the relevant section, not a blurry
+// whole-note average).
 type VectorRow struct {
-	NodeID string
-	Vec    []float32
+	NodeID  string
+	ChunkIx int
+	Vec     []float32
 }
 
 func encodeVec(v []float32) []byte {
@@ -28,21 +31,21 @@ func decodeVec(b []byte) []float32 {
 	return v
 }
 
-// ReplaceVectors wipes the vectors table and stores the given embeddings under
-// one canonical model (homogeneity: a vault holds exactly one embedding model so
-// cosine stays meaningful). Runs in the writer goroutine.
+// ReplaceVectors wipes the vectors table and stores the given chunk embeddings
+// under one canonical model (homogeneity: a vault holds exactly one embedding
+// model so cosine stays meaningful). Runs in the writer goroutine.
 func (s *Store) ReplaceVectors(model string, rows []VectorRow) error {
 	return s.Write(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`DELETE FROM vectors`); err != nil {
 			return err
 		}
-		ins, err := tx.Prepare(`INSERT INTO vectors(node_id, chunk_ix, model, dim, embedding) VALUES(?,0,?,?,?)`)
+		ins, err := tx.Prepare(`INSERT INTO vectors(node_id, chunk_ix, model, dim, embedding) VALUES(?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
 		defer ins.Close()
 		for _, r := range rows {
-			if _, err := ins.Exec(r.NodeID, model, len(r.Vec), encodeVec(r.Vec)); err != nil {
+			if _, err := ins.Exec(r.NodeID, r.ChunkIx, model, len(r.Vec), encodeVec(r.Vec)); err != nil {
 				return err
 			}
 		}
@@ -51,11 +54,13 @@ func (s *Store) ReplaceVectors(model string, rows []VectorRow) error {
 	})
 }
 
-// LoadVectors returns the canonical model and every stored vector by node id.
-func (s *Store) LoadVectors() (model string, byNode map[string][]float32, err error) {
+// LoadVectors returns the canonical model and every stored chunk vector grouped
+// by node id. A note's relevance is later scored as the max cosine over its
+// chunks (best-matching section).
+func (s *Store) LoadVectors() (model string, byNode map[string][][]float32, err error) {
 	_ = s.readDB.QueryRow(`SELECT value FROM meta WHERE key='vector_model'`).Scan(&model)
-	byNode = map[string][]float32{}
-	rows, err := s.readDB.Query(`SELECT node_id, embedding FROM vectors`)
+	byNode = map[string][][]float32{}
+	rows, err := s.readDB.Query(`SELECT node_id, embedding FROM vectors ORDER BY node_id, chunk_ix`)
 	if err != nil {
 		return model, byNode, err
 	}
@@ -66,32 +71,32 @@ func (s *Store) LoadVectors() (model string, byNode map[string][]float32, err er
 		if err := rows.Scan(&id, &blob); err != nil {
 			return model, byNode, err
 		}
-		byNode[id] = decodeVec(blob)
+		byNode[id] = append(byNode[id], decodeVec(blob))
 	}
 	return model, byNode, rows.Err()
 }
 
-// NoteText pairs a note node id with the text to embed for it.
-type NoteText struct {
+// NoteFile pairs a note's graph node id with its vault-relative path.
+type NoteFile struct {
 	NodeID string
-	Text   string
+	Path   string
 }
 
-// NoteTexts returns the embeddable text (title + indexed body) for every note,
-// read from the FTS rows so it matches what search sees.
-func (s *Store) NoteTexts() ([]NoteText, error) {
-	rows, err := s.readDB.Query(`SELECT node_id, title, body FROM search_index`)
+// NoteFiles lists every note's node id + path so the embedder can read and
+// chunk the source file.
+func (s *Store) NoteFiles() ([]NoteFile, error) {
+	rows, err := s.readDB.Query(`SELECT 'note:' || id, path FROM notes`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []NoteText
+	var out []NoteFile
 	for rows.Next() {
-		var id, title, body string
-		if err := rows.Scan(&id, &title, &body); err != nil {
+		var nf NoteFile
+		if err := rows.Scan(&nf.NodeID, &nf.Path); err != nil {
 			return nil, err
 		}
-		out = append(out, NoteText{NodeID: id, Text: title + "\n" + body})
+		out = append(out, nf)
 	}
 	return out, rows.Err()
 }

@@ -86,7 +86,7 @@ func TestRetrieveExpandsAlongReferences(t *testing.T) {
 
 func TestEnableVectorsHomogeneityGuard(t *testing.T) {
 	r := buildVault(t)
-	vecs := map[string][]float32{"note:a": {1, 0}, "note:b": {0, 1}}
+	vecs := map[string][][]float32{"note:a": {{1, 0}}, "note:b": {{0, 1}}}
 	if r.EnableVectors(embed.Stub{D: 2}, "different-model", vecs) {
 		t.Error("guard must reject when the query embedder's model != the vault's stored model")
 	}

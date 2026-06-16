@@ -55,8 +55,8 @@ type Retriever struct {
 
 	emb         embed.Embedder
 	vecModel    string
-	vecs        map[string][]float32
-	queryPrefix string // e.g. "search_query: " for nomic-style asymmetric models
+	vecs        map[string][][]float32 // node id -> per-section chunk vectors
+	queryPrefix string                 // e.g. "search_query: " for nomic-style asymmetric models
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
@@ -85,7 +85,7 @@ func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 // embedder's model matches the vault's stored model (homogeneity guard: vectors
 // from different models are not comparable, so we fail safe to lexical-only
 // rather than mix them).
-func (r *Retriever) EnableVectors(e embed.Embedder, model string, vecs map[string][]float32) bool {
+func (r *Retriever) EnableVectors(e embed.Embedder, model string, vecs map[string][][]float32) bool {
 	if e == nil || model == "" || len(vecs) == 0 || e.Model() != model {
 		return false
 	}
@@ -147,14 +147,23 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	}
 
 	// Semantic signal: cosine of the query embedding against stored note vectors
-	// (brute-force; the homogeneity guard already ensured comparable models).
+	// (brute-force; the homogeneity guard already ensured comparable models). A
+	// note is scored by its best-matching section (max over its chunk vectors),
+	// so a long multi-topic note still surfaces on the one section that answers
+	// the query instead of being diluted by a whole-note average.
 	if vectorsActive && wVec > 0 {
 		if qv, err := r.emb.Embed(context.Background(), []string{r.queryPrefix + query}); err == nil && len(qv) == 1 {
 			ids := make([]string, 0, len(r.vecs))
 			sims := make([]float64, 0, len(r.vecs))
-			for id, v := range r.vecs {
+			for id, chunks := range r.vecs {
+				best := -1.0
+				for _, v := range chunks {
+					if s := embed.Cosine(qv[0], v); s > best {
+						best = s
+					}
+				}
 				ids = append(ids, id)
-				sims = append(sims, embed.Cosine(qv[0], v))
+				sims = append(sims, best)
 			}
 			vNorm := minMax(sims)
 			for i, id := range ids {
