@@ -269,6 +269,7 @@ func evalCmd() *cobra.Command {
 func embedCmd() *cobra.Command {
 	var endpoint, model, keyEnv string
 	var batch int
+	var perSection bool
 	c := &cobra.Command{
 		Use:   "embed [vault]",
 		Short: "Embed notes via a BYOAI endpoint and store vectors (turns on semantic search)",
@@ -293,13 +294,38 @@ func embedCmd() *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			texts, err := store.NoteTexts()
+			files, err := store.NoteFiles()
 			if err != nil {
 				return err
 			}
-			if len(texts) == 0 {
+			if len(files) == 0 {
 				fmt.Println("no notes to embed")
 				return nil
+			}
+			// Default: one vector per note (the structured title + flywheel + titled
+			// sections joined). --per-section instead stores one vector per heading
+			// section and scores a note by its best-matching section (max-pool). On
+			// the Hive corpus per-section gave no recall or answer@1 lift at ~18x the
+			// embedding cost, so whole-note is the default; the flag keeps the lever
+			// available for long heterogeneous corpora where it may pay off.
+			type chunkRef struct {
+				NodeID  string
+				ChunkIx int
+				Text    string
+			}
+			var refs []chunkRef
+			for _, nf := range files {
+				pn, err := index.ParseFile(filepath.Join(root, nf.Path))
+				if err != nil {
+					return fmt.Errorf("parse %s: %w", nf.Path, err)
+				}
+				if !perSection {
+					refs = append(refs, chunkRef{NodeID: nf.NodeID, ChunkIx: 0, Text: strings.Join(index.ChunkText(pn), "\n")})
+					continue
+				}
+				for ix, text := range index.ChunkText(pn) {
+					refs = append(refs, chunkRef{NodeID: nf.NodeID, ChunkIx: ix, Text: text})
+				}
 			}
 			emb := embed.NewHTTP(endpoint, model, os.Getenv(keyEnv))
 			if batch <= 0 {
@@ -307,24 +333,24 @@ func embedCmd() *cobra.Command {
 			}
 			ctx := context.Background()
 			docPrefix := os.Getenv("MESH_EMBED_DOC_PREFIX") // e.g. "search_document: " for nomic
-			rows := make([]index.VectorRow, 0, len(texts))
-			for i := 0; i < len(texts); i += batch {
+			rows := make([]index.VectorRow, 0, len(refs))
+			for i := 0; i < len(refs); i += batch {
 				j := i + batch
-				if j > len(texts) {
-					j = len(texts)
+				if j > len(refs) {
+					j = len(refs)
 				}
 				inputs := make([]string, 0, j-i)
-				for _, t := range texts[i:j] {
-					inputs = append(inputs, docPrefix+t.Text)
+				for _, r := range refs[i:j] {
+					inputs = append(inputs, docPrefix+r.Text)
 				}
 				vecs, err := emb.Embed(ctx, inputs)
 				if err != nil {
 					return fmt.Errorf("embed batch %d-%d via %s: %w", i, j, endpoint, err)
 				}
 				for k, v := range vecs {
-					rows = append(rows, index.VectorRow{NodeID: texts[i+k].NodeID, Vec: v})
+					rows = append(rows, index.VectorRow{NodeID: refs[i+k].NodeID, ChunkIx: refs[i+k].ChunkIx, Vec: v})
 				}
-				fmt.Printf("\rembedded %d/%d notes", j, len(texts))
+				fmt.Printf("\rembedded %d/%d chunks", j, len(refs))
 			}
 			fmt.Println()
 			if err := store.ReplaceVectors(model, rows); err != nil {
@@ -334,7 +360,11 @@ func embedCmd() *cobra.Command {
 			if len(rows) > 0 {
 				dim = len(rows[0].Vec)
 			}
-			fmt.Printf("stored %d vectors (model %s, dim %d); semantic search active for mesh search / eval / mcp\n", len(rows), model, dim)
+			mode := "whole-note"
+			if perSection {
+				mode = "per-section"
+			}
+			fmt.Printf("stored %d vectors across %d notes (%s, model %s, dim %d); semantic search active for mesh search / eval / mcp\n", len(rows), len(files), mode, model, dim)
 			return nil
 		},
 	}
@@ -342,6 +372,7 @@ func embedCmd() *cobra.Command {
 	c.Flags().StringVar(&model, "model", "", "embedding model id (or MESH_EMBED_MODEL)")
 	c.Flags().StringVar(&keyEnv, "key-env", "MESH_EMBED_KEY", "env var holding the bearer key (empty for local)")
 	c.Flags().IntVar(&batch, "batch", 32, "embeddings per request")
+	c.Flags().BoolVar(&perSection, "per-section", false, "store one vector per heading section instead of one per note (~18x more vectors; no measured lift on Hive)")
 	return c
 }
 
