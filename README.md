@@ -8,8 +8,10 @@ It is one Go binary, no cgo, no external services. Retrieving from Mesh is cheap
 
 ## Honest scope
 
-- **What's proven (lexical core):** cheap card-based retrieval (matches plain full-text search on quality, at a fraction of the tokens of reading files in full) plus the agent write-back flywheel, in a single no-glue binary. The FTS + graph-BM25 + tier-0 fusion *matches* full-text search on keyword-friendly queries (a non-harmful re-ranker, not a lexical-quality win).
-- **What's proven (BYOAI semantic + rerank):** with a vector embedder configured, surfacing recall on paraphrase queries (where keyword search breaks) jumps from 13/20 to 20/20. Adding a cross-encoder rerank stage lifts paraphrase top-1 precision (`answer@1`) from 3/20 to 10/20, with a small (-1/25) trade on keyword queries. Both are BYOAI and sovereign by default (run them locally; nothing egresses). See `docs/SPEC.md` for the matched-arm measurements and their adversarial reviews.
+- **The core, zero models:** cheap card-based retrieval (FTS + graph-BM25 + tier-0, pure Go, no inference, near-zero CPU) plus the agent write-back flywheel, in a single no-glue binary. `mesh_search` hands the agent ranked cards (title + snippet + why); **the agent reads the cards and picks** the 1-2 notes worth fetching. A capable coding agent is already a stronger relevance judge than any bolt-on reranker, so for the agent consumer the agent *is* the reranker, free. This is the whole product for an agent.
+- **Optional BYOAI add-ons (off by default, for cost-sensitive or non-agent consumers):**
+  - **Vectors (`mesh embed`)** lift recall on paraphrase queries where keyword search breaks (13/20 -> 20/20 on the Hive eval). Worth turning on when queries paraphrase the notes; can point at a cloud endpoint for zero local CPU, or be skipped (FTS keyword recall is already 23/25).
+  - **Cross-encoder rerank** lifts top-1 precision for a consumer that *trusts the top result without reading the cards* (`answer@1` 3/20 -> 10/20 on paraphrase). That is not a capable agent (which reads the cards and judges); it is a cheap/small downstream model, a blind "fetch top-1" pipeline, or a multi-tenant cloud deployment where offloading ranking to a local judge saves the tenant's billed model from reading and ranking candidates. Off unless an endpoint is configured. See `docs/SPEC.md` for the matched-arm measurements and adversarial reviews.
 - **Deferred:** a TUI + web graph viewer, and team sync (a self-hosted hub). Solo, local v1 first.
 
 ## Install
@@ -42,10 +44,12 @@ mesh migrate my-vault              # synthesize ids, updated->when, lift ## Rela
 mesh index my-vault
 ```
 
-## Semantic search + rerank (BYOAI, sovereign)
+## Optional: semantic search + rerank (BYOAI, sovereign)
 
-Mesh runs no inference itself. Two optional stages call HTTP endpoints **you**
-control, so they stay on your infrastructure:
+The core above needs no models. These two stages are **optional** and **off by
+default**; turn them on only for the cases in "Honest scope" (paraphrase recall,
+or a cost-sensitive / non-agent consumer). Mesh runs no inference itself, both
+call HTTP endpoints **you** control, so they stay on your infrastructure:
 
 ```
 # 1. Vectors: embed notes via any OpenAI-compatible /embeddings endpoint (Ollama, etc.)
