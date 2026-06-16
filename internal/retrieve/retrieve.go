@@ -11,11 +11,15 @@ import (
 )
 
 const (
-	tier0Boost  = 0.5  // additive fused-score boost for decision/gotcha/post-mortem
-	expandSeeds = 5    // expand from the top-N fused notes
-	expandK     = 3    // pull at most K strong note-neighbors per seed
-	expandDecay = 0.4  // a neighbor inherits this fraction of the seed's score
-	godDegree   = 24   // skip expansion into hub nodes above this degree
+	// tier0Mult nudges decision/gotcha/post-mortem notes UP among similarly-scored
+	// results so institutional memory surfaces, but as a small multiplier (not the
+	// old +0.5 additive, which could override a much stronger content match and
+	// flip the top-1 pick to a wrong tier-0 note - the Gate-1 answer@1 regression).
+	tier0Mult   = 1.1
+	expandSeeds = 5   // expand from the top-N fused notes
+	expandK     = 3   // pull at most K strong note-neighbors per seed
+	expandDecay = 0.4 // a neighbor inherits this fraction of the seed's score
+	godDegree   = 24  // skip expansion into hub nodes above this degree
 )
 
 var tier0Types = map[string]bool{"decision": true, "gotcha": true, "post-mortem": true}
@@ -58,7 +62,9 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 		opt.Limit = 20
 	}
 	if opt.WeightFTS == 0 && opt.WeightGraph == 0 {
-		opt.WeightFTS, opt.WeightGraph = 0.6, 0.4
+		// FTS-top1 beat the fused top-1 in the honest Gate-1 re-gate, so trust the
+		// full-text signal more; graph-BM25 stays a minority re-ranker.
+		opt.WeightFTS, opt.WeightGraph = 0.7, 0.3
 	}
 
 	ftsHits, err := r.store.Search(query, opt.Limit)
@@ -115,7 +121,7 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 		c.Snippet = snippet[id]
 		c.Reason = reason[id]
 		if c.Tier0 {
-			c.Score += tier0Boost
+			c.Score *= tier0Mult
 		}
 		cards = append(cards, c)
 	}
