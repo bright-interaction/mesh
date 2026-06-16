@@ -193,6 +193,30 @@ func TestRerankConstantScoresKeepFusedOrder(t *testing.T) {
 	}
 }
 
+func TestRerankBlendKnobSpansPureFusedToPureRerank(t *testing.T) {
+	r := buildVault(t)
+	r.EnableRerank(fakeReranker{needle: "extensions"}) // prefers note:b
+	// alpha=1.0: cross-encoder owns the head, note:b wins.
+	r.rerankBlend = 1.0
+	pure, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	if len(pure) == 0 || pure[0].NodeID != "note:b" {
+		t.Errorf("alpha=1 (pure rerank) should put the reranked note first, got %v", topID(pure))
+	}
+	// alpha=0.0: the blend collapses to the fused score, restoring fused top note:a.
+	r.rerankBlend = 0.0
+	fused, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	if len(fused) == 0 || fused[0].NodeID != "note:a" {
+		t.Errorf("alpha=0 (pure fused) should restore the fused top note:a, got %v", topID(fused))
+	}
+}
+
+func topID(cards []Card) string {
+	if len(cards) == 0 {
+		return "(none)"
+	}
+	return cards[0].NodeID
+}
+
 func TestRetrieveBudgetPacking(t *testing.T) {
 	r := buildVault(t)
 	all, _ := r.Retrieve("sqlite modernc storage", Options{Limit: 10})
