@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,6 +42,7 @@ func rootCmd() *cobra.Command {
 		embedCmd(),
 		searchCmd(),
 		evalCmd(),
+		tuneCmd(),
 		statusCmd(),
 		migrateCmd(),
 		lintCmd(),
@@ -266,6 +268,110 @@ func evalCmd() *cobra.Command {
 	return c
 }
 
+func loadCases(files ...string) ([]eval.Case, error) {
+	var all []eval.Case
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		var cs []eval.Case
+		if err := json.Unmarshal(raw, &cs); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", f, err)
+		}
+		all = append(all, cs...)
+	}
+	return all, nil
+}
+
+func tuneCmd() *cobra.Command {
+	var vaultDir, testFile string
+	var step, holdout float64
+	c := &cobra.Command{
+		Use:   "tune <train-cases.json> [more-cases.json ...]",
+		Short: "Learn fusion weights (FTS/graph/vector) from labelled queries, validated on held-out",
+		Long:  "Grid-searches the fusion-weight simplex to maximize answer@1 on the training queries (rerank off, so the fused order is what is measured), then reports how the learned weights and the built-in defaults score on a held-out test split. Set the winner with MESH_WEIGHT_FTS/GRAPH/VEC. Tuning to the same queries you report on is p-hacking; pass --test (or use --holdout) so the headline number is held-out.",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			train, err := loadCases(args...)
+			if err != nil {
+				return err
+			}
+			var test []eval.Case
+			if testFile != "" {
+				if test, err = loadCases(testFile); err != nil {
+					return err
+				}
+			} else {
+				// Deterministic interleave split so the headline is still held-out
+				// without a separate file: every k-th case goes to test.
+				if holdout <= 0 || holdout >= 1 {
+					holdout = 0.33
+				}
+				k := int(math.Round(1 / holdout))
+				if k < 2 {
+					k = 2
+				}
+				var tr []eval.Case
+				for i, cse := range train {
+					if (i+1)%k == 0 {
+						test = append(test, cse)
+					} else {
+						tr = append(tr, cse)
+					}
+				}
+				train = tr
+			}
+			if len(train) == 0 || len(test) == 0 {
+				return fmt.Errorf("need non-empty train and test sets (train %d, test %d)", len(train), len(test))
+			}
+			store, err := index.Open(vaultDir)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			g, err := store.LoadGraph()
+			if err != nil {
+				return err
+			}
+			r := retrieve.NewFromEnv(store, g)
+			vectors := r.VectorsActive()
+			if step <= 0 || step > 0.5 {
+				step = 0.05
+			}
+			rep := eval.TuneWeights(r, train, test, step, vectors)
+
+			fmt.Printf("mesh tune (vault %s, vectors %v, %d candidates, step %.2f)\n", vaultDir, vectors, rep.Candidates, step)
+			fmt.Printf("  train %d cases, test %d cases (held-out)\n", len(train), len(test))
+			w := func(s eval.WeightSet) string {
+				return fmt.Sprintf("fts=%.2f graph=%.2f vec=%.2f", s.FTS, s.Graph, s.Vec)
+			}
+			sc := func(s eval.Score) string {
+				return fmt.Sprintf("answer@1 %d/%d, recall %d/%d", s.Answer1, s.N, s.Recall, s.N)
+			}
+			fmt.Printf("  default (%s):\n      train %s | test %s\n", w(rep.Default), sc(rep.DefaultTrain), sc(rep.DefaultTest))
+			fmt.Printf("  learned (%s):\n      train %s | test %s\n", w(rep.Best), sc(rep.BestTrain), sc(rep.BestTest))
+			win := rep.BestTest.Answer1 > rep.DefaultTest.Answer1
+			tie := rep.BestTest.Answer1 == rep.DefaultTest.Answer1
+			switch {
+			case win:
+				fmt.Printf("  VERDICT: learned weights beat default on held-out (+%d answer@1). Apply with:\n", rep.BestTest.Answer1-rep.DefaultTest.Answer1)
+				fmt.Printf("      export MESH_WEIGHT_FTS=%.2f MESH_WEIGHT_GRAPH=%.2f MESH_WEIGHT_VEC=%.2f\n", rep.Best.FTS, rep.Best.Graph, rep.Best.Vec)
+			case tie:
+				fmt.Println("  VERDICT: learned weights TIE the default on held-out; keep the default (no evidence of a real gain).")
+			default:
+				fmt.Printf("  VERDICT: learned weights LOSE on held-out (%d vs %d answer@1); the train win did not generalize. Keep the default.\n", rep.BestTest.Answer1, rep.DefaultTest.Answer1)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
+	c.Flags().StringVar(&testFile, "test", "", "held-out test cases file (else --holdout splits the train set)")
+	c.Flags().Float64Var(&step, "step", 0.05, "weight grid step (smaller = finer search)")
+	c.Flags().Float64Var(&holdout, "holdout", 0.33, "test fraction when --test is not given")
+	return c
+}
+
 func embedCmd() *cobra.Command {
 	var endpoint, model, keyEnv string
 	var batch int
@@ -434,6 +540,11 @@ func statusCmd() *cobra.Command {
 				fmt.Printf("  rerank       active (cross-encoder %s)\n", r.RerankModel())
 			} else {
 				fmt.Println("  rerank       off (set MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL; see tools/rerank-server)")
+			}
+			if wf, wg, wv := r.Weights(); wf != 0 || wg != 0 || wv != 0 {
+				fmt.Printf("  weights      learned fts=%.2f graph=%.2f vec=%.2f (MESH_WEIGHT_*)\n", wf, wg, wv)
+			} else {
+				fmt.Println("  weights      built-in defaults (run: mesh tune <cases.json> to fit your corpus)")
 			}
 			return nil
 		},

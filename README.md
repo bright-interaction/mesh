@@ -68,6 +68,14 @@ down rerank endpoint falls back to the fused order. Pointing either env var at a
 cloud provider sends note content off-box, so keep them local to stay sovereign.
 A ready-to-run local cross-encoder server lives in `tools/rerank-server/`.
 
+Got a set of labelled queries for your corpus? `mesh tune cases.json --test
+held-out.json` grid-searches the fusion weights to maximize answer@1 and prints
+the held-out result plus the `MESH_WEIGHT_FTS/GRAPH/VEC` line to apply the
+winner. It tunes the fused ranking, so it helps most when you run vectors
+without a reranker (with a reranker on, the cross-encoder owns the top result and
+fusion weights wash out). Always pass a held-out `--test` set; tuning to the
+queries you report on is how you fool yourself.
+
 ## Wire it to your coding agent
 
 Mesh speaks MCP (JSON-RPC) over stdio. Point your agent at:
@@ -92,6 +100,7 @@ The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note o
 | `mesh lint [vault]` | Frontmatter / links / filenames (non-zero exit for CI) |
 | `mesh doctor [vault]` | Index freshness (drift), counts, health |
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |
+| `mesh tune <cases.json>` | Learn fusion weights from labelled queries (validated on held-out) |
 | `mesh mcp [--vault]` | Serve the agent retrieval + write-back surface |
 
 ## Build

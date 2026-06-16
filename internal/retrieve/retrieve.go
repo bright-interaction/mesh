@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/brightinteraction/mesh/internal/embed"
 	"github.com/brightinteraction/mesh/internal/graph"
@@ -56,8 +57,10 @@ type Card struct {
 type Options struct {
 	Limit       int     // candidates pulled per signal (default 20)
 	Budget      int     // token budget for packing; 0 = return all ranked
-	WeightFTS   float64 // default 0.6
-	WeightGraph float64 // default 0.4
+	WeightFTS   float64 // fusion weight; 0 across all three => resolved defaults
+	WeightGraph float64
+	WeightVec   float64
+	NoRerank    bool // skip the cross-encoder stage even when configured (for tuning the fusion itself)
 }
 
 type Retriever struct {
@@ -73,10 +76,29 @@ type Retriever struct {
 	rr          rerank.Reranker // optional cross-encoder; reorders the top-K head
 	rerankName  string          // model id, for status/diagnostics
 	rerankBlend float64         // cross-encoder vs fused weight (see rerankBlendDefault)
+
+	// Learned/operator fusion-weight defaults (0 across all three => built-in
+	// defaults). Set from MESH_WEIGHT_FTS/GRAPH/VEC or by `mesh tune`.
+	defWFTS, defWGraph, defWVec float64
+
+	qvec   map[string][]float32 // query-embedding cache (keyed by prefixed query)
+	qvecMu sync.Mutex
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
-	return &Retriever{store: store, graph: g, ranker: g.NewRanker(), rerankBlend: rerankBlendDefault}
+	return &Retriever{store: store, graph: g, ranker: g.NewRanker(), rerankBlend: rerankBlendDefault, qvec: map[string][]float32{}}
+}
+
+// SetWeights sets the fusion-weight defaults used when a retrieval does not pass
+// explicit Options weights (e.g. learned weights from `mesh tune`). Any value
+// may be 0; if all three are 0 the built-in defaults apply.
+func (r *Retriever) SetWeights(fts, graph, vec float64) {
+	r.defWFTS, r.defWGraph, r.defWVec = fts, graph, vec
+}
+
+// Weights reports the active fusion-weight defaults (0,0,0 => built-in defaults).
+func (r *Retriever) Weights() (fts, graph, vec float64) {
+	return r.defWFTS, r.defWGraph, r.defWVec
 }
 
 // NewFromEnv builds a retriever and enables the optional BYOAI stages from the
@@ -87,7 +109,20 @@ func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 	r := New(store, g)
 	r.enableVectorsFromEnv()
 	r.enableRerankFromEnv()
+	r.loadWeightsFromEnv()
 	return r
+}
+
+// loadWeightsFromEnv applies learned/operator fusion weights from
+// MESH_WEIGHT_FTS/GRAPH/VEC (e.g. the output of `mesh tune`). Missing vars stay 0.
+func (r *Retriever) loadWeightsFromEnv() {
+	parse := func(k string) float64 {
+		if v, err := strconv.ParseFloat(os.Getenv(k), 64); err == nil && v >= 0 {
+			return v
+		}
+		return 0
+	}
+	r.SetWeights(parse("MESH_WEIGHT_FTS"), parse("MESH_WEIGHT_GRAPH"), parse("MESH_WEIGHT_VEC"))
 }
 
 // enableVectorsFromEnv turns on the semantic signal when the vault has stored
@@ -144,6 +179,49 @@ func (r *Retriever) VectorsActive() bool { return r.emb != nil && len(r.vecs) > 
 // VectorModel returns the active embedding model id (empty when inactive).
 func (r *Retriever) VectorModel() string { return r.vecModel }
 
+// resolveWeights picks the fusion weights: explicit Options weights win; else the
+// learned/operator defaults (SetWeights / env); else the built-in defaults. The
+// vector weight is zeroed when no semantic signal is active.
+func (r *Retriever) resolveWeights(opt Options, vectorsActive bool) (wFTS, wGraph, wVec float64) {
+	switch {
+	case opt.WeightFTS != 0 || opt.WeightGraph != 0 || opt.WeightVec != 0:
+		wFTS, wGraph, wVec = opt.WeightFTS, opt.WeightGraph, opt.WeightVec
+	case r.defWFTS != 0 || r.defWGraph != 0 || r.defWVec != 0:
+		wFTS, wGraph, wVec = r.defWFTS, r.defWGraph, r.defWVec
+	case vectorsActive:
+		// FTS-top1 beat fused-top1 lexically, so FTS stays the largest share, the
+		// semantic signal gets real weight, graph-BM25 the smallest.
+		wFTS, wGraph, wVec = 0.5, 0.2, 0.3
+	default:
+		wFTS, wGraph = 0.7, 0.3
+	}
+	if !vectorsActive {
+		wVec = 0
+	}
+	return
+}
+
+// queryVec returns the (cached) embedding of the query, prefixed for asymmetric
+// models. Returns nil if no embedder is set or the call fails. The cache makes
+// repeated retrievals of the same query (e.g. a weight sweep) embed only once.
+func (r *Retriever) queryVec(query string) []float32 {
+	if r.emb == nil {
+		return nil
+	}
+	key := r.queryPrefix + query
+	r.qvecMu.Lock()
+	defer r.qvecMu.Unlock()
+	if v, ok := r.qvec[key]; ok {
+		return v
+	}
+	qv, err := r.emb.Embed(context.Background(), []string{key})
+	if err != nil || len(qv) != 1 {
+		return nil
+	}
+	r.qvec[key] = qv[0]
+	return qv[0]
+}
+
 // EnableVectors turns on the semantic signal. It is a no-op unless the query
 // embedder's model matches the vault's stored model (homogeneity guard: vectors
 // from different models are not comparable, so we fail safe to lexical-only
@@ -163,16 +241,7 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 		opt.Limit = 20
 	}
 	vectorsActive := r.emb != nil && len(r.vecs) > 0
-	wVec := 0.0
-	if opt.WeightFTS == 0 && opt.WeightGraph == 0 {
-		if vectorsActive {
-			// With a semantic signal, give it real weight; FTS-top1 beat fused-top1
-			// lexically, so FTS stays the largest share and graph-BM25 the smallest.
-			opt.WeightFTS, opt.WeightGraph, wVec = 0.5, 0.2, 0.3
-		} else {
-			opt.WeightFTS, opt.WeightGraph = 0.7, 0.3
-		}
-	}
+	wFTS, wGraph, wVec := r.resolveWeights(opt, vectorsActive)
 
 	ftsHits, err := r.store.Search(query, opt.Limit)
 	if err != nil {
@@ -191,7 +260,7 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	}
 	fNorm := minMax(fScores)
 	for i, h := range ftsHits {
-		fused[h.NodeID] += opt.WeightFTS * fNorm[i]
+		fused[h.NodeID] += wFTS * fNorm[i]
 		snippet[h.NodeID] = h.Snippet
 		reason[h.NodeID] = "fts"
 	}
@@ -203,7 +272,7 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	}
 	gNorm := minMax(gScores)
 	for i, h := range graphHits {
-		fused[h.Node.ID] += opt.WeightGraph * gNorm[i]
+		fused[h.Node.ID] += wGraph * gNorm[i]
 		if reason[h.Node.ID] == "" {
 			reason[h.Node.ID] = "graph"
 		}
@@ -215,13 +284,13 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	// so a long multi-topic note still surfaces on the one section that answers
 	// the query instead of being diluted by a whole-note average.
 	if vectorsActive && wVec > 0 {
-		if qv, err := r.emb.Embed(context.Background(), []string{r.queryPrefix + query}); err == nil && len(qv) == 1 {
+		if qv := r.queryVec(query); qv != nil {
 			ids := make([]string, 0, len(r.vecs))
 			sims := make([]float64, 0, len(r.vecs))
 			for id, chunks := range r.vecs {
 				best := -1.0
 				for _, v := range chunks {
-					if s := embed.Cosine(qv[0], v); s > best {
+					if s := embed.Cosine(qv, v); s > best {
 						best = s
 					}
 				}
@@ -266,8 +335,11 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	// Cross-encoder rerank of the top-K head: a model that reads the query and
 	// each candidate jointly reorders the strongest fused results, which is the
 	// lever for top-1 precision. It refines the head only and never gates: any
-	// endpoint error leaves the fused order intact.
-	r.rerankHead(query, cards)
+	// endpoint error leaves the fused order intact. Skipped when tuning the fusion
+	// itself (NoRerank), so the fused order is what gets measured.
+	if !opt.NoRerank {
+		r.rerankHead(query, cards)
+	}
 
 	if opt.Budget > 0 {
 		cards = packToBudget(cards, opt.Budget)
