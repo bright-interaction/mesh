@@ -306,6 +306,7 @@ func embedCmd() *cobra.Command {
 				batch = 32
 			}
 			ctx := context.Background()
+			docPrefix := os.Getenv("MESH_EMBED_DOC_PREFIX") // e.g. "search_document: " for nomic
 			rows := make([]index.VectorRow, 0, len(texts))
 			for i := 0; i < len(texts); i += batch {
 				j := i + batch
@@ -314,7 +315,7 @@ func embedCmd() *cobra.Command {
 				}
 				inputs := make([]string, 0, j-i)
 				for _, t := range texts[i:j] {
-					inputs = append(inputs, t.Text)
+					inputs = append(inputs, docPrefix+t.Text)
 				}
 				vecs, err := emb.Embed(ctx, inputs)
 				if err != nil {
