@@ -109,6 +109,29 @@ restart. Watch progress goes to stderr; stdout stays the pure JSON-RPC stream.
 Omit it for the classic behavior where the index only refreshes on the agent's
 own write-backs.
 
+## Team sync (Milestone S1, in progress)
+
+Share a vault across a team with no git on any client. One sovereign `mesh-hub`
+on your own server holds the markdown history; clients pull-reconcile.
+
+```
+# On the hub server (once):
+mesh-hub init /srv/teamvault                          # git repo + hub.db + mesh.toml
+mesh-hub invite --repo /srv/teamvault --user alice    # prints a one-time invite token
+mesh-hub serve  --repo /srv/teamvault --addr :8848    # run it (behind TLS in prod)
+
+# On each teammate's laptop:
+mesh join https://mesh.example.com <invite-token> my-vault   # clone, no git needed
+# ... edit notes in your editor ...
+mesh sync my-vault                                    # push yours, pull theirs
+```
+
+Reconcile-first: `mesh sync` is a three-way merge. Two people adding blocks to the
+same page auto-merge; a true overwrite of the same lines keeps the hub version and
+saves yours to a `*.sync-conflict-*.md` sibling to resolve by hand. Deletes and
+renames propagate; the hub authors git history attributed to each user. Real-time
+push (SSE) and the BYOAI sync-curator are the next milestone (S2).
+
 ## Commands
 
 | Command | Purpose |
@@ -126,6 +149,9 @@ own write-backs.
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |
 | `mesh tune <cases.json>` | Learn fusion weights from labelled queries (validated on held-out) |
 | `mesh mcp [--vault] [--watch]` | Serve the agent retrieval + write-back surface (live-reindex with `--watch`) |
+| `mesh join <hub> <invite> [vault]` | Join a team vault and clone it (no git) |
+| `mesh sync [vault]` | Reconcile with the hub (push local edits, pull teammates') |
+| `mesh-hub init/invite/serve` | Run the sovereign team-sync hub |
 
 ## Build
 

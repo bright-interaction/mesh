@@ -174,6 +174,9 @@ func relevant(ev fsnotify.Event) bool {
 	if !strings.EqualFold(filepath.Ext(ev.Name), ".md") {
 		return false
 	}
+	if vault.IsConflictSibling(filepath.Base(ev.Name)) {
+		return false // conflict artifacts are not indexed; ignore their churn
+	}
 	return ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) != 0
 }
 

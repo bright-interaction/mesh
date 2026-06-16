@@ -35,12 +35,21 @@ func Walk(root string) ([]string, error) {
 			}
 			return nil
 		}
-		if strings.EqualFold(filepath.Ext(path), ".md") {
+		if strings.EqualFold(filepath.Ext(path), ".md") && !IsConflictSibling(d.Name()) {
 			out = append(out, path)
 		}
 		return nil
 	})
 	return out, err
+}
+
+// IsConflictSibling reports whether a filename is a sync-conflict artifact
+// (e.g. note.sync-conflict-20260616-bob-1a2b3c4d.md). These are a copy of a note
+// the team-sync hub parked for a human to resolve; they duplicate the original's
+// frontmatter id, so the indexer, watcher, and linter must skip them rather than
+// trip on a duplicate id or surface a half-merged version in retrieval.
+func IsConflictSibling(name string) bool {
+	return strings.Contains(name, ".sync-conflict-")
 }
 
 // Dirs returns every directory under root that Walk traverses (root included,

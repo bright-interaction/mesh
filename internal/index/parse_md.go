@@ -187,9 +187,11 @@ func stripInlineCode(line string) string {
 	return b.String()
 }
 
-func isSpace(r rune) bool   { return r == ' ' || r == '\t' }
-func isLetter(r rune) bool  { return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' }
-func isTagRune(r rune) bool { return isLetter(r) || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '/' }
+func isSpace(r rune) bool  { return r == ' ' || r == '\t' }
+func isLetter(r rune) bool { return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' }
+func isTagRune(r rune) bool {
+	return isLetter(r) || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '/'
+}
 
 // BuildGraph resolves a set of parsed notes into the in-memory graph. Node
 // identity is the frontmatter id (falling back to the filename, with an issue
