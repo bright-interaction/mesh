@@ -31,6 +31,7 @@ func rootCmd() *cobra.Command {
 	root.AddCommand(
 		newCmd(),
 		indexCmd(),
+		searchCmd(),
 		statusCmd(),
 		migrateCmd(),
 		lintCmd(),
@@ -40,6 +41,45 @@ func rootCmd() *cobra.Command {
 		doctorCmd(),
 	)
 	return root
+}
+
+func searchCmd() *cobra.Command {
+	var vaultDir string
+	var limit int
+	c := &cobra.Command{
+		Use:   "search <query>",
+		Short: "Full-text search the indexed vault",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dbPath := filepath.Join(vaultDir, ".mesh", "mesh.db")
+			if _, err := os.Stat(dbPath); err != nil {
+				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, vaultDir)
+			}
+			store, err := index.Open(vaultDir)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			hits, err := store.Search(strings.Join(args, " "), limit)
+			if err != nil {
+				return err
+			}
+			if len(hits) == 0 {
+				fmt.Println("no matches")
+				return nil
+			}
+			for i, h := range hits {
+				fmt.Printf("%d. %s  (%s)\n", i+1, h.Title, h.Path)
+				if sn := strings.TrimSpace(h.Snippet); sn != "" {
+					fmt.Printf("   %s\n", sn)
+				}
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
+	c.Flags().IntVar(&limit, "limit", 10, "max results")
+	return c
 }
 
 func statusCmd() *cobra.Command {

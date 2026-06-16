@@ -6,9 +6,27 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"regexp"
+	"strings"
 
 	"github.com/brightinteraction/mesh/internal/graph"
 )
+
+var htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
+
+// searchText is the body Mesh indexes into FTS5: the prose with comment noise
+// stripped, plus the flywheel fields (do/dont/why) and tags, which carry the
+// institutional memory but live in frontmatter, not the body.
+func searchText(pn *ParsedNote) string {
+	parts := []string{htmlCommentRe.ReplaceAllString(pn.Body, " ")}
+	for _, v := range []string{pn.FM.Do, pn.FM.Dont, pn.FM.Why} {
+		if v != "" {
+			parts = append(parts, v)
+		}
+	}
+	parts = append(parts, pn.FM.Tags...)
+	return strings.Join(parts, "\n")
+}
 
 // IndexVault writes the parsed notes and graph into the store as a full reindex
 // in a single transaction (M0: wipe + insert; incremental upsert lands with the
@@ -47,7 +65,7 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), string(fmJSON), fileMtime(pn.Path), updated); err != nil {
 				return err
 			}
-			if _, err := insFTS.Exec("note:"+id, "note", "", title, pn.Body); err != nil {
+			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
 				return err
 			}
 			count++
