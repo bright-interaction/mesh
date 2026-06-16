@@ -117,6 +117,13 @@ func (g *Graph) Neighbors(id string) []Edge {
 	return append([]Edge(nil), g.adj[id]...)
 }
 
+// RefsTo returns a copy of the inbound edges pointing at id.
+func (g *Graph) RefsTo(id string) []Edge {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return append([]Edge(nil), g.rev[id]...)
+}
+
 func (g *Graph) Nodes() []*Node {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
