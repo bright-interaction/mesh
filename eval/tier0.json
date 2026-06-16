@@ -1,0 +1,8 @@
+[
+  {"query": "how do we store data sqlite", "relevant": ["no-sqlc-or-goose-for-the-index", "modernc-cannot-load-c-extensions"]},
+  {"query": "team sync approach", "relevant": ["defer-team-sync-to-milestone-s"]},
+  {"query": "node identity rename edges", "relevant": ["node-identity-is-the-frontmatter-id"]},
+  {"query": "what to build first gate", "relevant": ["lean-binary-prove-gate-1-first"]},
+  {"query": "vector embeddings extension", "relevant": ["modernc-cannot-load-c-extensions"]},
+  {"query": "migrations schema changes", "relevant": ["no-sqlc-or-goose-for-the-index"]}
+]

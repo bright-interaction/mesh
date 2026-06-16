@@ -1,6 +1,10 @@
 package index
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/brightinteraction/mesh/internal/graph"
+)
 
 // SearchHit is one FTS5 result over the note corpus.
 type SearchHit struct {
@@ -53,35 +57,19 @@ LIMIT ?`
 	return out, rows.Err()
 }
 
-// buildFTS5Query turns raw user input into an FTS5 MATCH expression that treats
-// every token as a quoted literal, joined by implicit AND. Empty input returns
-// "" so the caller short-circuits. Ported from atomicsite's search handler.
+// buildFTS5Query turns raw user input into an FTS5 MATCH expression. It uses the
+// shared graph tokenizer (lowercase, unicode boundaries, stopwords dropped) so
+// FTS and graph-BM25 see the same terms, then joins them with OR: an agent's
+// natural-language query ("how do we store data") should recall any note that
+// matches a content word and let bm25 rank, not require that every word be
+// present AND-style. Reserved FTS grammar can't leak because each token is a
+// quoted alphanumeric literal. Empty input returns "" so the caller
+// short-circuits.
 func buildFTS5Query(q string) string {
-	parts := strings.Fields(q)
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = sanitizeFTS5Token(p)
-		if p == "" {
-			continue
-		}
-		escaped := strings.ReplaceAll(p, `"`, `""`)
-		out = append(out, `"`+escaped+`"`)
+	toks := graph.Tokenize(q)
+	out := make([]string, 0, len(toks))
+	for _, t := range toks {
+		out = append(out, `"`+strings.ReplaceAll(t, `"`, `""`)+`"`)
 	}
-	return strings.Join(out, " AND ")
-}
-
-// sanitizeFTS5Token drops characters that carry meaning in FTS5 query grammar
-// while keeping normal word/path content (letters, digits, apostrophes,
-// hyphens, slashes, unicode).
-func sanitizeFTS5Token(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '(', ')', ':', '*', '^', '"':
-			continue
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return strings.TrimSpace(b.String())
+	return strings.Join(out, " OR ")
 }

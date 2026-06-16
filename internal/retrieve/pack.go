@@ -30,6 +30,10 @@ func estimateTokens(s string) int {
 	return tokens
 }
 
+// EstimateTokens is the exported counter so the measurement harness counts both
+// arms with the exact same function the packer uses.
+func EstimateTokens(s string) int { return estimateTokens(s) }
+
 // cardTokens estimates the rendered cost of a card (title + path + snippet +
 // reason + a little structural overhead).
 func cardTokens(c Card) int {
