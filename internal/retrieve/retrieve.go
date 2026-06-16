@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"sort"
+	"strconv"
 
 	"github.com/brightinteraction/mesh/internal/embed"
 	"github.com/brightinteraction/mesh/internal/graph"
@@ -26,6 +27,14 @@ const (
 	godDegree   = 24  // skip expansion into hub nodes above this degree
 
 	rerankK = 30 // rerank at most this many top fused candidates
+
+	// rerankBlendDefault weights the cross-encoder vs the fused score when reranking
+	// the head: score = a*rerank + (1-a)*fused. 1.0 = pure rerank (the default).
+	// On the Hive vault an alpha sweep showed pure rerank dominates every blend
+	// (lowering it monotonically hurt paraphrase answer@1 and never recovered the
+	// one keyword case), so 1.0 ships; the MESH_RERANK_BLEND knob stays for corpora
+	// where the lexical/graph signal is strong enough to deserve a vote.
+	rerankBlendDefault = 1.0
 )
 
 var tier0Types = map[string]bool{"decision": true, "gotcha": true, "post-mortem": true}
@@ -61,12 +70,13 @@ type Retriever struct {
 	vecs        map[string][][]float32 // node id -> per-section chunk vectors
 	queryPrefix string                 // e.g. "search_query: " for nomic-style asymmetric models
 
-	rr         rerank.Reranker // optional cross-encoder; reorders the top-K head
-	rerankName string          // model id, for status/diagnostics
+	rr          rerank.Reranker // optional cross-encoder; reorders the top-K head
+	rerankName  string          // model id, for status/diagnostics
+	rerankBlend float64         // cross-encoder vs fused weight (see rerankBlendDefault)
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
-	return &Retriever{store: store, graph: g, ranker: g.NewRanker()}
+	return &Retriever{store: store, graph: g, ranker: g.NewRanker(), rerankBlend: rerankBlendDefault}
 }
 
 // NewFromEnv builds a retriever and enables the optional BYOAI stages from the
@@ -101,6 +111,11 @@ func (r *Retriever) enableRerankFromEnv() {
 	endpoint, model := os.Getenv("MESH_RERANK_ENDPOINT"), os.Getenv("MESH_RERANK_MODEL")
 	if endpoint == "" || model == "" {
 		return
+	}
+	if b := os.Getenv("MESH_RERANK_BLEND"); b != "" {
+		if v, err := strconv.ParseFloat(b, 64); err == nil && v >= 0 && v <= 1 {
+			r.rerankBlend = v
+		}
 	}
 	r.EnableRerank(rerank.NewHTTP(endpoint, model, os.Getenv("MESH_RERANK_KEY")))
 }
@@ -319,6 +334,15 @@ func (r *Retriever) rerankHead(query string, cards []Card) {
 		return
 	}
 	norm := minMax(scores)
+	// Capture the head's fused scores before we overwrite them, normalized over the
+	// head, so the blend can give the lexical/graph/vector signal a real vote
+	// instead of discarding it. Pure rerank (alpha=1) threw away a correct fused
+	// top-1 on keyword queries; blending keeps a strong fused hit in contention.
+	fused := make([]float64, k)
+	for i := range head {
+		fused[i] = head[i].Score
+	}
+	fusedNorm := minMax(fused)
 	// Lift the reranked head above the untouched fused tail. Derive the base from
 	// the actual max tail score (not a fixed constant) so the invariant holds
 	// regardless of edge-weight magnitudes in graph expansion.
@@ -328,11 +352,13 @@ func (r *Retriever) rerankHead(query string, cards []Card) {
 			base = c.Score + 1.0
 		}
 	}
+	a := r.rerankBlend
 	for i := range head {
+		// Convex blend of cross-encoder relevance and fused score, both in [0,1].
+		rel := a*norm[i] + (1-a)*fusedNorm[i]
 		// The tier-0 nudge multiplies the relevance component only, never the
 		// offset, so institutional-memory notes get a small (<=0.1) tiebreak among
-		// near-equal cross-encoder scores without overriding a clearly better pick.
-		rel := norm[i]
+		// near-equal scores without overriding a clearly better pick.
 		if head[i].Tier0 {
 			rel *= tier0Mult
 		}

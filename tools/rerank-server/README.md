@@ -63,6 +63,13 @@ Rerank is independent of embeddings: it reorders the fused FTS + graph (+ vector
 if on) candidates, so it works with or without `mesh embed`. It pairs best with
 vectors on, since that is where the paraphrase top-1 gain was measured.
 
+`MESH_RERANK_BLEND` (default `1.0`) sets how much the cross-encoder owns the head
+vs the fused score: `score = a*cross-encoder + (1-a)*fused`. On the Hive vault an
+alpha sweep showed pure rerank (`1.0`) is best; lowering it traded the paraphrase
+gain away faster than it recovered keyword cases. Lower it only on a keyword-heavy
+corpus where the lexical signal deserves a vote, and re-measure with
+`eval/ab-rerank.sh` before trusting a non-default value.
+
 ## Sovereignty / data boundary
 
 When the endpoint is **this local server**, candidate note bodies never leave
