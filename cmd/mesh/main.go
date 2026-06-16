@@ -11,6 +11,7 @@ import (
 
 	"github.com/brightinteraction/mesh/internal/graph"
 	"github.com/brightinteraction/mesh/internal/index"
+	"github.com/brightinteraction/mesh/internal/mcp"
 	"github.com/brightinteraction/mesh/internal/retrieve"
 	"github.com/brightinteraction/mesh/internal/vault"
 	"github.com/spf13/cobra"
@@ -423,7 +424,24 @@ func isKebab(filename string) bool {
 	return true
 }
 
-func mcpCmd() *cobra.Command { return stub("mcp", "Serve the agent retrieval contract over MCP", "Milestone 1") }
+func mcpCmd() *cobra.Command {
+	var vaultDir string
+	c := &cobra.Command{
+		Use:   "mcp",
+		Short: "Serve the agent retrieval contract over MCP (JSON-RPC on stdio)",
+		Long:  "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Configure your agent with: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			srv, err := mcp.NewServer(vaultDir)
+			if err != nil {
+				return err
+			}
+			defer srv.Close()
+			return srv.ServeStdio()
+		},
+	}
+	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
+	return c
+}
 func tuiCmd() *cobra.Command     { return stub("tui", "Open the terminal UI", "Milestone 3") }
 func uiCmd() *cobra.Command      { return stub("ui", "Serve the localhost graph viewer", "Milestone 3") }
 func doctorCmd() *cobra.Command  { return stub("doctor", "Diagnose index drift and config", "Milestone 0") }
