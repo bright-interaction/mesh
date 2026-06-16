@@ -1,0 +1,35 @@
+services:
+  # ---------------------------------------------------------------------------
+  # mesh-hub: the sovereign team-sync hub.
+  #
+  # Holds the team's markdown history in a git repo + the authoritative sync
+  # state in hub.db, both on the /var/lib/mesh-hub volume. Joins the shared
+  # dockyard-proxy network so Caddy terminates TLS and routes the public domain
+  # to it; the port is only `expose`d, never published to the host. Every
+  # endpoint except /healthz is fail-closed bearer auth, so it is safe to face
+  # the internet. Invites are minted by an operator with:
+  #   docker exec mesh-hub mesh-hub invite --repo /var/lib/mesh-hub/vault --user <name>
+  # ---------------------------------------------------------------------------
+  mesh-hub:
+    build:
+      context: .
+    image: mesh-hub:latest
+    container_name: mesh-hub
+    restart: unless-stopped
+    expose:
+      - "8848"
+    environment:
+      - MESH_HUB_REPO=/var/lib/mesh-hub/vault
+      - MESH_HUB_ADDR=:8848
+      - MESH_HUB_GC_HORIZON=${MESH_HUB_GC_HORIZON:-90}
+    volumes:
+      # Persistent: the git repo (history) + hub.db (tokens, versions). Back this
+      # up: hub.db holds non-rebuildable client tokens. The host dir must be
+      # owned by uid 1000 (the `mesh` user): chown -R 1000:1000 /var/lib/mesh-hub
+      - /var/lib/mesh-hub:/var/lib/mesh-hub
+    networks:
+      - dockyard-proxy
+
+networks:
+  dockyard-proxy:
+    external: true

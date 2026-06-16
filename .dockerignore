@@ -1,0 +1,9 @@
+.git
+.mesh
+**/.mesh
+bin
+vault/.mesh
+docs
+*.md
+eval
+tools
