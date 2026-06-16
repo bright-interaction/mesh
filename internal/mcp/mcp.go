@@ -53,7 +53,7 @@ func (s *Server) reload() error {
 		return err
 	}
 	s.graph = g
-	s.retriever = retrieve.New(s.store, g)
+	s.retriever = retrieve.NewFromEnv(s.store, g)
 	return nil
 }
 

@@ -4,8 +4,11 @@
 package retrieve
 
 import (
+	"context"
+	"os"
 	"sort"
 
+	"github.com/brightinteraction/mesh/internal/embed"
 	"github.com/brightinteraction/mesh/internal/graph"
 	"github.com/brightinteraction/mesh/internal/index"
 )
@@ -49,10 +52,43 @@ type Retriever struct {
 	store  *index.Store
 	graph  *graph.Graph
 	ranker *graph.Ranker
+
+	emb      embed.Embedder
+	vecModel string
+	vecs     map[string][]float32
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
 	return &Retriever{store: store, graph: g, ranker: g.NewRanker()}
+}
+
+// NewFromEnv builds a retriever and enables the semantic signal when the vault
+// has stored vectors and MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL are set (BYOAI).
+// Falls back silently to lexical-only when no embedder is configured.
+func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
+	r := New(store, g)
+	endpoint, model := os.Getenv("MESH_EMBED_ENDPOINT"), os.Getenv("MESH_EMBED_MODEL")
+	if endpoint == "" || model == "" {
+		return r
+	}
+	vm, vecs, err := store.LoadVectors()
+	if err != nil || len(vecs) == 0 {
+		return r
+	}
+	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv("MESH_EMBED_KEY")), vm, vecs)
+	return r
+}
+
+// EnableVectors turns on the semantic signal. It is a no-op unless the query
+// embedder's model matches the vault's stored model (homogeneity guard: vectors
+// from different models are not comparable, so we fail safe to lexical-only
+// rather than mix them).
+func (r *Retriever) EnableVectors(e embed.Embedder, model string, vecs map[string][]float32) bool {
+	if e == nil || model == "" || len(vecs) == 0 || e.Model() != model {
+		return false
+	}
+	r.emb, r.vecModel, r.vecs = e, model, vecs
+	return true
 }
 
 // Retrieve runs the full pipeline and returns ranked (and optionally
@@ -61,10 +97,16 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	if opt.Limit <= 0 {
 		opt.Limit = 20
 	}
+	vectorsActive := r.emb != nil && len(r.vecs) > 0
+	wVec := 0.0
 	if opt.WeightFTS == 0 && opt.WeightGraph == 0 {
-		// FTS-top1 beat the fused top-1 in the honest Gate-1 re-gate, so trust the
-		// full-text signal more; graph-BM25 stays a minority re-ranker.
-		opt.WeightFTS, opt.WeightGraph = 0.7, 0.3
+		if vectorsActive {
+			// With a semantic signal, give it real weight; FTS-top1 beat fused-top1
+			// lexically, so FTS stays the largest share and graph-BM25 the smallest.
+			opt.WeightFTS, opt.WeightGraph, wVec = 0.5, 0.2, 0.3
+		} else {
+			opt.WeightFTS, opt.WeightGraph = 0.7, 0.3
+		}
 	}
 
 	ftsHits, err := r.store.Search(query, opt.Limit)
@@ -99,6 +141,26 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 		fused[h.Node.ID] += opt.WeightGraph * gNorm[i]
 		if reason[h.Node.ID] == "" {
 			reason[h.Node.ID] = "graph"
+		}
+	}
+
+	// Semantic signal: cosine of the query embedding against stored note vectors
+	// (brute-force; the homogeneity guard already ensured comparable models).
+	if vectorsActive && wVec > 0 {
+		if qv, err := r.emb.Embed(context.Background(), []string{query}); err == nil && len(qv) == 1 {
+			ids := make([]string, 0, len(r.vecs))
+			sims := make([]float64, 0, len(r.vecs))
+			for id, v := range r.vecs {
+				ids = append(ids, id)
+				sims = append(sims, embed.Cosine(qv[0], v))
+			}
+			vNorm := minMax(sims)
+			for i, id := range ids {
+				fused[id] += wVec * vNorm[i]
+				if reason[id] == "" {
+					reason[id] = "vector"
+				}
+			}
 		}
 	}
 

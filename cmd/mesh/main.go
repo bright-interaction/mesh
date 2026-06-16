@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/brightinteraction/mesh/internal/embed"
 	"github.com/brightinteraction/mesh/internal/eval"
 	"github.com/brightinteraction/mesh/internal/graph"
 	"github.com/brightinteraction/mesh/internal/index"
@@ -36,6 +38,7 @@ func rootCmd() *cobra.Command {
 		initCmd(),
 		newCmd(),
 		indexCmd(),
+		embedCmd(),
 		searchCmd(),
 		evalCmd(),
 		statusCmd(),
@@ -171,7 +174,7 @@ func searchCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cards, err := retrieve.New(store, g).Retrieve(strings.Join(args, " "), retrieve.Options{Limit: limit, Budget: budget})
+			cards, err := retrieve.NewFromEnv(store, g).Retrieve(strings.Join(args, " "), retrieve.Options{Limit: limit, Budget: budget})
 			if err != nil {
 				return err
 			}
@@ -235,7 +238,7 @@ func evalCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			rep := eval.RunGate(store, retrieve.New(store, g), vaultDir, cases, budget)
+			rep := eval.RunGate(store, retrieve.NewFromEnv(store, g), vaultDir, cases, budget)
 
 			pf := func(b bool) string {
 				if b {
@@ -260,6 +263,84 @@ func evalCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
 	c.Flags().IntVar(&budget, "budget", 0, "token budget for the Mesh arm (0 = unbudgeted)")
+	return c
+}
+
+func embedCmd() *cobra.Command {
+	var endpoint, model, keyEnv string
+	var batch int
+	c := &cobra.Command{
+		Use:   "embed [vault]",
+		Short: "Embed notes via a BYOAI endpoint and store vectors (turns on semantic search)",
+		Long:  "Calls an OpenAI-compatible /embeddings endpoint (Ollama, OpenAI, Voyage, ...) you control. Vectors stay in .mesh/mesh.db. After this, mesh search / eval / mcp fuse the semantic signal automatically.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := vaultArg(args)
+			if endpoint == "" {
+				endpoint = os.Getenv("MESH_EMBED_ENDPOINT")
+			}
+			if model == "" {
+				model = os.Getenv("MESH_EMBED_MODEL")
+			}
+			if endpoint == "" || model == "" {
+				return fmt.Errorf("set --endpoint and --model (or MESH_EMBED_ENDPOINT / MESH_EMBED_MODEL).\n  example: mesh embed %s --endpoint http://localhost:11434/v1 --model nomic-embed-text", root)
+			}
+			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
+				return fmt.Errorf("no index (run: mesh index %s)", root)
+			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			texts, err := store.NoteTexts()
+			if err != nil {
+				return err
+			}
+			if len(texts) == 0 {
+				fmt.Println("no notes to embed")
+				return nil
+			}
+			emb := embed.NewHTTP(endpoint, model, os.Getenv(keyEnv))
+			if batch <= 0 {
+				batch = 32
+			}
+			ctx := context.Background()
+			rows := make([]index.VectorRow, 0, len(texts))
+			for i := 0; i < len(texts); i += batch {
+				j := i + batch
+				if j > len(texts) {
+					j = len(texts)
+				}
+				inputs := make([]string, 0, j-i)
+				for _, t := range texts[i:j] {
+					inputs = append(inputs, t.Text)
+				}
+				vecs, err := emb.Embed(ctx, inputs)
+				if err != nil {
+					return fmt.Errorf("embed batch %d-%d via %s: %w", i, j, endpoint, err)
+				}
+				for k, v := range vecs {
+					rows = append(rows, index.VectorRow{NodeID: texts[i+k].NodeID, Vec: v})
+				}
+				fmt.Printf("\rembedded %d/%d notes", j, len(texts))
+			}
+			fmt.Println()
+			if err := store.ReplaceVectors(model, rows); err != nil {
+				return err
+			}
+			dim := 0
+			if len(rows) > 0 {
+				dim = len(rows[0].Vec)
+			}
+			fmt.Printf("stored %d vectors (model %s, dim %d); semantic search active for mesh search / eval / mcp\n", len(rows), model, dim)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&endpoint, "endpoint", "", "OpenAI-compatible embeddings base URL (or MESH_EMBED_ENDPOINT)")
+	c.Flags().StringVar(&model, "model", "", "embedding model id (or MESH_EMBED_MODEL)")
+	c.Flags().StringVar(&keyEnv, "key-env", "MESH_EMBED_KEY", "env var holding the bearer key (empty for local)")
+	c.Flags().IntVar(&batch, "batch", 32, "embeddings per request")
 	return c
 }
 
