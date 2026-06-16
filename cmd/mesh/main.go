@@ -204,7 +204,8 @@ func indexCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "parse %s: %v\n", fe.Path, fe.Err)
 			}
 			g, issues := index.BuildGraph(notes)
-			printStats(root, len(files), len(ferrs), parseDur, w, notes, g, issues)
+			communities := g.DetectCommunities(0)
+			printStats(root, len(files), len(ferrs), parseDur, w, communities, notes, g, issues)
 			if dryRun {
 				return nil
 			}
@@ -226,7 +227,7 @@ func indexCmd() *cobra.Command {
 	return c
 }
 
-func printStats(root string, files, parseErrs int, parseDur time.Duration, workers int, notes []*index.ParsedNote, g *graph.Graph, issues []index.Issue) {
+func printStats(root string, files, parseErrs int, parseDur time.Duration, workers, communities int, notes []*index.ParsedNote, g *graph.Graph, issues []index.Issue) {
 	byType := map[string]int{}
 	for _, n := range notes {
 		byType[string(n.FM.Type)]++
@@ -243,6 +244,7 @@ func printStats(root string, files, parseErrs int, parseDur time.Duration, worke
 		fmt.Printf("          %-8s %d\n", kv.k, kv.v)
 	}
 	fmt.Printf("edges:  %d\n", g.EdgeCount())
+	fmt.Printf("communs: %d\n", communities)
 	fmt.Printf("types:\n")
 	for _, kv := range sortedCounts(byType) {
 		fmt.Printf("          %-12s %d\n", kv.k, kv.v)

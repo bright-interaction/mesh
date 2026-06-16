@@ -220,7 +220,13 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		if title == "" {
 			title = n.Key
 		}
-		g.AddNode(&graph.Node{ID: noteNode, Kind: "note", Label: title, NoteID: id, NotePath: n.Path})
+		attrs := map[string]any{"type": string(n.FM.Type)}
+		for k, v := range map[string]string{"when": n.FM.When, "do": n.FM.Do, "dont": n.FM.Dont, "why": n.FM.Why} {
+			if v != "" {
+				attrs[k] = v
+			}
+		}
+		g.AddNode(&graph.Node{ID: noteNode, Kind: "note", Label: title, NoteID: id, NotePath: n.Path, Attrs: attrs})
 
 		for _, h := range n.Headings {
 			if h.Anchor == "" {
