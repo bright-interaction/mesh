@@ -53,9 +53,10 @@ type Retriever struct {
 	graph  *graph.Graph
 	ranker *graph.Ranker
 
-	emb      embed.Embedder
-	vecModel string
-	vecs     map[string][]float32
+	emb         embed.Embedder
+	vecModel    string
+	vecs        map[string][]float32
+	queryPrefix string // e.g. "search_query: " for nomic-style asymmetric models
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
@@ -75,6 +76,7 @@ func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 	if err != nil || len(vecs) == 0 {
 		return r
 	}
+	r.queryPrefix = os.Getenv("MESH_EMBED_QUERY_PREFIX")
 	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv("MESH_EMBED_KEY")), vm, vecs)
 	return r
 }
@@ -147,7 +149,7 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	// Semantic signal: cosine of the query embedding against stored note vectors
 	// (brute-force; the homogeneity guard already ensured comparable models).
 	if vectorsActive && wVec > 0 {
-		if qv, err := r.emb.Embed(context.Background(), []string{query}); err == nil && len(qv) == 1 {
+		if qv, err := r.emb.Embed(context.Background(), []string{r.queryPrefix + query}); err == nil && len(qv) == 1 {
 			ids := make([]string, 0, len(r.vecs))
 			sims := make([]float64, 0, len(r.vecs))
 			for id, v := range r.vecs {
