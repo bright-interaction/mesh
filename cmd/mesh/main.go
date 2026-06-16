@@ -401,12 +401,39 @@ func statusCmd() *cobra.Command {
 				{"nodes", "nodes"},
 				{"edges", "edges"},
 				{"fts rows", "search_index"},
+				{"vectors", "vectors"},
 			} {
 				n, err := store.Count(t.table)
 				if err != nil {
 					return err
 				}
 				fmt.Printf("  %-9s %d\n", t.label, n)
+			}
+
+			// Report which retrieval signals will actually fire, reflecting both the
+			// stored index and the current BYOAI env config, so the operator can see
+			// at a glance what mesh search / eval / mcp will use.
+			g, err := store.LoadGraph()
+			if err != nil {
+				return err
+			}
+			r := retrieve.NewFromEnv(store, g)
+			fmt.Println("retrieval signals:")
+			fmt.Println("  fts + graph  always on")
+			if r.VectorsActive() {
+				fmt.Printf("  vectors      active (model %s)\n", r.VectorModel())
+			} else {
+				vcount, _ := store.Count("vectors")
+				if vcount > 0 {
+					fmt.Println("  vectors      stored but query embedder not configured (set MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL)")
+				} else {
+					fmt.Println("  vectors      off (run: mesh embed)")
+				}
+			}
+			if r.RerankActive() {
+				fmt.Printf("  rerank       active (cross-encoder %s)\n", r.RerankModel())
+			} else {
+				fmt.Println("  rerank       off (set MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL; see tools/rerank-server)")
 			}
 			return nil
 		},
