@@ -61,3 +61,28 @@ type SyncResponse struct {
 	Conflicts     []Conflict `json:"conflicts"`
 	FullReconcile bool       `json:"full_reconcile"`
 }
+
+// CurationJob is a hub-recorded marker that a path had a true conflict and would
+// benefit from the BYOAI sync-curator (S2.1). The hub stays AI-free: it only
+// records the marker (incl. the losing incoming bytes captured at merge time) and
+// serves it; the standalone mesh-curator does the AI and commits back via the
+// normal sync path. IncomingB64 is the loser; the winner is read from HeadSHA.
+type CurationJob struct {
+	ID           int64  `json:"id"`
+	Path         string `json:"path"`
+	BaseSHA      string `json:"base_sha"`
+	HeadSHA      string `json:"head_sha"`
+	IncomingB64  string `json:"incoming_b64,omitempty"`
+	User         string `json:"user"`
+	Status       string `json:"status"`
+	Attempts     int64  `json:"attempts,omitempty"`
+	CreatedAt    int64  `json:"created_at"`
+	ResolvedAt   int64  `json:"resolved_at,omitempty"`
+	ResolvedHead string `json:"resolved_head,omitempty"`
+}
+
+// CurationJobsResponse lists pending curation jobs (metadata only; fetch one job
+// to get its IncomingB64).
+type CurationJobsResponse struct {
+	Jobs []CurationJob `json:"jobs"`
+}
