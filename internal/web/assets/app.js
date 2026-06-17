@@ -82,9 +82,12 @@
   function buildInfluence(root) {
     const m = new Map([[root.id, 1]]);
     let n1 = adj.get(root.id) || [];
-    if (n1.length > 60) n1 = n1.slice(0, 60);
-    for (const a of n1) if (!m.has(a)) m.set(a, 0.55);
-    for (const a of n1) for (const b of (adj.get(a) || [])) if (!m.has(b)) m.set(b, 0.22);
+    if (n1.length > 90) n1 = n1.slice(0, 90);
+    for (const a of n1) if (!m.has(a)) m.set(a, 0.72); // 1-hop comes along strongly
+    for (const a of n1) for (const b of (adj.get(a) || [])) {
+      if (!m.has(b)) m.set(b, 0.42); // 2-hop follows clearly
+      for (const c of (adj.get(b) || [])) if (!m.has(c)) m.set(c, 0.18); // 3-hop drifts a little
+    }
     return m;
   }
 
@@ -102,14 +105,18 @@
     const grad = g.createRadialGradient(R, R, 0, R, R, R);
     const { r, gg, b } = rgb(color);
     if (sun) {
-      grad.addColorStop(0, `rgba(255,250,242,0.85)`);
-      grad.addColorStop(0.10, `rgba(255,241,220,0.6)`);
-      grad.addColorStop(0.30, `rgba(${r},${gg},${b},0.22)`);
+      // a real star: hot bright core fading through the community hue (the "sun
+      // pulling planets" look), bright but not the old nuclear white-out.
+      grad.addColorStop(0, `rgba(255,252,246,0.95)`);
+      grad.addColorStop(0.08, `rgba(255,243,224,0.78)`);
+      grad.addColorStop(0.26, `rgba(${r},${gg},${b},0.4)`);
+      grad.addColorStop(0.55, `rgba(${r},${gg},${b},0.14)`);
       grad.addColorStop(1, `rgba(${r},${gg},${b},0)`);
     } else {
-      // low deposit: ~30 overlapping centers still sit under 1.0 (no white-out)
-      grad.addColorStop(0, `rgba(${r},${gg},${b},0.14)`);
-      grad.addColorStop(0.35, `rgba(${r},${gg},${b},0.05)`);
+      // glow back, a touch: a bit more deposit than the de-tackify low, still under
+      // 1.0 for a moderately dense cluster (the force swirl keeps it from collapsing).
+      grad.addColorStop(0, `rgba(${r},${gg},${b},0.18)`);
+      grad.addColorStop(0.35, `rgba(${r},${gg},${b},0.06)`);
       grad.addColorStop(1, `rgba(${r},${gg},${b},0)`);
     }
     g.fillStyle = grad;
@@ -188,17 +195,19 @@
       const fx = (dx / d) * f, fy = (dy / d) * f;
       a.fx += fx; a.fy += fy; b.fx -= fx; b.fy -= fy;
     }
-    for (const v of nodes) { v.fx -= v.gx * 0.0016; v.fy -= v.gy * 0.0016; }
-    const damp = 0.9; // heavier damping = calmer, less shaky settle
+    for (const v of nodes) { v.fx -= v.gx * 0.0011; v.fy -= v.gy * 0.0011; } // lighter gravity = spreads, less blocky
+    // Smooth perpetual flow: a near-rigid slow rotation (OMEGA, preserves the
+    // Obsidian structure as it turns) plus a small inner-faster shear (TWIST), both
+    // damping-independent so the field always flows, never freezes into quadrants.
+    const damp = 0.9, OMEGA = 0.00022, TWIST = 0.02;
     for (const v of nodes) {
       if (drag && v === drag.node) continue;
-      v.vx = (v.vx + v.fx * alpha) * damp;
-      v.vy = (v.vy + v.fy * alpha) * damp;
-      // dead-zone: below a tiny speed, stop, so a settled graph is still (not jittery)
-      if (v.vx * v.vx + v.vy * v.vy < 0.0009) { v.vx = 0; v.vy = 0; }
+      const r = Math.max(60, Math.sqrt(v.gx * v.gx + v.gy * v.gy));
+      v.vx = (v.vx + v.fx * alpha) * damp + (-v.gy * OMEGA) + (-v.gy / r) * TWIST;
+      v.vy = (v.vy + v.fy * alpha) * damp + (v.gx * OMEGA) + (v.gx / r) * TWIST;
       v.gx += v.vx; v.gy += v.vy;
     }
-    if (alpha > 0.02) alpha *= 0.99; // cool to a low floor: alive but calm, not shaking
+    if (alpha > 0.045) alpha *= 0.99; // keep the field gently responsive so it flows, not frozen
   }
 
   // ---- render ----
@@ -221,7 +230,7 @@
         const o = galaxyPos(drag.node), tgtX = drag.wx - o.x, tgtY = drag.wy - o.y;
         for (const n of G.nodes) {
           const w = drag.influence.get(n.id);
-          if (w) { n.dispX += (w * tgtX - n.dispX) * 0.25; n.dispY += (w * tgtY - n.dispY) * 0.25; }
+          if (w) { n.dispX += (w * tgtX - n.dispX) * 0.32; n.dispY += (w * tgtY - n.dispY) * 0.32; }
           else decay(n);
         }
       } else for (const n of G.nodes) decay(n);
@@ -254,15 +263,14 @@
     }
     const on = (s, m) => s.x >= -m && s.x <= W + m && s.y >= -m && s.y <= H + m;
 
-    // edges: bulk is near-invisible and intent-gated (structure reads from the
-    // node clustering); only the focused subgraph is bright. Neutral grey, no chroma.
-    const drawBase = neighborSet || z >= 1.6;
+    // edges: always draw the faint web (that connective tissue IS the Obsidian
+    // look), just very low alpha so it reads as structure not a hairball; the
+    // focused subgraph lights up bright. Neutral grey, no chroma.
+    const drawBase = true;
     const emph = [];
-    if (drawBase) {
-      ctx.lineWidth = Math.max(0.5, 0.7 * z);
-      ctx.strokeStyle = neighborSet ? "rgba(150,150,165,0.012)" : "rgba(150,150,165,0.022)";
-      ctx.beginPath();
-    }
+    ctx.lineWidth = Math.max(0.5, 0.65 * z);
+    ctx.strokeStyle = neighborSet ? "rgba(150,150,165,0.022)" : "rgba(150,150,165,0.04)";
+    ctx.beginPath();
     for (const e of G.edges) {
       const ai = nodeIndex.get(e.source), bi = nodeIndex.get(e.target);
       if (ai === undefined || bi === undefined) continue;
@@ -286,12 +294,12 @@
       const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
       const core = nodeRadius(n) * z;
       if (n.id === G.meta.index_id) {
-        const pulse = 1 + 0.025 * Math.sin(t * 0.018);
-        blit(sunSprite, s, core * 3.2 * pulse, dim ? 0.25 : 0.9);
+        const pulse = 1 + 0.035 * Math.sin(t * 0.02);
+        blit(sunSprite, s, core * 5.5 * pulse, dim ? 0.3 : 0.92); // the sun glow, back
       } else {
-        let halo = core * (2.2 + Math.min(1.4, n.degree * 0.02)); // only true hubs glow wide
+        let halo = core * (2.5 + Math.min(1.6, n.degree * 0.022)); // a bit more reach
         if (z <= 0.6) halo *= 0.7;
-        blit(sprites.get(commColor.get(n.community)) || sprites.get("#7c766e"), s, halo, dim ? 0.05 : 0.22);
+        blit(sprites.get(commColor.get(n.community)) || sprites.get("#7c766e"), s, halo, dim ? 0.06 : 0.3);
       }
     }
     ctx.globalCompositeOperation = "source-over";
