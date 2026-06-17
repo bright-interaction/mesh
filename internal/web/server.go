@@ -90,16 +90,19 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasSuffix(name, ".js"):
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache") // assets change on every binary rebuild; revalidate
 	case strings.HasSuffix(name, ".css"):
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
 	case strings.HasSuffix(name, ".woff2"):
 		w.Header().Set("Content-Type", "font/woff2")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable") // fonts never change
 	default:
 		if ct := mime.TypeByExtension(filepath.Ext(name)); ct != "" {
 			w.Header().Set("Content-Type", ct)
 		}
+		w.Header().Set("Cache-Control", "no-cache")
 	}
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	_, _ = w.Write(body)
 }
 

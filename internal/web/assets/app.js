@@ -1,5 +1,7 @@
-// mesh ui: a sovereign canvas graph viewer. No dependencies. Two views over one
-// graph: an Obsidian-style force layout and a galaxy orbiting the index note.
+// mesh ui: a sovereign canvas graph viewer. No dependencies. Two living views over
+// one graph: an Obsidian-style force graph (a continuous velocity sim you can grab
+// and fling) and a galaxy orbiting the index note. Nodes are additive glow blobs;
+// the index is a small sun.
 (() => {
   "use strict";
   const $ = (id) => document.getElementById(id);
@@ -10,21 +12,27 @@
 
   let G = null;
   const byId = new Map();
-  const nodeIndex = new Map(); // id -> array index, built once
+  const nodeIndex = new Map();
   const commColor = new Map();
-  let sp = [];                 // reused screen-position buffer (no per-frame alloc)
+  const sprites = new Map(); // community color -> offscreen glow sprite
+  let sunSprite = null;
+  let sp = [];               // reused screen-position buffer
   let view = "graph";
   const cam = { x: 0, y: 0, zoom: 1 };
   let hover = null, selected = null, query = "";
   let dpr = Math.max(1, window.devicePixelRatio || 1);
   let W = 0, H = 0;
   let galaxyAngle = 0;
-  let neighborSet = null; // ids adjacent to hover/selection, for emphasis
-  let dirty = true;       // redraw gate: static graph view idles, galaxy animates
-  const markDirty = () => { dirty = true; };
+  let alpha = 1;             // sim energy: cools to a floor so the graph stays alive
+  let neighborSet = null;
+  let drag = null;           // { node, vx, vy } while dragging/flinging a node
+  let running = true;        // rAF gate; paused when the tab is hidden
+  let stars = [];
+  let vignette = null;
+  let t = 0;                 // frame clock for the sun pulse
+
   const safeColor = (c) => (HEX.test(c) ? c : "#7c766e");
 
-  // ---- boot ----
   fetch("/graph.json").then((r) => {
     if (!r.ok) throw new Error("graph.json " + r.status);
     return r.json();
@@ -32,48 +40,84 @@
 
   function boot(data) {
     G = data;
+    G.communities = G.communities || []; // tolerate a graph indexed before community detection
+    G.edges = G.edges || [];
     resize();
     if (!G.nodes || G.nodes.length === 0) return showEmpty();
     for (const c of G.communities) { c.color = safeColor(c.color); commColor.set(c.id, c.color); }
-    G.nodes.forEach((n, i) => { byId.set(n.id, n); nodeIndex.set(n.id, i); });
+    G.nodes.forEach((n, i) => { byId.set(n.id, n); nodeIndex.set(n.id, i); n.vx = 0; n.vy = 0; });
     sp = new Array(G.nodes.length);
     buildAdjacency();
+    buildSprites();
+    seedLayout();
+    layoutGalaxy();
     setStats();
     buildLegend();
-    layoutGalaxy();
-    layoutGraph(() => { fitView(); doneOverlay(); markDirty(); requestAnimationFrame(loop); });
+    fitView();
+    doneOverlay();
     wire();
+    requestAnimationFrame(loop);
   }
 
-  // ---- adjacency (for emphasis + force springs) ----
   const adj = new Map();
   function buildAdjacency() {
     for (const n of G.nodes) adj.set(n.id, []);
     for (const e of G.edges) {
       if (e.source === e.target) continue;
-      if (adj.has(e.source) && adj.has(e.target)) {
-        adj.get(e.source).push(e.target);
-        adj.get(e.target).push(e.source);
-      }
+      if (adj.has(e.source) && adj.has(e.target)) { adj.get(e.source).push(e.target); adj.get(e.target).push(e.source); }
     }
   }
 
-  // ---- galaxy layout: deterministic radial by orbit, communities as arms ----
-  function layoutGalaxy() {
-    const ringGap = 130;
-    const byOrbit = new Map();
-    for (const n of G.nodes) {
-      const o = n.orbit || 0;
-      if (!byOrbit.has(o)) byOrbit.set(o, []);
-      byOrbit.get(o).push(n);
+  // ---- glow sprites (built once per community color; drawn additively) ----
+  function buildSprites() {
+    for (const c of G.communities) sprites.set(c.color, haloSprite(c.color));
+    sprites.set("#7c766e", haloSprite("#7c766e"));
+    sunSprite = haloSprite("#fff1dc", true);
+  }
+  function haloSprite(color, sun) {
+    const R = 48;
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = R * 2;
+    const g = cv.getContext("2d");
+    const grad = g.createRadialGradient(R, R, 0, R, R, R);
+    const { r, gg, b } = rgb(color);
+    if (sun) {
+      grad.addColorStop(0, `rgba(255,255,255,0.95)`);
+      grad.addColorStop(0.18, `rgba(${r},${gg},${b},0.85)`);
+      grad.addColorStop(0.45, `rgba(${r},${gg},${b},0.28)`);
+      grad.addColorStop(1, `rgba(${r},${gg},${b},0)`);
+    } else {
+      grad.addColorStop(0, `rgba(${r},${gg},${b},0.55)`);
+      grad.addColorStop(0.5, `rgba(${r},${gg},${b},0.16)`);
+      grad.addColorStop(1, `rgba(${r},${gg},${b},0)`);
     }
+    g.fillStyle = grad;
+    g.beginPath(); g.arc(R, R, R, 0, TAU); g.fill();
+    return cv;
+  }
+
+  // ---- layouts ----
+  function seedLayout() {
+    const k = Math.sqrt(120000);
+    const ci = new Map();
+    G.communities.forEach((c, i) => ci.set(c.id, i));
+    G.nodes.forEach((n, i) => {
+      const base = ((ci.get(n.community) || 0) / Math.max(1, G.communities.length)) * TAU;
+      const rr = k * (0.2 + (i % 23) * 0.05);
+      n.gx = Math.cos(base + (i % 9) * 0.3) * rr;
+      n.gy = Math.sin(base + (i % 9) * 0.3) * rr;
+    });
+  }
+  function layoutGalaxy() {
+    const ringGap = 150;
+    const byOrbit = new Map();
+    for (const n of G.nodes) { const o = n.orbit || 0; (byOrbit.get(o) || byOrbit.set(o, []).get(o)).push(n); }
     for (const [o, ring] of byOrbit) {
       ring.sort((a, b) => a.community - b.community || (a.id < b.id ? -1 : 1));
-      const r = o * ringGap;
       ring.forEach((n, i) => {
         n.theta0 = ring.length <= 1 ? 0 : (i / ring.length) * TAU;
-        n.radius0 = r;
-        n.speed = 1 / Math.sqrt(o + 1); // inner rings revolve faster
+        n.radius0 = o * ringGap;
+        n.speed = 1 / Math.sqrt(o + 1);
       });
     }
   }
@@ -83,53 +127,17 @@
     const a = (n.theta0 || 0) + galaxyAngle * (n.speed || 0);
     return { x: Math.cos(a) * r0, y: Math.sin(a) * r0 };
   }
+  function pos(n) { return view === "galaxy" ? galaxyPos(n) : { x: n.gx, y: n.gy }; }
 
-  // ---- force layout (Fruchterman-Reingold, grid repulsion, chunked) ----
-  function layoutGraph(done) {
-    const n = G.nodes.length;
-    const cached = loadCachedLayout();
-    if (cached) {
-      for (const node of G.nodes) {
-        const p = cached[node.id];
-        if (p && Number.isFinite(p[0]) && Number.isFinite(p[1])) { node.gx = p[0]; node.gy = p[1]; }
-      }
-      if (G.nodes.every((nd) => Number.isFinite(nd.gx))) return done();
-    }
-    const k = Math.sqrt((Math.max(1, n) * 16000) / Math.max(1, n));
-    const commIndex = new Map();
-    G.communities.forEach((c, i) => commIndex.set(c.id, i));
-    G.nodes.forEach((nd, i) => {
-      const ci = commIndex.get(nd.community) || 0;
-      const base = (ci / Math.max(1, G.communities.length)) * TAU;
-      const rr = k * (1 + (i % 17) * 0.18);
-      nd.gx = Math.cos(base + (i % 7) * 0.21) * rr;
-      nd.gy = Math.sin(base + (i % 7) * 0.21) * rr;
-    });
-    const iters = n > 1200 ? 90 : n > 400 ? 140 : 200;
-    let t = k * 1.6;
-    const cool = t / (iters + 1);
-    let it = 0;
-    const stepBatch = () => {
-      const batch = Math.min(8, iters - it);
-      for (let b = 0; b < batch; b++) { frIteration(k, t); t -= cool; }
-      it += batch;
-      overlayMsg.textContent = "building the graph " + Math.round((it / iters) * 100) + "%";
-      if (it < iters) return setTimeout(stepBatch, 0);
-      saveCachedLayout();
-      done();
-    };
-    stepBatch();
-  }
-
-  function frIteration(k, temp) {
-    const nodes = G.nodes;
-    for (const v of nodes) { v.dx = 0; v.dy = 0; }
+  // ---- velocity force sim (graph view): repulsion (grid) + springs + gravity ----
+  function simStep() {
+    const nodes = G.nodes, k = 150;
     const cell = k, grid = new Map();
     for (const v of nodes) {
-      const kk = ((v.gx / cell) | 0) + ":" + ((v.gy / cell) | 0);
-      if (!grid.has(kk)) grid.set(kk, []);
-      grid.get(kk).push(v);
+      const key = ((v.gx / cell) | 0) + ":" + ((v.gy / cell) | 0);
+      (grid.get(key) || grid.set(key, []).get(key)).push(v);
     }
+    for (const v of nodes) { v.fx = 0; v.fy = 0; }
     for (const v of nodes) {
       const cx = (v.gx / cell) | 0, cy = (v.gy / cell) | 0;
       for (let gx = cx - 1; gx <= cx + 1; gx++)
@@ -138,158 +146,187 @@
           if (!bucket) continue;
           for (const u of bucket) {
             if (u === v) continue;
-            let ddx = v.gx - u.gx, ddy = v.gy - u.gy;
-            let d2 = ddx * ddx + ddy * ddy;
-            if (d2 < 0.01) { ddx = Math.random() - 0.5; ddy = Math.random() - 0.5; d2 = 0.01; }
-            const d = Math.sqrt(d2), rep = (k * k) / d;
-            v.dx += (ddx / d) * rep; v.dy += (ddy / d) * rep;
+            let dx = v.gx - u.gx, dy = v.gy - u.gy, d2 = dx * dx + dy * dy;
+            if (d2 < 1) { dx = (v.id < u.id ? 1 : -1) * 0.5; dy = 0.5; d2 = 1; }
+            if (d2 > k * k * 9) continue;
+            const inv = (k * k) / d2;
+            v.fx += dx * inv * 0.02; v.fy += dy * inv * 0.02;
           }
         }
     }
     for (const e of G.edges) {
       const a = byId.get(e.source), b = byId.get(e.target);
       if (!a || !b || a === b) continue;
-      let ddx = a.gx - b.gx, ddy = a.gy - b.gy;
-      const d = Math.sqrt(ddx * ddx + ddy * ddy) || 0.01;
-      const att = (d * d) / k, fx = (ddx / d) * att, fy = (ddy / d) * att;
-      a.dx -= fx; a.dy -= fy; b.dx += fx; b.dy += fy;
+      const dx = b.gx - a.gx, dy = b.gy - a.gy, d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = (d - k) * 0.012;
+      const fx = (dx / d) * f, fy = (dy / d) * f;
+      a.fx += fx; a.fy += fy; b.fx -= fx; b.fy -= fy;
     }
-    for (const v of nodes) { v.dx -= v.gx * 0.012; v.dy -= v.gy * 0.012; }
+    for (const v of nodes) { v.fx -= v.gx * 0.0016; v.fy -= v.gy * 0.0016; }
+    const damp = 0.82;
     for (const v of nodes) {
-      const d = Math.sqrt(v.dx * v.dx + v.dy * v.dy) || 0.01;
-      v.gx += (v.dx / d) * Math.min(d, temp);
-      v.gy += (v.dy / d) * Math.min(d, temp);
+      if (drag && v === drag.node) continue;
+      v.vx = (v.vx + v.fx * alpha) * damp;
+      v.vy = (v.vy + v.fy * alpha) * damp;
+      v.gx += v.vx; v.gy += v.vy;
     }
+    if (alpha > 0.06) alpha *= 0.985; // cool toward a living floor, never fully freeze
   }
 
-  function layoutSig() { return G.meta.node_count + "x" + G.meta.edge_count + "@" + G.meta.index_id; }
-  function loadCachedLayout() {
-    try { const j = localStorage.getItem("mesh-layout:" + layoutSig()); return j ? JSON.parse(j) : null; } catch { return null; }
-  }
-  function saveCachedLayout() {
-    try {
-      const o = {};
-      for (const n of G.nodes) o[n.id] = [Math.round(n.gx), Math.round(n.gy)];
-      localStorage.setItem("mesh-layout:" + layoutSig(), JSON.stringify(o));
-    } catch { /* private mode / quota: layout just recomputes next time */ }
-  }
-
-  // ---- positions ----
-  function pos(n) { return view === "galaxy" ? galaxyPos(n) : { x: n.gx, y: n.gy }; }
-  function toScreen(p) { return { x: (p.x - cam.x) * cam.zoom + W / 2, y: (p.y - cam.y) * cam.zoom + H / 2 }; }
-  function radius(n) { return Math.max(2.2, (n.size || 1) * 2.4); }
-  function nodeScale() { return Math.max(0.7, Math.min(cam.zoom, 2.2)); }
-
-  // ---- render loop ----
+  // ---- render ----
   function loop() {
-    if (view === "galaxy") { galaxyAngle += 0.0016; dirty = true; }
-    if (dirty) { draw(); dirty = false; }
+    if (document.hidden) { running = false; return; } // pause when the tab is hidden (battery)
+    t += 1;
+    if (view === "graph") simStep();
+    else galaxyAngle += 0.0014;
+    draw();
     requestAnimationFrame(loop);
   }
 
   function draw() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#06050a";
+    ctx.fillRect(0, 0, W, H);
     const z = cam.zoom, ox = W / 2 - cam.x * z, oy = H / 2 - cam.y * z;
-    const nodes = G.nodes, N = nodes.length;
-    for (let i = 0; i < N; i++) {
-      const p = pos(nodes[i]);
-      let s = sp[i]; if (!s) { s = sp[i] = { x: 0, y: 0 }; }
-      s.x = p.x * z + ox; s.y = p.y * z + oy;
-    }
-    const onScreen = (s) => s.x >= -60 && s.x <= W + 60 && s.y >= -60 && s.y <= H + 60;
 
-    // faint edges batched into one stroke; emphasized edges brighter, separately
-    ctx.lineWidth = Math.max(0.4, 0.6 * z);
-    ctx.strokeStyle = "rgba(245,242,236,0.06)";
+    if (view === "galaxy") drawStars(z);
+
+    const nodes = G.nodes, N = nodes.length, galaxy = view === "galaxy";
+    for (let i = 0; i < N; i++) {
+      const n = nodes[i];
+      let px, py; // inline pos() to avoid N object allocations per frame
+      if (galaxy) {
+        const r0 = n.radius0 || 0;
+        if (r0 === 0) { px = 0; py = 0; }
+        else { const a = (n.theta0 || 0) + galaxyAngle * (n.speed || 0); px = Math.cos(a) * r0; py = Math.sin(a) * r0; }
+      } else { px = n.gx; py = n.gy; }
+      const s = sp[i] || (sp[i] = { x: 0, y: 0 });
+      s.x = px * z + ox; s.y = py * z + oy;
+    }
+    const on = (s, m) => s.x >= -m && s.x <= W + m && s.y >= -m && s.y <= H + m;
+
+    // curved edges, batched; emphasized brighter
+    ctx.lineWidth = Math.max(0.5, 0.7 * z);
+    ctx.strokeStyle = "rgba(170,190,230,0.05)";
     ctx.beginPath();
     const emph = [];
     for (const e of G.edges) {
       const ai = nodeIndex.get(e.source), bi = nodeIndex.get(e.target);
       if (ai === undefined || bi === undefined) continue;
       const a = sp[ai], b = sp[bi];
-      if (!onScreen(a) && !onScreen(b)) continue;
+      if (!on(a, 40) && !on(b, 40)) continue;
       if (neighborSet && (isFocus(e.source) || isFocus(e.target))) { emph.push(a, b); continue; }
-      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      curve(a, b);
     }
     ctx.stroke();
     if (emph.length) {
-      ctx.strokeStyle = "rgba(245,242,236,0.35)";
-      ctx.beginPath();
-      for (let i = 0; i < emph.length; i += 2) { ctx.moveTo(emph[i].x, emph[i].y); ctx.lineTo(emph[i + 1].x, emph[i + 1].y); }
+      ctx.strokeStyle = "rgba(245,242,236,0.4)"; ctx.lineWidth = Math.max(0.8, 1.1 * z); ctx.beginPath();
+      for (let i = 0; i < emph.length; i += 2) curve(emph[i], emph[i + 1]);
       ctx.stroke();
     }
 
-    // nodes + labels (off-screen culled)
-    const labelZoom = z > 1.4, scale = nodeScale();
-    ctx.font = "11px Geist, sans-serif";
-    const hoverId = hover && hover.id;
+    // glow halos (additive bloom)
+    ctx.globalCompositeOperation = "lighter";
     for (let i = 0; i < N; i++) {
       const n = nodes[i], s = sp[i];
-      if (!onScreen(s)) continue;
-      const r = radius(n) * scale;
+      if (!on(s, 80)) continue;
       const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
-      ctx.globalAlpha = dim ? 0.12 : 1;
-      ctx.fillStyle = commColor.get(n.community) || "#7c766e";
-      ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, TAU); ctx.fill();
+      const core = nodeRadius(n) * z;
       if (n.id === G.meta.index_id) {
-        ctx.globalAlpha = dim ? 0.2 : 1;
-        ctx.strokeStyle = "#f5f2ec"; ctx.lineWidth = 1.5;
-        ctx.beginPath(); ctx.arc(s.x, s.y, r + 3, 0, TAU); ctx.stroke();
+        const pulse = 1 + 0.07 * Math.sin(t * 0.05);
+        blit(sunSprite, s, core * 7 * pulse, dim ? 0.25 : 1);
+      } else {
+        // moderate halo alpha + extent so a dense single community blooms hot
+        // without additive-summing to a white-out (the real 271-node Hive cluster).
+        blit(sprites.get(commColor.get(n.community)) || sprites.get("#7c766e"), s, core * 4.5, dim ? 0.1 : 0.5);
       }
+    }
+    ctx.globalCompositeOperation = "source-over";
+
+    // crisp cores + labels
+    const labelZoom = z > 1.3, hoverId = hover && hover.id;
+    ctx.font = "11px Geist, sans-serif"; ctx.textBaseline = "middle";
+    for (let i = 0; i < N; i++) {
+      const n = nodes[i], s = sp[i];
+      if (!on(s, 10)) continue;
+      const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
+      const r = Math.max(1.6, nodeRadius(n) * z);
+      ctx.globalAlpha = dim ? 0.18 : 1;
+      ctx.fillStyle = n.id === G.meta.index_id ? "#fff6e8" : lighten(commColor.get(n.community) || "#7c766e", 0.45);
+      ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, TAU); ctx.fill();
       if (!dim && (n.degree >= 8 || labelZoom || isFocus(n.id) || n.id === hoverId)) {
-        ctx.globalAlpha = 0.9; ctx.fillStyle = "#f5f2ec";
-        ctx.fillText(n.label || n.id, s.x + r + 4, s.y + 4);
+        ctx.globalAlpha = 0.92; ctx.fillStyle = "#0a0908";
+        ctx.fillText(n.label || n.id, s.x + r + 5, s.y + 1); // shadow
+        ctx.fillStyle = "#f3efe7";
+        ctx.fillText(n.label || n.id, s.x + r + 4, s.y);
       }
     }
     ctx.globalAlpha = 1;
+
+    if (vignette) { ctx.fillStyle = vignette; ctx.fillRect(0, 0, W, H); }
   }
 
-  function isFocus(id) {
-    if (!neighborSet) return false;
-    const f = selected || hover;
-    return neighborSet.has(id) || (f && id === f.id);
+  function curve(a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+    const off = Math.min(len * 0.12, 36); // gentle, capped bow (long edges do not over-arc)
+    const mx = (a.x + b.x) / 2 - (dy / len) * off, my = (a.y + b.y) / 2 + (dx / len) * off;
+    ctx.moveTo(a.x, a.y);
+    ctx.quadraticCurveTo(mx, my, b.x, b.y);
   }
+  function blit(spr, s, size, a) {
+    if (!spr || size <= 0) return;
+    ctx.globalAlpha = a;
+    ctx.drawImage(spr, s.x - size, s.y - size, size * 2, size * 2);
+  }
+  function drawStars(z) {
+    ctx.fillStyle = "#cdd6f4";
+    const px = -cam.x * z * 0.25 + W / 2, py = -cam.y * z * 0.25 + H / 2;
+    for (const st of stars) {
+      const x = ((st.x + px) % W + W) % W, y = ((st.y + py) % H + H) % H;
+      ctx.globalAlpha = st.a;
+      ctx.fillRect(x, y, st.r, st.r);
+    }
+    ctx.globalAlpha = 1;
+  }
+  function nodeRadius(n) { return Math.max(1.4, (n.size || 1) * 1.7); }
+  function isFocus(id) { if (!neighborSet) return false; const f = selected || hover; return neighborSet.has(id) || (f && id === f.id); }
 
   // ---- camera ----
   function fitView() {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let a = Infinity, b = Infinity, c = -Infinity, d = -Infinity;
     for (const n of G.nodes) {
       const p = pos(n);
       if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
-      minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
-      maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+      a = Math.min(a, p.x); b = Math.min(b, p.y); c = Math.max(c, p.x); d = Math.max(d, p.y);
     }
-    if (!isFinite(minX)) { cam.x = 0; cam.y = 0; cam.zoom = 1; markDirty(); return; }
-    cam.x = (minX + maxX) / 2; cam.y = (minY + maxY) / 2;
-    const spanX = (maxX - minX) || 1, spanY = (maxY - minY) || 1;
-    cam.zoom = Math.min(0.95, (W - 120) / spanX, (H - 160) / spanY);
+    if (!isFinite(a)) { cam.x = cam.y = 0; cam.zoom = 1; return; }
+    cam.x = (a + c) / 2; cam.y = (b + d) / 2;
+    cam.zoom = Math.min(1.1, (W - 140) / ((c - a) || 1), (H - 180) / ((d - b) || 1));
     if (!isFinite(cam.zoom) || cam.zoom <= 0) cam.zoom = 1;
-    markDirty();
   }
 
-  // ---- hit test ----
   function nodeAt(sx, sy) {
     let best = null, bestD = Infinity;
-    const scale = nodeScale();
-    for (const n of G.nodes) {
+    for (let i = 0; i < G.nodes.length; i++) {
+      const n = G.nodes[i];
       if (query && !matches(n)) continue;
-      const p = toScreen(pos(n));
-      const r = radius(n) * scale + 4;
-      const d = (p.x - sx) ** 2 + (p.y - sy) ** 2;
-      if (d <= r * r && d < bestD) { best = n; bestD = d; }
+      const s = sp[i]; if (!s) continue;
+      const r = nodeRadius(n) * cam.zoom + 6;
+      const dd = (s.x - sx) ** 2 + (s.y - sy) ** 2;
+      if (dd <= r * r && dd < bestD) { best = n; bestD = dd; }
     }
     return best;
   }
+  function worldAt(sx, sy) { return { x: (sx - W / 2) / cam.zoom + cam.x, y: (sy - H / 2) / cam.zoom + cam.y }; }
 
   // ---- card + focus ----
   function setFocus(n) { neighborSet = n ? new Set(adj.get(n.id) || []) : null; }
   function showCard(n) {
     const card = $("card");
-    const color = commColor.get(n.community) || "#7c766e"; // sanitized at boot
+    const color = commColor.get(n.community) || "#7c766e";
     const comm = G.communities.find((c) => c.id === n.community) || {};
     const editor = "vscode://file/" + joinPath(G.meta.vault, n.path) + ":" + (n.line || 1);
-    const tags = (n.tags || []).map((t) => `<span class="chip">#${esc(t)}</span>`).join("");
+    const tags = (n.tags || []).map((x) => `<span class="chip">#${esc(x)}</span>`).join("");
     card.innerHTML = `
       <h2><span class="swatch" style="background:${esc(color)}"></span>${esc(n.label || n.id)}</h2>
       <div class="path">${esc(n.path)}</div>
@@ -314,71 +351,76 @@
   function matches(n) { return !query || (n.label || "").toLowerCase().includes(query) || (n.path || "").toLowerCase().includes(query); }
   function runSearch(q) {
     query = q.trim().toLowerCase();
-    if (query) {
-      const first = G.nodes.find(matches);
-      if (first) { const p = pos(first); cam.x = p.x; cam.y = p.y; cam.zoom = Math.max(cam.zoom, 1.6); }
-    }
-    markDirty();
+    if (query) { const f = G.nodes.find(matches); if (f) { const p = pos(f); cam.x = p.x; cam.y = p.y; cam.zoom = Math.max(cam.zoom, 1.6); } }
   }
 
-  // ---- interaction ----
+  // ---- interaction (grab + fling a node, pan empty space, zoom, hover, click) ----
   function wire() {
-    let dragging = false, lastX = 0, lastY = 0, moved = false;
-    canvas.addEventListener("mousedown", (e) => { dragging = true; moved = false; lastX = e.clientX; lastY = e.clientY; canvas.classList.add("panning"); });
-    window.addEventListener("mouseup", () => { dragging = false; canvas.classList.remove("panning"); });
+    let panning = false, lastX = 0, lastY = 0, moved = false;
+    canvas.addEventListener("mousedown", (e) => {
+      const rect = canvas.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      moved = false; lastX = e.clientX; lastY = e.clientY;
+      const n = view === "graph" ? nodeAt(mx, my) : null;
+      if (n) { drag = { node: n, vx: 0, vy: 0 }; alpha = Math.max(alpha, 0.9); canvas.classList.add("panning"); }
+      else { panning = true; canvas.classList.add("panning"); }
+    });
+    window.addEventListener("mouseup", (e) => {
+      if (drag) { drag.node.vx = drag.vx; drag.node.vy = drag.vy; drag = null; }
+      panning = false; canvas.classList.remove("panning");
+    });
     window.addEventListener("mousemove", (e) => {
-      if (dragging) {
-        const ddx = e.clientX - lastX, ddy = e.clientY - lastY;
-        if (Math.abs(ddx) + Math.abs(ddy) > 2) moved = true;
-        cam.x -= ddx / cam.zoom; cam.y -= ddy / cam.zoom; lastX = e.clientX; lastY = e.clientY;
-        markDirty();
+      const ddx = e.clientX - lastX, ddy = e.clientY - lastY;
+      if (Math.abs(ddx) + Math.abs(ddy) > 2) moved = true;
+      lastX = e.clientX; lastY = e.clientY;
+      if (panning) { cam.x -= ddx / cam.zoom; cam.y -= ddy / cam.zoom; return; }
+      const rect = canvas.getBoundingClientRect(); // once per event, not per axis
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      if (drag) {
+        const w = worldAt(mx, my);
+        drag.vx = w.x - drag.node.gx; drag.vy = w.y - drag.node.gy;
+        drag.node.gx = w.x; drag.node.gy = w.y; drag.node.vx = 0; drag.node.vy = 0;
         return;
       }
-      const rect = canvas.getBoundingClientRect();
-      const n = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
+      const n = nodeAt(mx, my);
       canvas.classList.toggle("hovering", !!n);
-      if (n !== hover) {
-        hover = n;
-        if (!selected) { setFocus(n); n ? showCard(n) : hideCard(); }
-        markDirty();
-      }
+      if (n !== hover) { hover = n; if (!selected) { setFocus(n); n ? showCard(n) : hideCard(); } }
     });
     canvas.addEventListener("click", (e) => {
       if (moved) return;
       const rect = canvas.getBoundingClientRect();
       const n = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
-      if (n) { selected = n; setFocus(n); showCard(n); }
-      else { selected = null; setFocus(null); hideCard(); }
-      markDirty();
+      if (n) { selected = n; setFocus(n); showCard(n); } else { selected = null; setFocus(null); hideCard(); }
     });
     canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
-      const wx = (sx - W / 2) / cam.zoom + cam.x, wy = (sy - H / 2) / cam.zoom + cam.y;
-      cam.zoom = Math.max(0.1, Math.min(8, cam.zoom * Math.exp(-e.deltaY * 0.0012)));
-      cam.x = wx - (sx - W / 2) / cam.zoom; cam.y = wy - (sy - H / 2) / cam.zoom;
-      markDirty();
+      const rect = canvas.getBoundingClientRect(), sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+      const w = worldAt(sx, sy);
+      cam.zoom = Math.max(0.08, Math.min(8, cam.zoom * Math.exp(-e.deltaY * 0.0012)));
+      cam.x = w.x - (sx - W / 2) / cam.zoom; cam.y = w.y - (sy - H / 2) / cam.zoom;
     }, { passive: false });
 
     $("view-graph").onclick = () => setView("graph");
     $("view-galaxy").onclick = () => setView("galaxy");
     $("q").addEventListener("input", (e) => runSearch(e.target.value));
-    window.addEventListener("resize", () => { resize(); markDirty(); });
+    window.addEventListener("resize", resize);
     window.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { selected = null; setFocus(null); hideCard(); $("q").value = ""; query = ""; markDirty(); }
+      if (e.key === "Escape") { selected = null; setFocus(null); hideCard(); $("q").value = ""; query = ""; }
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && !running) { running = true; requestAnimationFrame(loop); }
     });
   }
 
   function setView(v) {
     if (v === view) return;
     view = v;
+    if (v === "graph") alpha = Math.max(alpha, 0.5); // re-energize the sim on return
     $("view-graph").classList.toggle("active", v === "graph");
     $("view-galaxy").classList.toggle("active", v === "galaxy");
     $("view-graph").setAttribute("aria-selected", v === "graph");
     $("view-galaxy").setAttribute("aria-selected", v === "galaxy");
     fitView();
-    if (query) runSearch(query); // keep the search framing across a view switch
+    if (query) runSearch(query);
   }
 
   // ---- chrome / states ----
@@ -394,12 +436,28 @@
     W = window.innerWidth; H = window.innerHeight;
     canvas.width = W * dpr; canvas.height = H * dpr;
     canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
+    g.addColorStop(0, "rgba(6,5,10,0)"); g.addColorStop(1, "rgba(0,0,0,0.55)");
+    vignette = g;
+    stars = []; const n = Math.min(260, Math.round(W * H / 9000));
+    for (let i = 0; i < n; i++) stars.push({ x: rand(i * 7) * W, y: rand(i * 13 + 3) * H, r: rand(i * 5) > 0.85 ? 2 : 1, a: 0.08 + rand(i * 3) * 0.22 });
   }
   function doneOverlay() { overlay.classList.add("done", "hidden"); }
   function showEmpty() { overlay.classList.add("done"); overlayMsg.textContent = "no notes indexed yet. run: mesh index"; }
   function fail(err) { overlay.classList.add("done"); overlayMsg.textContent = "could not load the graph: " + (err && err.message ? err.message : err); }
 
   // ---- utils ----
+  function rgb(hex) {
+    let h = hex.replace("#", "");
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    return { r: parseInt(h.slice(0, 2), 16) || 0, gg: parseInt(h.slice(2, 4), 16) || 0, b: parseInt(h.slice(4, 6), 16) || 0 };
+  }
+  function lighten(hex, amt) {
+    const { r, gg, b } = rgb(hex);
+    const m = (v) => Math.round(v + (255 - v) * amt);
+    return `rgb(${m(r)},${m(gg)},${m(b)})`;
+  }
+  function rand(seed) { const x = Math.sin(seed * 99.13 + 17.7) * 43758.5453; return x - Math.floor(x); }
   function joinPath(root, rel) { return (root || "").replace(/\/$/, "") + "/" + (rel || ""); }
   function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
 })();
