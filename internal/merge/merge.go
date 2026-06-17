@@ -145,6 +145,33 @@ func SiblingPath(path string, now time.Time, user string, losing []byte) string 
 	return fmt.Sprintf("%s.sync-conflict-%s-%s-%s%s", stem, now.Format("20060102"), sanitizeUser(user), short, ext)
 }
 
+// siblingMarker is the reserved infix SiblingPath inserts; a legitimate base note
+// name never contains it (the vault walker excludes any file that does).
+const siblingMarker = ".sync-conflict-"
+
+// BasePath reverses SiblingPath: given a sync-conflict sibling path it returns the
+// base note path the loser was parked next to (ok=false if the name is not a
+// sibling). It strips from the LAST marker on the extension-stripped stem, so a
+// sanitized user containing '-' (e.g. alice-smith) and a base whose own stem has
+// hyphens both reverse correctly. A recovered base that still looks like a sibling
+// (a doubly-nested/garbage name) is refused, since no real base note can.
+func BasePath(sibling string) (string, bool) {
+	ext := filepath.Ext(sibling)
+	stem := strings.TrimSuffix(sibling, ext)
+	idx := strings.LastIndex(stem, siblingMarker)
+	if idx < 0 {
+		return "", false
+	}
+	base := stem[:idx] + ext
+	// Reject an empty base stem in any directory (e.g. "notes/.md" from a crafted
+	// ".sync-conflict-..." name) and a recovered base that still looks like a
+	// sibling (a doubly-nested/garbage name): no real base note can.
+	if strings.TrimSuffix(filepath.Base(base), ext) == "" || strings.Contains(base, siblingMarker) {
+		return "", false
+	}
+	return base, true
+}
+
 // appendMerge unions two additive edits to a shared file. It succeeds only when
 // both hub and incoming preserve every base block (i.e. each side only ADDED
 // blocks). Incoming's novel blocks are inserted into the hub sequence anchored by
