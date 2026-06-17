@@ -48,6 +48,20 @@ func (s *Server) handleToolsList() any {
 			"inputSchema": obj(map[string]any{"type": "object", "required": []string{"since"}, "properties": map[string]any{"since": intp}}),
 		},
 		{
+			"name":        "mesh_neighbors",
+			"description": "The typed neighborhood of a note (its linked notes/tags, in and out), out to a small depth. Walk the graph one hop at a time instead of fetching whole files.",
+			"inputSchema": obj(map[string]any{
+				"type":       "object",
+				"required":   []string{"id"},
+				"properties": map[string]any{"id": str, "depth": intp, "limit": intp},
+			}),
+		},
+		{
+			"name":        "mesh_community",
+			"description": "With an id: the note's community and its members. Without: the community overview (clusters by size with an exemplar each) to orient before searching.",
+			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{"id": str, "limit": intp}}),
+		},
+		{
 			"name":        "mesh_append_note",
 			"description": "Write back what you learned: create a decision/gotcha/post-mortem/note with do/dont/why so the next agent inherits it (the flywheel). Mesh fills id/timestamp/placement.",
 			"inputSchema": obj(map[string]any{
@@ -89,6 +103,10 @@ func (s *Server) handleToolsCall(params json.RawMessage) (any, *rpcError) {
 		return s.toolGodNodes(p.Arguments)
 	case "mesh_changed_since":
 		return s.toolChangedSince(p.Arguments)
+	case "mesh_neighbors":
+		return s.toolNeighbors(p.Arguments)
+	case "mesh_community":
+		return s.toolCommunity(p.Arguments)
 	case "mesh_append_note":
 		return s.toolWrite(p.Arguments, "")
 	case "mesh_write_entity":
