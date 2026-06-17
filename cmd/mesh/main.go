@@ -22,6 +22,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/bright-interaction/mesh/internal/watch"
+	"github.com/bright-interaction/mesh/internal/web"
 	"github.com/bright-interaction/mesh/pkg/meshclient"
 	"github.com/spf13/cobra"
 )
@@ -1095,4 +1096,17 @@ func short8(s string) string {
 }
 
 func tuiCmd() *cobra.Command { return stub("tui", "Open the terminal UI", "Milestone 3") }
-func uiCmd() *cobra.Command  { return stub("ui", "Serve the localhost graph viewer", "Milestone 3") }
+func uiCmd() *cobra.Command {
+	var addr string
+	c := &cobra.Command{
+		Use:   "ui [vault]",
+		Short: "Serve the localhost graph viewer (two views: Graph and Galaxy)",
+		Long:  "Open a local web view of the vault graph: an Obsidian-style force layout and a galaxy orbiting the index note. Same graph the agent reads over MCP, rendered from the single binary with no CDN. Hover a note for its card, click to open it in your editor.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return web.Serve(vaultArg(args), addr)
+		},
+	}
+	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")
+	return c
+}
