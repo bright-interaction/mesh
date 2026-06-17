@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Mesh graph</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <canvas id="stage"></canvas>
+
+  <header id="bar">
+    <div class="brand">
+      <span class="dot" aria-hidden="true"></span>
+      <span class="name">mesh</span>
+      <span class="stats" id="stats"></span>
+    </div>
+    <div class="views" role="tablist" aria-label="View">
+      <button id="view-graph" class="view active" role="tab" aria-selected="true">Graph</button>
+      <button id="view-galaxy" class="view" role="tab" aria-selected="false">Galaxy</button>
+    </div>
+    <div class="search">
+      <input id="q" type="search" placeholder="search notes" autocomplete="off" spellcheck="false">
+    </div>
+  </header>
+
+  <aside id="card" class="card hidden" aria-live="polite"></aside>
+
+  <div id="legend" class="legend hidden"></div>
+
+  <div id="overlay" class="overlay">
+    <div class="overlay-inner">
+      <span class="spinner" aria-hidden="true"></span>
+      <p id="overlay-msg">building the graph</p>
+    </div>
+  </div>
+
+  <footer id="hint">drag to pan &middot; scroll to zoom &middot; hover a note &middot; click to open in your editor</footer>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
