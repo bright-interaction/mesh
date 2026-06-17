@@ -27,7 +27,12 @@
   let neighborSet = null;
   let drag = null;           // { node, vx, vy } while dragging/flinging a node
   let running = true;        // rAF gate; paused when the tab is hidden
+  let lastInteract = 0;      // for easing galaxy rotation to a near-stop when idle
+  let labelOrder = [];       // node indices by descending importance, for ambient labels
+  let floor = null;          // centered radial floor gradient (graph view depth)
+  const boxes = [];          // per-frame label rects, for the declutter pass
   let stars = [];
+  const now = () => (window.performance && performance.now ? performance.now() : 0);
   let vignette = null;
   let t = 0;                 // frame clock for the sun pulse
 
@@ -48,6 +53,8 @@
     G.nodes.forEach((n, i) => { byId.set(n.id, n); nodeIndex.set(n.id, i); n.vx = 0; n.vy = 0; n.dispX = 0; n.dispY = 0; });
     sp = new Array(G.nodes.length);
     buildAdjacency();
+    labelOrder = G.nodes.map((_, i) => i).sort((a, b) =>
+      G.nodes[b].degree - G.nodes[a].degree || nodeRadius(G.nodes[b]) - nodeRadius(G.nodes[a]) || (G.nodes[a].id < G.nodes[b].id ? -1 : 1));
     buildSprites();
     seedLayout();
     layoutGalaxy();
@@ -56,6 +63,7 @@
     fitView();
     doneOverlay();
     wire();
+    lastInteract = now();
     requestAnimationFrame(loop);
   }
 
@@ -66,6 +74,18 @@
       if (e.source === e.target) continue;
       if (adj.has(e.source) && adj.has(e.target)) { adj.get(e.source).push(e.target); adj.get(e.target).push(e.source); }
     }
+  }
+
+  // buildInfluence weights the dragged node (1) + its 1-hop (0.55) and 2-hop
+  // (0.22) neighbors, so a galaxy drag pulls the local cluster elastically. Hub
+  // fan-out is capped so dragging a 382-link node does not haul a third of the map.
+  function buildInfluence(root) {
+    const m = new Map([[root.id, 1]]);
+    let n1 = adj.get(root.id) || [];
+    if (n1.length > 60) n1 = n1.slice(0, 60);
+    for (const a of n1) if (!m.has(a)) m.set(a, 0.55);
+    for (const a of n1) for (const b of (adj.get(a) || [])) if (!m.has(b)) m.set(b, 0.22);
+    return m;
   }
 
   // ---- glow sprites (built once per community color; drawn additively) ----
@@ -82,13 +102,14 @@
     const grad = g.createRadialGradient(R, R, 0, R, R, R);
     const { r, gg, b } = rgb(color);
     if (sun) {
-      grad.addColorStop(0, `rgba(255,255,255,0.95)`);
-      grad.addColorStop(0.18, `rgba(${r},${gg},${b},0.85)`);
-      grad.addColorStop(0.45, `rgba(${r},${gg},${b},0.28)`);
+      grad.addColorStop(0, `rgba(255,250,242,0.85)`);
+      grad.addColorStop(0.10, `rgba(255,241,220,0.6)`);
+      grad.addColorStop(0.30, `rgba(${r},${gg},${b},0.22)`);
       grad.addColorStop(1, `rgba(${r},${gg},${b},0)`);
     } else {
-      grad.addColorStop(0, `rgba(${r},${gg},${b},0.55)`);
-      grad.addColorStop(0.5, `rgba(${r},${gg},${b},0.16)`);
+      // low deposit: ~30 overlapping centers still sit under 1.0 (no white-out)
+      grad.addColorStop(0, `rgba(${r},${gg},${b},0.14)`);
+      grad.addColorStop(0.35, `rgba(${r},${gg},${b},0.05)`);
       grad.addColorStop(1, `rgba(${r},${gg},${b},0)`);
     }
     g.fillStyle = grad;
@@ -186,18 +207,24 @@
     t += 1;
     if (view === "graph") simStep();
     else {
-      galaxyAngle += 0.0013;
-      // galaxy grab (same effect as the graph): the held node tracks the cursor as
-      // an offset from its orbit; every other node's offset springs back to 0.
-      for (const n of G.nodes) {
-        if (drag && drag.node === n) {
-          const o = galaxyPos(n);
-          n.dispX = drag.wx - o.x; n.dispY = drag.wy - o.y;
-        } else if (n.dispX || n.dispY) {
-          n.dispX *= 0.88; n.dispY *= 0.88;
+      const idle = (now() - lastInteract) > 4000;
+      galaxyAngle += idle ? 0.0002 : 0.0007; // an instrument, not a screensaver
+      const decay = (n) => {
+        if (n.dispX || n.dispY) {
+          n.dispX *= 0.86; n.dispY *= 0.86;
           if (Math.abs(n.dispX) < 0.5 && Math.abs(n.dispY) < 0.5) { n.dispX = 0; n.dispY = 0; }
         }
-      }
+      };
+      if (drag && drag.influence) {
+        // elastic pull: the held node + its neighborhood spring toward the cursor
+        // (1-hop at 0.55, 2-hop at 0.22), the rest decay back, all keep orbiting.
+        const o = galaxyPos(drag.node), tgtX = drag.wx - o.x, tgtY = drag.wy - o.y;
+        for (const n of G.nodes) {
+          const w = drag.influence.get(n.id);
+          if (w) { n.dispX += (w * tgtX - n.dispX) * 0.25; n.dispY += (w * tgtY - n.dispY) * 0.25; }
+          else decay(n);
+        }
+      } else for (const n of G.nodes) decay(n);
     }
     draw();
     requestAnimationFrame(loop);
@@ -205,8 +232,9 @@
 
   function draw() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = "#06050a";
+    ctx.fillStyle = "#050409";
     ctx.fillRect(0, 0, W, H);
+    if (view === "graph" && floor) { ctx.fillStyle = floor; ctx.fillRect(0, 0, W, H); }
     const z = cam.zoom, ox = W / 2 - cam.x * z, oy = H / 2 - cam.y * z;
 
     if (view === "galaxy") drawStars(z);
@@ -226,27 +254,31 @@
     }
     const on = (s, m) => s.x >= -m && s.x <= W + m && s.y >= -m && s.y <= H + m;
 
-    // curved edges, batched; emphasized brighter
-    ctx.lineWidth = Math.max(0.5, 0.7 * z);
-    ctx.strokeStyle = "rgba(170,190,230,0.05)";
-    ctx.beginPath();
+    // edges: bulk is near-invisible and intent-gated (structure reads from the
+    // node clustering); only the focused subgraph is bright. Neutral grey, no chroma.
+    const drawBase = neighborSet || z >= 1.6;
     const emph = [];
+    if (drawBase) {
+      ctx.lineWidth = Math.max(0.5, 0.7 * z);
+      ctx.strokeStyle = neighborSet ? "rgba(150,150,165,0.012)" : "rgba(150,150,165,0.022)";
+      ctx.beginPath();
+    }
     for (const e of G.edges) {
       const ai = nodeIndex.get(e.source), bi = nodeIndex.get(e.target);
       if (ai === undefined || bi === undefined) continue;
       const a = sp[ai], b = sp[bi];
       if (!on(a, 40) && !on(b, 40)) continue;
       if (neighborSet && (isFocus(e.source) || isFocus(e.target))) { emph.push(a, b); continue; }
-      curve(a, b);
+      if (drawBase) curve(a, b);
     }
-    ctx.stroke();
+    if (drawBase) ctx.stroke();
     if (emph.length) {
-      ctx.strokeStyle = "rgba(245,242,236,0.4)"; ctx.lineWidth = Math.max(0.8, 1.1 * z); ctx.beginPath();
+      ctx.strokeStyle = "rgba(245,242,236,0.55)"; ctx.lineWidth = Math.max(0.9, 1.2 * z); ctx.beginPath();
       for (let i = 0; i < emph.length; i += 2) curve(emph[i], emph[i + 1]);
       ctx.stroke();
     }
 
-    // glow halos (additive bloom)
+    // glow halos (additive, low-deposit so a dense cluster saturates to a hue, not white)
     ctx.globalCompositeOperation = "lighter";
     for (let i = 0; i < N; i++) {
       const n = nodes[i], s = sp[i];
@@ -254,42 +286,90 @@
       const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
       const core = nodeRadius(n) * z;
       if (n.id === G.meta.index_id) {
-        const pulse = 1 + 0.07 * Math.sin(t * 0.05);
-        blit(sunSprite, s, core * 7 * pulse, dim ? 0.25 : 1);
+        const pulse = 1 + 0.025 * Math.sin(t * 0.018);
+        blit(sunSprite, s, core * 3.2 * pulse, dim ? 0.25 : 0.9);
       } else {
-        // moderate halo alpha + extent so a dense single community blooms hot
-        // without additive-summing to a white-out (the real 271-node Hive cluster).
-        blit(sprites.get(commColor.get(n.community)) || sprites.get("#7c766e"), s, core * 4.5, dim ? 0.1 : 0.5);
+        let halo = core * (2.2 + Math.min(1.4, n.degree * 0.02)); // only true hubs glow wide
+        if (z <= 0.6) halo *= 0.7;
+        blit(sprites.get(commColor.get(n.community)) || sprites.get("#7c766e"), s, halo, dim ? 0.05 : 0.22);
       }
     }
     ctx.globalCompositeOperation = "source-over";
 
-    // crisp cores + labels
-    const labelZoom = z > 1.3, hoverId = hover && hover.id;
-    ctx.font = "11px Geist, sans-serif"; ctx.textBaseline = "middle";
+    // crisp cores: every node is a discrete dot with a dark separator ring, so it
+    // reads even inside a saturated halo region.
     for (let i = 0; i < N; i++) {
       const n = nodes[i], s = sp[i];
       if (!on(s, 10)) continue;
       const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
-      const r = Math.max(1.6, nodeRadius(n) * z);
+      const r = coreR(n, z);
       ctx.globalAlpha = dim ? 0.18 : 1;
-      ctx.fillStyle = n.id === G.meta.index_id ? "#fff6e8" : lighten(commColor.get(n.community) || "#7c766e", 0.45);
+      ctx.fillStyle = "#06050a";
+      ctx.beginPath(); ctx.arc(s.x, s.y, r + 0.8, 0, TAU); ctx.fill();
+      ctx.fillStyle = n.id === G.meta.index_id ? "#fff6e8" : lighten(commColor.get(n.community) || "#7c766e", 0.6);
       ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, TAU); ctx.fill();
-      if (!dim && (n.degree >= 8 || labelZoom || isFocus(n.id) || n.id === hoverId)) {
-        ctx.globalAlpha = 0.92; ctx.fillStyle = "#0a0908";
-        ctx.fillText(n.label || n.id, s.x + r + 5, s.y + 1); // shadow
-        ctx.fillStyle = "#f3efe7";
-        ctx.fillText(n.label || n.id, s.x + r + 4, s.y);
-      }
     }
     ctx.globalAlpha = 1;
 
     if (vignette) { ctx.fillStyle = vignette; ctx.fillRect(0, 0, W, H); }
+
+    // labels: focus first (always, decluttered), then a capped ambient set by
+    // importance, gated by a zoom band. Never the old "every hub at once" soup.
+    boxes.length = 0;
+    const hoverId = hover && hover.id;
+    for (let i = 0; i < N; i++) {
+      const n = nodes[i], s = sp[i];
+      if (!on(s, 10)) continue;
+      if (n.id === hoverId || (selected && n.id === selected.id) || isFocus(n.id)) placeLabel(n, s, coreR(n, z), 1);
+    }
+    const band = z < 0.9 ? 0 : z < 2.2 ? 1 : 2;
+    if (band > 0) {
+      const cap = band === 1 ? 12 : 18;
+      const a = 0.35 + 0.55 * Math.max(0, Math.min(1, (z - 0.9) / 1.3));
+      let placed = 0;
+      for (const idx of labelOrder) {
+        if (placed >= cap) break;
+        const n = nodes[idx], s = sp[idx];
+        if (!s || !on(s, 10)) continue;
+        if ((query && !matches(n)) || (neighborSet && !isFocus(n.id))) continue;
+        if (n.id === hoverId || (selected && n.id === selected.id) || isFocus(n.id)) continue;
+        if (placeLabel(n, s, coreR(n, z), a)) placed++;
+      }
+    }
+  }
+
+  function coreR(n, z) { return n.id === G.meta.index_id ? Math.max(2, nodeRadius(n) * z) * 1.6 : Math.max(2, nodeRadius(n) * z); }
+
+  function measureLabel(n) {
+    if (n._lw != null) return;
+    ctx.font = "600 10.5px Geist, sans-serif";
+    let txt = n.label || n.id || "";
+    if (ctx.measureText(txt).width > 140) {
+      while (txt.length > 1 && ctx.measureText(txt + "…").width > 140) txt = txt.slice(0, -1);
+      txt += "…";
+    }
+    n._ltxt = txt; n._lw = Math.min(140, ctx.measureText(txt).width);
+  }
+  function placeLabel(n, s, r, alpha) {
+    measureLabel(n);
+    const x = s.x + r + 4, y = s.y - 7, w = n._lw + 10, h = 14;
+    for (const b of boxes) if (b.x < x + w && x < b.x + b.w && b.y < y + h && y < b.y + b.h) return false;
+    boxes.push({ x, y, w, h });
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = "rgba(10,9,8,0.72)";
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, y, w, h, 4); else ctx.rect(x, y, w, h);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.06)"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = "#e9e4da"; ctx.font = "600 10.5px Geist, sans-serif"; ctx.textBaseline = "middle";
+    ctx.fillText(n._ltxt, x + 5, y + h / 2);
+    ctx.globalAlpha = 1;
+    return true;
   }
 
   function curve(a, b) {
     const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
-    const off = Math.min(len * 0.12, 36); // gentle, capped bow (long edges do not over-arc)
+    const off = Math.min(len * 0.10, 18); // flatter bow so dense short edges stay near-straight
     const mx = (a.x + b.x) / 2 - (dy / len) * off, my = (a.y + b.y) / 2 + (dx / len) * off;
     ctx.moveTo(a.x, a.y);
     ctx.quadraticCurveTo(mx, my, b.x, b.y);
@@ -380,12 +460,13 @@
     let panning = false, lastX = 0, lastY = 0, moved = false;
     canvas.addEventListener("mousedown", (e) => {
       const rect = canvas.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
-      moved = false; lastX = e.clientX; lastY = e.clientY;
+      moved = false; lastX = e.clientX; lastY = e.clientY; lastInteract = now();
       const n = nodeAt(mx, my); // grab a node in either view; empty space pans
       if (n) {
         const w = worldAt(mx, my);
         drag = { node: n, vx: 0, vy: 0, wx: w.x, wy: w.y };
         if (view === "graph") alpha = Math.max(alpha, 0.9);
+        else drag.influence = buildInfluence(n); // galaxy: pull the local cluster elastically
         canvas.classList.add("panning");
       } else { panning = true; canvas.classList.add("panning"); }
     });
@@ -396,7 +477,7 @@
     window.addEventListener("mousemove", (e) => {
       const ddx = e.clientX - lastX, ddy = e.clientY - lastY;
       if (Math.abs(ddx) + Math.abs(ddy) > 2) moved = true;
-      lastX = e.clientX; lastY = e.clientY;
+      lastX = e.clientX; lastY = e.clientY; lastInteract = now();
       if (panning) { cam.x -= ddx / cam.zoom; cam.y -= ddy / cam.zoom; return; }
       const rect = canvas.getBoundingClientRect(); // once per event, not per axis
       const mx = e.clientX - rect.left, my = e.clientY - rect.top;
@@ -421,6 +502,7 @@
     });
     canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
+      lastInteract = now();
       const rect = canvas.getBoundingClientRect(), sx = e.clientX - rect.left, sy = e.clientY - rect.top;
       const w = worldAt(sx, sy);
       cam.zoom = Math.max(0.08, Math.min(8, cam.zoom * Math.exp(-e.deltaY * 0.0012)));
@@ -464,9 +546,12 @@
     W = window.innerWidth; H = window.innerHeight;
     canvas.width = W * dpr; canvas.height = H * dpr;
     canvas.style.width = W + "px"; canvas.style.height = H + "px";
-    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.75);
-    g.addColorStop(0, "rgba(6,5,10,0)"); g.addColorStop(1, "rgba(0,0,0,0.55)");
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.22, W / 2, H / 2, Math.max(W, H) * 0.75);
+    g.addColorStop(0, "rgba(6,5,10,0)"); g.addColorStop(1, "rgba(0,0,0,0.72)");
     vignette = g;
+    const f = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.min(W, H) * 0.6);
+    f.addColorStop(0, "rgba(20,17,30,0.5)"); f.addColorStop(1, "rgba(5,4,9,0)");
+    floor = f;
     stars = []; const n = Math.min(260, Math.round(W * H / 9000));
     for (let i = 0; i < n; i++) stars.push({ x: rand(i * 7) * W, y: rand(i * 13 + 3) * H, r: rand(i * 5) > 0.85 ? 2 : 1, a: 0.08 + rand(i * 3) * 0.22 });
   }
