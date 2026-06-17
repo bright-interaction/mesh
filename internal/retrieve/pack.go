@@ -1,34 +1,12 @@
 package retrieve
 
-// estimateTokens approximates the token count of a string. Words contribute
-// ~one token per 4 characters (subword splitting), and each punctuation or
-// symbol is its own token. This beats the chars/3.5 heuristic the review
-// flagged as ~1.6x off on dense markdown. Milestone 1 step 5 swaps in a vendored
-// BPE tokenizer for Gate-1-accurate measurement; the packer reads it through
-// this one function so the swap is local.
-func estimateTokens(s string) int {
-	tokens := 0
-	wlen := 0
-	flush := func() {
-		if wlen > 0 {
-			tokens += (wlen + 3) / 4
-			wlen = 0
-		}
-	}
-	for _, r := range s {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
-			wlen++
-		case r == ' ' || r == '\n' || r == '\t' || r == '\r':
-			flush()
-		default:
-			flush()
-			tokens++
-		}
-	}
-	flush()
-	return tokens
-}
+import "github.com/bright-interaction/mesh/internal/tokenize"
+
+// estimateTokens returns the token count of a string using the real cl100k_base
+// BPE tokenizer (internal/tokenize). The packer reads token cost through this one
+// function, so budgeting and the Gate-1 measurement rest on a genuine count, not
+// a chars-per-token estimate. The name is kept so the call sites are unchanged.
+func estimateTokens(s string) int { return tokenize.Count(s) }
 
 // EstimateTokens is the exported counter so the measurement harness counts both
 // arms with the exact same function the packer uses.
