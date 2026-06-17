@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -117,5 +119,65 @@ func TestNewFromEnv(t *testing.T) {
 	}
 	if !strings.HasPrefix(c.Describe(), "local/") {
 		t.Fatalf("describe = %q", c.Describe())
+	}
+
+	// cli is the default when no agent is set, and reads MESH_CURATOR_CMD.
+	t.Setenv("MESH_CURATOR_AGENT", "")
+	t.Setenv("MESH_CURATOR_CMD", "myagent --print")
+	c, err = NewFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Describe() != "cli/myagent --print" {
+		t.Fatalf("describe = %q", c.Describe())
+	}
+}
+
+// writeScript writes an executable shell script to a temp dir and returns its path.
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "agent.sh")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestCLIComplete(t *testing.T) {
+	// `cat` echoes stdin to stdout, so the completion is exactly the prompt we sent:
+	// proves the prompt reaches the subprocess on stdin and the reply is read back.
+	c := &cliClient{argv: []string{writeScript(t, "cat")}, timeout: 5 * time.Second}
+	out, err := c.Complete(context.Background(), "SYS-INSTRUCTIONS", "USER-PAYLOAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "SYS-INSTRUCTIONS") || !strings.Contains(out, "USER-PAYLOAD") {
+		t.Fatalf("prompt did not reach the CLI on stdin: %q", out)
+	}
+}
+
+func TestCLINonZeroExitIsAuth(t *testing.T) {
+	// A misconfigured/unauthenticated CLI exits non-zero. That is an operator
+	// problem, not a poison merge, so it must be ErrAuth (no attempt charged).
+	c := &cliClient{argv: []string{writeScript(t, "echo 'not logged in' >&2; exit 1")}, timeout: 5 * time.Second}
+	_, err := c.Complete(context.Background(), "s", "u")
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("want ErrAuth, got %v", err)
+	}
+}
+
+func TestCLIEmptyOutputIsAuth(t *testing.T) {
+	c := &cliClient{argv: []string{writeScript(t, "exit 0")}, timeout: 5 * time.Second}
+	_, err := c.Complete(context.Background(), "s", "u")
+	if !errors.Is(err, ErrAuth) {
+		t.Fatalf("empty output should be ErrAuth, got %v", err)
+	}
+}
+
+func TestCLITimeout(t *testing.T) {
+	c := &cliClient{argv: []string{writeScript(t, "sleep 5")}, timeout: 50 * time.Millisecond}
+	_, err := c.Complete(context.Background(), "s", "u")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want DeadlineExceeded, got %v", err)
 	}
 }
