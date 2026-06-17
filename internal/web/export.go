@@ -28,8 +28,8 @@ type Export struct {
 }
 
 type ExportMeta struct {
-	Vault     string `json:"vault"`     // absolute vault root, for the editor:// bridge
-	IndexID   string `json:"index_id"`  // galaxy center: the highest-degree note
+	Vault     string `json:"vault"`    // absolute vault root, for the editor:// bridge
+	IndexID   string `json:"index_id"` // galaxy center: the highest-degree note
 	NodeCount int    `json:"node_count"`
 	EdgeCount int    `json:"edge_count"`
 	MaxOrbit  int    `json:"max_orbit"` // largest graph-distance from the index note

@@ -28,7 +28,7 @@ type Store struct {
 // deletable artifact (the markdown vault is the source of truth), so a version
 // mismatch drops and rebuilds rather than running a migration. This is why Mesh
 // uses no goose/golang-migrate: there is no irreplaceable data to migrate.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type job struct {
 	fn    func(*sql.Tx) error
@@ -103,6 +103,10 @@ func ensureSchema(db *sql.DB) error {
 }
 
 func (s *Store) Path() string { return s.dbPath }
+
+// MeshDir returns the vault's .mesh directory (where mesh.db and the solo
+// config.toml live).
+func (s *Store) MeshDir() string { return s.dir }
 
 func (s *Store) writer() {
 	for {

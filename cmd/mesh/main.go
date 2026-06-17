@@ -19,6 +19,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/mcp"
+	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/tui"
 	"github.com/bright-interaction/mesh/internal/vault"
@@ -387,6 +388,7 @@ func embedCmd() *cobra.Command {
 	var endpoint, model, keyEnv string
 	var batch int
 	var perSection bool
+	var noCache bool
 	c := &cobra.Command{
 		Use:   "embed [vault]",
 		Short: "Embed notes via a BYOAI endpoint and store vectors (turns on semantic search)",
@@ -394,11 +396,18 @@ func embedCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := vaultArg(args)
+			// Resolve config flag-first, then env, then the persisted solo config.toml.
+			cfg, _ := meshcfg.Load(filepath.Join(root, ".mesh"))
 			if endpoint == "" {
-				endpoint = os.Getenv("MESH_EMBED_ENDPOINT")
+				endpoint = firstNonEmpty(os.Getenv("MESH_EMBED_ENDPOINT"), cfg.Endpoint)
 			}
 			if model == "" {
-				model = os.Getenv("MESH_EMBED_MODEL")
+				model = firstNonEmpty(os.Getenv("MESH_EMBED_MODEL"), cfg.Model)
+			}
+			// If --key-env was not passed, inherit the persisted key_env (so a re-embed
+			// does not silently fall back to MESH_EMBED_KEY and clobber a custom name).
+			if !cmd.Flags().Changed("key-env") && cfg.KeyEnv != "" {
+				keyEnv = cfg.KeyEnv
 			}
 			if endpoint == "" || model == "" {
 				return fmt.Errorf("set --endpoint and --model (or MESH_EMBED_ENDPOINT / MESH_EMBED_MODEL).\n  example: mesh embed %s --endpoint http://localhost:11434/v1 --model nomic-embed-text", root)
@@ -426,9 +435,10 @@ func embedCmd() *cobra.Command {
 			// embedding cost, so whole-note is the default; the flag keeps the lever
 			// available for long heterogeneous corpora where it may pay off.
 			type chunkRef struct {
-				NodeID  string
-				ChunkIx int
-				Text    string
+				NodeID   string
+				ChunkIx  int
+				Text     string
+				NoteHash string // the note's retrieval hash, stamped so retrieval can detect a later edit
 			}
 			var refs []chunkRef
 			for _, nf := range files {
@@ -436,12 +446,13 @@ func embedCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("parse %s: %w", nf.Path, err)
 				}
+				noteHash := index.RetrievalHash(pn)
 				if !perSection {
-					refs = append(refs, chunkRef{NodeID: nf.NodeID, ChunkIx: 0, Text: strings.Join(index.ChunkText(pn), "\n")})
+					refs = append(refs, chunkRef{NodeID: nf.NodeID, ChunkIx: 0, Text: strings.Join(index.ChunkText(pn), "\n"), NoteHash: noteHash})
 					continue
 				}
 				for ix, text := range index.ChunkText(pn) {
-					refs = append(refs, chunkRef{NodeID: nf.NodeID, ChunkIx: ix, Text: text})
+					refs = append(refs, chunkRef{NodeID: nf.NodeID, ChunkIx: ix, Text: text, NoteHash: noteHash})
 				}
 			}
 			emb := embed.NewHTTP(endpoint, model, os.Getenv(keyEnv))
@@ -449,27 +460,53 @@ func embedCmd() *cobra.Command {
 				batch = 32
 			}
 			ctx := context.Background()
-			docPrefix := os.Getenv("MESH_EMBED_DOC_PREFIX") // e.g. "search_document: " for nomic
-			rows := make([]index.VectorRow, 0, len(refs))
-			for i := 0; i < len(refs); i += batch {
-				j := i + batch
-				if j > len(refs) {
-					j = len(refs)
+			docPrefix := firstNonEmpty(os.Getenv("MESH_EMBED_DOC_PREFIX"), cfg.DocPrefix) // e.g. "search_document: " for nomic
+
+			// Content-hash cache: reuse the stored vector for any chunk whose embedding
+			// input is unchanged since the last embed, so a re-embed only pays for the
+			// changed and new chunks. The cache is model-scoped (a different model
+			// invalidates it). --no-cache forces a full re-embed (e.g. if a same-named
+			// model changed its output width).
+			cache := map[string]index.CachedVec{}
+			if !noCache {
+				cache, err = store.CachedVectors(model)
+				if err != nil {
+					return err
 				}
+			}
+			hashes := make([]string, len(refs))
+			for i, r := range refs {
+				hashes[i] = index.ContentHash(docPrefix, r.Text)
+			}
+			rows := make([]index.VectorRow, 0, len(refs))
+			var toEmbed []int
+			for idx, r := range refs {
+				if c, ok := cache[index.VecKey(r.NodeID, r.ChunkIx)]; ok && c.Hash == hashes[idx] {
+					rows = append(rows, index.VectorRow{NodeID: r.NodeID, ChunkIx: r.ChunkIx, Vec: c.Vec, ContentHash: hashes[idx], NoteHash: r.NoteHash})
+					continue
+				}
+				toEmbed = append(toEmbed, idx)
+			}
+			reused := len(refs) - len(toEmbed)
+			for i := 0; i < len(toEmbed); i += batch {
+				j := min(i+batch, len(toEmbed))
 				inputs := make([]string, 0, j-i)
-				for _, r := range refs[i:j] {
-					inputs = append(inputs, docPrefix+r.Text)
+				for _, idx := range toEmbed[i:j] {
+					inputs = append(inputs, docPrefix+refs[idx].Text)
 				}
 				vecs, err := emb.Embed(ctx, inputs)
 				if err != nil {
 					return fmt.Errorf("embed batch %d-%d via %s: %w", i, j, endpoint, err)
 				}
 				for k, v := range vecs {
-					rows = append(rows, index.VectorRow{NodeID: refs[i+k].NodeID, ChunkIx: refs[i+k].ChunkIx, Vec: v})
+					idx := toEmbed[i+k]
+					rows = append(rows, index.VectorRow{NodeID: refs[idx].NodeID, ChunkIx: refs[idx].ChunkIx, Vec: v, ContentHash: hashes[idx], NoteHash: refs[idx].NoteHash})
 				}
-				fmt.Printf("\rembedded %d/%d chunks", j, len(refs))
+				fmt.Printf("\rembedded %d/%d new chunks", j, len(toEmbed))
 			}
-			fmt.Println()
+			if len(toEmbed) > 0 {
+				fmt.Println()
+			}
 			if err := store.ReplaceVectors(model, rows); err != nil {
 				return err
 			}
@@ -481,7 +518,20 @@ func embedCmd() *cobra.Command {
 			if perSection {
 				mode = "per-section"
 			}
-			fmt.Printf("stored %d vectors across %d notes (%s, model %s, dim %d); semantic search active for mesh search / eval / mcp\n", len(rows), len(files), mode, model, dim)
+			// Persist the solo config so mesh search / mcp work next session without
+			// re-exporting env vars. Best-effort: a write failure must not fail the embed
+			// (the vectors are already stored). Secrets are never written, only key_env.
+			if err := meshcfg.Save(filepath.Join(root, ".mesh"), meshcfg.Embedding{
+				Endpoint:    endpoint,
+				Model:       model,
+				Dim:         dim,
+				KeyEnv:      keyEnv,
+				QueryPrefix: firstNonEmpty(os.Getenv("MESH_EMBED_QUERY_PREFIX"), cfg.QueryPrefix),
+				DocPrefix:   docPrefix,
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not write .mesh/config.toml (%v); set MESH_EMBED_* env vars to keep semantic search on\n", err)
+			}
+			fmt.Printf("stored %d vectors across %d notes (%s, model %s, dim %d; %d embedded, %d reused from cache); semantic search active for mesh search / eval / mcp\n", len(rows), len(files), mode, model, dim, len(toEmbed), reused)
 			return nil
 		},
 	}
@@ -490,6 +540,7 @@ func embedCmd() *cobra.Command {
 	c.Flags().StringVar(&keyEnv, "key-env", "MESH_EMBED_KEY", "env var holding the bearer key (empty for local)")
 	c.Flags().IntVar(&batch, "batch", 32, "embeddings per request")
 	c.Flags().BoolVar(&perSection, "per-section", false, "store one vector per heading section instead of one per note (~18x more vectors; no measured lift on Hive)")
+	c.Flags().BoolVar(&noCache, "no-cache", false, "re-embed every chunk, ignoring the content-hash cache (use if a same-named model changed its output width)")
 	return c
 }
 
@@ -537,15 +588,17 @@ func statusCmd() *cobra.Command {
 			r := retrieve.NewFromEnv(store, g)
 			fmt.Println("retrieval signals:")
 			fmt.Println("  fts + graph  always on")
+			total, live, stale, _ := store.VectorStats()
 			if r.VectorsActive() {
-				fmt.Printf("  vectors      active (model %s)\n", r.VectorModel())
-			} else {
-				vcount, _ := store.Count("vectors")
-				if vcount > 0 {
-					fmt.Println("  vectors      stored but query embedder not configured (set MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL)")
-				} else {
-					fmt.Println("  vectors      off (run: mesh embed)")
+				fmt.Printf("  vectors      active (model %s, %d live", r.VectorModel(), live)
+				if stale > 0 {
+					fmt.Printf(", %d stale - run mesh embed to refresh", stale)
 				}
+				fmt.Println(")")
+			} else if total > 0 {
+				fmt.Println("  vectors      stored but query embedder not configured (re-run mesh embed, or set MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL)")
+			} else {
+				fmt.Println("  vectors      off (run: mesh embed)")
 			}
 			if r.RerankActive() {
 				fmt.Printf("  rerank       active (cross-encoder %s)\n", r.RerankModel())
@@ -835,6 +888,17 @@ func vaultArg(args []string) string {
 		return args[0]
 	}
 	return "."
+}
+
+// firstNonEmpty returns the first non-empty string (the config-resolution chain:
+// flag, then env, then persisted config.toml).
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func isKebab(filename string) bool {

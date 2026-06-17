@@ -4,12 +4,74 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/syncproto"
 )
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+
+// TestCheckHomogeneity covers the join-time one-embedding-space guard across both
+// axes (model name and dim) and the section-aware toml read.
+func TestCheckHomogeneity(t *testing.T) {
+	const toml = `vault_id = "v1"
+gc_horizon_days = 90
+
+[embedding]
+model = "nomic-embed-text"
+dim = 768
+`
+	cases := []struct {
+		name          string
+		model, dim    string // operator env (empty = unset)
+		wantErr       bool
+		wantErrSubstr string
+	}{
+		{name: "both match", model: "nomic-embed-text", dim: "768", wantErr: false},
+		{name: "model unset is allowed", model: "", dim: "", wantErr: false},
+		{name: "model mismatch fails closed", model: "bge-small", dim: "", wantErr: true, wantErrSubstr: "model mismatch"},
+		{name: "dim mismatch fails closed (same model name, different width)", model: "nomic-embed-text", dim: "384", wantErr: true, wantErrSubstr: "dim mismatch"},
+		{name: "dim 0 operator is treated as unset", model: "nomic-embed-text", dim: "0", wantErr: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MESH_EMBED_MODEL", tc.model)
+			t.Setenv("MESH_EMBED_DIM", tc.dim)
+			err := checkHomogeneity(toml)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+			if tc.wantErrSubstr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr)) {
+				t.Fatalf("error %v does not contain %q", err, tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+// TestTomlSectionStringIsSectionAware proves a key in one section cannot shadow the
+// same key in another (the latent section-blind bug the old tomlString had).
+func TestTomlSectionStringIsSectionAware(t *testing.T) {
+	const toml = `[rerank]
+model = "cross-encoder"
+
+[embedding]
+model = "nomic-embed-text"
+dim = 768
+`
+	if got := tomlSectionString(toml, "embedding", "model"); got != "nomic-embed-text" {
+		t.Errorf("embedding model = %q, want nomic-embed-text (must not read the [rerank] model)", got)
+	}
+	if got := tomlSectionString(toml, "rerank", "model"); got != "cross-encoder" {
+		t.Errorf("rerank model = %q, want cross-encoder", got)
+	}
+	if got := tomlSectionString(toml, "embedding", "dim"); got != "768" {
+		t.Errorf("embedding dim = %q, want 768", got)
+	}
+}
 
 // TestApplyDeltasExternalEditorGuard: a local edit made after the outbox was
 // computed must not be clobbered; the incoming hub version is parked.

@@ -102,6 +102,15 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 				}
 			}
 		}
+
+		// Prune orphaned vectors (a note was deleted since the last embed). Stale
+		// vectors for still-existing-but-edited notes are kept on disk but excluded
+		// from retrieval by LoadVectors' note_hash JOIN; they are refreshed in place
+		// on the next `mesh embed`. Orphans have no note to refresh them, so remove
+		// them here to keep the table from growing unbounded across deletes.
+		if _, err := tx.Exec(`DELETE FROM vectors WHERE node_id NOT IN (SELECT 'note:' || id FROM notes)`); err != nil {
+			return err
+		}
 		return nil
 	})
 	return count, err
@@ -121,6 +130,12 @@ func fileMtime(path string) int64 {
 	}
 	return fi.ModTime().Unix()
 }
+
+// RetrievalHash is the exported retrieval hash for a parsed note: it is what the
+// notes table stores in retrieval_hash, and the embedder stamps onto each vector
+// (note_hash) so a later content change can be detected and the stale vector
+// excluded from retrieval.
+func RetrievalHash(pn *ParsedNote) string { return retrievalHash(pn) }
 
 // retrievalHash is SHA256 over the body plus the retrieval-critical frontmatter
 // (type, status, supersedes, related), so a status change (accepted ->
