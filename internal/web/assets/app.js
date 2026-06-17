@@ -163,28 +163,44 @@
 
   // ---- velocity force sim (graph view): repulsion (grid) + springs + gravity ----
   function simStep() {
-    const nodes = G.nodes, k = 150;
-    const cell = k, grid = new Map();
-    for (const v of nodes) {
-      const key = ((v.gx / cell) | 0) + ":" + ((v.gy / cell) | 0);
-      (grid.get(key) || grid.set(key, []).get(key)).push(v);
-    }
+    const nodes = G.nodes, N = nodes.length, k = 150;
     for (const v of nodes) { v.fx = 0; v.fy = 0; }
-    for (const v of nodes) {
-      const cx = (v.gx / cell) | 0, cy = (v.gy / cell) | 0;
-      for (let gx = cx - 1; gx <= cx + 1; gx++)
-        for (let gy = cy - 1; gy <= cy + 1; gy++) {
-          const bucket = grid.get(gx + ":" + gy);
-          if (!bucket) continue;
-          for (const u of bucket) {
-            if (u === v) continue;
-            let dx = v.gx - u.gx, dy = v.gy - u.gy, d2 = dx * dx + dy * dy;
-            if (d2 < 1) { dx = (v.id < u.id ? 1 : -1) * 0.5; dy = 0.5; d2 = 1; }
-            if (d2 > k * k * 9) continue;
-            const inv = (k * k) / d2;
-            v.fx += dx * inv * 0.02; v.fy += dy * inv * 0.02;
-          }
+    if (N <= 1500) {
+      // all-pairs repulsion: full long-range force, so the graph settles into an
+      // even ROUND organic disk (the reference look) instead of the blocky shape
+      // the local-grid cutoff produced. O(N^2) is trivial at this scale.
+      for (let i = 0; i < N; i++) {
+        const v = nodes[i];
+        for (let j = i + 1; j < N; j++) {
+          const u = nodes[j];
+          let dx = v.gx - u.gx, dy = v.gy - u.gy, d2 = dx * dx + dy * dy;
+          if (d2 < 1) { dx = (i < j ? 1 : -1) * 0.5; dy = 0.5; d2 = 1; }
+          const inv = (k * k) / d2 * 0.02, fx = dx * inv, fy = dy * inv;
+          v.fx += fx; v.fy += fy; u.fx -= fx; u.fy -= fy;
         }
+      }
+    } else {
+      const cell = k, grid = new Map(); // big graphs: local grid for perf
+      for (const v of nodes) {
+        const key = ((v.gx / cell) | 0) + ":" + ((v.gy / cell) | 0);
+        (grid.get(key) || grid.set(key, []).get(key)).push(v);
+      }
+      for (const v of nodes) {
+        const cx = (v.gx / cell) | 0, cy = (v.gy / cell) | 0;
+        for (let gx = cx - 1; gx <= cx + 1; gx++)
+          for (let gy = cy - 1; gy <= cy + 1; gy++) {
+            const bucket = grid.get(gx + ":" + gy);
+            if (!bucket) continue;
+            for (const u of bucket) {
+              if (u === v) continue;
+              let dx = v.gx - u.gx, dy = v.gy - u.gy, d2 = dx * dx + dy * dy;
+              if (d2 < 1) { dx = (v.id < u.id ? 1 : -1) * 0.5; dy = 0.5; d2 = 1; }
+              if (d2 > k * k * 9) continue;
+              const inv = (k * k) / d2;
+              v.fx += dx * inv * 0.02; v.fy += dy * inv * 0.02;
+            }
+          }
+      }
     }
     for (const e of G.edges) {
       const a = byId.get(e.source), b = byId.get(e.target);
@@ -194,19 +210,16 @@
       const fx = (dx / d) * f, fy = (dy / d) * f;
       a.fx += fx; a.fy += fy; b.fx -= fx; b.fy -= fy;
     }
-    for (const v of nodes) { v.fx -= v.gx * 0.0011; v.fy -= v.gy * 0.0011; } // lighter gravity = spreads, less blocky
-    // Smooth perpetual flow at the SAME slow pace as the galaxy: a near-rigid
-    // rotation (OMEGA, steady-state angular speed ~= OMEGA/(1-damp) matches the
-    // galaxy's ~0.0005/frame) plus a small inner-faster shear (TWIST), eased when
-    // idle exactly like the galaxy so both views drift at one cadence.
+    for (const v of nodes) { v.fx -= v.gx * 0.0022; v.fy -= v.gy * 0.0022; } // central gravity -> a contained ROUND disk
+    // Slow RIGID rotation only (no inner-faster shear: shear distorted the disk into
+    // the blocky/rectangular shape). Pure rotation preserves the round organic shape
+    // while it spins at the galaxy's cadence; eased when idle like the galaxy.
     const idle = (now() - lastInteract) > 4000;
-    const fp = idle ? 0.43 : 1;
-    const damp = 0.9, OMEGA = 0.00005 * fp, TWIST = 0.008 * fp;
+    const damp = 0.9, OMEGA = 0.00005 * (idle ? 0.43 : 1);
     for (const v of nodes) {
       if (drag && v === drag.node) continue;
-      const r = Math.max(60, Math.sqrt(v.gx * v.gx + v.gy * v.gy));
-      v.vx = (v.vx + v.fx * alpha) * damp + (-v.gy * OMEGA) + (-v.gy / r) * TWIST;
-      v.vy = (v.vy + v.fy * alpha) * damp + (v.gx * OMEGA) + (v.gx / r) * TWIST;
+      v.vx = (v.vx + v.fx * alpha) * damp + (-v.gy * OMEGA);
+      v.vy = (v.vy + v.fy * alpha) * damp + (v.gx * OMEGA);
       v.gx += v.vx; v.gy += v.vy;
     }
     if (alpha > 0.045) alpha *= 0.99; // keep the field gently responsive so it flows, not frozen
@@ -305,16 +318,13 @@
     }
     ctx.globalCompositeOperation = "source-over";
 
-    // crisp cores: every node is a discrete dot with a dark separator ring, so it
-    // reads even inside a saturated halo region.
+    // crisp cores: clean glowing dots, NO border ring (shiny + spacy).
     for (let i = 0; i < N; i++) {
       const n = nodes[i], s = sp[i];
       if (!on(s, 10)) continue;
       const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
       const r = coreR(n, z);
       ctx.globalAlpha = dim ? 0.18 : 1;
-      ctx.fillStyle = "#06050a";
-      ctx.beginPath(); ctx.arc(s.x, s.y, r + 0.8, 0, TAU); ctx.fill();
       ctx.fillStyle = n.id === G.meta.index_id ? "#fff6e8" : lighten(commColor.get(n.community) || "#7c766e", 0.6);
       ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, TAU); ctx.fill();
     }
