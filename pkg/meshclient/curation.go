@@ -26,6 +26,21 @@ func (c *Client) CurationJobs() ([]syncproto.CurationJob, error) {
 	return resp.Jobs, nil
 }
 
+// CurationActivity lists the hub's recent terminal curation jobs (resolved +
+// failed), most-recent first, for the team-wide "what did the curator do" view.
+// limit <= 0 uses the hub default.
+func (c *Client) CurationActivity(limit int) ([]syncproto.CurationJob, error) {
+	path := "/v1/curation/activity"
+	if limit > 0 {
+		path = fmt.Sprintf("%s?limit=%d", path, limit)
+	}
+	var resp syncproto.CurationJobsResponse
+	if err := c.rpc("GET", path, nil, true, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Jobs, nil
+}
+
 // CurationJob fetches one job including its IncomingB64 (the losing version).
 func (c *Client) CurationJob(id int64) (syncproto.CurationJob, error) {
 	var job syncproto.CurationJob

@@ -54,6 +54,8 @@ func rootCmd() *cobra.Command {
 		watchCmd(),
 		joinCmd(),
 		syncCmd(),
+		conflictsCmd(),
+		curatorCmd(),
 		tuiCmd(),
 		uiCmd(),
 		doctorCmd(),

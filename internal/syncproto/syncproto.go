@@ -76,6 +76,7 @@ type CurationJob struct {
 	User         string `json:"user"`
 	Status       string `json:"status"`
 	Attempts     int64  `json:"attempts,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
 	CreatedAt    int64  `json:"created_at"`
 	ResolvedAt   int64  `json:"resolved_at,omitempty"`
 	ResolvedHead string `json:"resolved_head,omitempty"`
