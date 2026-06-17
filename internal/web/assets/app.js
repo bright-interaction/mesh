@@ -45,7 +45,7 @@
     resize();
     if (!G.nodes || G.nodes.length === 0) return showEmpty();
     for (const c of G.communities) { c.color = safeColor(c.color); commColor.set(c.id, c.color); }
-    G.nodes.forEach((n, i) => { byId.set(n.id, n); nodeIndex.set(n.id, i); n.vx = 0; n.vy = 0; });
+    G.nodes.forEach((n, i) => { byId.set(n.id, n); nodeIndex.set(n.id, i); n.vx = 0; n.vy = 0; n.dispX = 0; n.dispY = 0; });
     sp = new Array(G.nodes.length);
     buildAdjacency();
     buildSprites();
@@ -98,15 +98,14 @@
 
   // ---- layouts ----
   function seedLayout() {
-    const k = Math.sqrt(120000);
-    const ci = new Map();
-    G.communities.forEach((c, i) => ci.set(c.id, i));
-    G.nodes.forEach((n, i) => {
-      const base = ((ci.get(n.community) || 0) / Math.max(1, G.communities.length)) * TAU;
-      const rr = k * (0.2 + (i % 23) * 0.05);
-      n.gx = Math.cos(base + (i % 9) * 0.3) * rr;
-      n.gy = Math.sin(base + (i % 9) * 0.3) * rr;
-    });
+    // Scatter randomly across a disk so the sim resolves into an organic shape
+    // instead of betraying a seeded ring/arc. The springs still pull communities
+    // together as it settles.
+    const spread = Math.sqrt(G.nodes.length + 1) * 95;
+    for (const n of G.nodes) {
+      const a = Math.random() * TAU, r = Math.sqrt(Math.random()) * spread;
+      n.gx = Math.cos(a) * r; n.gy = Math.sin(a) * r;
+    }
   }
   function layoutGalaxy() {
     const ringGap = 150;
@@ -115,9 +114,15 @@
     for (const [o, ring] of byOrbit) {
       ring.sort((a, b) => a.community - b.community || (a.id < b.id ? -1 : 1));
       ring.forEach((n, i) => {
-        n.theta0 = ring.length <= 1 ? 0 : (i / ring.length) * TAU;
-        n.radius0 = o * ringGap;
-        n.speed = 1 / Math.sqrt(o + 1);
+        // Scatter, not a perfect ring: jitter each planet's angle within its slot
+        // and its radius, and give it its own orbital speed, so the galaxy looks
+        // organic (uneven bands) rather than concentric circles. Deterministic per
+        // node (seeded by orbit+index) so it is stable across frames.
+        const seed = o * 131 + i;
+        const slot = ring.length <= 1 ? 0 : (i / ring.length) * TAU;
+        n.theta0 = slot + (rand(seed) - 0.5) * (TAU / Math.max(1, ring.length)) * 1.4;
+        n.radius0 = o === 0 ? 0 : o * ringGap + (rand(seed + 7) - 0.5) * ringGap * 0.85;
+        n.speed = (1 / Math.sqrt(o + 1)) * (0.8 + rand(seed + 13) * 0.5);
       });
     }
   }
@@ -163,14 +168,16 @@
       a.fx += fx; a.fy += fy; b.fx -= fx; b.fy -= fy;
     }
     for (const v of nodes) { v.fx -= v.gx * 0.0016; v.fy -= v.gy * 0.0016; }
-    const damp = 0.82;
+    const damp = 0.9; // heavier damping = calmer, less shaky settle
     for (const v of nodes) {
       if (drag && v === drag.node) continue;
       v.vx = (v.vx + v.fx * alpha) * damp;
       v.vy = (v.vy + v.fy * alpha) * damp;
+      // dead-zone: below a tiny speed, stop, so a settled graph is still (not jittery)
+      if (v.vx * v.vx + v.vy * v.vy < 0.0009) { v.vx = 0; v.vy = 0; }
       v.gx += v.vx; v.gy += v.vy;
     }
-    if (alpha > 0.06) alpha *= 0.985; // cool toward a living floor, never fully freeze
+    if (alpha > 0.02) alpha *= 0.99; // cool to a low floor: alive but calm, not shaking
   }
 
   // ---- render ----
@@ -178,7 +185,20 @@
     if (document.hidden) { running = false; return; } // pause when the tab is hidden (battery)
     t += 1;
     if (view === "graph") simStep();
-    else galaxyAngle += 0.0014;
+    else {
+      galaxyAngle += 0.0013;
+      // galaxy grab (same effect as the graph): the held node tracks the cursor as
+      // an offset from its orbit; every other node's offset springs back to 0.
+      for (const n of G.nodes) {
+        if (drag && drag.node === n) {
+          const o = galaxyPos(n);
+          n.dispX = drag.wx - o.x; n.dispY = drag.wy - o.y;
+        } else if (n.dispX || n.dispY) {
+          n.dispX *= 0.88; n.dispY *= 0.88;
+          if (Math.abs(n.dispX) < 0.5 && Math.abs(n.dispY) < 0.5) { n.dispX = 0; n.dispY = 0; }
+        }
+      }
+    }
     draw();
     requestAnimationFrame(loop);
   }
@@ -199,6 +219,7 @@
         const r0 = n.radius0 || 0;
         if (r0 === 0) { px = 0; py = 0; }
         else { const a = (n.theta0 || 0) + galaxyAngle * (n.speed || 0); px = Math.cos(a) * r0; py = Math.sin(a) * r0; }
+        px += n.dispX || 0; py += n.dispY || 0; // grab/spring-back offset
       } else { px = n.gx; py = n.gy; }
       const s = sp[i] || (sp[i] = { x: 0, y: 0 });
       s.x = px * z + ox; s.y = py * z + oy;
@@ -360,12 +381,16 @@
     canvas.addEventListener("mousedown", (e) => {
       const rect = canvas.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
       moved = false; lastX = e.clientX; lastY = e.clientY;
-      const n = view === "graph" ? nodeAt(mx, my) : null;
-      if (n) { drag = { node: n, vx: 0, vy: 0 }; alpha = Math.max(alpha, 0.9); canvas.classList.add("panning"); }
-      else { panning = true; canvas.classList.add("panning"); }
+      const n = nodeAt(mx, my); // grab a node in either view; empty space pans
+      if (n) {
+        const w = worldAt(mx, my);
+        drag = { node: n, vx: 0, vy: 0, wx: w.x, wy: w.y };
+        if (view === "graph") alpha = Math.max(alpha, 0.9);
+        canvas.classList.add("panning");
+      } else { panning = true; canvas.classList.add("panning"); }
     });
-    window.addEventListener("mouseup", (e) => {
-      if (drag) { drag.node.vx = drag.vx; drag.node.vy = drag.vy; drag = null; }
+    window.addEventListener("mouseup", () => {
+      if (drag) { if (view === "graph") { drag.node.vx = drag.vx; drag.node.vy = drag.vy; } drag = null; } // galaxy: offset springs back
       panning = false; canvas.classList.remove("panning");
     });
     window.addEventListener("mousemove", (e) => {
@@ -377,8 +402,11 @@
       const mx = e.clientX - rect.left, my = e.clientY - rect.top;
       if (drag) {
         const w = worldAt(mx, my);
-        drag.vx = w.x - drag.node.gx; drag.vy = w.y - drag.node.gy;
-        drag.node.gx = w.x; drag.node.gy = w.y; drag.node.vx = 0; drag.node.vy = 0;
+        drag.wx = w.x; drag.wy = w.y; // galaxy: the loop applies this to the held node's offset
+        if (view === "graph") {
+          drag.vx = w.x - drag.node.gx; drag.vy = w.y - drag.node.gy;
+          drag.node.gx = w.x; drag.node.gy = w.y; drag.node.vx = 0; drag.node.vy = 0;
+        }
         return;
       }
       const n = nodeAt(mx, my);
