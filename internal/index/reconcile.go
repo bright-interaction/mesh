@@ -48,3 +48,33 @@ func Reconcile(s *Store, root string) (Reconciliation, error) {
 	r.Dur = time.Since(start)
 	return r, nil
 }
+
+// ReconcileIncremental is the incremental sibling of Reconcile for a long-running
+// watcher that holds a NoteCache. It parses only the changed files (DriftDeltaReport
+// retains that parse), rebuilds the graph in memory from the cache (CPU-only, no
+// disk re-parse), and applies targeted note/FTS writes plus a full nodes/edges
+// rewrite from the rebuilt graph. The DB is always left authoritative for a
+// concurrent `mesh search` reader. The returned Graph is the in-memory one, so the
+// caller can swap it directly without a LoadGraph round-trip.
+func ReconcileIncremental(s *Store, root string, cache *NoteCache) (Reconciliation, error) {
+	start := time.Now()
+	dd, err := s.DriftDeltaReport(root)
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	r := Reconciliation{Added: len(dd.Drift.Added), Changed: len(dd.Drift.Changed), Removed: len(dd.Drift.Removed)}
+	if !dd.Drift.Any() {
+		r.Dur = time.Since(start)
+		return r, nil
+	}
+	cache.Apply(dd.Upserts, dd.RemovedIDs)
+	g, _ := BuildGraph(cache.Snapshot())
+	g.DetectCommunities(0)
+	if _, err := s.IndexVaultIncremental(dd.Upserts, dd.RemovedIDs, g); err != nil {
+		return Reconciliation{}, err
+	}
+	r.Reindexed = true
+	r.Graph = g
+	r.Dur = time.Since(start)
+	return r, nil
+}

@@ -39,7 +39,8 @@ type Server struct {
 	graph     *graph.Graph
 	retriever *retrieve.Retriever
 
-	reloadMu sync.Mutex // serializes rebuilds across dispatch + watcher
+	reloadMu sync.Mutex       // serializes rebuilds across dispatch + watcher
+	cache    *index.NoteCache // parsed-note cache for incremental reconcile; guarded by reloadMu
 }
 
 // NewServer opens the vault's index and loads it into memory.
@@ -48,7 +49,7 @@ func NewServer(vaultRoot string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{vaultRoot: vaultRoot, store: store}
+	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache()}
 	if err := s.reload(); err != nil {
 		store.Close()
 		return nil, err
@@ -76,25 +77,27 @@ func (s *Server) swap(g *graph.Graph) {
 }
 
 // reload fully re-indexes the vault and rebuilds the in-memory graph +
-// retriever. Run at startup and after a write-back so new notes are immediately
-// retrievable.
+// retriever, seeding the parsed-note cache so later reconciles can be incremental.
+// Run at startup and after a write-back so new notes are immediately retrievable.
 func (s *Server) reload() error {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
-	g, err := index.Reindex(s.store, s.vaultRoot)
+	g, notes, err := index.ReindexFull(s.store, s.vaultRoot)
 	if err != nil {
 		return err
 	}
+	s.cache.Seed(notes)
 	s.swap(g)
 	return nil
 }
 
 // reconcileOnce reindexes only when the vault has drifted, swapping in the fresh
-// graph when it did. It is the watcher's reindex callback.
+// graph when it did. It is the watcher's reindex callback. Incremental: it parses
+// only changed files and rebuilds the graph in memory from the cache.
 func (s *Server) reconcileOnce() (index.Reconciliation, error) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
-	rec, err := index.Reconcile(s.store, s.vaultRoot)
+	rec, err := index.ReconcileIncremental(s.store, s.vaultRoot, s.cache)
 	if err != nil {
 		return rec, err
 	}

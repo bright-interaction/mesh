@@ -36,7 +36,9 @@ func searchText(pn *ParsedNote) string {
 func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 	count := 0
 	err := s.Write(func(tx *sql.Tx) error {
-		for _, t := range []string{"notes", "nodes", "edges", "search_index"} {
+		// Note + FTS get a full wipe here; nodes/edges are wiped+rewritten by
+		// writeGraphTables below.
+		for _, t := range []string{"notes", "search_index"} {
 			if _, err := tx.Exec("DELETE FROM " + t); err != nil {
 				return err
 			}
@@ -54,17 +56,11 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 		defer insFTS.Close()
 
 		for _, pn := range notes {
-			id := effectiveID(pn)
-			title := titleOf(pn)
-			fmJSON, err := json.Marshal(pn.FM)
+			id, title, fmJSON, updated, mtime, err := noteRowValues(pn)
 			if err != nil {
 				return err
 			}
-			updated := pn.FM.When
-			if pn.FM.Updated != "" {
-				updated = pn.FM.Updated
-			}
-			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), string(fmJSON), fileMtime(pn.Path), updated); err != nil {
+			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated); err != nil {
 				return err
 			}
 			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
@@ -73,47 +69,141 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 			count++
 		}
 
-		insNode, err := tx.Prepare(`INSERT OR REPLACE INTO nodes(id,kind,label,note_id,note_path,anchor,source_loc,community,attrs) VALUES(?,?,?,?,?,?,?,?,?)`)
-		if err != nil {
+		if err := writeGraphTables(tx, g); err != nil {
 			return err
 		}
-		defer insNode.Close()
-		insEdge, err := tx.Prepare(`INSERT OR IGNORE INTO edges(source,target,relation,confidence,confidence_score,weight,source_loc) VALUES(?,?,?,?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer insEdge.Close()
-
-		for _, nd := range g.Nodes() {
-			attrs := "null"
-			if nd.Attrs != nil {
-				b, err := json.Marshal(nd.Attrs)
-				if err != nil {
-					return err
-				}
-				attrs = string(b)
-			}
-			if _, err := insNode.Exec(nd.ID, nd.Kind, nd.Label, nd.NoteID, nd.NotePath, nd.Anchor, nd.SourceLoc, nd.Community, attrs); err != nil {
-				return err
-			}
-			for _, e := range g.Neighbors(nd.ID) {
-				if _, err := insEdge.Exec(e.Source, e.Target, e.Relation, e.Confidence, e.ConfidenceScore, e.Weight, e.SourceLoc); err != nil {
-					return err
-				}
-			}
-		}
-
-		// Prune orphaned vectors (a note was deleted since the last embed). Stale
-		// vectors for still-existing-but-edited notes are kept on disk but excluded
-		// from retrieval by LoadVectors' note_hash JOIN; they are refreshed in place
-		// on the next `mesh embed`. Orphans have no note to refresh them, so remove
-		// them here to keep the table from growing unbounded across deletes.
-		if _, err := tx.Exec(`DELETE FROM vectors WHERE node_id NOT IN (SELECT 'note:' || id FROM notes)`); err != nil {
-			return err
-		}
-		return nil
+		return pruneOrphanVectors(tx)
 	})
 	return count, err
+}
+
+// IndexVaultIncremental applies a drift delta: targeted INSERT OR REPLACE / DELETE
+// for the changed notes + their FTS rows, a full rewrite of the (globally rebuilt)
+// nodes/edges tables from the in-memory graph, and the orphan-vector prune, all in
+// one writer-goroutine transaction so a concurrent reader sees an all-or-nothing
+// WAL snapshot. upserts are Added+Changed notes (vault-relative Path); removedIDs
+// are ids whose files are gone (and old ids retired on an id change). Returns the
+// number of upserted notes.
+func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string, g *graph.Graph) (int, error) {
+	err := s.Write(func(tx *sql.Tx) error {
+		// Deletes first: a rename frees a path another note now claims, and an id
+		// change retires the old id; deleting before inserting avoids the notes.path
+		// UNIQUE and notes.id PK collisions.
+		for _, id := range removedIDs {
+			if _, err := tx.Exec(`DELETE FROM notes WHERE id=?`, id); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
+				return err
+			}
+		}
+
+		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated) VALUES(?,?,?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer insNote.Close()
+		insFTS, err := tx.Prepare(`INSERT INTO search_index(node_id,kind,anchor,title,body) VALUES(?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer insFTS.Close()
+
+		for _, pn := range upserts {
+			id, title, fmJSON, updated, mtime, err := noteRowValues(pn)
+			if err != nil {
+				return err
+			}
+			// FTS5 has no PK upsert; delete the existing row (if any) then insert, so
+			// the body can never lag the note.
+			if _, err := tx.Exec(`DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
+				return err
+			}
+			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated); err != nil {
+				return err
+			}
+			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
+				return err
+			}
+		}
+
+		if err := writeGraphTables(tx, g); err != nil {
+			return err
+		}
+		return pruneOrphanVectors(tx)
+	})
+	return len(upserts), err
+}
+
+// noteRowValues derives the notes-table column values for a parsed note. Shared by
+// the full and incremental index paths so they can never drift.
+func noteRowValues(pn *ParsedNote) (id, title, fmJSON, updated string, mtime int64, err error) {
+	id = effectiveID(pn)
+	title = titleOf(pn)
+	b, err := json.Marshal(pn.FM)
+	if err != nil {
+		return "", "", "", "", 0, err
+	}
+	fmJSON = string(b)
+	updated = pn.FM.When
+	if pn.FM.Updated != "" {
+		updated = pn.FM.Updated
+	}
+	mtime = fileMtime(pn.Path)
+	return id, title, fmJSON, updated, mtime, nil
+}
+
+// writeGraphTables wipes and rewrites the nodes + edges tables from the in-memory
+// graph. Shared by the full and incremental paths: communities are label-prop
+// (global), so the graph is rebuilt whole in memory either way, and dumping it to
+// two small tables is cheap relative to parsing the vault.
+func writeGraphTables(tx *sql.Tx, g *graph.Graph) error {
+	if _, err := tx.Exec(`DELETE FROM nodes`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM edges`); err != nil {
+		return err
+	}
+	insNode, err := tx.Prepare(`INSERT OR REPLACE INTO nodes(id,kind,label,note_id,note_path,anchor,source_loc,community,attrs) VALUES(?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer insNode.Close()
+	insEdge, err := tx.Prepare(`INSERT OR IGNORE INTO edges(source,target,relation,confidence,confidence_score,weight,source_loc) VALUES(?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer insEdge.Close()
+
+	for _, nd := range g.Nodes() {
+		attrs := "null"
+		if nd.Attrs != nil {
+			b, err := json.Marshal(nd.Attrs)
+			if err != nil {
+				return err
+			}
+			attrs = string(b)
+		}
+		if _, err := insNode.Exec(nd.ID, nd.Kind, nd.Label, nd.NoteID, nd.NotePath, nd.Anchor, nd.SourceLoc, nd.Community, attrs); err != nil {
+			return err
+		}
+		for _, e := range g.Neighbors(nd.ID) {
+			if _, err := insEdge.Exec(e.Source, e.Target, e.Relation, e.Confidence, e.ConfidenceScore, e.Weight, e.SourceLoc); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// pruneOrphanVectors removes vectors whose note was deleted (a note left in the
+// vectors table with no live note row). Stale vectors for still-existing-but-edited
+// notes are kept on disk and excluded from retrieval by LoadVectors' note_hash
+// JOIN; they are refreshed in place on the next `mesh embed`. Orphans have no note
+// to refresh them, so they are removed here to bound table growth across deletes.
+func pruneOrphanVectors(tx *sql.Tx) error {
+	_, err := tx.Exec(`DELETE FROM vectors WHERE node_id NOT IN (SELECT 'note:' || id FROM notes)`)
+	return err
 }
 
 func titleOf(pn *ParsedNote) string {
@@ -137,12 +227,16 @@ func fileMtime(path string) int64 {
 // excluded from retrieval.
 func RetrievalHash(pn *ParsedNote) string { return retrievalHash(pn) }
 
-// retrievalHash is SHA256 over the body plus the retrieval-critical frontmatter
-// (type, status, supersedes, related), so a status change (accepted ->
-// superseded) forces a reindex while a cosmetic frontmatter edit does not
-// (spec section 3.2).
+// retrievalHash is SHA256 over the node identity (effectiveID) plus the body and
+// the retrieval-critical frontmatter (type, status, supersedes, related), so a
+// status change (accepted -> superseded) or an id change forces a reindex while a
+// cosmetic frontmatter edit (title, unrelated fields) does not (spec section 3.2).
+// The id is included because it is the node identity: an id-only edit must retire
+// the old node and create the new one, so the drift check has to see it.
 func retrievalHash(pn *ParsedNote) string {
 	h := sha256.New()
+	h.Write([]byte(effectiveID(pn)))
+	h.Write([]byte{0})
 	h.Write([]byte(pn.Body))
 	h.Write([]byte{0})
 	h.Write([]byte(string(pn.FM.Type)))

@@ -983,13 +983,16 @@ func watchCmd() *cobra.Command {
 			logf := func(format string, a ...any) {
 				fmt.Printf("%s  "+format+"\n", append([]any{time.Now().Format("15:04:05")}, a...)...)
 			}
+			// Incremental: the first reconcile seeds the cache (full), later ones parse
+			// only changed files and rebuild the graph in memory.
+			live := index.NewLiveIndexer(store, root)
 			err = watch.Run(ctx, watch.Options{
 				Root:      root,
 				Debounce:  debounce,
 				Reconcile: reconcile,
 				Logf:      logf,
 				OnReindex: func() (watch.Result, error) {
-					rec, err := index.Reconcile(store, root)
+					rec, err := live.Reconcile()
 					if err != nil {
 						return watch.Result{}, err
 					}
@@ -1062,13 +1065,16 @@ func syncCmd() *cobra.Command {
 			defer store.Close()
 
 			// One sync round: push/pull via the hub, then reindex so search reflects
-			// the merged result. Reused by the one-shot path and the watch loop.
+			// the merged result. Reused by the one-shot path and the watch loop. The
+			// LiveIndexer makes the watch loop incremental (full seed on the first call,
+			// targeted updates after); the one-shot path just does that single full pass.
+			live := index.NewLiveIndexer(store, vaultDir)
 			syncOnce := func() (meshclient.Summary, error) {
 				sum, err := meshclient.SyncVault(vaultDir)
 				if err != nil {
 					return sum, err
 				}
-				if _, err := index.Reconcile(store, vaultDir); err != nil {
+				if _, err := live.Reconcile(); err != nil {
 					return sum, err
 				}
 				return sum, nil

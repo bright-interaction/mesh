@@ -7,13 +7,15 @@ import (
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
-// Reindex walks the vault, parses it, builds the graph + communities, persists
-// everything into the store, and returns the freshly loaded in-memory graph.
-// Shared by the CLI index path and the MCP server's write-back reload.
-func Reindex(s *Store, root string) (*graph.Graph, error) {
+// ReindexFull walks the vault, parses every note, builds the graph + communities,
+// persists everything, and returns BOTH the in-memory graph and the parsed notes
+// (so a long-running caller can seed its NoteCache without a second parse). It does
+// NOT re-read the graph from the DB: the returned graph is the one just built, so a
+// caller that already holds the graph in memory skips the LoadGraph round-trip.
+func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 	files, err := vault.Walk(root)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	notes, _ := ParseFiles(files, 0)
 	for _, pn := range notes {
@@ -24,6 +26,16 @@ func Reindex(s *Store, root string) (*graph.Graph, error) {
 	g, _ := BuildGraph(notes)
 	g.DetectCommunities(0)
 	if _, err := s.IndexVault(notes, g); err != nil {
+		return nil, nil, err
+	}
+	return g, notes, nil
+}
+
+// Reindex walks the vault, parses it, builds the graph + communities, persists
+// everything, and returns the freshly DB-loaded in-memory graph. Used by the CLI
+// index path; long-running watchers use ReindexFull + ReconcileIncremental instead.
+func Reindex(s *Store, root string) (*graph.Graph, error) {
+	if _, _, err := ReindexFull(s, root); err != nil {
 		return nil, err
 	}
 	return s.LoadGraph()
