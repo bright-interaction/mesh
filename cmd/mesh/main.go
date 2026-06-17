@@ -20,6 +20,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/tui"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/bright-interaction/mesh/internal/watch"
 	"github.com/bright-interaction/mesh/internal/web"
@@ -1095,7 +1096,17 @@ func short8(s string) string {
 	return s
 }
 
-func tuiCmd() *cobra.Command { return stub("tui", "Open the terminal UI", "Milestone 3") }
+func tuiCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "tui [vault]",
+		Short: "Open the keyboard-driven terminal view of the vault",
+		Long:  "A three-pane terminal UI over the same index + graph the agent uses: browse the notes list (hub-first), search (the same ranked cards as the agent), and preview a note with its frontmatter and neighbors. Keyboard-driven; press ? for help.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tui.Run(vaultArg(args))
+		},
+	}
+}
 func uiCmd() *cobra.Command {
 	var addr string
 	c := &cobra.Command{
