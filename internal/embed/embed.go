@@ -13,14 +13,18 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Embedder turns text into vectors. Implementations must be deterministic for a
-// given model so a vault's vectors stay comparable.
+// given model so a vault's vectors stay comparable. Dim() is the vector width;
+// it pins the space so a same-named-but-different-width model is caught, not
+// silently cosined across incompatible dimensions.
 type Embedder interface {
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
 	Model() string
+	Dim() int
 }
 
 // HTTP is an OpenAI-compatible embeddings client. It speaks the
@@ -33,6 +37,9 @@ type HTTP struct {
 	ModelID string
 	Key     string // bearer token; empty for keyless local endpoints
 	Client  *http.Client
+
+	mu  sync.Mutex
+	dim int // cached vector width; 0 = unknown until first Embed or a probe
 }
 
 func NewHTTP(baseURL, model, key string) *HTTP {
@@ -45,6 +52,24 @@ func NewHTTP(baseURL, model, key string) *HTTP {
 }
 
 func (h *HTTP) Model() string { return h.ModelID }
+
+// Dim returns the embedding width. It is cached from the first Embed; if Dim is
+// asked before any Embed it probes once with a sentinel string (no /embeddings
+// endpoint exposes dim metadata, so a probe is the only honest option). Returns
+// 0 if the endpoint is unreachable.
+func (h *HTTP) Dim() int {
+	h.mu.Lock()
+	d := h.dim
+	h.mu.Unlock()
+	if d > 0 {
+		return d
+	}
+	vecs, err := h.Embed(context.Background(), []string{"dim probe"})
+	if err != nil || len(vecs) == 0 {
+		return 0
+	}
+	return len(vecs[0]) // Embed recorded h.dim
+}
 
 func (h *HTTP) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	body, err := json.Marshal(map[string]any{"model": h.ModelID, "input": texts})
@@ -79,16 +104,31 @@ func (h *HTTP) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(out.Data) != len(texts) {
 		return nil, fmt.Errorf("embed: got %d vectors for %d inputs", len(out.Data), len(texts))
 	}
+	// Place each embedding by its declared index. Reject an out-of-range or duplicate
+	// index rather than guessing positionally: a hybrid (index-then-position) recovery
+	// could silently mis-pair a vector to the wrong chunk, and the content-hash cache
+	// would then lock that wrong vector in under a correct hash.
 	vecs := make([][]float32, len(texts))
 	for _, d := range out.Data {
-		if d.Index >= 0 && d.Index < len(vecs) {
-			vecs[d.Index] = d.Embedding
+		if d.Index < 0 || d.Index >= len(vecs) {
+			return nil, fmt.Errorf("embed: response index %d out of range [0,%d)", d.Index, len(vecs))
+		}
+		if vecs[d.Index] != nil {
+			return nil, fmt.Errorf("embed: duplicate response index %d", d.Index)
+		}
+		vecs[d.Index] = d.Embedding
+	}
+	for i := range vecs {
+		if vecs[i] == nil {
+			return nil, fmt.Errorf("embed: no vector returned for input %d", i)
 		}
 	}
-	for i, v := range vecs {
-		if v == nil {
-			vecs[i] = out.Data[i].Embedding
+	if len(vecs) > 0 && len(vecs[0]) > 0 {
+		h.mu.Lock()
+		if h.dim == 0 {
+			h.dim = len(vecs[0])
 		}
+		h.mu.Unlock()
 	}
 	return vecs, nil
 }
@@ -100,6 +140,13 @@ func (h *HTTP) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 type Stub struct{ D int }
 
 func (s Stub) Model() string { return "stub-bow" }
+
+func (s Stub) Dim() int {
+	if s.D > 0 {
+		return s.D
+	}
+	return 64
+}
 
 func (s Stub) Embed(_ context.Context, texts []string) ([][]float32, error) {
 	dim := s.D

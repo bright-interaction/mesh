@@ -158,9 +158,9 @@ func TestCtrlCQuitsEverywhere(t *testing.T) {
 	be := stubBackend{notes: []NoteRef{{ID: "a", Title: "A"}}}
 	// In raw mode ctrl+c is a keystroke; it must quit from every mode.
 	for _, setup := range []func(*App){
-		func(a *App) {},                                                          // base
-		func(a *App) { a.editing = true },                                        // editing search
-		func(a *App) { a.help = true },                                           // help open
+		func(a *App) {},                   // base
+		func(a *App) { a.editing = true }, // editing search
+		func(a *App) { a.help = true },    // help open
 	} {
 		a := NewApp(be)
 		a.Update(tea.WindowSizeMsg{Width: 100, Height: 30})

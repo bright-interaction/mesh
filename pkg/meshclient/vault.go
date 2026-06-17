@@ -304,24 +304,43 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 	return SyncVault(vaultDir)
 }
 
-// checkHomogeneity fails closed if the vault's canonical embedding model (from
-// the synced mesh.toml) conflicts with the operator's configured MESH_EMBED_MODEL
-// (SPEC 8: one embedding space per team).
+// checkHomogeneity fails closed if the vault's canonical embedding space (from the
+// synced mesh.toml [embedding] section) conflicts with the operator's configured
+// MESH_EMBED_MODEL / MESH_EMBED_DIM (SPEC 8: one embedding space per team). Both
+// axes matter: two endpoints can serve the same model NAME at different widths (a
+// requantized or truncated variant), which passes the name check but would later
+// cosine across incompatible dimensions and emit a silent uniform garbage signal.
 func checkHomogeneity(meshToml string) error {
-	model := tomlString(meshToml, "model")
+	model := tomlSectionString(meshToml, "embedding", "model")
 	env := strings.TrimSpace(os.Getenv("MESH_EMBED_MODEL"))
 	if model != "" && env != "" && model != env {
 		return fmt.Errorf("embedding model mismatch: this vault uses %q but MESH_EMBED_MODEL=%q; align them before joining (fail closed)", model, env)
 	}
+	if vd := tomlSectionString(meshToml, "embedding", "dim"); vd != "" && vd != "0" {
+		if ed := strings.TrimSpace(os.Getenv("MESH_EMBED_DIM")); ed != "" && ed != "0" && ed != vd {
+			return fmt.Errorf("embedding dim mismatch: this vault uses dim %s but MESH_EMBED_DIM=%s; align them before joining (fail closed)", vd, ed)
+		}
+	}
 	return nil
 }
 
-// tomlString pulls a simple top-level/`section` string value (key = "value")
-// from the small, hub-written mesh.toml. Not a general TOML parser.
-func tomlString(toml, key string) string {
+// tomlSectionString pulls a simple `key = "value"` from inside a named [section]
+// of the small, hub-written mesh.toml (keys before any section header are the
+// top-level scope; pass section "" for those). Section-aware so a future section
+// reusing a key name (e.g. a [rerank] model) cannot shadow the [embedding] one.
+// Not a general TOML parser.
+func tomlSectionString(toml, section, key string) string {
+	cur := ""
 	for _, line := range strings.Split(toml, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "#") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			cur = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		if cur != section {
 			continue
 		}
 		k, v, ok := strings.Cut(line, "=")

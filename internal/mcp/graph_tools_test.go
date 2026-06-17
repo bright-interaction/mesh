@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 func serverWithNotes(t *testing.T, notes map[string]string) *Server {
@@ -167,6 +169,68 @@ func TestCommunity(t *testing.T) {
 	// Members are notes only (the tag is not a member).
 	if ids["core"] {
 		t.Fatal("a tag must not appear as a community member")
+	}
+}
+
+func TestStatsResourceEmpty(t *testing.T) {
+	s := newTestServer(t)
+	res := call(t, s, "resources/read", map[string]any{"uri": "mesh://stats"})
+	contents, _ := res["contents"].([]map[string]any)
+	if len(contents) == 0 {
+		t.Fatal("no resource contents")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(contents[0]["text"].(string)), &payload); err != nil {
+		t.Fatal(err)
+	}
+	vecs, ok := payload["vectors"].(map[string]any)
+	if !ok {
+		t.Fatalf("mesh://stats missing vectors: %v", payload)
+	}
+	if vecs["active"] != false {
+		t.Errorf("a vault with no vectors should report active=false, got %v", vecs["active"])
+	}
+	if vecs["total"].(float64) != 0 {
+		t.Errorf("expected 0 vectors, got %v", vecs["total"])
+	}
+	if _, ok := payload["rerank"]; !ok {
+		t.Error("stats should include a rerank block")
+	}
+}
+
+func TestStatsResourceActiveAndFresh(t *testing.T) {
+	t.Setenv("MESH_EMBED_ENDPOINT", "http://127.0.0.1:1/v1") // unreachable; Dim() probe -> 0 -> lenient
+	t.Setenv("MESH_EMBED_MODEL", "test-model")
+	s := newTestServer(t)
+	// Seed a live vector for note:sqlite with the matching note_hash, then reload so
+	// the retriever picks it up.
+	h, _ := s.store.NoteRetrievalHash("note:sqlite")
+	if err := s.store.ReplaceVectors("test-model", []index.VectorRow{
+		{NodeID: "note:sqlite", ChunkIx: 0, Vec: []float32{1, 0, 0, 0}, NoteHash: h},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reload(); err != nil {
+		t.Fatal(err)
+	}
+	res := call(t, s, "resources/read", map[string]any{"uri": "mesh://stats"})
+	contents, _ := res["contents"].([]map[string]any)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(contents[0]["text"].(string)), &payload); err != nil {
+		t.Fatal(err)
+	}
+	vecs := payload["vectors"].(map[string]any)
+	if vecs["active"] != true {
+		t.Errorf("vectors should be active, got %v", vecs["active"])
+	}
+	if vecs["model"] != "test-model" {
+		t.Errorf("model = %v, want test-model", vecs["model"])
+	}
+	if vecs["live"].(float64) != 1 || vecs["total"].(float64) != 1 {
+		t.Errorf("expected 1 live / 1 total, got live=%v total=%v", vecs["live"], vecs["total"])
+	}
+	if vecs["fresh_pct"].(float64) != 100 {
+		t.Errorf("fresh_pct = %v, want 100", vecs["fresh_pct"])
 	}
 }
 

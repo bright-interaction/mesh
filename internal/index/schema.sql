@@ -47,13 +47,15 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
 
--- Vectors: DEFERRED to milestone V. Flat blob, brute-force cosine, homogeneous per vault.
+-- Vectors: milestone V. Flat blob, brute-force cosine, homogeneous per vault.
 CREATE TABLE IF NOT EXISTS vectors (
-  node_id   TEXT NOT NULL,
-  chunk_ix  INTEGER NOT NULL,
-  model     TEXT NOT NULL,                   -- canonical embedding model id (homogeneity guard)
-  dim       INTEGER NOT NULL,
-  embedding BLOB NOT NULL,                   -- []float32 little-endian
+  node_id      TEXT NOT NULL,
+  chunk_ix     INTEGER NOT NULL,
+  model        TEXT NOT NULL,                -- canonical embedding model id (homogeneity guard)
+  dim          INTEGER NOT NULL,
+  embedding    BLOB NOT NULL,                -- []float32 little-endian
+  content_hash TEXT NOT NULL DEFAULT '',     -- sha256 of the embedding input, so an unchanged chunk is not re-embedded
+  note_hash    TEXT NOT NULL DEFAULT '',     -- the note's retrieval_hash when embedded; a mismatch with notes.retrieval_hash means this vector is stale and is excluded from retrieval
   PRIMARY KEY (node_id, chunk_ix)
 );
 

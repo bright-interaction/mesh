@@ -13,6 +13,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/rerank"
 )
 
@@ -70,6 +71,7 @@ type Retriever struct {
 
 	emb         embed.Embedder
 	vecModel    string
+	vecDim      int                    // stored embedding width; pins the space (query embeddings of any other width are rejected, never silently cosined to a uniform 0)
 	vecs        map[string][][]float32 // node id -> per-section chunk vectors
 	queryPrefix string                 // e.g. "search_query: " for nomic-style asymmetric models
 
@@ -126,18 +128,34 @@ func (r *Retriever) loadWeightsFromEnv() {
 }
 
 // enableVectorsFromEnv turns on the semantic signal when the vault has stored
-// vectors and MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL are set.
+// vectors and the embedding endpoint + model are configured. Resolution is
+// env-first, then the solo .mesh/config.toml (written by `mesh embed`), so a solo
+// dev does not re-export env vars every session. Env always wins.
 func (r *Retriever) enableVectorsFromEnv() {
-	endpoint, model := os.Getenv("MESH_EMBED_ENDPOINT"), os.Getenv("MESH_EMBED_MODEL")
+	cfg, _ := meshcfg.Load(r.store.MeshDir())
+	endpoint := envOr("MESH_EMBED_ENDPOINT", cfg.Endpoint)
+	model := envOr("MESH_EMBED_MODEL", cfg.Model)
 	if endpoint == "" || model == "" {
 		return
 	}
-	vm, vecs, err := r.store.LoadVectors()
+	vm, dim, vecs, err := r.store.LoadVectors()
 	if err != nil || len(vecs) == 0 {
 		return
 	}
-	r.queryPrefix = os.Getenv("MESH_EMBED_QUERY_PREFIX")
-	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv("MESH_EMBED_KEY")), vm, vecs)
+	r.queryPrefix = envOr("MESH_EMBED_QUERY_PREFIX", cfg.QueryPrefix)
+	keyEnv := cfg.KeyEnv
+	if keyEnv == "" {
+		keyEnv = "MESH_EMBED_KEY"
+	}
+	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs)
+}
+
+// envOr returns the env var if set (non-empty), else the fallback.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // enableRerankFromEnv turns on the cross-encoder rerank stage when
@@ -223,14 +241,40 @@ func (r *Retriever) queryVec(query string) []float32 {
 }
 
 // EnableVectors turns on the semantic signal. It is a no-op unless the query
-// embedder's model matches the vault's stored model (homogeneity guard: vectors
-// from different models are not comparable, so we fail safe to lexical-only
-// rather than mix them).
-func (r *Retriever) EnableVectors(e embed.Embedder, model string, vecs map[string][][]float32) bool {
+// embedder's model matches the vault's stored model AND its vector width matches
+// the stored width (homogeneity guard: vectors from a different model, or even the
+// same model name at a different dimension, are not comparable. A length mismatch
+// makes every cosine return 0, which min-max then normalizes to a uniform 1 - a
+// silent garbage signal that boosts every note equally. We fail safe to
+// lexical-only rather than emit it). storedDim is the vault's recorded width; if it
+// is 0 (old vault, pre-vector_dim) we derive it from the loaded vectors.
+func (r *Retriever) EnableVectors(e embed.Embedder, model string, storedDim int, vecs map[string][][]float32) bool {
 	if e == nil || model == "" || len(vecs) == 0 || e.Model() != model {
 		return false
 	}
-	r.emb, r.vecModel, r.vecs = e, model, vecs
+	dim := storedDim
+	if dim == 0 {
+		for _, chunks := range vecs {
+			if len(chunks) > 0 && len(chunks[0]) > 0 {
+				dim = len(chunks[0])
+				break
+			}
+		}
+	}
+	// We must know the stored width to guard the query side; if we cannot determine
+	// it (no stamped dim AND only zero-length vectors), refuse rather than activate
+	// with vecDim==0, which would disable the per-query length guard and let a
+	// uniform-garbage signal through.
+	if dim == 0 {
+		return false
+	}
+	// If the embedder reports a width and it disagrees with the stored width, refuse.
+	// A 0 from Dim() means the probe failed (endpoint down); allow activation and let
+	// the per-query length guard in Retrieve catch any mismatch at retrieval time.
+	if ed := e.Dim(); ed != 0 && ed != dim {
+		return false
+	}
+	r.emb, r.vecModel, r.vecDim, r.vecs = e, model, dim, vecs
 	return true
 }
 
@@ -284,7 +328,11 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	// so a long multi-topic note still surfaces on the one section that answers
 	// the query instead of being diluted by a whole-note average.
 	if vectorsActive && wVec > 0 {
-		if qv := r.queryVec(query); qv != nil {
+		// Length guard: a query embedding whose width disagrees with the stored width
+		// would make every cosine 0, which min-max turns into a uniform 1 boosting every
+		// note equally. Skip the whole vector contribution rather than emit that garbage.
+		// vecDim is always > 0 once EnableVectors succeeds, so a mismatch is a real skip.
+		if qv := r.queryVec(query); qv != nil && r.vecDim > 0 && len(qv) == r.vecDim {
 			ids := make([]string, 0, len(r.vecs))
 			sims := make([]float64, 0, len(r.vecs))
 			for id, chunks := range r.vecs {
