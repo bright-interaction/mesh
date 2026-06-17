@@ -7,6 +7,7 @@ func (s *Server) handleResourcesList() any {
 		"resources": []map[string]any{
 			{"uri": "mesh://capabilities", "name": "Mesh capabilities", "description": "Vault stats + tool surface", "mimeType": "application/json"},
 			{"uri": "mesh://contract", "name": "Agent usage contract", "description": "How to retrieve from Mesh cheaply", "mimeType": "text/markdown"},
+			{"uri": "mesh://community", "name": "Community overview", "description": "The vault's clusters by size, each with an exemplar, for orientation", "mimeType": "application/json"},
 		},
 	}
 }
@@ -21,6 +22,10 @@ func (s *Server) handleResourcesRead(params json.RawMessage) (any, *rpcError) {
 	switch p.URI {
 	case "mesh://contract":
 		return contents(p.URI, "text/markdown", contractText), nil
+	case "mesh://community":
+		g, _ := s.snapshot()
+		b, _ := json.Marshal(map[string]any{"communities": communityOverview(g, 50)})
+		return contents(p.URI, "application/json", string(b)), nil
 	case "mesh://capabilities":
 		notes, _ := s.store.Count("notes")
 		nodes, _ := s.store.Count("nodes")
@@ -29,7 +34,7 @@ func (s *Server) handleResourcesRead(params json.RawMessage) (any, *rpcError) {
 			"server":   map[string]any{"name": serverName, "version": serverVersion},
 			"vault":    s.vaultRoot,
 			"counts":   map[string]any{"notes": notes, "nodes": nodes, "edges": edges},
-			"tools":    []string{"mesh_search", "mesh_fetch", "mesh_god_nodes", "mesh_changed_since", "mesh_append_note", "mesh_write_entity"},
+			"tools":    []string{"mesh_search", "mesh_fetch", "mesh_god_nodes", "mesh_changed_since", "mesh_neighbors", "mesh_community", "mesh_append_note", "mesh_write_entity"},
 			"contract": "mesh://contract",
 		})
 		return contents(p.URI, "application/json", string(b)), nil
