@@ -23,6 +23,7 @@
   let dpr = Math.max(1, window.devicePixelRatio || 1);
   let W = 0, H = 0;
   let galaxyAngle = 0;
+  let galaxyScale = 1;       // scales the galaxy to the graph's extent so dots match size
   let alpha = 1;             // sim energy: cools to a floor so the graph stays alive
   let neighborSet = null;
   let drag = null;           // { node, vx, vy } while dragging/flinging a node
@@ -154,10 +155,21 @@
     }
   }
   function galaxyPos(n) {
-    const r0 = n.radius0 || 0;
+    const r0 = (n.radius0 || 0) * galaxyScale;
     if (r0 === 0) return { x: 0, y: 0 };
     const a = (n.theta0 || 0) + galaxyAngle * (n.speed || 0);
     return { x: Math.cos(a) * r0, y: Math.sin(a) * r0 };
+  }
+
+  // syncGalaxyScale resizes the galaxy so its extent matches the graph's, so both
+  // views fit to the same zoom and the dots render at the same size.
+  function syncGalaxyScale() {
+    let rg = 0, rgal = 0;
+    for (const n of G.nodes) {
+      rg = Math.max(rg, Math.hypot(n.gx || 0, n.gy || 0));
+      rgal = Math.max(rgal, n.radius0 || 0);
+    }
+    if (rgal > 0 && rg > 0) galaxyScale = rg / rgal;
   }
   function pos(n) { return view === "galaxy" ? galaxyPos(n) : { x: n.gx, y: n.gy }; }
 
@@ -267,7 +279,7 @@
       const n = nodes[i];
       let px, py; // inline pos() to avoid N object allocations per frame
       if (galaxy) {
-        const r0 = n.radius0 || 0;
+        const r0 = (n.radius0 || 0) * galaxyScale;
         if (r0 === 0) { px = 0; py = 0; }
         else { const a = (n.theta0 || 0) + galaxyAngle * (n.speed || 0); px = Math.cos(a) * r0; py = Math.sin(a) * r0; }
         px += n.dispX || 0; py += n.dispY || 0; // grab/spring-back offset
@@ -544,6 +556,7 @@
     if (v === view) return;
     view = v;
     if (v === "graph") alpha = Math.max(alpha, 0.5); // re-energize the sim on return
+    else syncGalaxyScale(); // size the galaxy to the (now-settled) graph so dots match
     $("view-graph").classList.toggle("active", v === "graph");
     $("view-galaxy").classList.toggle("active", v === "galaxy");
     $("view-graph").setAttribute("aria-selected", v === "graph");
