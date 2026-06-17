@@ -29,7 +29,6 @@
   let running = true;        // rAF gate; paused when the tab is hidden
   let lastInteract = 0;      // for easing galaxy rotation to a near-stop when idle
   let labelOrder = [];       // node indices by descending importance, for ambient labels
-  let floor = null;          // centered radial floor gradient (graph view depth)
   const boxes = [];          // per-frame label rects, for the declutter pass
   let stars = [];
   const now = () => (window.performance && performance.now ? performance.now() : 0);
@@ -196,10 +195,13 @@
       a.fx += fx; a.fy += fy; b.fx -= fx; b.fy -= fy;
     }
     for (const v of nodes) { v.fx -= v.gx * 0.0011; v.fy -= v.gy * 0.0011; } // lighter gravity = spreads, less blocky
-    // Smooth perpetual flow: a near-rigid slow rotation (OMEGA, preserves the
-    // Obsidian structure as it turns) plus a small inner-faster shear (TWIST), both
-    // damping-independent so the field always flows, never freezes into quadrants.
-    const damp = 0.9, OMEGA = 0.00022, TWIST = 0.02;
+    // Smooth perpetual flow at the SAME slow pace as the galaxy: a near-rigid
+    // rotation (OMEGA, steady-state angular speed ~= OMEGA/(1-damp) matches the
+    // galaxy's ~0.0005/frame) plus a small inner-faster shear (TWIST), eased when
+    // idle exactly like the galaxy so both views drift at one cadence.
+    const idle = (now() - lastInteract) > 4000;
+    const fp = idle ? 0.43 : 1;
+    const damp = 0.9, OMEGA = 0.00005 * fp, TWIST = 0.008 * fp;
     for (const v of nodes) {
       if (drag && v === drag.node) continue;
       const r = Math.max(60, Math.sqrt(v.gx * v.gx + v.gy * v.gy));
@@ -217,7 +219,7 @@
     if (view === "graph") simStep();
     else {
       const idle = (now() - lastInteract) > 4000;
-      galaxyAngle += idle ? 0.0002 : 0.0007; // an instrument, not a screensaver
+      galaxyAngle += idle ? 0.0003 : 0.0007; // same cadence as the graph swirl; eases when idle
       const decay = (n) => {
         if (n.dispX || n.dispY) {
           n.dispX *= 0.86; n.dispY *= 0.86;
@@ -243,10 +245,9 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = "#050409";
     ctx.fillRect(0, 0, W, H);
-    if (view === "graph" && floor) { ctx.fillStyle = floor; ctx.fillRect(0, 0, W, H); }
     const z = cam.zoom, ox = W / 2 - cam.x * z, oy = H / 2 - cam.y * z;
 
-    if (view === "galaxy") drawStars(z);
+    drawStars(z); // open deep-space starfield in BOTH views (no framed floor disc)
 
     const nodes = G.nodes, N = nodes.length, galaxy = view === "galaxy";
     for (let i = 0; i < N; i++) {
@@ -554,14 +555,12 @@
     W = window.innerWidth; H = window.innerHeight;
     canvas.width = W * dpr; canvas.height = H * dpr;
     canvas.style.width = W + "px"; canvas.style.height = H + "px";
-    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.22, W / 2, H / 2, Math.max(W, H) * 0.75);
-    g.addColorStop(0, "rgba(6,5,10,0)"); g.addColorStop(1, "rgba(0,0,0,0.72)");
+    // soft, wide vignette only: a hint of depth at the far corners, NO hard frame
+    const g = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.55, W / 2, H / 2, Math.max(W, H) * 0.95);
+    g.addColorStop(0, "rgba(6,5,10,0)"); g.addColorStop(1, "rgba(0,0,0,0.34)");
     vignette = g;
-    const f = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.min(W, H) * 0.6);
-    f.addColorStop(0, "rgba(20,17,30,0.5)"); f.addColorStop(1, "rgba(5,4,9,0)");
-    floor = f;
-    stars = []; const n = Math.min(260, Math.round(W * H / 9000));
-    for (let i = 0; i < n; i++) stars.push({ x: rand(i * 7) * W, y: rand(i * 13 + 3) * H, r: rand(i * 5) > 0.85 ? 2 : 1, a: 0.08 + rand(i * 3) * 0.22 });
+    stars = []; const n = Math.min(320, Math.round(W * H / 7000));
+    for (let i = 0; i < n; i++) stars.push({ x: rand(i * 7) * W, y: rand(i * 13 + 3) * H, r: rand(i * 5) > 0.88 ? 2 : 1, a: 0.07 + rand(i * 3) * 0.2 });
   }
   function doneOverlay() { overlay.classList.add("done", "hidden"); }
   function showEmpty() { overlay.classList.add("done"); overlayMsg.textContent = "no notes indexed yet. run: mesh index"; }
