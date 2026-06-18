@@ -63,6 +63,7 @@ func rootCmd() *cobra.Command {
 		tuiCmd(),
 		uiCmd(),
 		serveSSHCmd(),
+		installCmd(),
 		orientCmd(),
 		hooksCmd(),
 		doctorCmd(),

@@ -30,11 +30,26 @@ but can only do cleanup, so the write-back nudge lives on Stop.)
 
 ## Setting it up
 
-The easiest way: just ask your agent. Once Mesh is connected over MCP, say
-"set up the Mesh session hooks" and it will call `mesh_setup_hooks`, explain the
-trade-offs, ask which project and whether to enforce write-back, and wire it in.
+### One command, then it onboards you
 
-Or do it yourself from the CLI:
+```
+mesh install /path/to/vault
+```
+
+That single command registers the Mesh MCP server (`.mcp.json`), installs the
+SessionStart read hook, and arms a one-time welcome. Start a new agent session and
+**the agent greets you and finishes onboarding itself**, no further commands: it
+explains the flywheel, asks whether to enable the write-back nudge, and offers a
+quick tour. Add `--enforce-writeback` to also turn on the Stop nudge up front, or
+`--no-mcp` if your MCP server is already registered.
+
+### Or let the agent do all of it
+
+If Mesh is already connected over MCP, just say "set up the Mesh session hooks" and
+it calls `mesh_setup_hooks`, explains the trade-offs, asks which project and whether
+to enforce write-back, and wires it in.
+
+### Or the explicit CLI
 
 ```
 mesh hooks install /path/to/vault                 # read at start + nudge write-back
@@ -43,9 +58,9 @@ mesh hooks install /path/to/vault --dry-run       # preview the settings.json fi
 mesh hooks uninstall                              # remove them
 ```
 
-It merges into the project's `.claude/settings.json` (it never clobbers your other
-settings and is safe to run twice). After installing, run `/hooks` in Claude Code
-to verify and start a new session.
+All of these merge into the project's `.claude/settings.json` (they never clobber
+your other settings and are safe to run twice). After installing, run `/hooks` in
+Claude Code to verify and start a new session.
 
 ## Read-only vs enforce write-back
 

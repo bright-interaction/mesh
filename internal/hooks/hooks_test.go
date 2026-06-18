@@ -68,6 +68,46 @@ func TestReadOnlyInstall(t *testing.T) {
 	}
 }
 
+func TestInstallMCPIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	// pre-existing unrelated server must be preserved.
+	os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(`{"mcpServers":{"other":{"command":"x"}}}`), 0o644)
+	added, p, err := InstallMCP(dir, "/v", "/bin/mesh")
+	if err != nil || !added {
+		t.Fatalf("first InstallMCP added=%v err=%v", added, err)
+	}
+	data, _ := os.ReadFile(p)
+	var cfg map[string]any
+	json.Unmarshal(data, &cfg)
+	servers := cfg["mcpServers"].(map[string]any)
+	if servers["other"] == nil {
+		t.Error("existing mcp server was dropped")
+	}
+	if servers["mesh"] == nil {
+		t.Error("mesh server was not registered")
+	}
+	added2, _, _ := InstallMCP(dir, "/v", "/bin/mesh")
+	if added2 {
+		t.Error("re-registering should be a no-op")
+	}
+}
+
+func TestOnboardMarkerConsumeOnce(t *testing.T) {
+	vault := t.TempDir()
+	if ConsumeOnboardPending(vault) {
+		t.Error("no marker yet: consume should be false")
+	}
+	if err := SetOnboardPending(vault); err != nil {
+		t.Fatal(err)
+	}
+	if !ConsumeOnboardPending(vault) {
+		t.Error("after SetOnboardPending, first consume should be true")
+	}
+	if ConsumeOnboardPending(vault) {
+		t.Error("second consume should be false (fires exactly once)")
+	}
+}
+
 func TestDryRunWritesNothing(t *testing.T) {
 	dir := t.TempDir()
 	o := opts(dir, true)

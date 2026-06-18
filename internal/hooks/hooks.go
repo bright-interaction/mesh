@@ -153,6 +153,59 @@ func Uninstall(projectDir string) (int, string, error) {
 	return removed, p, nil
 }
 
+// InstallMCP registers the Mesh MCP server in the project's .mcp.json so the agent
+// gets the mesh-* tools without any manual config. Idempotent; preserves other
+// servers. Returns whether it added the entry.
+func InstallMCP(projectDir, vaultAbs, binPath string) (bool, string, error) {
+	p := filepath.Join(projectDir, ".mcp.json")
+	cfg := map[string]any{}
+	if data, err := os.ReadFile(p); err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return false, p, fmt.Errorf("existing %s is not valid JSON: %w", p, err)
+		}
+	}
+	servers, _ := cfg["mcpServers"].(map[string]any)
+	if servers == nil {
+		servers = map[string]any{}
+	}
+	if _, exists := servers["mesh"]; exists {
+		return false, p, nil
+	}
+	servers["mesh"] = map[string]any{
+		"command": binPath,
+		"args":    []any{"mcp", "--vault", vaultAbs, "--watch"},
+	}
+	cfg["mcpServers"] = servers
+	out, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(p, append(out, '\n'), 0o644); err != nil {
+		return false, p, err
+	}
+	return true, p, nil
+}
+
+func onboardMarker(vaultRoot string) string { return filepath.Join(vaultRoot, ".mesh", "onboard") }
+
+// SetOnboardPending arms a one-time welcome: the next SessionStart orient prepends an
+// onboarding instruction so the agent greets the user and finishes setup itself.
+func SetOnboardPending(vaultRoot string) error {
+	p := onboardMarker(vaultRoot)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(p, []byte("1"), 0o644)
+}
+
+// ConsumeOnboardPending returns true at most once (clearing the marker), so the
+// welcome fires on exactly the first session after install.
+func ConsumeOnboardPending(vaultRoot string) bool {
+	p := onboardMarker(vaultRoot)
+	if _, err := os.Stat(p); err != nil {
+		return false
+	}
+	_ = os.Remove(p)
+	return true
+}
+
 // GetStatus reports whether the hooks are installed in a project.
 func GetStatus(projectDir string) (Status, error) {
 	settings, p, err := load(projectDir)
