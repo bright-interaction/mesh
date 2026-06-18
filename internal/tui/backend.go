@@ -6,6 +6,7 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -87,7 +88,7 @@ func (b *LocalBackend) Notes() []NoteRef {
 
 // Search runs the same fused retrieval the agent's mesh_search uses.
 func (b *LocalBackend) Search(query string) ([]retrieve.Card, error) {
-	return b.rtr.Retrieve(query, retrieve.Options{Limit: 30})
+	return b.rtr.Retrieve(context.Background(), query, retrieve.Options{Limit: 30})
 }
 
 // Note reads a note's markdown and its typed neighbors (in + out, headings and

@@ -188,7 +188,7 @@ func searchCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cards, err := retrieve.NewFromEnv(store, g).Retrieve(strings.Join(args, " "), retrieve.Options{Limit: limit, Budget: budget})
+			cards, err := retrieve.NewFromEnv(store, g).Retrieve(cmd.Context(), strings.Join(args, " "), retrieve.Options{Limit: limit, Budget: budget})
 			if err != nil {
 				return err
 			}

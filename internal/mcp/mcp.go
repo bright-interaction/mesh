@@ -171,7 +171,7 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	case "tools/list":
 		return s.handleToolsList(), nil
 	case "tools/call":
-		return s.handleToolsCall(req.Params)
+		return s.handleToolsCall(ctx, req.Params)
 	case "resources/list":
 		return s.handleResourcesList(), nil
 	case "resources/read":

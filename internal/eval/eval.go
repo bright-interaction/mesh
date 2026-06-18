@@ -8,6 +8,7 @@
 package eval
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -69,7 +70,7 @@ func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases 
 		}
 
 		fts, _ := store.Search(c.Query, surfaceK)
-		cards, _ := r.Retrieve(c.Query, retrieve.Options{Budget: budget})
+		cards, _ := r.Retrieve(context.Background(), c.Query, retrieve.Options{Budget: budget})
 
 		cr := CaseResult{Query: c.Query}
 

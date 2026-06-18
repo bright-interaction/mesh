@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"context"
 	"math"
 
 	"github.com/bright-interaction/mesh/internal/retrieve"
@@ -33,7 +34,7 @@ func scoreWeights(r *retrieve.Retriever, cases []Case, w WeightSet) Score {
 		for _, id := range c.Relevant {
 			want["note:"+id] = true
 		}
-		cards, _ := r.Retrieve(c.Query, retrieve.Options{
+		cards, _ := r.Retrieve(context.Background(), c.Query, retrieve.Options{
 			Limit:       surfaceK,
 			NoRerank:    true,
 			WeightFTS:   w.FTS,

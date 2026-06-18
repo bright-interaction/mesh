@@ -125,7 +125,7 @@ func buildVault(t *testing.T) *Retriever {
 
 func TestRetrieveFusesAndBoostsTier0(t *testing.T) {
 	r := buildVault(t)
-	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestRetrieveExpandsAlongReferences(t *testing.T) {
 	r := buildVault(t)
 	// "storage" hits a; a references b. Expansion should surface b even though
 	// "storage" is not in b's text.
-	cards, err := r.Retrieve("storage", Options{Limit: 10})
+	cards, err := r.Retrieve(context.Background(), "storage", Options{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestEnableVectorsHomogeneityGuard(t *testing.T) {
 		t.Error("guard must reject when there are no stored vectors")
 	}
 	// With vectors enabled, retrieval still works end to end.
-	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if err != nil || len(cards) == 0 {
 		t.Fatalf("retrieve with vectors enabled failed: err=%v cards=%d", err, len(cards))
 	}
@@ -274,7 +274,7 @@ func TestEnableVectorsDerivesDimFromVectors(t *testing.T) {
 
 func TestRerankReordersHead(t *testing.T) {
 	r := buildVault(t)
-	base, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	base, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if err != nil || len(base) < 2 {
 		t.Fatalf("precondition: need multiple fused cards, got %d (err %v)", len(base), err)
 	}
@@ -283,7 +283,7 @@ func TestRerankReordersHead(t *testing.T) {
 	}
 	// The reranker prefers the note whose text mentions "extensions" (note:b).
 	r.EnableRerank(fakeReranker{needle: "extensions"})
-	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,9 +297,9 @@ func TestRerankReordersHead(t *testing.T) {
 
 func TestRerankDegradesOnError(t *testing.T) {
 	r := buildVault(t)
-	base, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	base, _ := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	r.EnableRerank(errReranker{})
-	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if err != nil {
 		t.Fatalf("a failing reranker must not fail retrieval: %v", err)
 	}
@@ -310,9 +310,9 @@ func TestRerankDegradesOnError(t *testing.T) {
 
 func TestRerankConstantScoresKeepFusedOrder(t *testing.T) {
 	r := buildVault(t)
-	base, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	base, _ := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	r.EnableRerank(constReranker{})
-	cards, err := r.Retrieve("sqlite storage", Options{Limit: 10})
+	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,13 +327,13 @@ func TestRerankBlendKnobSpansPureFusedToPureRerank(t *testing.T) {
 	r.EnableRerank(fakeReranker{needle: "extensions"}) // prefers note:b
 	// alpha=1.0: cross-encoder owns the head, note:b wins.
 	r.rerankBlend = 1.0
-	pure, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	pure, _ := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if len(pure) == 0 || pure[0].NodeID != "note:b" {
 		t.Errorf("alpha=1 (pure rerank) should put the reranked note first, got %v", topID(pure))
 	}
 	// alpha=0.0: the blend collapses to the fused score, restoring fused top note:a.
 	r.rerankBlend = 0.0
-	fused, _ := r.Retrieve("sqlite storage", Options{Limit: 10})
+	fused, _ := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
 	if len(fused) == 0 || fused[0].NodeID != "note:a" {
 		t.Errorf("alpha=0 (pure fused) should restore the fused top note:a, got %v", topID(fused))
 	}
@@ -348,12 +348,12 @@ func topID(cards []Card) string {
 
 func TestRetrieveBudgetPacking(t *testing.T) {
 	r := buildVault(t)
-	all, _ := r.Retrieve("sqlite modernc storage", Options{Limit: 10})
+	all, _ := r.Retrieve(context.Background(), "sqlite modernc storage", Options{Limit: 10})
 	if len(all) < 2 {
 		t.Skip("need multiple cards to test packing")
 	}
 	tiny := cardTokens(all[0]) + 1
-	packed, err := r.Retrieve("sqlite modernc storage", Options{Limit: 10, Budget: tiny})
+	packed, err := r.Retrieve(context.Background(), "sqlite modernc storage", Options{Limit: 10, Budget: tiny})
 	if err != nil {
 		t.Fatal(err)
 	}
