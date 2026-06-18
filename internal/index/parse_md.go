@@ -39,6 +39,7 @@ type ParsedNote struct {
 	Headings []Heading
 	Links    []Link
 	Tags     []Tag
+	Mtime    int64 // file modification time (unix seconds); set by ParseFile from the on-disk file, 0 for byte-only Parse
 }
 
 // Issue is a non-fatal problem found while parsing or building the graph.
@@ -72,7 +73,19 @@ func ParseFile(path string) (*ParsedNote, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Parse(path, data)
+	pn, err := Parse(path, data)
+	if err != nil {
+		return nil, err
+	}
+	// Capture mtime from the file we just read (path is the real, usually absolute,
+	// path here), so the stored mtime is correct regardless of the process CWD. The
+	// old fileMtime(pn.Path) stat'd the vault-relative path and returned 0 whenever
+	// mesh ran outside the vault root - which is the normal MCP case (an agent spawns
+	// `mesh mcp --vault <abs>` from its own dir) - silently breaking mesh_changed_since.
+	if fi, err := os.Stat(path); err == nil {
+		pn.Mtime = fi.ModTime().Unix()
+	}
+	return pn, nil
 }
 
 // Parse extracts the deterministic structure of a markdown document. Wikilinks

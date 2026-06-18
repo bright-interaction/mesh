@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"os"
 	"regexp"
 	"strings"
 
@@ -149,7 +148,7 @@ func noteRowValues(pn *ParsedNote) (id, title, fmJSON, updated string, mtime int
 	if pn.FM.Updated != "" {
 		updated = pn.FM.Updated
 	}
-	mtime = fileMtime(pn.Path)
+	mtime = pn.Mtime // captured by ParseFile from the on-disk file (CWD-independent)
 	return id, title, fmJSON, updated, mtime, nil
 }
 
@@ -211,14 +210,6 @@ func titleOf(pn *ParsedNote) string {
 		return pn.FM.Title
 	}
 	return pn.Key
-}
-
-func fileMtime(path string) int64 {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return fi.ModTime().Unix()
 }
 
 // RetrievalHash is the exported retrieval hash for a parsed note: it is what the
