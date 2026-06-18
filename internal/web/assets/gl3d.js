@@ -82,8 +82,9 @@
   layout(location=2) in float iSize;
   layout(location=3) in vec3 iColor;
   layout(location=4) in float iFlag;
+  layout(location=5) in float iComm;
   uniform mat4 uProj, uView;
-  uniform float uHi, uTime, uSpinTime, uSizeMul, uTwinkle, uOmega;
+  uniform float uHi, uTime, uSpinTime, uSizeMul, uTwinkle, uOmega, uSpotComm;
   out vec2 vUV; out vec3 vColor; out float vGlow; out float vViewZ;
   ${SPIN_GLSL}
   void main(){
@@ -100,6 +101,7 @@
     vUV = corner;
     vColor = sun ? mix(iColor, vec3(1.0, 0.96, 0.86), 0.78) : iColor;
     vGlow = (sun ? 1.9 : (hi ? 1.7 : 1.0)) * tw;
+    if (uSpotComm >= 0.0 && abs(iComm - uSpotComm) > 0.5) vGlow *= 0.10; // legend spotlight dims the rest
     vViewZ = -vp.z;
   }`;
 
@@ -185,7 +187,7 @@
     if (!sprite || !line) return null;
 
     const su = {};
-    ["uProj", "uView", "uHi", "uTime", "uSpinTime", "uSizeMul", "uTwinkle", "uSoft", "uHalo", "uIntensity", "uFog", "uCamDist", "uOmega"].forEach((n) => (su[n] = gl.getUniformLocation(sprite, n)));
+    ["uProj", "uView", "uHi", "uTime", "uSpinTime", "uSizeMul", "uTwinkle", "uSoft", "uHalo", "uIntensity", "uFog", "uCamDist", "uOmega", "uSpotComm"].forEach((n) => (su[n] = gl.getUniformLocation(sprite, n)));
     const lu = {};
     ["uProj", "uView", "uCamDist", "uSpinTime", "uOmega"].forEach((n) => (lu[n] = gl.getUniformLocation(line, n)));
 
@@ -213,9 +215,10 @@
       return [Math.cos(theta) * radius, cy, Math.sin(theta) * radius];
     }
 
-    const pos = new Float32Array(N * 3), size = new Float32Array(N), color = new Float32Array(N * 3), flag = new Float32Array(N);
+    const pos = new Float32Array(N * 3), size = new Float32Array(N), color = new Float32Array(N * 3), flag = new Float32Array(N), comm = new Float32Array(N);
     for (let i = 0; i < N; i++) {
       const n = nodes[i];
+      comm[i] = n.community || 0;
       const isSun = n.id === indexId;
       let x, y, z;
       if (isSun) { x = 0; y = 0; z = 0; }
@@ -248,6 +251,12 @@
       return vao;
     }
     const nodeVAO = makeSprites(pos, size, color, flag);
+    // node-only per-instance community (location 5) so the legend can spotlight a cluster.
+    let spotComm = -1;
+    gl.bindVertexArray(nodeVAO);
+    const cb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cb); gl.bufferData(gl.ARRAY_BUFFER, comm, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 1, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(5, 1);
+    gl.bindVertexArray(null);
 
     // fullscreen quad VAO (for the bloom passes)
     const fsVAO = gl.createVertexArray();
@@ -467,6 +476,7 @@
     canvas.addEventListener("wheel", onWheel, { passive: false });
 
     function setHighlight(id) { hi = (id != null && idIndex.has(id)) ? idIndex.get(id) : -1; }
+    function setSpotlight(commId) { spotComm = (commId == null) ? -1 : commId; } // legend cluster spotlight
 
     // Fly the camera into a note and lock onto it (the disc spin freezes so the note
     // stays put while you read). clearFocus eases back out and resumes the spin.
@@ -487,7 +497,7 @@
       gl.uniform1f(su.uSoft, o.soft); gl.uniform1f(su.uHalo, o.halo || 0);
       gl.uniform1f(su.uIntensity, o.intensity); gl.uniform1f(su.uTwinkle, o.twinkle || 0);
       gl.uniform1f(su.uFog, o.fog || 0); gl.uniform1f(su.uHi, o.hi == null ? -1 : o.hi);
-      gl.uniform1f(su.uOmega, o.omega || 0);
+      gl.uniform1f(su.uOmega, o.omega || 0); gl.uniform1f(su.uSpotComm, o.spot == null ? -1 : o.spot);
     }
     function drawLayer(vao, count, o) { setLayer(o); gl.bindVertexArray(vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count); }
 
@@ -516,7 +526,7 @@
 
       drawLayer(coronaVAO, CORO, { soft: 1.2, intensity: 1.0, fog: 0.0, omega: 0 });
       drawLayer(bulgeVAO, BULGE, { soft: 4.0, halo: 0.1, intensity: 0.8, twinkle: 0.6, fog: 0.3, omega: SPIN });
-      drawLayer(nodeVAO, N, { soft: 5.0, halo: 0.3, intensity: 1.3, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN });
+      drawLayer(nodeVAO, N, { soft: 5.0, halo: 0.3, intensity: 1.3, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm });
       gl.bindVertexArray(null);
     }
 
@@ -587,7 +597,7 @@
       const ext = gl.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext();
     }
 
-    return { frame, resize, dispose, setHighlight, focusNode, clearFocus, setData() {} };
+    return { frame, resize, dispose, setHighlight, setSpotlight, focusNode, clearFocus, setData() {} };
   }
 
   window.Mesh3D = { init };
