@@ -66,8 +66,8 @@ func TestInitializeAndToolsList(t *testing.T) {
 	}
 	list := call(t, s, "tools/list", map[string]any{})
 	tools, _ := list["tools"].([]map[string]any)
-	if len(tools) != 8 {
-		t.Errorf("expected 8 tools, got %d", len(tools))
+	if len(tools) != 9 {
+		t.Errorf("expected 9 tools, got %d", len(tools))
 	}
 }
 
@@ -128,4 +128,62 @@ func TestToolWriteBackReindexes(t *testing.T) {
 func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// TestReindexPicksUpDirectFileEdit covers the IDE/CLI collaboration loop: an agent
+// edits a note file directly (not via mesh_append_note), so the running server is
+// stale until mesh_reindex forces a re-read. After reindex the new note is queryable.
+func TestReindexPicksUpDirectFileEdit(t *testing.T) {
+	s := newTestServer(t)
+	dir := s.vaultRoot
+
+	// A brand-new note written straight to disk, as the Edit tool would.
+	if err := os.WriteFile(filepath.Join(dir, "decisions", "hnsw.md"),
+		[]byte("---\nid: hnsw\ntype: decision\nwhen: 2026-02-02\ndo: gate it\ndont: always build\nwhy: pure-go hnsw ann index for large vault retrieval\n---\n# HNSW\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before reindex: the server has not seen the file.
+	out := toolText(t, call(t, s, "tools/call", map[string]any{
+		"name": "mesh_search", "arguments": map[string]any{"query": "hnsw ann index"}}))
+	for _, c := range asCards(out) {
+		if c["NodeID"] == "note:hnsw" {
+			t.Fatal("server should be stale before mesh_reindex")
+		}
+	}
+
+	// Reindex, then it must be found.
+	r := toolText(t, call(t, s, "tools/call", map[string]any{"name": "mesh_reindex", "arguments": map[string]any{}}))
+	if r["reindexed"] != true || r["added"].(float64) != 1 {
+		t.Fatalf("reindex should report 1 added, got %v", r)
+	}
+	out = toolText(t, call(t, s, "tools/call", map[string]any{
+		"name": "mesh_search", "arguments": map[string]any{"query": "hnsw ann index"}}))
+	found := false
+	for _, c := range asCards(out) {
+		if c["NodeID"] == "note:hnsw" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("note must be retrievable after mesh_reindex")
+	}
+
+	// Idempotent: a second reindex with no change reports nothing added.
+	r2 := toolText(t, call(t, s, "tools/call", map[string]any{"name": "mesh_reindex", "arguments": map[string]any{}}))
+	if r2["added"].(float64) != 0 || r2["changed"].(float64) != 0 || r2["removed"].(float64) != 0 {
+		t.Fatalf("second reindex should be a no-op, got %v", r2)
+	}
+}
+
+func asCards(out map[string]any) []map[string]any {
+	raw, _ := out["cards"].([]any)
+	var cards []map[string]any
+	for _, c := range raw {
+		if m, ok := c.(map[string]any); ok {
+			cards = append(cards, m)
+		}
+	}
+	return cards
 }

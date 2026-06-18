@@ -37,7 +37,7 @@ func (s *Server) handleResourcesRead(params json.RawMessage) (any, *rpcError) {
 			"server":   map[string]any{"name": serverName, "version": serverVersion},
 			"vault":    s.vaultRoot,
 			"counts":   map[string]any{"notes": notes, "nodes": nodes, "edges": edges},
-			"tools":    []string{"mesh_search", "mesh_fetch", "mesh_god_nodes", "mesh_changed_since", "mesh_neighbors", "mesh_community", "mesh_append_note", "mesh_write_entity"},
+			"tools":    []string{"mesh_search", "mesh_fetch", "mesh_god_nodes", "mesh_changed_since", "mesh_neighbors", "mesh_community", "mesh_append_note", "mesh_write_entity", "mesh_reindex"},
 			"contract": "mesh://contract",
 			"stats":    "mesh://stats",
 		})
