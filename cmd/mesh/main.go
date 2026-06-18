@@ -21,6 +21,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/sshserve"
 	"github.com/bright-interaction/mesh/internal/tui"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/bright-interaction/mesh/internal/watch"
@@ -61,6 +62,7 @@ func rootCmd() *cobra.Command {
 		curatorCmd(),
 		tuiCmd(),
 		uiCmd(),
+		serveSSHCmd(),
 		doctorCmd(),
 	)
 	return root
@@ -1167,6 +1169,41 @@ func short8(s string) string {
 		return "(none)"
 	}
 	return s
+}
+
+func serveSSHCmd() *cobra.Command {
+	var addr, hostKey, authKeys string
+	var allowAnon bool
+	c := &cobra.Command{
+		Use:   "serve-ssh [vault]",
+		Short: "Serve the TUI over SSH (ssh into your knowledge graph, no local install)",
+		Long: "Run an SSH server that hands every connection the Mesh TUI over the same index the agent uses, " +
+			"so a teammate browses the graph with `ssh -p <port> <host>` and no Mesh install. Read-only. " +
+			"Auth is fail-closed: pass --authorized-keys (OpenSSH format) and only those keys may connect; " +
+			"--allow-anonymous opts out for a localhost demo.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			vaultDir := vaultArg(args)
+			if hostKey == "" {
+				hostKey = filepath.Join(vaultDir, ".mesh", "ssh_host_ed25519_key")
+			}
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			logf := func(format string, a ...any) {
+				fmt.Printf("%s  "+format+"\n", append([]any{time.Now().Format("15:04:05")}, a...)...)
+			}
+			err := sshserve.Serve(ctx, vaultDir, sshserve.Options{
+				Addr: addr, HostKeyPath: hostKey, AuthKeysPath: authKeys, AllowAnon: allowAnon, Logf: logf,
+			})
+			fmt.Println("stopped.")
+			return err
+		},
+	}
+	c.Flags().StringVar(&addr, "addr", ":2222", "listen address")
+	c.Flags().StringVar(&hostKey, "host-key", "", "host key path (default <vault>/.mesh/ssh_host_ed25519_key; generated if missing)")
+	c.Flags().StringVar(&authKeys, "authorized-keys", "", "OpenSSH authorized_keys file; only these public keys may connect (required unless --allow-anonymous)")
+	c.Flags().BoolVar(&allowAnon, "allow-anonymous", false, "DANGER: serve with no auth (localhost demos only)")
+	return c
 }
 
 func tuiCmd() *cobra.Command {
