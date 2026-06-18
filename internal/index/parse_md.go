@@ -211,7 +211,7 @@ func isTagRune(r rune) bool {
 // raised so `mesh migrate` can fix it). Wikilinks resolve by basename to the
 // target note's id, so edges survive a file rename (spec section 3.6).
 func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
-	g := graph.New()
+	g := graph.NewSized(len(notes))
 	var issues []Issue
 
 	idByKey := make(map[string]string, len(notes))

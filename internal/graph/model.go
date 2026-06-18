@@ -46,12 +46,27 @@ type Graph struct {
 	edgeSet map[string]bool
 }
 
-func New() *Graph {
+func New() *Graph { return NewSized(0) }
+
+// NewSized preallocates the maps for a graph expected to hold about n notes. A
+// note contributes roughly one note node plus a handful of heading/tag nodes and
+// edges, so the hints below avoid the repeated rehashing that dominates a
+// from-scratch rebuild of a large vault. Hints are advisory; the graph still grows
+// past them. n <= 0 builds with no hint (the small-vault default).
+func NewSized(n int) *Graph {
+	if n <= 0 {
+		return &Graph{
+			nodes:   make(map[string]*Node),
+			adj:     make(map[string][]Edge),
+			rev:     make(map[string][]Edge),
+			edgeSet: make(map[string]bool),
+		}
+	}
 	return &Graph{
-		nodes:   make(map[string]*Node),
-		adj:     make(map[string][]Edge),
-		rev:     make(map[string][]Edge),
-		edgeSet: make(map[string]bool),
+		nodes:   make(map[string]*Node, n*3),
+		adj:     make(map[string][]Edge, n*2),
+		rev:     make(map[string][]Edge, n*2),
+		edgeSet: make(map[string]bool, n*3),
 	}
 }
 
