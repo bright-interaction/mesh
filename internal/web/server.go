@@ -57,6 +57,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/reindex", s.handleReindex)
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/note/{id}", s.handleNote)
+	mux.HandleFunc("GET /api/docs", s.handleDocsList)
+	mux.HandleFunc("GET /api/docs/{slug}", s.handleDoc)
 	return s.auth.guard(mux)
 }
 

@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/ssh v0.0.0-20250826160808-ebfa259c7309
 	github.com/charmbracelet/wish v1.4.7
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/gomarkdown/markdown v0.0.0-20260614204949-e08cff860f76
 	github.com/spf13/cobra v1.8.1
 	github.com/tiktoken-go/tokenizer v0.8.0
 	gopkg.in/yaml.v3 v3.0.1

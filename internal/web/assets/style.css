@@ -492,6 +492,45 @@ body.panel-active #stage3d { display: none; }
 .note-body { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 22px 24px; }
 .note-md { font-family: var(--mono); font-size: 12.5px; color: var(--fg); white-space: pre-wrap; word-break: break-word; margin: 0; line-height: 1.6; }
 
+/* ---- docs ---- */
+.docs-layout { display: flex; gap: 40px; align-items: flex-start; }
+.docs-nav { flex: none; width: 180px; position: sticky; top: 56px; display: flex; flex-direction: column; gap: 1px; }
+.docs-nav .docs-link {
+  text-align: left; font-family: var(--sans); font-size: 13px; color: var(--muted);
+  background: transparent; border: 0; border-radius: 8px; padding: 8px 10px; cursor: pointer;
+  transition: color .15s, background .15s;
+}
+.docs-nav .docs-link:hover { color: var(--fg); background: var(--bg-2); }
+.docs-nav .docs-link.active { color: var(--fg); background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--border); }
+.docs-content { flex: 1; min-width: 0; }
+
+/* prose: rendered markdown */
+.prose { color: var(--fg); font-size: 15px; line-height: 1.7; max-width: 70ch; }
+.prose h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 18px; }
+.prose h2 { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; margin: 32px 0 12px; }
+.prose h3 { font-size: 15px; font-weight: 600; margin: 22px 0 8px; }
+.prose p { color: var(--muted); margin: 0 0 14px; }
+.prose a { color: var(--fg); text-decoration: underline; text-decoration-color: var(--border-strong); text-underline-offset: 2px; }
+.prose a:hover { text-decoration-color: var(--fg); }
+.prose strong { color: var(--fg); font-weight: 600; }
+.prose ul, .prose ol { color: var(--muted); margin: 0 0 14px; padding-left: 22px; }
+.prose li { margin: 4px 0; }
+.prose code {
+  font-family: var(--mono); font-size: 12.5px; color: var(--fg);
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px;
+}
+.prose pre {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; overflow-x: auto; margin: 0 0 16px;
+}
+.prose pre code { background: none; border: 0; padding: 0; font-size: 12.5px; }
+
+@media (max-width: 720px) {
+  .docs-layout { flex-direction: column; gap: 18px; }
+  .docs-nav { width: 100%; position: static; flex-direction: row; flex-wrap: wrap; }
+}
+
 @media (max-width: 640px) {
   .search input { width: 130px; }
   .search input:focus { width: 160px; }
