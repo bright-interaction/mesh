@@ -85,6 +85,13 @@ export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
 mesh status my-vault    # shows which retrieval signals are active
 ```
 
+For a very large vault, set `MESH_HNSW_THRESHOLD=<N>` to build an in-memory HNSW
+(approximate-nearest-neighbour) index once the vault has at least N chunk vectors,
+replacing the brute-force cosine scan. It is off by default (brute force is
+sub-5ms well past a few thousand notes) and falls back to brute force on any build
+error, so it can only ever speed up retrieval. `mesh status` shows `ANN/hnsw` when
+it is active.
+
 Once set, `mesh search` / `eval` / `mcp` fuse the semantic signal and apply the
 rerank automatically. Both degrade safely: no embedder means lexical-only, a
 down rerank endpoint falls back to the fused order. Pointing either env var at a

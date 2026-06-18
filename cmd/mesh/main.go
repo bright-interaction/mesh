@@ -594,6 +594,9 @@ func statusCmd() *cobra.Command {
 				if stale > 0 {
 					fmt.Printf(", %d stale - run mesh embed to refresh", stale)
 				}
+				if r.HNSWActive() {
+					fmt.Print(", ANN/hnsw")
+				}
 				fmt.Println(")")
 			} else if total > 0 {
 				fmt.Println("  vectors      stored but query embedder not configured (re-run mesh embed, or set MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL)")
