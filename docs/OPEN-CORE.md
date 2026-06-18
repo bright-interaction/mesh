@@ -15,7 +15,7 @@ The whole single-user + hub-client experience:
 
 - `cmd/mesh`: the CLI (`index`, `search`, `mcp`, `tui`, `ui`, `watch`, `join`, `sync`, `doctor`, `tune`, `migrate`).
 - `internal/vault`, `internal/index`, `internal/graph`: parse, the in-memory graph, Louvain communities.
-- `internal/retrieve`, `internal/rerank`, `internal/embed`, `internal/tokenize`, `internal/hnsw`: fused FTS + graph-BM25 + BYOAI vectors/rerank retrieval, with the (gated, off-by-default) ANN index. HNSW stays open: it is a known algorithm and gating it would add no defensible value.
+- `internal/retrieve`, `internal/rerank`, `internal/embed`, `internal/tokenize`: fused FTS + graph-BM25 + BYOAI vectors/rerank retrieval. The open core uses brute-force cosine for the vector signal (sub-5ms well past v1 scale).
 - `internal/mcp`: the agent retrieval + write-back surface (read tools, `mesh_append_note`/`mesh_write_entity`, `mesh_reindex`).
 - `internal/web`, `internal/tui`, `internal/sshserve`: the 2D/3D viewers, the terminal UI, and the SSH viewer (`mesh serve-ssh`: the TUI over SSH, key-auth, fail-closed).
 - `internal/merge`, `internal/syncproto`, `pkg/meshclient`: the sync **client** and wire protocol, so the open core can join a hub.
@@ -27,13 +27,17 @@ The collaboration server and the AI layer, the monetized value:
 
 - `internal/hub`, `cmd/mesh-hub`: the team-sync hub server (the durable moat: a managed/licensed service, not code value).
 - `internal/curator`, `cmd/mesh-curator`, `internal/llm`: the BYOAI sync-curator (AI conflict merge).
-- Future: cross-vault federation, team-scale (1000+ file) collaboration analytics, pro graph functions. These belong here, behind the service/license, not as a flag in the open binary.
+- `internal/hnsw` + `internal/retrieve/retrieve_ann_pro.go`: the HNSW ANN index, the "1000+ vectors" scale gate. The core has a build-tag seam (`annSearcher`/`buildANN`, nil in the open build) so it compiles brute-force-only; the pro build wires HNSW with `-tags pro`. This is gated by ABSENCE (the impl is stripped from the mirror), not a removable flag.
+- Future: cross-vault federation, team-scale collaboration analytics, pro graph functions. These belong here, behind the service/license, not as a flag in the open binary.
 
 Authoritative exclude set for the public mirror:
 
 ```
 internal/hub  cmd/mesh-hub  internal/curator  cmd/mesh-curator  internal/llm
+internal/hnsw  internal/retrieve/retrieve_ann_pro.go  internal/retrieve/retrieve_ann_pro_test.go
 ```
+
+The pro binaries build with `-tags pro` (wires HNSW); the open mirror builds with the default tags (brute-force only).
 
 ## How the public mirror is produced
 

@@ -12,7 +12,6 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/graph"
-	"github.com/bright-interaction/mesh/internal/hnsw"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/rerank"
@@ -74,7 +73,7 @@ type Retriever struct {
 	vecModel    string
 	vecDim      int                    // stored embedding width; pins the space (query embeddings of any other width are rejected, never silently cosined to a uniform 0)
 	vecs        map[string][][]float32 // node id -> per-section chunk vectors
-	hnsw        *hnsw.Index            // optional ANN index over vecs; nil => brute-force cosine scan
+	ann         annSearcher            // optional ANN index over vecs; nil => brute-force cosine scan
 	hnswGate    int                    // build hnsw only when chunk count >= this; 0 => never (brute force)
 	queryPrefix string                 // e.g. "search_query: " for nomic-style asymmetric models
 
@@ -206,8 +205,29 @@ func (r *Retriever) VectorsActive() bool { return r.emb != nil && len(r.vecs) > 
 func (r *Retriever) VectorModel() string { return r.vecModel }
 
 // HNSWActive reports whether the ANN index is built and serving the vector signal
-// (vs the brute-force scan). Only true past the configured MESH_HNSW_THRESHOLD.
-func (r *Retriever) HNSWActive() bool { return r.hnsw != nil }
+// (vs the brute-force scan). Only true past the configured MESH_HNSW_THRESHOLD,
+// and only in the pro build (the open core has no ANN implementation wired).
+func (r *Retriever) HNSWActive() bool { return r.ann != nil }
+
+// annResult is one ANN hit. It mirrors the (pro-only) hnsw.Result shape but lives
+// here so the open core compiles without importing the hnsw package.
+type annResult struct {
+	NodeID  string
+	ChunkIx int
+	Score   float64
+}
+
+// annSearcher is the optional approximate-nearest-neighbour seam. The open core
+// ships no implementation (brute-force cosine only); the pro build wires HNSW by
+// setting buildANN (see retrieve_ann_pro.go, //go:build pro).
+type annSearcher interface {
+	Search(q []float32, k, ef int) []annResult
+}
+
+// buildANN constructs the ANN index from the per-node vectors. nil in the open
+// core (brute-force always); set by the pro build. On any error the caller keeps
+// the brute-force scan, so the ANN path can only speed up, never break, retrieval.
+var buildANN func(byNode map[string][][]float32) (annSearcher, error)
 
 // resolveWeights picks the fusion weights: explicit Options weights win; else the
 // learned/operator defaults (SetWeights / env); else the built-in defaults. The
@@ -287,17 +307,19 @@ func (r *Retriever) EnableVectors(e embed.Embedder, model string, storedDim int,
 		return false
 	}
 	r.emb, r.vecModel, r.vecDim, r.vecs = e, model, dim, vecs
-	// Optional ANN index for large vaults. Off unless hnswGate is set; on any build
-	// error the brute-force scan stays (r.hnsw nil), so this can only speed up, never
-	// break, retrieval. Built from the same vecs map, so the vectors are identical.
-	if r.hnswGate > 0 {
+	// Optional ANN index for large vaults (pro build only). Off unless hnswGate is
+	// set AND a buildANN implementation is wired; on any build error the brute-force
+	// scan stays (r.ann nil), so this can only speed up, never break, retrieval.
+	// Built from the same vecs map, so the vectors are identical. In the open core
+	// buildANN is nil, so retrieval is always brute-force cosine.
+	if r.hnswGate > 0 && buildANN != nil {
 		total := 0
 		for _, chunks := range vecs {
 			total += len(chunks)
 		}
 		if total >= r.hnswGate {
-			if ix, err := hnsw.Build(vecs, hnsw.Params{}); err == nil {
-				r.hnsw = ix
+			if ix, err := buildANN(vecs); err == nil {
+				r.ann = ix
 			}
 		}
 	}
@@ -361,7 +383,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		if qv := r.queryVec(ctx, query); qv != nil && r.vecDim > 0 && len(qv) == r.vecDim {
 			var ids []string
 			var sims []float64
-			if r.hnsw != nil {
+			if r.ann != nil {
 				// ANN path (large vaults): the index returns the top chunks; fold them to
 				// a per-note max, exactly the brute-force semantics, over a candidate set
 				// instead of every note. hnswK is generous so the fused/reranked head is
@@ -371,7 +393,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 					hnswK = 50
 				}
 				best := map[string]float64{}
-				for _, h := range r.hnsw.Search(qv, hnswK, 0) {
+				for _, h := range r.ann.Search(qv, hnswK, 0) {
 					if cur, ok := best[h.NodeID]; !ok || h.Score > cur {
 						best[h.NodeID] = h.Score
 					}
