@@ -48,6 +48,12 @@ func orientCmd() *cobra.Command {
 				return err
 			}
 			text := orientText(store, g)
+			// First session after `mesh install`: prepend a one-time welcome so the
+			// agent greets the user and finishes onboarding. Only consume on the hook
+			// path (the real SessionStart), never on a manual `mesh orient`.
+			if hook && hooks.ConsumeOnboardPending(root) {
+				text = onboardWelcome + text
+			}
 			if hook {
 				out, _ := json.Marshal(map[string]any{
 					"hookSpecificOutput": map[string]any{
@@ -116,6 +122,86 @@ func orientText(store *index.Store, g *graph.Graph) string {
 	b.WriteString(mcp.Contract())
 	b.WriteString("\n")
 	return b.String()
+}
+
+// onboardWelcome is injected (once) at the first SessionStart after `mesh install`,
+// so the agent greets the user and finishes setup itself, no commands needed.
+const onboardWelcome = `# First Mesh session - onboard the user now
+
+The user just installed Mesh and this is their first session. Before their task:
+1. Greet them warmly and say in one line what Mesh is: a knowledge mesh you (the agent) read at the start of every session and write back to at the end - the flywheel, so knowledge compounds instead of being relearned.
+2. Tell them it is now wired to read automatically each session (this orientation IS that hook firing).
+3. Ask two short questions: (a) enable write-back enforcement? - a one-time nudge per session to record decisions/gotchas, recommended; (b) want a 60-second tour of what is already in their mesh?
+4. If they say yes to write-back, call mesh_setup_hooks with action=install. For a tour, use mesh_god_nodes + mesh_search.
+Keep it short and friendly, then carry on with whatever they need.
+
+---
+`
+
+// installCmd is the one-shot agent setup: register the MCP server, install the
+// SessionStart read hook, and arm the first-run welcome. After this single command
+// the agent onboards the user automatically on its next session.
+func installCmd() *cobra.Command {
+	var dir string
+	var noMCP, enforce bool
+	c := &cobra.Command{
+		Use:   "install [vault]",
+		Short: "One-shot setup: register the MCP server + session hook so the agent onboards you automatically",
+		Long:  "Wires everything so a coding agent uses Mesh automatically: registers the Mesh MCP server in .mcp.json, installs the SessionStart read hook in .claude/settings.json, and arms a one-time welcome. After this, start a new agent session and it greets you and finishes onboarding itself - no further commands.",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			vaultPath := "."
+			if len(args) == 1 {
+				vaultPath = args[0]
+			}
+			vaultAbs, err := filepath.Abs(vaultPath)
+			if err != nil {
+				return err
+			}
+			projAbs, err := filepath.Abs(dir)
+			if err != nil {
+				return err
+			}
+			bin, err := os.Executable()
+			if err != nil || bin == "" {
+				bin = "mesh"
+			}
+			fmt.Println("Setting up Mesh for your agent...")
+			if !noMCP {
+				added, p, err := hooks.InstallMCP(projAbs, vaultAbs, bin)
+				if err != nil {
+					return err
+				}
+				if added {
+					fmt.Printf("  + registered the Mesh MCP server in %s\n", p)
+				} else {
+					fmt.Printf("  . MCP server already present in %s\n", p)
+				}
+			}
+			res, err := hooks.Install(hooks.Options{ProjectDir: projAbs, Vault: vaultAbs, Bin: bin, EnforceWriteback: enforce})
+			if err != nil {
+				return err
+			}
+			if len(res.Added) > 0 {
+				for _, a := range res.Added {
+					fmt.Printf("  + %s\n", a)
+				}
+			} else {
+				fmt.Printf("  . session hooks already in %s\n", res.SettingsPath)
+			}
+			if err := hooks.SetOnboardPending(vaultAbs); err != nil {
+				return err
+			}
+			fmt.Println("  + armed the first-run welcome")
+			fmt.Println("\nDone. Start a new agent session (or reconnect the MCP server) and Mesh will")
+			fmt.Println("greet you and finish onboarding automatically, no commands needed.")
+			return nil
+		},
+	}
+	c.Flags().StringVar(&dir, "dir", ".", "project dir (.mcp.json + .claude/settings.json)")
+	c.Flags().BoolVar(&noMCP, "no-mcp", false, "skip registering the MCP server in .mcp.json")
+	c.Flags().BoolVar(&enforce, "enforce-writeback", false, "also install the Stop write-back nudge now (default: the agent asks during onboarding)")
+	return c
 }
 
 // hooksCmd installs/removes the Claude Code session hooks that enforce the read-at-
