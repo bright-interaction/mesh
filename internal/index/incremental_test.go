@@ -120,7 +120,7 @@ func TestIncrementalMatchesFullReindex(t *testing.T) {
 			}
 			defer s.Close()
 			live := NewLiveIndexer(s, dir)
-			if _, err := live.Reconcile(); err != nil { // seed (full)
+			if _, err := live.Reconcile(true); err != nil { // seed (full)
 				t.Fatalf("seed: %v", err)
 			}
 			// Seed a vector per note so the orphan-prune / stale paths are exercised.
@@ -128,7 +128,7 @@ func TestIncrementalMatchesFullReindex(t *testing.T) {
 
 			tc.mutate(t, dir)
 
-			if _, err := live.Reconcile(); err != nil { // incremental
+			if _, err := live.Reconcile(true); err != nil { // incremental
 				t.Fatalf("incremental: %v", err)
 			}
 			got := snapshotTables(t, s)
@@ -176,7 +176,7 @@ func TestIncrementalCosmeticEditIsNoOp(t *testing.T) {
 	}
 	defer s.Close()
 	live := NewLiveIndexer(s, dir)
-	if _, err := live.Reconcile(); err != nil {
+	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
 	// Rewrite a.md with byte-identical content (a touch-like save).
@@ -184,7 +184,7 @@ func TestIncrementalCosmeticEditIsNoOp(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a.md"), body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rec, err := live.Reconcile()
+	rec, err := live.Reconcile(true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestIncrementalRefusesDuplicateID(t *testing.T) {
 	}
 	defer s.Close()
 	live := NewLiveIndexer(s, dir)
-	if _, err := live.Reconcile(); err != nil {
+	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := s.Count("notes")
@@ -212,7 +212,7 @@ func TestIncrementalRefusesDuplicateID(t *testing.T) {
 	// dup.md declares id "b", already owned by b.md.
 	write(t, dir, "dup.md", "---\nid: b\ntype: note\nwhen: 2026-01-01\n---\n# Dup\nclashing id\n")
 
-	if _, err := live.Reconcile(); err == nil {
+	if _, err := live.Reconcile(true); err == nil {
 		t.Fatal("a duplicate note id must be refused with an error, not silently applied")
 	}
 	// The existing index is untouched: original note count, b.md still owns id b.
@@ -228,7 +228,7 @@ func TestIncrementalRefusesDuplicateID(t *testing.T) {
 		t.Errorf("the live note must not be clobbered: id b is now at %q, want b.md", path)
 	}
 	// It stays a stable error (converges, does not flip-flop) until the dup is fixed.
-	if _, err := live.Reconcile(); err == nil {
+	if _, err := live.Reconcile(true); err == nil {
 		t.Fatal("duplicate id must keep erroring until fixed (no flip-flop to success)")
 	}
 }

@@ -94,10 +94,10 @@ func (s *Server) reload() error {
 // reconcileOnce reindexes only when the vault has drifted, swapping in the fresh
 // graph when it did. It is the watcher's reindex callback. Incremental: it parses
 // only changed files and rebuilds the graph in memory from the cache.
-func (s *Server) reconcileOnce() (index.Reconciliation, error) {
+func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
-	rec, err := index.ReconcileIncremental(s.store, s.vaultRoot, s.cache)
+	rec, err := index.ReconcileIncremental(s.store, s.vaultRoot, s.cache, !authoritative)
 	if err != nil {
 		return rec, err
 	}
@@ -116,8 +116,8 @@ func (s *Server) Watch(ctx context.Context, debounce, reconcile time.Duration, l
 		Debounce:  debounce,
 		Reconcile: reconcile,
 		Logf:      logf,
-		OnReindex: func() (watch.Result, error) {
-			rec, err := s.reconcileOnce()
+		OnReindex: func(authoritative bool) (watch.Result, error) {
+			rec, err := s.reconcileOnce(authoritative)
 			if err != nil {
 				return watch.Result{}, err
 			}

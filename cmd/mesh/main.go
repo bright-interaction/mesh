@@ -991,8 +991,8 @@ func watchCmd() *cobra.Command {
 				Debounce:  debounce,
 				Reconcile: reconcile,
 				Logf:      logf,
-				OnReindex: func() (watch.Result, error) {
-					rec, err := live.Reconcile()
+				OnReindex: func(authoritative bool) (watch.Result, error) {
+					rec, err := live.Reconcile(authoritative)
 					if err != nil {
 						return watch.Result{}, err
 					}
@@ -1069,19 +1069,19 @@ func syncCmd() *cobra.Command {
 			// LiveIndexer makes the watch loop incremental (full seed on the first call,
 			// targeted updates after); the one-shot path just does that single full pass.
 			live := index.NewLiveIndexer(store, vaultDir)
-			syncOnce := func() (meshclient.Summary, error) {
+			syncOnce := func(authoritative bool) (meshclient.Summary, error) {
 				sum, err := meshclient.SyncVault(vaultDir)
 				if err != nil {
 					return sum, err
 				}
-				if _, err := live.Reconcile(); err != nil {
+				if _, err := live.Reconcile(authoritative); err != nil {
 					return sum, err
 				}
 				return sum, nil
 			}
 
 			if !doWatch {
-				sum, err := syncOnce()
+				sum, err := syncOnce(true) // one-shot: full authoritative reconcile
 				if err != nil {
 					return err
 				}
@@ -1119,7 +1119,7 @@ func syncCmd() *cobra.Command {
 				Reconcile: reconcile,
 				Trigger:   nudge,
 				Logf:      logf,
-				OnReindex: func() (watch.Result, error) {
+				OnReindex: func(authoritative bool) (watch.Result, error) {
 					// Note: applying the hub's deltas writes .md files, which the
 					// watcher sees and debounces into one more reconcile. That follow-up
 					// is a guaranteed no-op (SyncVault re-hashes from disk and persists
@@ -1127,7 +1127,7 @@ func syncCmd() *cobra.Command {
 					// fast-forwards without a broadcast), so it converges in one extra
 					// idle round rather than looping. We accept that cheap round instead
 					// of threading self-written paths through the watcher.
-					sum, serr := syncOnce()
+					sum, serr := syncOnce(authoritative)
 					if serr != nil {
 						return watch.Result{}, serr
 					}

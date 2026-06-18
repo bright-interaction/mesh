@@ -56,9 +56,9 @@ func Reconcile(s *Store, root string) (Reconciliation, error) {
 // rewrite from the rebuilt graph. The DB is always left authoritative for a
 // concurrent `mesh search` reader. The returned Graph is the in-memory one, so the
 // caller can swap it directly without a LoadGraph round-trip.
-func ReconcileIncremental(s *Store, root string, cache *NoteCache) (Reconciliation, error) {
+func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast bool) (Reconciliation, error) {
 	start := time.Now()
-	dd, err := s.DriftDeltaReport(root)
+	dd, err := s.DriftDeltaReport(root, mtimeFast)
 	if err != nil {
 		return Reconciliation{}, err
 	}

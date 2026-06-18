@@ -109,8 +109,10 @@ func (li *LiveIndexer) Full() (*graph.Graph, error) {
 
 // Reconcile brings the index up to date. The first call does a full reindex to
 // seed the cache; later calls are incremental (parse only changed files, targeted
-// note/FTS writes, in-memory graph rebuild).
-func (li *LiveIndexer) Reconcile() (Reconciliation, error) {
+// note/FTS writes, in-memory graph rebuild). authoritative=false enables the mtime
+// fast path (skip parsing mtime-unchanged files); pass true for the periodic
+// safety tick so a mtime-preserving edit is still caught.
+func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 	li.mu.Lock()
 	defer li.mu.Unlock()
 	if !li.seeded {
@@ -123,5 +125,5 @@ func (li *LiveIndexer) Reconcile() (Reconciliation, error) {
 		li.seeded = true
 		return Reconciliation{Added: len(notes), Reindexed: true, Graph: g, Dur: time.Since(start)}, nil
 	}
-	return ReconcileIncremental(li.store, li.root, li.cache)
+	return ReconcileIncremental(li.store, li.root, li.cache, !authoritative)
 }

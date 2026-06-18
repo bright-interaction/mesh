@@ -71,7 +71,7 @@ func BenchmarkReconcileIncremental(b *testing.B) {
 			}
 			defer s.Close()
 			live := NewLiveIndexer(s, dir)
-			if _, err := live.Reconcile(); err != nil { // seed
+			if _, err := live.Reconcile(true); err != nil { // seed (full)
 				b.Fatal(err)
 			}
 			b.ResetTimer()
@@ -79,7 +79,8 @@ func BenchmarkReconcileIncremental(b *testing.B) {
 				b.StopTimer()
 				editNote(b, dir, i, n)
 				b.StartTimer()
-				if _, err := live.Reconcile(); err != nil {
+				// authoritative=false: the mtime fast path a debounced change event uses.
+				if _, err := live.Reconcile(false); err != nil {
 					b.Fatal(err)
 				}
 			}

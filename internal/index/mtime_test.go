@@ -7,6 +7,81 @@ import (
 	"time"
 )
 
+// TestMtimeFastPathDetectsChange: a normal edit (content + mtime move) is caught by
+// the fast path.
+func TestMtimeFastPathDetectsChange(t *testing.T) {
+	dir := writeVault(t)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	live := NewLiveIndexer(s, dir)
+	if _, err := live.Reconcile(true); err != nil { // seed
+		t.Fatal(err)
+	}
+	apath := filepath.Join(dir, "a.md")
+	if err := os.WriteFile(apath, []byte("---\nid: a\ntype: decision\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: changed\n---\n# A\nnew body #core\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(apath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := live.Reconcile(false) // fast path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.Reindexed || rec.Changed != 1 {
+		t.Fatalf("fast path should detect the changed file, got %+v", rec)
+	}
+}
+
+// TestMtimeFastPathSkipsUnchangedButTickCatchesIt is the documented blind spot +
+// its backstop: a mtime-preserving edit is invisible to the fast path (the mtime
+// matches stored) but the authoritative periodic tick (full hash check) catches it.
+func TestMtimeFastPathSkipsUnchangedButTickCatchesIt(t *testing.T) {
+	dir := writeVault(t)
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	live := NewLiveIndexer(s, dir)
+	if _, err := live.Reconcile(true); err != nil { // seed
+		t.Fatal(err)
+	}
+	var stored int64
+	if err := s.readDB.QueryRow(`SELECT mtime FROM notes WHERE id='a'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	apath := filepath.Join(dir, "a.md")
+	// Change the content but reset mtime to the stored value (a mtime-preserving edit).
+	if err := os.WriteFile(apath, []byte("---\nid: a\ntype: decision\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: secretly changed\n---\n# A\nquietly different #core\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mt := time.Unix(stored, 0)
+	if err := os.Chtimes(apath, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+	// Fast path: mtime unchanged -> file skipped -> the edit is invisible.
+	rec, err := live.Reconcile(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Reindexed {
+		t.Fatal("fast path should skip a file whose mtime did not move (the documented blind spot)")
+	}
+	// Authoritative tick: full hash check catches it.
+	rec, err = live.Reconcile(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.Reindexed || rec.Changed != 1 {
+		t.Fatalf("authoritative reconcile must catch the mtime-preserving edit, got %+v", rec)
+	}
+}
+
 // TestMtimeStoredCorrectlyOffRoot is the regression for the fileMtime bug: the
 // stored mtime must be the file's real mtime even when the process CWD is not the
 // vault root (the normal MCP case). The test's CWD is the package dir, and the
