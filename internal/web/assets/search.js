@@ -30,8 +30,9 @@
     inner.innerHTML =
       '<p class="panel-h">Retrieve</p>' +
       '<h1 class="panel-title">Search</h1>' +
-      '<div class="srch-box"><input id="srch-q" type="search" placeholder="search the vault (same ranking the agent gets)" autocomplete="off" spellcheck="false"></div>' +
-      '<div id="srch-results" class="srch-results"><p class="srch-hint">Type to search. Results are the fused full-text + graph + semantic ranking, tier-0 (decisions / gotchas / post-mortems) first.</p></div>';
+      '<p class="panel-lead">Searches the full text of every note and ranks by relevance. This is the same engine your AI agent uses. (The box on the Graph view is different: it only hides or shows nodes by name.)</p>' +
+      '<div class="srch-box"><input id="srch-q" type="search" placeholder="search the whole vault" autocomplete="off" spellcheck="false"></div>' +
+      '<div id="srch-results" class="srch-results"><p class="srch-hint">Type to search. Results are the fused full-text + graph + semantic ranking, with decisions, gotchas, and post-mortems surfaced first.</p></div>';
     el.replaceChildren(inner);
 
     const q = inner.querySelector("#srch-q");

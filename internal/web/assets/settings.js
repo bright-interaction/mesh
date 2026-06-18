@@ -53,6 +53,15 @@
     const groups = {};
     (cfg.fields || []).forEach((f) => (groups[f.group] = groups[f.group] || []).push(f));
 
+    // One-line description per group, shown in the collapsed summary so a user knows
+    // whether they need to open it at all.
+    const groupDesc = {
+      "Semantic search (optional)": "Add \"find by meaning\" search by pointing Mesh at an embedding model.",
+      "Ranking (advanced)": "Fine-tune how results are scored. Defaults are tuned; most people skip this.",
+      "Reranker (optional)": "Re-score the top hits with a reranker for a sharper #1 result.",
+      "Large-vault scale (pro)": "Speed knobs that only matter on very large vaults (pro build).",
+    };
+
     const c = (status && status.counts) || {};
     const sig = (status && status.signals) || {};
     const sigChip = (k, label) => '<span class="chip ' + (sig[k] ? "on" : "") + '">' + label + "</span>";
@@ -62,6 +71,7 @@
     inner.innerHTML =
       '<p class="panel-h">Configure</p>' +
       '<h1 class="panel-title">Settings</h1>' +
+      '<p class="panel-lead">Mesh works with no setup. Everything below is optional tuning, grouped and collapsed. Open a section only if you need it. Settings set by an environment variable show an "env" badge and are read-only here.</p>' +
       '<section class="set-group">' +
       '<h2 class="set-h">Index</h2>' +
       '<div class="set-status">' +
@@ -69,7 +79,11 @@
       '<div class="set-sigs">' + sigChip("fts", "full-text") + sigChip("graph", "graph") + sigChip("vector", "semantic") + sigChip("rerank", "rerank") + sigChip("ann", "ANN") + "</div>" +
       '<button class="btn ghost" id="set-reindex">Reindex now</button>' +
       "</div></section>" +
-      Object.keys(groups).map((g) => '<section class="set-group"><h2 class="set-h">' + esc(g) + "</h2>" + groups[g].map(row).join("") + "</section>").join("") +
+      Object.keys(groups).map((g) =>
+        '<details class="set-acc"><summary class="set-acc-sum"><span class="set-acc-name">' + esc(g) + "</span>" +
+        (groupDesc[g] ? '<span class="set-acc-desc">' + esc(groupDesc[g]) + "</span>" : "") + "</summary>" +
+        '<div class="set-acc-body">' + groups[g].map(row).join("") + "</div></details>"
+      ).join("") +
       '<div class="set-bar"><span class="set-note">Environment variables override these. Secrets stay in env vars; fields name the var, never the key.</span><button class="btn" id="set-save">Save changes</button></div>';
 
     el.replaceChildren(inner);

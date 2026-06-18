@@ -43,7 +43,8 @@
         <button id="view-galaxy3d" class="view" role="tab" aria-selected="false">Galaxy 3D</button>
       </div>
       <div class="search">
-        <input id="q" type="search" placeholder="filter notes" autocomplete="off" spellcheck="false">
+        <input id="q" type="search" placeholder="filter the graph by name" autocomplete="off" spellcheck="false">
+        <button id="to-search" class="to-search" title="Search the full text of every note">search &rarr;</button>
       </div>
     </header>
     <aside id="card" class="card hidden" aria-live="polite"></aside>
@@ -63,6 +64,16 @@
     <div class="overlay-inner">
       <span class="spinner" aria-hidden="true"></span>
       <p id="overlay-msg">building the graph</p>
+    </div>
+  </div>
+
+  <!-- Empty-state: shown over the graph when the vault has no notes yet, so a new
+       user sees how to fill it instead of a blank canvas. -->
+  <div id="empty" class="empty hidden">
+    <div class="empty-card">
+      <p class="empty-h">This vault is empty</p>
+      <p class="empty-sub">There are no notes here yet. Import an existing Obsidian vault, connect a team hub, or add a note, then reindex.</p>
+      <button class="btn" id="empty-docs">How to add notes</button>
     </div>
   </div>
 
