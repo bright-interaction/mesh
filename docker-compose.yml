@@ -32,6 +32,34 @@ services:
     networks:
       - dockyard-proxy
 
+  # mesh-ui: the web app over the team vault, served under /app at the hub domain.
+  # Reuses the mesh-hub image (which cross-builds the `mesh` CLI into mesh-dist) and
+  # runs `mesh ui`. Binds all interfaces inside the container, so the token is
+  # mandatory (fail-closed): set MESH_UI_TOKEN in /opt/mesh-hub/.env. Caddy routes
+  # mesh.brightinteraction.com/app/* here. The vault is mounted rw so the viewer can
+  # write its own .mesh/ index (the vault .gitignore excludes it from the hub git).
+  mesh-ui:
+    image: mesh-hub:latest
+    container_name: mesh-ui
+    restart: unless-stopped
+    depends_on:
+      - mesh-hub
+    entrypoint: ["/usr/local/share/mesh-dist/mesh-linux-amd64"]
+    command: ["ui", "/var/lib/mesh-hub/vault", "--addr", "0.0.0.0:7474", "--base-path", "/app"]
+    expose:
+      - "7474"
+    environment:
+      - MESH_UI_TOKEN=${MESH_UI_TOKEN:?set MESH_UI_TOKEN in /opt/mesh-hub/.env}
+    volumes:
+      - /var/lib/mesh-hub:/var/lib/mesh-hub
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7474/app/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - dockyard-proxy
+
 networks:
   dockyard-proxy:
     external: true
