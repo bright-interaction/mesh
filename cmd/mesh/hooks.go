@@ -189,6 +189,16 @@ func installCmd() *cobra.Command {
 			} else {
 				fmt.Printf("  . session hooks already in %s\n", res.SettingsPath)
 			}
+			// Build the initial index so the first orientation (and the agent) see
+			// real content immediately, instead of an empty mesh on the first session.
+			if store, err := index.Open(vaultAbs); err == nil {
+				if _, err := index.Reindex(store, vaultAbs); err == nil {
+					if n, _ := store.Count("notes"); n > 0 {
+						fmt.Printf("  + indexed the vault (%d notes)\n", n)
+					}
+				}
+				store.Close()
+			}
 			if err := hooks.SetOnboardPending(vaultAbs); err != nil {
 				return err
 			}

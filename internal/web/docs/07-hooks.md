@@ -36,8 +36,9 @@ but can only do cleanup, so the write-back nudge lives on Stop.)
 mesh install /path/to/vault
 ```
 
-That single command registers the Mesh MCP server (`.mcp.json`), installs the
-SessionStart read hook, and arms a one-time welcome. Start a new agent session and
+That single command registers the Mesh MCP server (`.mcp.json`), indexes your
+vault, installs the SessionStart read hook, and arms a one-time welcome. Start a
+new agent session and
 **the agent greets you and finishes onboarding itself**, no further commands: it
 explains the flywheel, asks whether to enable the write-back nudge, and offers a
 quick tour. Add `--enforce-writeback` to also turn on the Stop nudge up front, or
