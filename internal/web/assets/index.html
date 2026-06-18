@@ -66,6 +66,20 @@
     </div>
   </div>
 
+  <!-- Login card: shown when the API returns 401 (a token-bound deployment). The key
+       is exchanged for an HttpOnly session cookie, so it is never stored in JS. -->
+  <div id="login" class="login hidden" aria-hidden="true">
+    <form id="login-form" class="login-card" autocomplete="on">
+      <span class="login-dot" aria-hidden="true"></span>
+      <h1 class="login-title">mesh</h1>
+      <p class="login-sub">Enter your access key to continue.</p>
+      <input id="login-key" name="password" type="password" placeholder="access key"
+             autocomplete="current-password" spellcheck="false" autofocus>
+      <button id="login-btn" type="submit" class="login-btn">Unlock</button>
+      <p id="login-err" class="login-err" hidden></p>
+    </form>
+  </div>
+
   <script src="assets/gl3d.js" defer></script>
   <script src="assets/app.js" defer></script>
   <script src="assets/search.js" defer></script>

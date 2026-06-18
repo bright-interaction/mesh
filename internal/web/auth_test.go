@@ -3,6 +3,7 @@ package web
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -70,4 +71,69 @@ func TestGuardTokenGate(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("api with wrong token = %d, want 401", rec.Code)
 	}
+}
+
+func TestCookieLoginFlow(t *testing.T) {
+	s, _ := cfgServer(t)
+	s.auth = authConfig{token: "s3cret", loopback: false}
+	h := s.Handler()
+
+	// login is reachable unauthenticated; a wrong key is refused with no cookie.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, jsonReq("POST", "/api/login", `{"key":"nope"}`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("login wrong key = %d, want 401", rec.Code)
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Error("a rejected login must not set a cookie")
+	}
+
+	// the correct key sets a hardened HttpOnly session cookie.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, jsonReq("POST", "/api/login", `{"key":"s3cret"}`))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("login correct key = %d, want 204", rec.Code)
+	}
+	var sess *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			sess = c
+		}
+	}
+	if sess == nil {
+		t.Fatal("login did not set the session cookie")
+	}
+	if !sess.HttpOnly || !sess.Secure || sess.SameSite != http.SameSiteStrictMode {
+		t.Errorf("cookie not hardened: HttpOnly=%v Secure=%v SameSite=%v", sess.HttpOnly, sess.Secure, sess.SameSite)
+	}
+	if sess.Value == "s3cret" {
+		t.Error("cookie must not be the raw token (use the HMAC-derived value)")
+	}
+	if sess.Value != s.auth.sessionValue() {
+		t.Error("cookie value is not the derived session value")
+	}
+
+	// the cookie authenticates a gated request (no Authorization header needed).
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/status", nil)
+	req.AddCookie(sess)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status with session cookie = %d, want 200", rec.Code)
+	}
+
+	// a tampered cookie is rejected.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/api/status", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.Value + "x"})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status with tampered cookie = %d, want 401", rec.Code)
+	}
+}
+
+func jsonReq(method, path, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	return req
 }

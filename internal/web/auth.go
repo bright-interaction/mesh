@@ -1,12 +1,20 @@
 package web
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
 	"strings"
 )
+
+// sessionCookie is the HttpOnly cookie set by POST /api/login. Its value is the
+// HMAC-derived session value (never the raw token), so a browser stays signed in
+// without the SPA ever holding the secret.
+const sessionCookie = "mesh_session"
 
 // errRemoteNeedsToken is returned when the viewer is bound beyond loopback without
 // a token. Fail closed: an exposed viewer must be authenticated.
@@ -51,9 +59,19 @@ func (a authConfig) guard(next http.Handler) http.Handler {
 	})
 }
 
-// isOpenPath is the unauthenticated allowlist: the shell and its assets only.
+// isOpenPath is the unauthenticated allowlist: the shell, its assets, and the
+// login/logout endpoints (which must be reachable to obtain or drop a session).
 func isOpenPath(p string) bool {
-	return p == "/" || strings.HasPrefix(p, "/assets/")
+	return p == "/" || strings.HasPrefix(p, "/assets/") || p == "/api/login" || p == "/api/logout"
+}
+
+// sessionValue derives the opaque session-cookie value from the token via HMAC, so
+// the raw token is never stored in the browser. Deterministic, so no server-side
+// session store is needed; constant-time compared on every request.
+func (a authConfig) sessionValue() string {
+	mac := hmac.New(sha256.New, []byte(a.token))
+	mac.Write([]byte("mesh-ui-session-v1"))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // authRequired reports whether the SPA must present a token (used by the shell to
@@ -61,9 +79,17 @@ func isOpenPath(p string) bool {
 func (a authConfig) authRequired() bool { return a.token != "" }
 
 func (a authConfig) tokenOK(r *http.Request) bool {
+	// Session cookie (set by POST /api/login) is the primary browser path: HttpOnly,
+	// so it survives a tab close and is never exposed to JS.
+	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
+		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(a.sessionValue())) == 1 {
+			return true
+		}
+	}
+	// Bearer header (CLI) or ?token= for EventSource/links that cannot set headers.
 	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
 	if got == "" {
-		got = r.URL.Query().Get("token") // allow ?token= for EventSource/links that cannot set headers
+		got = r.URL.Query().Get("token")
 	}
 	return subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
 }
