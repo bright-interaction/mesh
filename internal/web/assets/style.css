@@ -46,6 +46,13 @@ html, body {
 }
 #stage.panning { cursor: grabbing; }
 #stage.hovering { cursor: pointer; }
+#stage3d {
+  position: fixed;
+  inset: 0;
+  display: block;
+  cursor: grab;
+}
+#stage3d[hidden] { display: none; }
 
 /* top bar */
 #bar {

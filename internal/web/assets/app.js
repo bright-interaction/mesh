@@ -6,6 +6,8 @@
   "use strict";
   const $ = (id) => document.getElementById(id);
   const canvas = $("stage"), ctx = canvas.getContext("2d");
+  const canvas3d = $("stage3d");
+  let gl3d = null; // lazy WebGL2 galaxy; null until the 3D tab is first opened (or if unavailable)
   const overlay = $("overlay"), overlayMsg = $("overlay-msg");
   const TAU = Math.PI * 2;
   const HEX = /^#[0-9a-fA-F]{3,8}$/;
@@ -240,6 +242,7 @@
   // ---- render ----
   function loop() {
     if (document.hidden) { running = false; return; } // pause when the tab is hidden (battery)
+    if (view === "galaxy3d") { if (gl3d) gl3d.frame(); requestAnimationFrame(loop); return; } // 3D owns its own render; skip the 2D sim+draw
     t += 1;
     if (view === "graph") simStep();
     else {
@@ -542,6 +545,7 @@
 
     $("view-graph").onclick = () => setView("graph");
     $("view-galaxy").onclick = () => setView("galaxy");
+    if ($("view-galaxy3d")) $("view-galaxy3d").onclick = () => setView("galaxy3d");
     $("q").addEventListener("input", (e) => runSearch(e.target.value));
     window.addEventListener("resize", resize);
     window.addEventListener("keydown", (e) => {
@@ -552,15 +556,41 @@
     });
   }
 
+  function setViewTabs(v) {
+    for (const id of ["graph", "galaxy", "galaxy3d"]) {
+      const el = $("view-" + id);
+      if (!el) continue;
+      el.classList.toggle("active", id === v);
+      el.setAttribute("aria-selected", id === v ? "true" : "false");
+    }
+  }
   function setView(v) {
     if (v === view) return;
+    if (v === "galaxy3d") {
+      if (!gl3d && window.Mesh3D) {
+        gl3d = window.Mesh3D.init(canvas3d, G, {
+          commColor, indexId: G.meta.index_id,
+          onSelect: (n) => { selected = n; setFocus(n); if (n) showCard(n); else hideCard(); },
+          onHover: (n) => { if (n) showCard(n); else if (!selected) hideCard(); },
+        });
+      }
+      if (!gl3d) { // no WebGL2: disable the tab and fall back to the 2D galaxy
+        const tab = $("view-galaxy3d");
+        if (tab) { tab.disabled = true; tab.title = "WebGL2 unavailable"; }
+        return setView("galaxy");
+      }
+      view = "galaxy3d";
+      canvas.hidden = true; canvas3d.hidden = false;
+      gl3d.resize();
+      if (selected) gl3d.setHighlight(selected.id);
+      setViewTabs(v);
+      return;
+    }
     view = v;
+    canvas3d.hidden = true; canvas.hidden = false; // back to the 2D canvas
     if (v === "graph") alpha = Math.max(alpha, 0.5); // re-energize the sim on return
     else syncGalaxyScale(); // size the galaxy to the (now-settled) graph so dots match
-    $("view-graph").classList.toggle("active", v === "graph");
-    $("view-galaxy").classList.toggle("active", v === "galaxy");
-    $("view-graph").setAttribute("aria-selected", v === "graph");
-    $("view-galaxy").setAttribute("aria-selected", v === "galaxy");
+    setViewTabs(v);
     fitView();
     if (query) runSearch(query);
   }
@@ -584,6 +614,7 @@
     vignette = g;
     stars = []; const n = Math.min(320, Math.round(W * H / 7000));
     for (let i = 0; i < n; i++) stars.push({ x: rand(i * 7) * W, y: rand(i * 13 + 3) * H, r: rand(i * 5) > 0.88 ? 2 : 1, a: 0.07 + rand(i * 3) * 0.2 });
+    if (gl3d) gl3d.resize();
   }
   function doneOverlay() { overlay.classList.add("done", "hidden"); }
   function showEmpty() { overlay.classList.add("done"); overlayMsg.textContent = "no notes indexed yet. run: mesh index"; }
