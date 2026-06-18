@@ -8,6 +8,7 @@
 </head>
 <body>
   <canvas id="stage"></canvas>
+  <canvas id="stage3d" hidden></canvas>
 
   <header id="bar">
     <div class="brand">
@@ -18,6 +19,7 @@
     <div class="views" role="tablist" aria-label="View">
       <button id="view-graph" class="view active" role="tab" aria-selected="true">Graph</button>
       <button id="view-galaxy" class="view" role="tab" aria-selected="false">Galaxy</button>
+      <button id="view-galaxy3d" class="view" role="tab" aria-selected="false">Galaxy 3D</button>
     </div>
     <div class="search">
       <input id="q" type="search" placeholder="search notes" autocomplete="off" spellcheck="false">
@@ -37,6 +39,7 @@
 
   <footer id="hint">drag to pan &middot; scroll to zoom &middot; hover a note &middot; click to open in your editor</footer>
 
+  <script src="/assets/gl3d.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </body>
 </html>
