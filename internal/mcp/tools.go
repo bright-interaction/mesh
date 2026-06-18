@@ -83,6 +83,11 @@ func (s *Server) handleToolsList() any {
 				"properties": map[string]any{"title": str, "why": str, "related": strList, "tags": strList},
 			}),
 		},
+		{
+			"name":        "mesh_reindex",
+			"description": "Re-read the vault from disk and rebuild the index NOW. Call this right after you edit note files directly in the editor or CLI so your next mesh_search/mesh_fetch/mesh_neighbors reflects the edits with no watcher lag (works even when the server was started without --watch). Returns what changed.",
+			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
+		},
 	}
 	return map[string]any{"tools": tools}
 }
@@ -112,9 +117,32 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return s.toolWrite(p.Arguments, "")
 	case "mesh_write_entity":
 		return s.toolWrite(p.Arguments, "entity")
+	case "mesh_reindex":
+		return s.toolReindex()
 	default:
 		return nil, &rpcError{Code: codeMethodNotFound, Message: "unknown tool", Data: p.Name}
 	}
+}
+
+// toolReindex forces an authoritative reconcile so an agent editing note files
+// directly (via the editor or CLI) can make its edits queryable on demand, instead
+// of waiting on the --watch debounce or restarting a no-watch server. Authoritative
+// = full content-hash check, so it also catches an edit that did not move the mtime.
+func (s *Server) toolReindex() (any, *rpcError) {
+	rec, err := s.reconcileOnce(true)
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	g, _ := s.snapshot()
+	return textResult(map[string]any{
+		"reindexed": rec.Reindexed,
+		"added":     rec.Added,
+		"changed":   rec.Changed,
+		"removed":   rec.Removed,
+		"nodes":     g.NodeCount(),
+		"edges":     g.EdgeCount(),
+		"ms":        rec.Dur.Milliseconds(),
+	}), nil
 }
 
 func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
