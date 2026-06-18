@@ -111,32 +111,40 @@ func (r *Retriever) Weights() (fts, graph, vec float64) {
 // is configured.
 func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 	r := New(store, g)
-	r.enableVectorsFromEnv()
-	r.enableRerankFromEnv()
-	r.loadWeightsFromEnv()
+	cfg, _ := meshcfg.LoadConfig(store.MeshDir())
+	r.enableVectors(cfg.Embedding, cfg.Retrieval)
+	r.enableRerank(cfg.Retrieval)
+	r.loadWeights(cfg.Retrieval)
 	return r
 }
 
-// loadWeightsFromEnv applies learned/operator fusion weights from
-// MESH_WEIGHT_FTS/GRAPH/VEC (e.g. the output of `mesh tune`). Missing vars stay 0.
-func (r *Retriever) loadWeightsFromEnv() {
-	parse := func(k string) float64 {
-		if v, err := strconv.ParseFloat(os.Getenv(k), 64); err == nil && v >= 0 {
+// loadWeights applies fusion weights, env-first then the solo config file (0 means
+// "use the built-in default"). Env MESH_WEIGHT_* overrides the file, matching every
+// other knob's precedence.
+func (r *Retriever) loadWeights(rv meshcfg.Retrieval) {
+	pick := func(env string, file float64) float64 {
+		if v, err := strconv.ParseFloat(os.Getenv(env), 64); err == nil && v >= 0 {
 			return v
+		}
+		if file >= 0 {
+			return file
 		}
 		return 0
 	}
-	r.SetWeights(parse("MESH_WEIGHT_FTS"), parse("MESH_WEIGHT_GRAPH"), parse("MESH_WEIGHT_VEC"))
+	r.SetWeights(
+		pick("MESH_WEIGHT_FTS", rv.WeightFTS),
+		pick("MESH_WEIGHT_GRAPH", rv.WeightGraph),
+		pick("MESH_WEIGHT_VEC", rv.WeightVec),
+	)
 }
 
 // enableVectorsFromEnv turns on the semantic signal when the vault has stored
 // vectors and the embedding endpoint + model are configured. Resolution is
 // env-first, then the solo .mesh/config.toml (written by `mesh embed`), so a solo
 // dev does not re-export env vars every session. Env always wins.
-func (r *Retriever) enableVectorsFromEnv() {
-	cfg, _ := meshcfg.Load(r.store.MeshDir())
-	endpoint := envOr("MESH_EMBED_ENDPOINT", cfg.Endpoint)
-	model := envOr("MESH_EMBED_MODEL", cfg.Model)
+func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
+	endpoint := envOr("MESH_EMBED_ENDPOINT", emb.Endpoint)
+	model := envOr("MESH_EMBED_MODEL", emb.Model)
 	if endpoint == "" || model == "" {
 		return
 	}
@@ -144,15 +152,17 @@ func (r *Retriever) enableVectorsFromEnv() {
 	if err != nil || len(vecs) == 0 {
 		return
 	}
-	r.queryPrefix = envOr("MESH_EMBED_QUERY_PREFIX", cfg.QueryPrefix)
-	keyEnv := cfg.KeyEnv
+	r.queryPrefix = envOr("MESH_EMBED_QUERY_PREFIX", emb.QueryPrefix)
+	keyEnv := emb.KeyEnv
 	if keyEnv == "" {
 		keyEnv = "MESH_EMBED_KEY"
 	}
-	// Optional ANN: build an HNSW index past MESH_HNSW_THRESHOLD chunks (0/unset =
-	// brute force, the default; brute force is sub-5ms well past the v1 scale).
+	// Optional ANN: build an HNSW index past the threshold (0/unset = brute force,
+	// the default; sub-5ms well past v1 scale). Env wins, then the config file.
 	if v, err := strconv.Atoi(os.Getenv("MESH_HNSW_THRESHOLD")); err == nil && v > 0 {
 		r.hnswGate = v
+	} else if rv.HNSWThreshold > 0 {
+		r.hnswGate = rv.HNSWThreshold
 	}
 	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs)
 }
@@ -165,10 +175,11 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// enableRerankFromEnv turns on the cross-encoder rerank stage when
-// MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL are set (BYOAI, sovereign or cloud).
-func (r *Retriever) enableRerankFromEnv() {
-	endpoint, model := os.Getenv("MESH_RERANK_ENDPOINT"), os.Getenv("MESH_RERANK_MODEL")
+// enableRerank turns on the cross-encoder rerank stage when the endpoint + model
+// are set (BYOAI, sovereign or cloud), env-first then the solo config file.
+func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
+	endpoint := envOr("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
+	model := envOr("MESH_RERANK_MODEL", rv.RerankModel)
 	if endpoint == "" || model == "" {
 		return
 	}
@@ -176,8 +187,14 @@ func (r *Retriever) enableRerankFromEnv() {
 		if v, err := strconv.ParseFloat(b, 64); err == nil && v >= 0 && v <= 1 {
 			r.rerankBlend = v
 		}
+	} else if rv.RerankBlend > 0 {
+		r.rerankBlend = rv.RerankBlend
 	}
-	r.EnableRerank(rerank.NewHTTP(endpoint, model, os.Getenv("MESH_RERANK_KEY")))
+	keyEnv := rv.RerankKeyEnv
+	if keyEnv == "" {
+		keyEnv = "MESH_RERANK_KEY"
+	}
+	r.EnableRerank(rerank.NewHTTP(endpoint, model, os.Getenv(keyEnv)))
 }
 
 // EnableRerank turns on the cross-encoder rerank stage. The reranker reorders

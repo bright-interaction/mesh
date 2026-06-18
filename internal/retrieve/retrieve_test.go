@@ -248,7 +248,8 @@ func TestEnableVectorsFromConfigToml(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	r.enableVectorsFromEnv()
+	cfg, _ := meshcfg.LoadConfig(r.store.MeshDir())
+	r.enableVectors(cfg.Embedding, cfg.Retrieval)
 	if !r.VectorsActive() {
 		t.Fatal("config.toml should enable the semantic signal with no env vars set")
 	}
