@@ -55,7 +55,7 @@
       el.querySelector(".panel-soon").textContent = "Could not load the API reference: " + e.message;
       return;
     }
-    const cfg = JSON.stringify({ mcpServers: { "mesh-" + (mcp.vault || "vault").split("/").pop(): mcp.config } }, null, 2);
+    const cfg = JSON.stringify({ mcpServers: { ["mesh-" + (mcp.vault || "vault").split("/").pop()]: mcp.config } }, null, 2);
     const inner = document.createElement("div");
     inner.className = "panel-inner";
     inner.innerHTML =
@@ -68,7 +68,7 @@
       '<div class="tools">' + (mcp.tools || []).map(toolCard).join("") + "</div>" +
       "</section>" +
       '<section class="set-group"><h2 class="set-h">HTTP API</h2>' +
-      '<p class="api-lead">The local viewer API. <a href="/openapi.json" target="_blank" rel="noopener">openapi.json</a>. Loopback needs no auth; a non-loopback bind requires a bearer token.</p>' +
+      '<p class="api-lead">The viewer API. <a href="openapi.json" target="_blank" rel="noopener">openapi.json</a>. On a loopback bind it needs no auth; exposed (token) deployments require the session cookie or a bearer token.</p>' +
       '<div class="eps">' + endpointRows(spec) + "</div></section>";
     el.replaceChildren(inner);
 

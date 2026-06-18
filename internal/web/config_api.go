@@ -64,20 +64,20 @@ func (s *Server) effectiveConfig() []cfgField {
 	defs := []struct {
 		key, label, group, kind, file, help string
 	}{
-		{"embedding.endpoint", "Endpoint", "Embedding", "text", e.Endpoint, "BYOAI embedding endpoint (OpenAI-compatible /v1)"},
-		{"embedding.model", "Model", "Embedding", "text", e.Model, "Embedding model id"},
-		{"embedding.dim", "Dimensions", "Embedding", "number", ival(e.Dim), "Vector width (must match the model)"},
-		{"embedding.key_env", "Key env var", "Embedding", "keyref", e.KeyEnv, "NAME of the env var holding the bearer key (never the key itself)"},
-		{"embedding.query_prefix", "Query prefix", "Embedding", "text", e.QueryPrefix, "Prefix for query embeds (asymmetric models)"},
-		{"embedding.doc_prefix", "Doc prefix", "Embedding", "text", e.DocPrefix, "Prefix for document embeds"},
-		{"retrieval.weight_fts", "FTS weight", "Retrieval", "number", num(rv.WeightFTS), "Full-text fusion weight (0 = default)"},
-		{"retrieval.weight_graph", "Graph weight", "Retrieval", "number", num(rv.WeightGraph), "Graph-proximity fusion weight (0 = default)"},
-		{"retrieval.weight_vec", "Vector weight", "Retrieval", "number", num(rv.WeightVec), "Semantic fusion weight (0 = default)"},
-		{"rerank.endpoint", "Endpoint", "Rerank", "text", rv.RerankEndpoint, "Cross-encoder rerank endpoint (empty = off)"},
-		{"rerank.model", "Model", "Rerank", "text", rv.RerankModel, "Rerank model id"},
-		{"rerank.key_env", "Key env var", "Rerank", "keyref", rv.RerankKeyEnv, "NAME of the env var holding the rerank key"},
-		{"rerank.blend", "Blend", "Rerank", "number", num(rv.RerankBlend), "How much the reranker overrides fusion (0..1)"},
-		{"ann.hnsw_threshold", "HNSW threshold", "Scale (pro)", "number", ival(rv.HNSWThreshold), "Build the ANN index past this many chunks (pro build only; 0 = brute force)"},
+		{"embedding.endpoint", "Endpoint", "Semantic search (optional)", "text", e.Endpoint, "URL of an embedding service (OpenAI-compatible /v1). Adds \"find by meaning\" on top of keyword search. Leave blank to use fast keyword + graph search only."},
+		{"embedding.model", "Model", "Semantic search (optional)", "text", e.Model, "The embedding model your endpoint serves, e.g. nomic-embed-text."},
+		{"embedding.dim", "Dimensions", "Semantic search (optional)", "number", ival(e.Dim), "The vector size the model outputs, e.g. 768. Must match the model exactly."},
+		{"embedding.key_env", "Key env var", "Semantic search (optional)", "keyref", e.KeyEnv, "Name of an environment variable that holds the API key. Mesh reads the key from there; it is never typed or stored here."},
+		{"embedding.query_prefix", "Query prefix", "Semantic search (optional)", "text", e.QueryPrefix, "Some models need text prepended to a search query (e.g. \"search_query: \"). Leave blank unless the model's docs say so."},
+		{"embedding.doc_prefix", "Doc prefix", "Semantic search (optional)", "text", e.DocPrefix, "Like the query prefix, but for the notes being indexed. Leave blank unless required."},
+		{"retrieval.weight_fts", "Keyword weight", "Ranking (advanced)", "number", num(rv.WeightFTS), "How much exact keyword matches count toward ranking. Blank = the tuned default. Most people never change these."},
+		{"retrieval.weight_graph", "Link weight", "Ranking (advanced)", "number", num(rv.WeightGraph), "How much a note's links and closeness to your query count toward ranking. Blank = default."},
+		{"retrieval.weight_vec", "Meaning weight", "Ranking (advanced)", "number", num(rv.WeightVec), "How much meaning-based similarity counts. Only has an effect when semantic search is on. Blank = default."},
+		{"rerank.endpoint", "Endpoint", "Reranker (optional)", "text", rv.RerankEndpoint, "URL of a reranker service that re-scores the top hits for a sharper #1 result. Leave blank to skip reranking."},
+		{"rerank.model", "Model", "Reranker (optional)", "text", rv.RerankModel, "The rerank model your endpoint serves."},
+		{"rerank.key_env", "Key env var", "Reranker (optional)", "keyref", rv.RerankKeyEnv, "Name of the environment variable holding the reranker's API key."},
+		{"rerank.blend", "Blend", "Reranker (optional)", "number", num(rv.RerankBlend), "0 to 1. How strongly the reranker overrides the base ranking (1 = trust it fully). Blank = default."},
+		{"ann.hnsw_threshold", "Approx-index threshold", "Large-vault scale (pro)", "number", ival(rv.HNSWThreshold), "Pro builds only. Above this many chunks, switch to a faster approximate index. Blank or 0 = exact search, which is fine for most vaults."},
 	}
 	out := make([]cfgField, 0, len(defs))
 	for _, d := range defs {

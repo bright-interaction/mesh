@@ -97,16 +97,22 @@
     return panelViews.find((p) => p.dataset.panel === view);
   }
 
-  // placeholder for views whose module has not loaded yet (future phases).
-  function placeholder(el, title) {
+  // Proper display labels (so a fallback never mangles an acronym like "API" -> "Api").
+  const LABELS = { graph: "Graph", search: "Search", settings: "Settings", docs: "Docs", api: "API" };
+  function labelFor(view) { return LABELS[view] || (view.charAt(0).toUpperCase() + view.slice(1)); }
+
+  // placeholder for a view whose module did not load (e.g. a stale cache). It tells
+  // the user how to recover rather than implying the feature is unfinished.
+  function placeholder(el, view) {
+    const title = labelFor(view);
     el.innerHTML = "";
     const inner = document.createElement("div");
     inner.className = "panel-inner";
     inner.innerHTML =
       '<p class="panel-h">' + title + '</p>' +
       '<h1 class="panel-title">' + title + '</h1>' +
-      '<div class="panel-soon">This section is part of the web app build and lands in an upcoming phase. ' +
-      'The shell, navigation, and the live graph are in place.</div>';
+      '<div class="panel-soon">This view could not load its script (often a stale cache). ' +
+      'Try a hard refresh (Cmd-Shift-R).</div>';
     el.appendChild(inner);
   }
 
@@ -137,7 +143,7 @@
     if (typeof render === "function") {
       try { render(el, Mesh); } catch (e) { el.innerHTML = '<div class="panel-inner"><div class="panel-soon">Failed to render: ' + e.message + "</div></div>"; }
     } else {
-      placeholder(el, view.charAt(0).toUpperCase() + view.slice(1));
+      placeholder(el, view);
     }
   }
   Mesh.route = route;
@@ -149,6 +155,10 @@
       route(v);
     })
   );
+  // "search ->" beside the graph filter jumps to the full-text Search view.
+  const toSearch = document.getElementById("to-search");
+  if (toSearch) toSearch.addEventListener("click", () => { location.hash = "#/search"; route("search"); });
+
   window.addEventListener("hashchange", () => route(hashView()));
   function hashView() {
     const m = (location.hash || "").match(/^#\/(\w+)/);
@@ -168,11 +178,18 @@
       foot.innerHTML =
         (c.notes || 0) + " notes &middot; " + (c.edges || 0) + " links<br>" +
         dot("fts") + dot("graph") + dot("vector") + dot("rerank") + dot("ann");
+      // Surface the empty-state when the vault has no real notes yet (a fresh hub
+      // carries a single seed index.md).
+      const empty = document.getElementById("empty");
+      if (empty) empty.classList.toggle("hidden", (c.notes || 0) > 1);
     } catch (e) {
       foot.textContent = "";
     }
   }
   Mesh.refreshStatus = loadStatus;
+
+  const emptyDocs = document.getElementById("empty-docs");
+  if (emptyDocs) emptyDocs.addEventListener("click", () => { location.hash = "#/docs"; route("docs"); });
 
   wireLogin();
   (async function init() {

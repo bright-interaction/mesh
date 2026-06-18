@@ -117,7 +117,7 @@ html, body {
   background: var(--accent);
 }
 
-.search { margin-left: auto; }
+.search { margin-left: auto; display: flex; align-items: center; }
 .search input {
   font-family: var(--sans);
   font-size: 13px;
@@ -411,6 +411,86 @@ body.panel-active #stage3d { display: none; }
   line-height: 1.6;
 }
 .panel-soon b { color: var(--fg); font-weight: 600; }
+
+/* lead paragraph under a panel title: plain-language context for the view. */
+.panel-lead {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--muted);
+  margin: -16px 0 28px;
+  max-width: 640px;
+}
+
+/* settings accordion: collapsed groups so the page is short by default. */
+.set-acc {
+  border-top: 1px solid var(--border);
+}
+.set-acc-sum {
+  list-style: none;
+  cursor: pointer;
+  padding: 18px 28px 18px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+  transition: color .15s var(--ease);
+}
+.set-acc-sum::-webkit-details-marker { display: none; }
+.set-acc-sum::after {
+  content: "+";
+  position: absolute;
+  right: 4px;
+  top: 16px;
+  font-size: 18px;
+  color: var(--faint);
+  transition: transform .2s var(--ease);
+}
+.set-acc[open] > .set-acc-sum::after { content: "\2212"; } /* minus */
+.set-acc-name { font-size: 14px; color: var(--fg); font-weight: 600; }
+.set-acc-desc { font-size: 12.5px; color: var(--faint); line-height: 1.5; }
+.set-acc-sum:hover .set-acc-name { color: var(--fg); }
+.set-acc-body { padding: 6px 0 24px; }
+
+/* "search ->" button beside the graph's filter box. */
+.to-search {
+  margin-left: 8px;
+  font-family: var(--sans);
+  font-size: 11.5px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .15s var(--ease), border-color .15s var(--ease);
+}
+.to-search:hover { color: var(--fg); border-color: var(--border-strong); }
+
+/* empty-state over the graph: shown only when the vault has no notes. */
+.empty {
+  position: fixed;
+  inset: 0;
+  left: var(--rail-w);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  z-index: 15;
+  pointer-events: none;
+}
+.empty.hidden { display: none; }
+body.panel-active .empty { display: none; } /* never over a feature panel */
+.empty-card {
+  pointer-events: auto;
+  width: min(420px, 100%);
+  text-align: center;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 36px 32px;
+}
+.empty-h { font: 600 18px/1.2 var(--sans); margin: 0 0 10px; }
+.empty-sub { color: var(--muted); font-size: 13.5px; line-height: 1.6; margin: 0 0 20px; }
 
 @media (max-width: 720px) {
   :root { --rail-w: 56px; }
