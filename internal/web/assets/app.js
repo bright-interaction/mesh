@@ -32,6 +32,7 @@
   let galaxyScale = 1;       // scales the galaxy to the graph's extent so dots match size
   let alpha = 1;             // sim energy: cools to a floor so the graph stays alive
   let neighborSet = null;
+  let spotlight = null; // community id to spotlight (dim the rest); set by the legend
   let drag = null;           // { node, vx, vy } while dragging/flinging a node
   let running = true;        // rAF gate; paused when the tab is hidden
   let lastInteract = 0;      // for easing galaxy rotation to a near-stop when idle
@@ -339,7 +340,7 @@
     for (let i = 0; i < N; i++) {
       const n = nodes[i], s = sp[i];
       if (!on(s, 80)) continue;
-      const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
+      const dim = dimmed(n);
       const core = nodeRadius(n) * z;
       if (n.id === G.meta.index_id) {
         const pulse = 1 + 0.035 * Math.sin(t * 0.02);
@@ -356,7 +357,7 @@
     for (let i = 0; i < N; i++) {
       const n = nodes[i], s = sp[i];
       if (!on(s, 10)) continue;
-      const dim = (query && !matches(n)) || (neighborSet && !isFocus(n.id));
+      const dim = dimmed(n);
       const r = coreR(n, z);
       ctx.globalAlpha = dim ? 0.18 : 1;
       ctx.fillStyle = n.id === G.meta.index_id ? "#fff6e8" : lighten(commColor.get(n.community) || "#7c766e", 0.6);
@@ -384,7 +385,7 @@
         if (placed >= cap) break;
         const n = nodes[idx], s = sp[idx];
         if (!s || !on(s, 10)) continue;
-        if ((query && !matches(n)) || (neighborSet && !isFocus(n.id))) continue;
+        if (dimmed(n)) continue;
         if (n.id === hoverId || (selected && n.id === selected.id) || isFocus(n.id)) continue;
         if (placeLabel(n, s, coreR(n, z), a)) placed++;
       }
@@ -444,6 +445,9 @@
   }
   function nodeRadius(n) { return Math.max(1.4, (n.size || 1) * 1.7); }
   function isFocus(id) { if (!neighborSet) return false; const f = selected || hover; return neighborSet.has(id) || (f && id === f.id); }
+  // a node is dimmed by a text filter, a focus neighborhood, or a legend spotlight.
+  function dimmed(n) { return (query && !matches(n)) || (neighborSet && !isFocus(n.id)) || (spotlight != null && n.community !== spotlight); }
+  function clearSpotlight() { if (spotlight == null) return; spotlight = null; if (gl3d) gl3d.setSpotlight(null); buildLegend(); }
 
   // ---- camera ----
   function fitView() {
@@ -556,7 +560,7 @@
       const rect = canvas.getBoundingClientRect();
       const n = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
       if (n) { focusNodeById(n.id); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); } // fly in + read
-      else { selected = null; setFocus(null); hideCard(); clearFocus2d(); if (window.Mesh && Mesh.closeNote) Mesh.closeNote(); }
+      else { selected = null; setFocus(null); hideCard(); clearFocus2d(); clearSpotlight(); if (window.Mesh && Mesh.closeNote) Mesh.closeNote(); }
     });
     canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
@@ -574,7 +578,7 @@
     $("q").addEventListener("input", (e) => runSearch(e.target.value));
     window.addEventListener("resize", resize);
     window.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { selected = null; setFocus(null); hideCard(); $("q").value = ""; query = ""; }
+      if (e.key === "Escape") { selected = null; setFocus(null); hideCard(); clearFocus2d(); clearSpotlight(); $("q").value = ""; query = ""; }
     });
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && !running) { running = true; requestAnimationFrame(loop); }
@@ -629,8 +633,17 @@
   function buildLegend() {
     const top = G.communities.slice(0, 8).filter((c) => c.label);
     if (!top.length) return;
-    $("legend").innerHTML = top.map((c) => `<div class="row"><i style="background:${esc(c.color)}"></i><span>${esc(c.label)} (${c.size | 0})</span></div>`).join("");
-    $("legend").classList.remove("hidden");
+    const el = $("legend");
+    el.innerHTML = "";
+    top.forEach((c) => {
+      const b = document.createElement("button");
+      b.className = "row" + (spotlight === c.id ? " active" : "");
+      b.title = "Spotlight this cluster (dim the rest). Click again to clear.";
+      b.innerHTML = `<i style="background:${esc(c.color)}"></i><span>${esc(c.label)} (${c.size | 0})</span>`;
+      b.onclick = () => { spotlight = (spotlight === c.id) ? null : c.id; if (gl3d) gl3d.setSpotlight(spotlight); buildLegend(); };
+      el.appendChild(b);
+    });
+    el.classList.remove("hidden");
   }
   // ---- clusters explorer: browse communities + their notes, click to read ----
   function focusNodeById(id) {

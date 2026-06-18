@@ -226,7 +226,14 @@ html, body {
   color: var(--muted);
 }
 .legend.hidden { display: none; }
-.legend .row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.legend .row {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 4px 6px; margin: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--muted); font: inherit; text-align: left; cursor: pointer;
+  transition: background .15s var(--ease), color .15s var(--ease);
+}
+.legend .row:hover { background: var(--bg-2); color: var(--fg); }
+.legend .row.active { background: var(--bg-2); color: var(--fg); box-shadow: inset 0 0 0 1px var(--border-strong); }
 .legend .row i {
   width: 9px; height: 9px; border-radius: 2px; flex: none;
   font-style: normal;
