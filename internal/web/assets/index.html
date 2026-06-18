@@ -3,8 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- base href is rewritten by the server to the configured base path ("/" on a
+       loopback bind, "/app/" when served under a path), so every relative asset and
+       fetch below resolves under it. Do not use leading-slash absolute paths. -->
+  <base href="__MESH_BASE__">
   <title>Mesh</title>
-  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
   <!-- Graph engine canvases (full-window; app.js owns these, IDs unchanged) -->
@@ -62,12 +66,12 @@
     </div>
   </div>
 
-  <script src="/assets/gl3d.js" defer></script>
-  <script src="/assets/app.js" defer></script>
-  <script src="/assets/search.js" defer></script>
-  <script src="/assets/settings.js" defer></script>
-  <script src="/assets/docs.js" defer></script>
-  <script src="/assets/api.js" defer></script>
-  <script src="/assets/shell.js" defer></script>
+  <script src="assets/gl3d.js" defer></script>
+  <script src="assets/app.js" defer></script>
+  <script src="assets/search.js" defer></script>
+  <script src="assets/settings.js" defer></script>
+  <script src="assets/docs.js" defer></script>
+  <script src="assets/api.js" defer></script>
+  <script src="assets/shell.js" defer></script>
 </body>
 </html>

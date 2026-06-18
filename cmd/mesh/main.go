@@ -1218,20 +1218,24 @@ func tuiCmd() *cobra.Command {
 	}
 }
 func uiCmd() *cobra.Command {
-	var addr, token string
+	var addr, token, basePath string
 	c := &cobra.Command{
 		Use:   "ui [vault]",
 		Short: "Serve the local web app: graph, search, settings, docs, API reference",
-		Long:  "Open the Mesh web app for a vault: the graph (force + galaxy + 3D), a search view, editable settings, in-app docs, and the API reference. Same index the agent reads over MCP, served from the single binary with no CDN. Loopback bind needs no auth; binding beyond loopback requires --token (or MESH_UI_TOKEN), fail-closed.",
+		Long:  "Open the Mesh web app for a vault: the graph (force + galaxy + 3D), a search view, editable settings, in-app docs, and the API reference. Same index the agent reads over MCP, served from the single binary with no CDN. Loopback bind needs no auth; binding beyond loopback requires --token (or MESH_UI_TOKEN), fail-closed. Use --base-path to serve under a path (e.g. behind a reverse proxy at /app).",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if token == "" {
 				token = os.Getenv("MESH_UI_TOKEN")
 			}
-			return web.Serve(vaultArg(args), addr, token)
+			if basePath == "" {
+				basePath = os.Getenv("MESH_UI_BASE_PATH")
+			}
+			return web.Serve(vaultArg(args), addr, token, basePath)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")
 	c.Flags().StringVar(&token, "token", "", "bearer token required for /api access (or MESH_UI_TOKEN); mandatory when binding beyond loopback")
+	c.Flags().StringVar(&basePath, "base-path", "", "serve the app under a path, e.g. /app (or MESH_UI_BASE_PATH), for a reverse proxy")
 	return c
 }
