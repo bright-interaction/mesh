@@ -13,6 +13,9 @@
   // for a token (non-loopback binds require it), stores it, and retries.
   Mesh.api = async function (path, opts) {
     opts = opts || {};
+    // Resolve relative to <base href> so the app works under a path (e.g. /app/).
+    // Callers pass "/api/...": strip the leading slash so it is relative.
+    path = path.replace(/^\//, "");
     const headers = Object.assign({}, opts.headers);
     const tok = sessionStorage.getItem(TOKEN_KEY);
     if (tok) headers["Authorization"] = "Bearer " + tok;

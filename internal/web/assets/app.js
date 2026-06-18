@@ -40,7 +40,7 @@
 
   const safeColor = (c) => (HEX.test(c) ? c : "#7c766e");
 
-  fetch("/graph.json").then((r) => {
+  fetch("graph.json").then((r) => {
     if (!r.ok) throw new Error("graph.json " + r.status);
     return r.json();
   }).then(boot).catch(fail);

@@ -23,9 +23,19 @@ type Server struct {
 	vaultRoot string
 	store     *index.Store
 	auth      authConfig
+	basePath  string // "" for root, or "/app" when served under a path
 
 	mu    sync.RWMutex
 	graph *graph.Graph
+}
+
+// baseHref is the value injected into the SPA's <base> tag, so every relative
+// asset and fetch resolves under the configured path. Always ends in "/".
+func (s *Server) baseHref() string {
+	if s.basePath == "" {
+		return "/"
+	}
+	return s.basePath + "/"
 }
 
 // NewServer opens the vault index and builds the in-memory graph once.
@@ -61,7 +71,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/docs/{slug}", s.handleDoc)
 	mux.HandleFunc("GET /api/mcp-tools", s.handleMCPTools)
 	mux.HandleFunc("GET /openapi.json", s.handleOpenAPI)
-	return s.auth.guard(mux)
+	var h http.Handler = s.auth.guard(mux)
+	if s.basePath != "" {
+		// Serve the whole app under the path: strip it before the inner mux (so its
+		// root-relative routes match) and let the subtree pattern redirect /app -> /app/.
+		outer := http.NewServeMux()
+		outer.Handle(s.basePath+"/", http.StripPrefix(s.basePath, h))
+		h = outer
+	}
+	return h
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -74,6 +92,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusInternalServerError)
 		return
 	}
+	body = []byte(strings.ReplaceAll(string(body), "__MESH_BASE__", s.baseHref()))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(body)
@@ -140,6 +159,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// normalizeBasePath returns "" for root, or a clean "/seg" with a leading slash and
+// no trailing slash, so it composes with the route prefixes and the <base> href.
+func normalizeBasePath(p string) string {
+	p = strings.Trim(strings.TrimSpace(p), "/")
+	if p == "" {
+		return ""
+	}
+	return "/" + p
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -149,7 +178,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // Serve builds the server and listens on addr (e.g. 127.0.0.1:7474), printing the
 // URL. A loopback bind needs no auth; binding beyond loopback is fail-closed and
 // requires a token (see newAuthConfig).
-func Serve(vaultRoot, addr, token string) error {
+func Serve(vaultRoot, addr, token, basePath string) error {
 	auth, err := newAuthConfig(addr, token)
 	if err != nil {
 		return err
@@ -160,11 +189,12 @@ func Serve(vaultRoot, addr, token string) error {
 	}
 	defer s.Close()
 	s.auth = auth
+	s.basePath = normalizeBasePath(basePath)
 	exp := BuildExport(s.graph, vaultRoot)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))
 	if auth.authRequired() {
 		fmt.Printf("auth: token required (Authorization: Bearer ...)\n")
 	}
-	fmt.Printf("serving at http://%s  (Ctrl-C to stop)\n", addr)
+	fmt.Printf("serving at http://%s%s  (Ctrl-C to stop)\n", addr, s.baseHref())
 	return http.ListenAndServe(addr, s.Handler())
 }
