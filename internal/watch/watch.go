@@ -35,12 +35,12 @@ type Result struct {
 
 // Options configure a watch run.
 type Options struct {
-	Root      string                 // vault root to watch
-	Debounce  time.Duration          // quiet window to coalesce a save burst; <=0 uses the default
-	Reconcile time.Duration          // periodic safety-net interval; <=0 disables the tick
-	OnReindex func() (Result, error) // authoritative drift-check + reindex; called single-flight
-	Logf      func(string, ...any)   // progress sink; nil is silent
-	Trigger   <-chan struct{}        // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
+	Root      string                                   // vault root to watch
+	Debounce  time.Duration                            // quiet window to coalesce a save burst; <=0 uses the default
+	Reconcile time.Duration                            // periodic safety-net interval; <=0 disables the tick
+	OnReindex func(authoritative bool) (Result, error) // drift-check + reindex, single-flight; authoritative=false on a debounced change (mtime fast path ok), true on startup + the periodic safety tick (full hash check)
+	Logf      func(string, ...any)                     // progress sink; nil is silent
+	Trigger   <-chan struct{}                          // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
 }
 
 const defaultDebounce = 300 * time.Millisecond
@@ -135,7 +135,11 @@ func Run(ctx context.Context, opt Options) error {
 }
 
 func reconcile(opt Options, logf func(string, ...any), reason string) {
-	res, err := opt.OnReindex()
+	// A debounced local change can use the mtime fast path; startup and the periodic
+	// safety tick run an authoritative full hash check so a mtime-preserving edit (or
+	// any missed event) is always caught.
+	authoritative := reason != "change"
+	res, err := opt.OnReindex(authoritative)
 	if err != nil {
 		logf("reindex failed (%s): %v", reason, err)
 		return

@@ -32,7 +32,7 @@ func TestRunReconcilesOnChange(t *testing.T) {
 			Root:      dir,
 			Debounce:  20 * time.Millisecond,
 			Reconcile: 0, // isolate the fsnotify path
-			OnReindex: func() (Result, error) {
+			OnReindex: func(authoritative bool) (Result, error) {
 				calls <- struct{}{}
 				return Result{Reindexed: true, Added: 1}, nil
 			},
@@ -74,7 +74,7 @@ func TestRunPeriodicReconcile(t *testing.T) {
 		Root:      dir,
 		Debounce:  time.Hour, // make the event path irrelevant
 		Reconcile: 40 * time.Millisecond,
-		OnReindex: func() (Result, error) {
+		OnReindex: func(authoritative bool) (Result, error) {
 			calls <- struct{}{}
 			return Result{}, nil // no drift: the safety tick still fires the check
 		},
@@ -95,7 +95,7 @@ func TestRunIgnoresNonMarkdown(t *testing.T) {
 	go Run(ctx, Options{
 		Root:     dir,
 		Debounce: 20 * time.Millisecond,
-		OnReindex: func() (Result, error) {
+		OnReindex: func(authoritative bool) (Result, error) {
 			calls <- struct{}{}
 			return Result{}, nil
 		},

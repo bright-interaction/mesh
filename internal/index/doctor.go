@@ -2,6 +2,7 @@ package index
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -91,20 +92,33 @@ type DriftDelta struct {
 // incremental reconcile path never parses a file twice. It uses the same
 // authoritative retrieval_hash comparison, so a cosmetic edit (mtime moved, hash
 // unchanged) yields no drift.
-func (s *Store) DriftDeltaReport(root string) (DriftDelta, error) {
-	rows, err := s.readDB.Query(`SELECT path, id, retrieval_hash FROM notes`)
+//
+// mtimeFast trades a little safety for speed on the watcher's hot path: a file
+// whose on-disk mtime equals the stored mtime is trusted unchanged and NOT parsed,
+// so a single edit parses one file instead of the whole vault. The blind spot is
+// an edit that does not move mtime (rare: a mtime-preserving write, or a second
+// edit within the same one-second mtime resolution as the index); the watcher's
+// periodic tick calls this with mtimeFast=false (parse-all, hash-authoritative),
+// which catches any such case within one interval. Pass false for a correctness
+// pass (the tick, `mesh doctor`, startup).
+func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error) {
+	rows, err := s.readDB.Query(`SELECT path, id, retrieval_hash, mtime FROM notes`)
 	if err != nil {
 		return DriftDelta{}, err
 	}
-	type rec struct{ id, hash string }
+	type rec struct {
+		id, hash string
+		mtime    int64
+	}
 	dbByPath := map[string]rec{}
 	for rows.Next() {
 		var p, id, h string
-		if err := rows.Scan(&p, &id, &h); err != nil {
+		var mt int64
+		if err := rows.Scan(&p, &id, &h, &mt); err != nil {
 			rows.Close()
 			return DriftDelta{}, err
 		}
-		dbByPath[p] = rec{id, h}
+		dbByPath[p] = rec{id, h, mt}
 	}
 	rows.Close()
 
@@ -122,12 +136,29 @@ func (s *Store) DriftDeltaReport(root string) (DriftDelta, error) {
 	// it, so we refuse here too with a clear message rather than let INSERT OR
 	// REPLACE clobber a live note and flip-flop forever (never converging).
 	finalOwner := map[string]string{}
+	claim := func(id, rel string) error {
+		if other, dup := finalOwner[id]; dup {
+			return fmt.Errorf("duplicate note id %q at %q and %q; ids must be unique before either can be indexed", id, other, rel)
+		}
+		finalOwner[id] = rel
+		return nil
+	}
 	for _, f := range files {
 		rel, err := filepath.Rel(root, f)
 		if err != nil {
 			rel = f
 		}
 		seen[rel] = true
+		// Fast path: a file in the index whose mtime is unchanged is trusted as-is and
+		// not parsed. It still owns its id (from the DB) for the collision check.
+		if r, ok := dbByPath[rel]; mtimeFast && ok && r.mtime != 0 {
+			if fi, statErr := os.Stat(f); statErr == nil && fi.ModTime().Unix() == r.mtime {
+				if err := claim(r.id, rel); err != nil {
+					return DriftDelta{}, err
+				}
+				continue
+			}
+		}
 		pn, err := ParseFile(f)
 		if err != nil {
 			// A file that no longer parses but is in the index must be dropped (a full
@@ -140,10 +171,9 @@ func (s *Store) DriftDeltaReport(root string) (DriftDelta, error) {
 		}
 		pn.Path = rel
 		id := effectiveID(pn)
-		if other, dup := finalOwner[id]; dup {
-			return DriftDelta{}, fmt.Errorf("duplicate note id %q at %q and %q; ids must be unique before either can be indexed", id, other, rel)
+		if err := claim(id, rel); err != nil {
+			return DriftDelta{}, err
 		}
-		finalOwner[id] = rel
 		r, ok := dbByPath[rel]
 		switch {
 		case !ok:
