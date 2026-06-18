@@ -25,7 +25,8 @@ type credentials struct {
 
 type syncState struct {
 	HeadSHA string            `json:"head_sha"`
-	Hashes  map[string]string `json:"hashes"` // vault-relative path -> content sha
+	Hashes  map[string]string `json:"hashes"`             // vault-relative path -> content sha
+	TombSeq int64             `json:"tomb_seq,omitempty"` // last delete high-water mark seen from the hub
 }
 
 func credPath(vaultDir string) string  { return filepath.Join(vaultDir, ".mesh", "credentials") }
@@ -75,6 +76,7 @@ type Summary struct {
 	Head             string
 	ConflictSiblings []string // merge conflicts: our pushed version parked here
 	Protected        []string // external-editor race: incoming hub version parked here
+	Dropped          []string // full-reconcile: locals removed because deleted upstream
 }
 
 func contentHash(b []byte) string {
@@ -186,6 +188,77 @@ func keepParkedDirty(current, base map[string]string, parked []park) {
 	}
 }
 
+// dropFullReconcileOrphans removes local notes that a full reconcile proves are
+// gone from the team vault. A full reconcile's deltas carry the live snapshot as
+// upserts with NO deletes (the client's base was empty or too old to diff), so
+// without this a stale client keeps, and can later resurrect, every note deleted
+// while it was away (the offline-past-horizon resurrection bug).
+//
+// The deletion is content-safe: it only ever removes a file that is byte-identical
+// to the EXACT version we last synced (base[rel]), which is the version the hub
+// then deleted. The snapshot tells us the path is no longer live; matching base
+// tells us the on-disk bytes are that dead version and not something the user has
+// since edited or recreated at the same path. So a local recreate with any
+// different content, including content the hub silently rejected as non-text, is
+// never destroyed: its hash differs from base and it is kept (and re-pushes). The
+// hub tombstone list is a confirming signal only; the base-hash match is the
+// load-bearing safety, which also means tombstone GC can never cause data loss.
+//
+// Known limitation (safe direction): a client whose sync state was reset so base
+// no longer knows a path cannot prove the on-disk bytes are the dead version, so
+// it keeps the file rather than risk destroying local content. Such a note can
+// re-share on the next push (a re-share, never a loss). The horizon GC assumes
+// base is intact for offline clients.
+func dropFullReconcileOrphans(vaultDir string, deltas []syncproto.Delta, tombstones []string, base map[string]string) ([]string, error) {
+	keep := make(map[string]bool, len(deltas))
+	for _, d := range deltas {
+		if d.Op == "upsert" {
+			keep[d.Path] = true
+		}
+	}
+	tomb := make(map[string]bool, len(tombstones))
+	for _, p := range tombstones {
+		tomb[p] = true
+	}
+	files, err := vault.Walk(vaultDir) // excludes .mesh + conflict siblings already
+	if err != nil {
+		return nil, err
+	}
+	var dropped []string
+	for _, f := range files {
+		rel, err := filepath.Rel(vaultDir, f)
+		if err != nil {
+			rel = f
+		}
+		rel = filepath.ToSlash(rel)
+		if keep[rel] {
+			continue // present in the authoritative snapshot: alive
+		}
+		baseHash, syncedBefore := base[rel]
+		if !syncedBefore && !tomb[rel] {
+			continue // no evidence of an upstream delete: keep (e.g. a new local note)
+		}
+		// SAFETY GATE: only remove bytes identical to the exact version we last
+		// synced. A path with no base hash (state reset) or any local change since
+		// fails here and is kept, so we never destroy unacknowledged local content.
+		if !syncedBefore {
+			continue
+		}
+		onDisk, readErr := os.ReadFile(f)
+		if readErr != nil {
+			continue
+		}
+		if contentHash(onDisk) != baseHash {
+			continue // locally edited or recreated since last sync: keep it
+		}
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			return dropped, err
+		}
+		dropped = append(dropped, rel)
+	}
+	return dropped, nil
+}
+
 // writeConflictSiblings preserves the client's losing version of each conflicted
 // path in a local sibling BEFORE applyDeltas overwrites the path with the hub's
 // winning version. Siblings are local resolution artifacts, never pushed.
@@ -244,7 +317,7 @@ func SyncVault(vaultDir string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
-	resp, err := New(creds.HubURL, creds.Token).Sync(syncproto.SyncRequest{BaseSHA: state.HeadSHA, Outbox: outbox})
+	resp, err := New(creds.HubURL, creds.Token).Sync(syncproto.SyncRequest{BaseSHA: state.HeadSHA, Outbox: outbox, TombstoneSeq: state.TombSeq})
 	if err != nil {
 		return Summary{}, err
 	}
@@ -256,6 +329,16 @@ func SyncVault(vaultDir string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	// A full reconcile's deltas are upserts-only, so remove locals the snapshot
+	// proves were deleted upstream (else they linger and can resurrect). Must run
+	// before the recompute below so the dropped paths leave the persisted hashes.
+	var dropped []string
+	if resp.FullReconcile {
+		dropped, err = dropFullReconcileOrphans(vaultDir, resp.Deltas, resp.Tombstones, state.Hashes)
+		if err != nil {
+			return Summary{}, err
+		}
+	}
 	// Recompute hashes from disk so the next outbox reflects the canonical (post-
 	// merge) hub state, not what we optimistically pushed; then keep any
 	// guard-parked path dirty so its kept local change re-pushes next sync.
@@ -264,10 +347,10 @@ func SyncVault(vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	keepParkedDirty(current, state.Hashes, parked)
-	if err := writeState(vaultDir, syncState{HeadSHA: resp.HeadSHA, Hashes: current}); err != nil {
+	if err := writeState(vaultDir, syncState{HeadSHA: resp.HeadSHA, Hashes: current, TombSeq: resp.TombstoneSeq}); err != nil {
 		return Summary{}, err
 	}
-	sum := Summary{Pushed: len(outbox), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA}
+	sum := Summary{Pushed: len(outbox), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped}
 	for _, c := range resp.Conflicts {
 		sum.ConflictSiblings = append(sum.ConflictSiblings, c.SiblingPath)
 	}

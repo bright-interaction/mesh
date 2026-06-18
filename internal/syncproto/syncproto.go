@@ -34,8 +34,9 @@ type OutboxItem struct {
 
 // SyncRequest is one pull-based reconcile round.
 type SyncRequest struct {
-	BaseSHA string       `json:"base_sha"`
-	Outbox  []OutboxItem `json:"outbox"`
+	BaseSHA      string       `json:"base_sha"`
+	Outbox       []OutboxItem `json:"outbox"`
+	TombstoneSeq int64        `json:"tombstone_seq,omitempty"` // client's high-water delete seq (0 = none seen)
 }
 
 // Delta is one change the hub sends back for the client to apply.
@@ -60,6 +61,14 @@ type SyncResponse struct {
 	Deltas        []Delta    `json:"deltas"`
 	Conflicts     []Conflict `json:"conflicts"`
 	FullReconcile bool       `json:"full_reconcile"`
+	// Tombstones is the drop-list sent ONLY on a full reconcile (base empty/unknown):
+	// paths the client must delete because they were removed while it was away. On a
+	// full reconcile the deltas carry the live snapshot as upserts but no deletes, so
+	// without this a stale client would resurrect since-deleted notes.
+	Tombstones []string `json:"tombstones,omitempty"`
+	// TombstoneSeq is the hub's current delete high-water mark; the client persists it
+	// and sends it back as SyncRequest.TombstoneSeq.
+	TombstoneSeq int64 `json:"tombstone_seq,omitempty"`
 }
 
 // CurationJob is a hub-recorded marker that a path had a true conflict and would
