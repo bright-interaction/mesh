@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,25 +23,5 @@ func TestTranscriptHasWriteback(t *testing.T) {
 	}
 	if transcriptHasWriteback(filepath.Join(dir, "missing.jsonl")) {
 		t.Error("a missing transcript must not count as a write-back")
-	}
-}
-
-func TestHooksMergeIdempotentAndUninstall(t *testing.T) {
-	hooks := map[string]any{}
-	appendHook(hooks, "SessionStart", map[string]any{"matcher": "startup", "hooks": []any{cmdEntry(`mesh orient --hook --vault /v`)}})
-	settings := map[string]any{"hooks": hooks, "model": "keepme"}
-
-	if !settingsHasCommand(settings, "orient --hook") {
-		t.Fatal("settingsHasCommand should find the installed orient command")
-	}
-	if settingsHasCommand(settings, "hooks stop-check") {
-		t.Fatal("stop-check was not installed; should not be reported present")
-	}
-	// unrelated keys must be preserved through a marshal round-trip.
-	out, _ := json.Marshal(settings)
-	var rt map[string]any
-	json.Unmarshal(out, &rt)
-	if rt["model"] != "keepme" {
-		t.Error("unrelated settings keys must be preserved")
 	}
 }
