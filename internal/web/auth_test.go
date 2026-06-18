@@ -32,7 +32,15 @@ func TestGuardTokenGate(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("GET /assets/x.js", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("GET /graph.json", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	h := a.guard(mux)
+
+	// graph payload is vault data: it must be gated too (not just /api/).
+	grec := httptest.NewRecorder()
+	h.ServeHTTP(grec, httptest.NewRequest("GET", "/graph.json", nil))
+	if grec.Code != http.StatusUnauthorized {
+		t.Errorf("graph.json without token = %d, want 401", grec.Code)
+	}
 
 	// /api without token -> 401
 	rec := httptest.NewRecorder()
