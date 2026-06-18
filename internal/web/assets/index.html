@@ -35,6 +35,7 @@
   <div id="graph-chrome">
     <header id="bar">
       <div class="brand">
+        <button id="browse" class="browse-btn" title="Browse clusters and their notes">Browse</button>
         <span class="stats" id="stats"></span>
       </div>
       <div class="views" role="tablist" aria-label="View">
@@ -49,8 +50,26 @@
     </header>
     <aside id="card" class="card hidden" aria-live="polite"></aside>
     <div id="legend" class="legend hidden"></div>
-    <footer id="hint">drag to pan &middot; scroll to zoom &middot; hover a note &middot; click to open in your editor</footer>
+    <footer id="hint">drag to pan &middot; scroll to zoom &middot; hover a note &middot; click a note to read it &middot; Browse the clusters</footer>
   </div>
+
+  <!-- Clusters explorer: browse communities and their notes over the graph. Built by
+       app.js from the graph data; clicking a note opens it in the reader below. -->
+  <aside id="explorer" class="explorer hidden" aria-hidden="true">
+    <div class="exp-head"><span class="exp-title">Clusters</span><button class="exp-x" id="exp-close" title="Close" aria-label="Close">&times;</button></div>
+    <input id="exp-filter" type="search" class="exp-filter" placeholder="filter notes" autocomplete="off" spellcheck="false">
+    <div class="exp-list" id="exp-list"></div>
+  </aside>
+
+  <!-- Note reader: the clicked note's rendered markdown, in-app (no editor needed,
+       since the vault is rarely open locally). Filled by Mesh.openNote. -->
+  <aside id="note-drawer" class="note-drawer hidden" aria-hidden="true">
+    <div class="nd-bar">
+      <span class="nd-path" id="nd-path"></span>
+      <button class="nd-x" id="nd-close" title="Close" aria-label="Close">&times;</button>
+    </div>
+    <div class="nd-body prose" id="nd-body"></div>
+  </aside>
 
   <!-- Feature panels: shown over the canvas when their nav item is active -->
   <main id="panel" hidden>

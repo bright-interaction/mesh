@@ -49,7 +49,9 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read failed", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{"id": id, "path": rel, "markdown": string(data)})
+	// html is server-rendered (gomarkdown, same as docs) so every reader shows nicely
+	// formatted prose instead of raw markdown; markdown is kept for any raw consumer.
+	writeJSON(w, map[string]any{"id": id, "path": rel, "markdown": string(data), "html": renderMD(data)})
 }
 
 func atoiOr(s string, def int) int {

@@ -62,6 +62,7 @@
     layoutGalaxy();
     setStats();
     buildLegend();
+    buildExplorer();
     fitView();
     doneOverlay();
     wire();
@@ -473,10 +474,13 @@
       </div>
       ${tags ? `<div class="tags">${tags}</div>` : ""}
       <div class="actions">
-        <a class="btn" href="${esc(editor)}">open in editor</a>
+        <button class="btn" id="read">Read note</button>
         <button class="btn ghost" id="copy">copy path</button>
+        <a class="btn ghost" href="${esc(editor)}" title="Open in your editor (only works if the vault is open locally)">editor</a>
       </div>`;
     card.classList.remove("hidden");
+    const rd = $("read");
+    if (rd) rd.onclick = () => window.Mesh && Mesh.openNote && Mesh.openNote(n.id);
     const cp = $("copy");
     if (cp) cp.onclick = () => navigator.clipboard && navigator.clipboard.writeText(joinPath(G.meta.vault, n.path));
   }
@@ -532,7 +536,8 @@
       if (moved) return;
       const rect = canvas.getBoundingClientRect();
       const n = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
-      if (n) { selected = n; setFocus(n); showCard(n); } else { selected = null; setFocus(null); hideCard(); }
+      if (n) { selected = n; setFocus(n); showCard(n); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); }
+      else { selected = null; setFocus(null); hideCard(); }
     });
     canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
@@ -570,7 +575,7 @@
       if (!gl3d && window.Mesh3D) {
         gl3d = window.Mesh3D.init(canvas3d, G, {
           commColor, indexId: G.meta.index_id,
-          onSelect: (n) => { selected = n; setFocus(n); if (n) showCard(n); else hideCard(); },
+          onSelect: (n) => { selected = n; setFocus(n); if (n) { showCard(n); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); } else hideCard(); },
           onHover: (n) => { if (n) showCard(n); else if (!selected) hideCard(); },
         });
       }
@@ -603,6 +608,70 @@
     $("legend").innerHTML = top.map((c) => `<div class="row"><i style="background:${esc(c.color)}"></i><span>${esc(c.label)} (${c.size | 0})</span></div>`).join("");
     $("legend").classList.remove("hidden");
   }
+  // ---- clusters explorer: browse communities + their notes, click to read ----
+  function focusNodeById(id) {
+    const n = G.nodes.find((x) => x.id === id);
+    if (!n) return;
+    selected = n; setFocus(n); showCard(n);
+    if (view === "galaxy3d") { if (gl3d) gl3d.setHighlight(id); }
+    else { const p = pos(n); cam.x = p.x; cam.y = p.y; cam.zoom = Math.max(cam.zoom, 1.7); lastInteract = now(); }
+  }
+  function buildExplorer() {
+    const list = $("exp-list");
+    if (!list) return;
+    const byComm = new Map();
+    for (const n of G.nodes) { if (!byComm.has(n.community)) byComm.set(n.community, []); byComm.get(n.community).push(n); }
+    const order = [];
+    const seen = new Set();
+    for (const c of G.communities.slice().sort((a, b) => (b.size | 0) - (a.size | 0))) { if (byComm.has(c.id)) { order.push(c); seen.add(c.id); } }
+    for (const [cid, mem] of byComm) if (!seen.has(cid)) order.push({ id: cid, label: "#" + cid, color: commColor.get(cid) || "#7c766e", size: mem.length });
+
+    const typeSummary = (mem) => {
+      const t = new Map();
+      for (const m of mem) { const k = m.type || "note"; t.set(k, (t.get(k) || 0) + 1); }
+      return [...t.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${v} ${esc(k)}`).join(" &middot; ");
+    };
+    list.innerHTML = order.map((c) => {
+      const mem = (byComm.get(c.id) || []).slice().sort((a, b) => (b.degree | 0) - (a.degree | 0) || ((a.label || a.id) < (b.label || b.id) ? -1 : 1));
+      const notes = mem.map((n) =>
+        `<button class="exp-note" data-id="${esc(n.id)}" data-name="${esc((n.label || n.id) + " " + (n.path || ""))}">` +
+        `<span class="exp-type">${esc(n.type || "note")}</span>` +
+        `<span class="exp-name">${esc(n.label || n.id)}</span>` +
+        `<span class="exp-path">${esc(n.path || "")}</span></button>`).join("");
+      return `<div class="exp-group"><button class="exp-comm"><i class="exp-sw" style="background:${esc(c.color)}"></i>` +
+        `<span class="exp-clabel">${esc(c.label || ("#" + c.id))}</span><span class="exp-count">${mem.length}</span></button>` +
+        `<div class="exp-sub">${typeSummary(mem)}</div><div class="exp-notes hidden">${notes}</div></div>`;
+    }).join("");
+
+    list.onclick = (e) => {
+      const comm = e.target.closest(".exp-comm");
+      if (comm) { const nn = comm.parentElement.querySelector(".exp-notes"); if (nn) nn.classList.toggle("hidden"); return; }
+      const note = e.target.closest(".exp-note");
+      if (note) { focusNodeById(note.dataset.id); if (window.Mesh && Mesh.openNote) Mesh.openNote(note.dataset.id); }
+    };
+    const filter = $("exp-filter");
+    if (filter) filter.oninput = () => {
+      const q = filter.value.trim().toLowerCase();
+      list.querySelectorAll(".exp-group").forEach((g) => {
+        let any = false;
+        g.querySelectorAll(".exp-note").forEach((b) => { const hit = !q || (b.dataset.name || "").toLowerCase().includes(q); b.style.display = hit ? "" : "none"; if (hit) any = true; });
+        g.style.display = any ? "" : "none";
+        const nn = g.querySelector(".exp-notes"); if (q && nn) nn.classList.remove("hidden");
+      });
+    };
+
+    const browseBtn = $("browse"), explorer = $("explorer"), expClose = $("exp-close");
+    const toggleExplorer = (show) => {
+      if (!explorer) return;
+      const open = show == null ? explorer.classList.contains("hidden") : show;
+      explorer.classList.toggle("hidden", !open);
+      explorer.setAttribute("aria-hidden", String(!open));
+      if (browseBtn) browseBtn.classList.toggle("active", open);
+    };
+    if (browseBtn) browseBtn.onclick = () => toggleExplorer();
+    if (expClose) expClose.onclick = () => toggleExplorer(false);
+  }
+
   function resize() {
     dpr = Math.max(1, window.devicePixelRatio || 1);
     W = window.innerWidth; H = window.innerHeight;

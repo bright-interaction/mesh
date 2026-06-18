@@ -26,6 +26,37 @@
     return ct.includes("application/json") ? res.json() : res.text();
   };
 
+  // --- Note reader: a shared in-app markdown viewer (no editor needed) ----------
+  // Any view calls Mesh.openNote(id); it fetches the note and shows server-rendered
+  // HTML in the slide-in drawer. Used by graph clicks, the clusters explorer, etc.
+  const noteDrawer = document.getElementById("note-drawer");
+  Mesh.openNote = async function (id) {
+    if (!noteDrawer || !id) return;
+    const body = document.getElementById("nd-body"), pathEl = document.getElementById("nd-path");
+    noteDrawer.classList.remove("hidden");
+    noteDrawer.setAttribute("aria-hidden", "false");
+    pathEl.textContent = "";
+    body.innerHTML = '<p class="srch-hint">Loading...</p>';
+    try {
+      const n = await Mesh.api("/api/note/" + encodeURIComponent(id));
+      pathEl.textContent = n.path || id;
+      body.innerHTML = n.html || ("<pre>" + (n.markdown || "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])) + "</pre>");
+      body.scrollTop = 0;
+    } catch (e) {
+      body.innerHTML = '<p class="srch-hint">Could not load note: ' + e.message + "</p>";
+    }
+  };
+  Mesh.closeNote = function () {
+    if (!noteDrawer) return;
+    noteDrawer.classList.add("hidden");
+    noteDrawer.setAttribute("aria-hidden", "true");
+  };
+  if (noteDrawer) {
+    const x = document.getElementById("nd-close");
+    if (x) x.addEventListener("click", Mesh.closeNote);
+    window.addEventListener("keydown", (e) => { if (e.key === "Escape" && !noteDrawer.classList.contains("hidden")) Mesh.closeNote(); });
+  }
+
   // --- Login (HttpOnly cookie session) ----------------------------------------
   // POST the access key; the server validates it constant-time and sets the cookie.
   async function submitKey(key) {
