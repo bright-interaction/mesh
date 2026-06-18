@@ -177,6 +177,9 @@ func InstallMCP(projectDir, vaultAbs, binPath string) (bool, string, error) {
 	}
 	cfg["mcpServers"] = servers
 	out, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return false, p, err
+	}
 	if err := os.WriteFile(p, append(out, '\n'), 0o644); err != nil {
 		return false, p, err
 	}
