@@ -25,6 +25,27 @@ type Embedding struct {
 	DocPrefix   string // e.g. "search_document: "
 }
 
+// Retrieval is the [retrieval] + [rerank] + [ann] sections of config.toml: the
+// solo fallback for fusion weights, the cross-encoder rerank stage, and the ANN
+// gate. As with [embedding], the matching env vars (MESH_WEIGHT_*, MESH_RERANK_*,
+// MESH_HNSW_THRESHOLD) override these; keys live in env vars named by *KeyEnv.
+type Retrieval struct {
+	WeightFTS      float64
+	WeightGraph    float64
+	WeightVec      float64
+	RerankEndpoint string
+	RerankModel    string
+	RerankKeyEnv   string
+	RerankBlend    float64
+	HNSWThreshold  int
+}
+
+// Config is the full solo config.toml (embedding + retrieval).
+type Config struct {
+	Embedding Embedding
+	Retrieval Retrieval
+}
+
 // configName is the file under <vault>/.mesh.
 const configName = "config.toml"
 
@@ -52,10 +73,39 @@ func Load(meshDir string) (Embedding, error) {
 	return e, nil
 }
 
+// LoadConfig reads the full config.toml (embedding + retrieval). A missing file
+// returns a zero Config, like Load.
+func LoadConfig(meshDir string) (Config, error) {
+	emb, err := Load(meshDir)
+	if err != nil {
+		return Config{}, err
+	}
+	c := Config{Embedding: emb}
+	b, err := os.ReadFile(filepath.Join(meshDir, configName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return c, nil
+		}
+		return Config{}, err
+	}
+	body := string(b)
+	c.Retrieval = Retrieval{
+		WeightFTS:      sectionFloat(body, "retrieval", "weight_fts"),
+		WeightGraph:    sectionFloat(body, "retrieval", "weight_graph"),
+		WeightVec:      sectionFloat(body, "retrieval", "weight_vec"),
+		RerankEndpoint: sectionString(body, "rerank", "endpoint"),
+		RerankModel:    sectionString(body, "rerank", "model"),
+		RerankKeyEnv:   sectionString(body, "rerank", "key_env"),
+		RerankBlend:    sectionFloat(body, "rerank", "blend"),
+		HNSWThreshold:  int(sectionFloat(body, "ann", "hnsw_threshold")),
+	}
+	return c, nil
+}
+
 const configTemplate = `# Mesh solo vault config. Local, not synced (a team vault uses the
-# hub-authoritative mesh.toml instead). Pins your embedding setup so mesh search /
-# mesh mcp work without re-exporting env vars each session. Environment variables
-# (MESH_EMBED_ENDPOINT / MESH_EMBED_MODEL / the key_env var below / ...) OVERRIDE
+# hub-authoritative mesh.toml instead). Pins your setup so mesh search / mesh mcp
+# work without re-exporting env vars each session. Environment variables
+# (MESH_EMBED_* / MESH_WEIGHT_* / MESH_RERANK_* / MESH_HNSW_THRESHOLD) OVERRIDE
 # these values. Secrets are never stored here: key_env only names the env var that
 # holds the bearer key.
 
@@ -66,17 +116,51 @@ dim = %d
 key_env = %q
 query_prefix = %q
 doc_prefix = %q
+
+[retrieval]
+# Fusion weights. 0 means "use the built-in default". Env MESH_WEIGHT_* wins.
+weight_fts = %g
+weight_graph = %g
+weight_vec = %g
+
+[rerank]
+# Cross-encoder rerank (BYOAI). Empty endpoint/model = off. Env MESH_RERANK_* wins.
+endpoint = %q
+model = %q
+key_env = %q
+blend = %g
+
+[ann]
+# HNSW approximate-nearest-neighbour gate: build the index past this many chunks
+# (0 = brute force). Only acts in the pro build. Env MESH_HNSW_THRESHOLD wins.
+hnsw_threshold = %d
 `
 
-// Save writes <meshDir>/config.toml atomically (temp file + rename), 0644.
+// Save writes the [embedding] section, preserving any other sections already in the
+// file. Kept for the `mesh embed` caller; new callers should use SaveConfig.
 func Save(meshDir string, e Embedding) error {
-	// key_env is the NAME of an env var, never a secret. Reject anything that is not a
-	// plain env-var identifier: it could not name a real var anyway, and a value with
-	// quotes/newlines would not round-trip through the simple TOML reader.
-	if !validEnvName(e.KeyEnv) {
-		e.KeyEnv = "MESH_EMBED_KEY"
+	cfg, _ := LoadConfig(meshDir)
+	cfg.Embedding = e
+	return SaveConfig(meshDir, cfg)
+}
+
+// SaveConfig writes the full <meshDir>/config.toml atomically (temp + rename), 0644.
+func SaveConfig(meshDir string, c Config) error {
+	// key_env vars are NAMES of env vars, never secrets. Reject anything that is not
+	// a plain identifier so a bad value cannot break the simple TOML round-trip.
+	if !validEnvName(c.Embedding.KeyEnv) {
+		c.Embedding.KeyEnv = "MESH_EMBED_KEY"
 	}
-	body := fmt.Sprintf(configTemplate, e.Endpoint, e.Model, e.Dim, e.KeyEnv, e.QueryPrefix, e.DocPrefix)
+	if c.Retrieval.RerankKeyEnv != "" && !validEnvName(c.Retrieval.RerankKeyEnv) {
+		c.Retrieval.RerankKeyEnv = "MESH_RERANK_KEY"
+	}
+	e, rv := c.Embedding, c.Retrieval
+	body := fmt.Sprintf(configTemplate,
+		e.Endpoint, e.Model, e.Dim, e.KeyEnv, e.QueryPrefix, e.DocPrefix,
+		rv.WeightFTS, rv.WeightGraph, rv.WeightVec,
+		rv.RerankEndpoint, rv.RerankModel, rv.RerankKeyEnv, rv.RerankBlend,
+		rv.HNSWThreshold,
+	)
 	tmp, err := os.CreateTemp(meshDir, ".config-*.toml")
 	if err != nil {
 		return err
@@ -113,6 +197,16 @@ func validEnvName(s string) bool {
 		}
 	}
 	return true
+}
+
+// sectionFloat reads a numeric key from a section, 0 when absent or unparseable.
+func sectionFloat(toml, section, key string) float64 {
+	s := sectionString(toml, section, key)
+	if s == "" {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
 }
 
 // sectionString pulls a simple `key = "value"` (or bare key = value) from inside a
