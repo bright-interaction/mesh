@@ -44,6 +44,13 @@ explains the flywheel, asks whether to enable the write-back nudge, and offers a
 quick tour. Add `--enforce-writeback` to also turn on the Stop nudge up front, or
 `--no-mcp` if your MCP server is already registered.
 
+**Other clients.** `mesh install --client cursor|claude-desktop|vscode|windsurf|codex`
+registers the Mesh MCP server in that client's own config (and indexes your vault),
+so the agent gets the `mesh_*` tools there too. Session hooks (the auto-onboard and
+the read/write-back enforcement) are Claude Code only, so in other clients the agent
+uses Mesh via the MCP server's instructions, just tell it to use Mesh, or run
+`mesh hooks install` as well if you also use Claude Code in that project.
+
 ### Or let the agent do all of it
 
 If Mesh is already connected over MCP, just say "set up the Mesh session hooks" and

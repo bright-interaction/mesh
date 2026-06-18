@@ -138,16 +138,31 @@ Keep it short and friendly, then carry on with whatever they need.
 ---
 `
 
-// installCmd is the one-shot agent setup: register the MCP server, install the
-// SessionStart read hook, and arm the first-run welcome. After this single command
-// the agent onboards the user automatically on its next session.
+// indexVault builds the initial index so the first orientation (and the agent) see
+// real content immediately, instead of an empty mesh on the first session.
+func indexVault(vaultAbs string) {
+	if store, err := index.Open(vaultAbs); err == nil {
+		if _, err := index.Reindex(store, vaultAbs); err == nil {
+			if n, _ := store.Count("notes"); n > 0 {
+				fmt.Printf("  + indexed the vault (%d notes)\n", n)
+			}
+		}
+		store.Close()
+	}
+}
+
+// installCmd is the one-shot agent setup. For Claude Code it registers the MCP
+// server + the SessionStart read hook + arms the first-run welcome, so the agent
+// onboards the user automatically. For other clients (which have no session hooks)
+// it registers the MCP server in that client's own config and indexes the vault; the
+// agent then uses Mesh via the MCP server's instructions.
 func installCmd() *cobra.Command {
-	var dir string
+	var dir, client string
 	var noMCP, enforce bool
 	c := &cobra.Command{
 		Use:   "install [vault]",
-		Short: "One-shot setup: register the MCP server + session hook so the agent onboards you automatically",
-		Long:  "Wires everything so a coding agent uses Mesh automatically: registers the Mesh MCP server in .mcp.json, installs the SessionStart read hook in .claude/settings.json, and arms a one-time welcome. After this, start a new agent session and it greets you and finishes onboarding itself - no further commands.",
+		Short: "One-shot setup: register the MCP server (and, on Claude Code, the auto-onboard hook)",
+		Long:  "Wires a coding agent to use Mesh. --client claude-code (default) also installs the SessionStart read hook + a one-time welcome so the agent onboards you with no further commands. Other clients (claude-desktop, cursor, vscode, windsurf, codex) get the MCP server registered in their own config; session hooks are Claude Code only, so elsewhere the agent uses Mesh via the MCP server's instructions.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultPath := "."
@@ -166,51 +181,63 @@ func installCmd() *cobra.Command {
 			if err != nil || bin == "" {
 				bin = "mesh"
 			}
-			fmt.Println("Setting up Mesh for your agent...")
-			if !noMCP {
-				added, p, err := hooks.InstallMCP(projAbs, vaultAbs, bin)
+			fmt.Printf("Setting up Mesh for %s...\n", client)
+
+			if client == "claude-code" {
+				if !noMCP {
+					added, p, err := hooks.InstallMCP(projAbs, vaultAbs, bin)
+					if err != nil {
+						return err
+					}
+					if added {
+						fmt.Printf("  + registered the Mesh MCP server in %s\n", p)
+					} else {
+						fmt.Printf("  . MCP server already present in %s\n", p)
+					}
+				}
+				res, err := hooks.Install(hooks.Options{ProjectDir: projAbs, Vault: vaultAbs, Bin: bin, EnforceWriteback: enforce})
 				if err != nil {
 					return err
 				}
-				if added {
-					fmt.Printf("  + registered the Mesh MCP server in %s\n", p)
+				if len(res.Added) > 0 {
+					for _, a := range res.Added {
+						fmt.Printf("  + %s\n", a)
+					}
 				} else {
-					fmt.Printf("  . MCP server already present in %s\n", p)
+					fmt.Printf("  . session hooks already in %s\n", res.SettingsPath)
 				}
+				indexVault(vaultAbs)
+				if err := hooks.SetOnboardPending(vaultAbs); err != nil {
+					return err
+				}
+				fmt.Println("  + armed the first-run welcome")
+				fmt.Println("\nDone. Start a new agent session (or reconnect the MCP server) and Mesh will")
+				fmt.Println("greet you and finish onboarding automatically, no commands needed.")
+				return nil
 			}
-			res, err := hooks.Install(hooks.Options{ProjectDir: projAbs, Vault: vaultAbs, Bin: bin, EnforceWriteback: enforce})
+
+			// Other clients: MCP only (no session hooks exist for them).
+			added, p, err := hooks.RegisterMCP(client, projAbs, vaultAbs, bin)
 			if err != nil {
 				return err
 			}
-			if len(res.Added) > 0 {
-				for _, a := range res.Added {
-					fmt.Printf("  + %s\n", a)
-				}
+			if added {
+				fmt.Printf("  + registered the Mesh MCP server for %s in %s\n", client, p)
 			} else {
-				fmt.Printf("  . session hooks already in %s\n", res.SettingsPath)
+				fmt.Printf("  . MCP server already registered for %s in %s\n", client, p)
 			}
-			// Build the initial index so the first orientation (and the agent) see
-			// real content immediately, instead of an empty mesh on the first session.
-			if store, err := index.Open(vaultAbs); err == nil {
-				if _, err := index.Reindex(store, vaultAbs); err == nil {
-					if n, _ := store.Count("notes"); n > 0 {
-						fmt.Printf("  + indexed the vault (%d notes)\n", n)
-					}
-				}
-				store.Close()
-			}
-			if err := hooks.SetOnboardPending(vaultAbs); err != nil {
-				return err
-			}
-			fmt.Println("  + armed the first-run welcome")
-			fmt.Println("\nDone. Start a new agent session (or reconnect the MCP server) and Mesh will")
-			fmt.Println("greet you and finish onboarding automatically, no commands needed.")
+			indexVault(vaultAbs)
+			fmt.Printf("\nDone. Restart %s so it loads the MCP server.\n", client)
+			fmt.Println("Note: the auto-onboard + write-back hooks are Claude Code only. Here the agent")
+			fmt.Println("uses Mesh via the MCP server's instructions, just ask it to use Mesh, or run")
+			fmt.Println("`mesh hooks install` if you also use Claude Code in this project.")
 			return nil
 		},
 	}
-	c.Flags().StringVar(&dir, "dir", ".", "project dir (.mcp.json + .claude/settings.json)")
-	c.Flags().BoolVar(&noMCP, "no-mcp", false, "skip registering the MCP server in .mcp.json")
-	c.Flags().BoolVar(&enforce, "enforce-writeback", false, "also install the Stop write-back nudge now (default: the agent asks during onboarding)")
+	c.Flags().StringVar(&client, "client", "claude-code", "agent client: "+strings.Join(hooks.Clients, ", "))
+	c.Flags().StringVar(&dir, "dir", ".", "project dir (used for claude-code .mcp.json/.claude and vscode .vscode)")
+	c.Flags().BoolVar(&noMCP, "no-mcp", false, "skip registering the MCP server (claude-code only)")
+	c.Flags().BoolVar(&enforce, "enforce-writeback", false, "also install the Stop write-back nudge now (claude-code; default: the agent asks during onboarding)")
 	return c
 }
 
