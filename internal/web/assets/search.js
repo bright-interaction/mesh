@@ -66,15 +66,13 @@
       results.innerHTML = '<p class="srch-hint">Loading...</p>';
       try {
         const n = await M.api("/api/note/" + encodeURIComponent(id));
-        const bodyHTML = typeof Mesh.renderMarkdown === "function"
-          ? Mesh.renderMarkdown(n.markdown)
-          : '<pre class="note-md">' + esc(n.markdown) + "</pre>";
+        const bodyHTML = n.html || ('<pre class="note-md">' + esc(n.markdown) + "</pre>");
         results.innerHTML =
           '<div class="note-pane">' +
           '<div class="note-bar"><button class="btn ghost" id="note-back">&larr; results</button>' +
           '<span class="note-path">' + esc(n.path) + "</span>" +
           '<button class="btn ghost" id="note-graph">show in graph</button></div>' +
-          '<div class="note-body">' + bodyHTML + "</div></div>";
+          '<div class="note-body prose">' + bodyHTML + "</div></div>";
         results.querySelector("#note-back").addEventListener("click", run);
         results.querySelector("#note-graph").addEventListener("click", () => {
           if (Mesh.route) Mesh.route("graph");
