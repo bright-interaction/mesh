@@ -257,6 +257,70 @@ html, body {
 .overlay.done .spinner { display: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Login card: opaque cover above everything until a session cookie exists. */
+.login {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  z-index: 60;
+  padding: 24px;
+  transition: opacity .35s var(--ease);
+}
+.login.hidden { opacity: 0; pointer-events: none; }
+.login-card {
+  width: min(360px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 30px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, .6);
+}
+.login-dot {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.login-title {
+  font: 600 22px/1 var(--sans);
+  letter-spacing: -0.02em;
+  margin: 4px 0 0;
+}
+.login-sub { color: var(--muted); font-size: 13px; margin: 0 0 4px; }
+.login-card input {
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 11px 13px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--fg);
+  outline: none;
+  transition: border-color .15s var(--ease);
+}
+.login-card input:focus { border-color: var(--border-strong); }
+.login-card input::placeholder { color: var(--faint); }
+.login-btn {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 11px;
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: transform .15s var(--ease), opacity .15s var(--ease);
+}
+.login-btn:hover { opacity: .9; }
+.login-btn:active { transform: translateY(1px) scale(.99); }
+.login-btn:disabled { opacity: .6; cursor: default; }
+.login-err { color: #e0796b; font-size: 12px; margin: 2px 0 0; }
+
 #hint {
   position: fixed;
   bottom: 14px; left: var(--rail-w); right: 0;

@@ -5,33 +5,88 @@
 // settings.js / search.js / docs.js / api.js as those phases land). Vanilla, no deps.
 (function () {
   "use strict";
-  const TOKEN_KEY = "mesh_ui_token";
   const Mesh = (window.Mesh = window.Mesh || {});
   Mesh.views = Mesh.views || {};
 
-  // api: fetch /api/* with the bearer token when one is set. On 401 it prompts once
-  // for a token (non-loopback binds require it), stores it, and retries.
+  // api: fetch /api/* relying on the HttpOnly session cookie (set once via the login
+  // card / magic link). No token is ever held in JS. On 401 it reveals the login
+  // card so the user can re-authenticate.
   Mesh.api = async function (path, opts) {
     opts = opts || {};
     // Resolve relative to <base href> so the app works under a path (e.g. /app/).
     // Callers pass "/api/...": strip the leading slash so it is relative.
     path = path.replace(/^\//, "");
-    const headers = Object.assign({}, opts.headers);
-    const tok = sessionStorage.getItem(TOKEN_KEY);
-    if (tok) headers["Authorization"] = "Bearer " + tok;
-    let res = await fetch(path, Object.assign({}, opts, { headers }));
+    const res = await fetch(path, Object.assign({ credentials: "same-origin" }, opts));
     if (res.status === 401) {
-      const entered = window.prompt("This Mesh viewer requires an access token:");
-      if (entered) {
-        sessionStorage.setItem(TOKEN_KEY, entered.trim());
-        headers["Authorization"] = "Bearer " + entered.trim();
-        res = await fetch(path, Object.assign({}, opts, { headers }));
-      }
+      showLogin();
+      throw new Error(path + ": 401");
     }
     if (!res.ok) throw new Error(path + ": " + res.status);
     const ct = res.headers.get("content-type") || "";
     return ct.includes("application/json") ? res.json() : res.text();
   };
+
+  // --- Login (HttpOnly cookie session) ----------------------------------------
+  // POST the access key; the server validates it constant-time and sets the cookie.
+  async function submitKey(key) {
+    const res = await fetch("api/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: key }),
+    });
+    return res.ok;
+  }
+
+  function showLogin() {
+    const el = document.getElementById("login");
+    if (!el || !el.classList.contains("hidden")) return;
+    el.classList.remove("hidden");
+    el.setAttribute("aria-hidden", "false");
+    const inp = document.getElementById("login-key");
+    if (inp) setTimeout(() => inp.focus(), 60);
+  }
+  Mesh.showLogin = showLogin;
+
+  function wireLogin() {
+    const form = document.getElementById("login-form");
+    if (!form) return;
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const inp = document.getElementById("login-key");
+      const err = document.getElementById("login-err");
+      const btn = document.getElementById("login-btn");
+      const key = ((inp && inp.value) || "").trim();
+      if (!key) return;
+      if (err) err.hidden = true;
+      if (btn) { btn.disabled = true; btn.textContent = "Checking..."; }
+      let ok = false;
+      try { ok = await submitKey(key); } catch (_) { ok = false; }
+      if (ok) {
+        // Cookie is set: reload so every view loads authenticated, cleanly.
+        location.reload();
+        return;
+      }
+      if (btn) { btn.disabled = false; btn.textContent = "Unlock"; }
+      if (err) { err.hidden = false; err.textContent = "That key was not accepted. Check it and try again."; }
+      if (inp) inp.select();
+    });
+  }
+
+  // A magic link (mesh.../app/#k=<key>) signs you in with one click. The key lives in
+  // the URL fragment (never sent to the server, so it is not in access logs) and is
+  // stripped from the address bar immediately, before the network call.
+  async function consumeMagicLink() {
+    const m = (location.hash || "").match(/[#&]k=([^&]+)/);
+    if (!m) return false;
+    const key = decodeURIComponent(m[1]);
+    history.replaceState(null, "", location.pathname + location.search);
+    let ok = false;
+    try { ok = await submitKey(key); } catch (_) { ok = false; }
+    if (ok) { location.reload(); return true; }
+    showLogin();
+    return false;
+  }
 
   const panel = document.getElementById("panel");
   const overlay = document.getElementById("overlay");
@@ -119,6 +174,10 @@
   }
   Mesh.refreshStatus = loadStatus;
 
-  route(hashView());
-  loadStatus();
+  wireLogin();
+  (async function init() {
+    if (await consumeMagicLink()) return; // a successful magic link reloads the page
+    route(hashView());
+    loadStatus();
+  })();
 })();
