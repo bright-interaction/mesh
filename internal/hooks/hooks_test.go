@@ -108,6 +108,66 @@ func TestOnboardMarkerConsumeOnce(t *testing.T) {
 	}
 }
 
+func TestRegisterJSONServer(t *testing.T) {
+	dir := t.TempDir()
+	// mcpServers (Claude/Cursor/Windsurf), preserve an existing server.
+	p := filepath.Join(dir, "mcp.json")
+	os.WriteFile(p, []byte(`{"mcpServers":{"other":{"command":"x"}}}`), 0o644)
+	added, _, err := registerJSONServer(p, "mcpServers", "/v", "/bin/mesh")
+	if err != nil || !added {
+		t.Fatalf("registerJSONServer added=%v err=%v", added, err)
+	}
+	var cfg map[string]any
+	data, _ := os.ReadFile(p)
+	json.Unmarshal(data, &cfg)
+	servers := cfg["mcpServers"].(map[string]any)
+	if servers["other"] == nil || servers["mesh"] == nil {
+		t.Error("must add mesh and keep the existing server")
+	}
+	if a2, _, _ := registerJSONServer(p, "mcpServers", "/v", "/bin/mesh"); a2 {
+		t.Error("re-register should be idempotent")
+	}
+
+	// VS Code uses the "servers" key and requires type:stdio.
+	vp := filepath.Join(dir, "vscode.json")
+	registerJSONServer(vp, "servers", "/v", "/bin/mesh")
+	data, _ = os.ReadFile(vp)
+	json.Unmarshal(data, &cfg)
+	mesh := cfg["servers"].(map[string]any)["mesh"].(map[string]any)
+	if mesh["type"] != "stdio" {
+		t.Errorf("vscode server entry needs type:stdio, got %v", mesh["type"])
+	}
+}
+
+func TestRegisterCodexTOML(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.toml")
+	os.WriteFile(p, []byte("model = \"o4\"\n"), 0o644)
+	added, _, err := registerCodexTOML(p, "/v", "/bin/mesh")
+	if err != nil || !added {
+		t.Fatalf("codex add=%v err=%v", added, err)
+	}
+	data, _ := os.ReadFile(p)
+	s := string(data)
+	if !strings.Contains(s, "model = \"o4\"") || !strings.Contains(s, "[mcp_servers.mesh]") {
+		t.Errorf("must preserve existing config and append the mesh table:\n%s", s)
+	}
+	if a2, _, _ := registerCodexTOML(p, "/v", "/bin/mesh"); a2 {
+		t.Error("codex re-register should be idempotent")
+	}
+}
+
+func TestClientConfigPaths(t *testing.T) {
+	if _, f, _ := clientConfig("vscode", "/proj"); f != "servers" {
+		t.Errorf("vscode format = %q, want servers", f)
+	}
+	if _, f, _ := clientConfig("codex", "/proj"); f != "toml" {
+		t.Errorf("codex format = %q, want toml", f)
+	}
+	if _, _, err := clientConfig("nope", "/proj"); err == nil {
+		t.Error("unknown client should error")
+	}
+}
+
 func TestDryRunWritesNothing(t *testing.T) {
 	dir := t.TempDir()
 	o := opts(dir, true)

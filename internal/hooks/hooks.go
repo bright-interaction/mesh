@@ -14,8 +14,106 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
+
+// Clients lists the agent clients mesh install can register the MCP server for.
+// claude-code is the only one that also supports session hooks (auto-onboard);
+// the rest get the MCP tools + the server's instructions nudge.
+var Clients = []string{"claude-code", "claude-desktop", "cursor", "vscode", "windsurf", "codex"}
+
+// clientConfig returns the MCP config path + format for a client. Formats:
+// "mcpServers" (Claude Desktop/Code/Cursor/Windsurf JSON), "servers" (VS Code JSON,
+// needs type:stdio), "toml" (Codex ~/.codex/config.toml).
+func clientConfig(client, projectDir string) (path, format string, err error) {
+	home, _ := os.UserHomeDir()
+	switch client {
+	case "claude-code":
+		return filepath.Join(projectDir, ".mcp.json"), "mcpServers", nil
+	case "claude-desktop":
+		switch runtime.GOOS {
+		case "darwin":
+			return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), "mcpServers", nil
+		case "windows":
+			return filepath.Join(os.Getenv("APPDATA"), "Claude", "claude_desktop_config.json"), "mcpServers", nil
+		default:
+			return filepath.Join(home, ".config", "Claude", "claude_desktop_config.json"), "mcpServers", nil
+		}
+	case "cursor":
+		return filepath.Join(home, ".cursor", "mcp.json"), "mcpServers", nil
+	case "windsurf":
+		return filepath.Join(home, ".codeium", "windsurf", "mcp_config.json"), "mcpServers", nil
+	case "vscode":
+		return filepath.Join(projectDir, ".vscode", "mcp.json"), "servers", nil
+	case "codex":
+		return filepath.Join(home, ".codex", "config.toml"), "toml", nil
+	default:
+		return "", "", fmt.Errorf("unknown client %q (use one of: %s)", client, strings.Join(Clients, ", "))
+	}
+}
+
+// RegisterMCP registers the Mesh MCP server in the given client's config, in that
+// client's own format and location. Idempotent; preserves other servers.
+func RegisterMCP(client, projectDir, vaultAbs, binPath string) (bool, string, error) {
+	p, format, err := clientConfig(client, projectDir)
+	if err != nil {
+		return false, "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return false, p, err
+	}
+	if format == "toml" {
+		return registerCodexTOML(p, vaultAbs, binPath)
+	}
+	return registerJSONServer(p, format, vaultAbs, binPath)
+}
+
+func registerJSONServer(p, key, vaultAbs, binPath string) (bool, string, error) {
+	cfg := map[string]any{}
+	if data, err := os.ReadFile(p); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return false, p, fmt.Errorf("existing %s is not valid JSON: %w", p, err)
+		}
+	}
+	servers, _ := cfg[key].(map[string]any)
+	if servers == nil {
+		servers = map[string]any{}
+	}
+	if _, exists := servers["mesh"]; exists {
+		return false, p, nil
+	}
+	entry := map[string]any{"command": binPath, "args": []any{"mcp", "--vault", vaultAbs, "--watch"}}
+	if key == "servers" { // VS Code requires an explicit transport type
+		entry["type"] = "stdio"
+	}
+	servers["mesh"] = entry
+	cfg[key] = servers
+	out, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(p, append(out, '\n'), 0o644); err != nil {
+		return false, p, err
+	}
+	return true, p, nil
+}
+
+// registerCodexTOML appends a [mcp_servers.mesh] table to Codex's config.toml.
+// Appending is safe TOML and idempotent (skip if the table already exists), which
+// avoids needing a TOML parser to merge.
+func registerCodexTOML(p, vaultAbs, binPath string) (bool, string, error) {
+	if data, err := os.ReadFile(p); err == nil && strings.Contains(string(data), "[mcp_servers.mesh]") {
+		return false, p, nil
+	}
+	block := fmt.Sprintf("\n[mcp_servers.mesh]\ncommand = %q\nargs = [\"mcp\", \"--vault\", %q, \"--watch\"]\n", binPath, vaultAbs)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return false, p, err
+	}
+	defer f.Close()
+	if _, err := f.WriteString(block); err != nil {
+		return false, p, err
+	}
+	return true, p, nil
+}
 
 // Options controls an install.
 type Options struct {
