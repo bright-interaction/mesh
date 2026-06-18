@@ -222,7 +222,7 @@ func (r *Retriever) resolveWeights(opt Options, vectorsActive bool) (wFTS, wGrap
 // queryVec returns the (cached) embedding of the query, prefixed for asymmetric
 // models. Returns nil if no embedder is set or the call fails. The cache makes
 // repeated retrievals of the same query (e.g. a weight sweep) embed only once.
-func (r *Retriever) queryVec(query string) []float32 {
+func (r *Retriever) queryVec(ctx context.Context, query string) []float32 {
 	if r.emb == nil {
 		return nil
 	}
@@ -232,7 +232,7 @@ func (r *Retriever) queryVec(query string) []float32 {
 	if v, ok := r.qvec[key]; ok {
 		return v
 	}
-	qv, err := r.emb.Embed(context.Background(), []string{key})
+	qv, err := r.emb.Embed(ctx, []string{key})
 	if err != nil || len(qv) != 1 {
 		return nil
 	}
@@ -280,7 +280,7 @@ func (r *Retriever) EnableVectors(e embed.Embedder, model string, storedDim int,
 
 // Retrieve runs the full pipeline and returns ranked (and optionally
 // budget-packed) cards.
-func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
+func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]Card, error) {
 	if opt.Limit <= 0 {
 		opt.Limit = 20
 	}
@@ -332,7 +332,7 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 		// would make every cosine 0, which min-max turns into a uniform 1 boosting every
 		// note equally. Skip the whole vector contribution rather than emit that garbage.
 		// vecDim is always > 0 once EnableVectors succeeds, so a mismatch is a real skip.
-		if qv := r.queryVec(query); qv != nil && r.vecDim > 0 && len(qv) == r.vecDim {
+		if qv := r.queryVec(ctx, query); qv != nil && r.vecDim > 0 && len(qv) == r.vecDim {
 			ids := make([]string, 0, len(r.vecs))
 			sims := make([]float64, 0, len(r.vecs))
 			for id, chunks := range r.vecs {
@@ -386,7 +386,7 @@ func (r *Retriever) Retrieve(query string, opt Options) ([]Card, error) {
 	// endpoint error leaves the fused order intact. Skipped when tuning the fusion
 	// itself (NoRerank), so the fused order is what gets measured.
 	if !opt.NoRerank {
-		r.rerankHead(query, cards)
+		r.rerankHead(ctx, query, cards)
 	}
 
 	if opt.Budget > 0 {
@@ -407,7 +407,7 @@ func sortCards(cards []Card) {
 // rerankHead reorders the top-K cards in place using the configured
 // cross-encoder. Reranked cards are rescored above any fused tail card so the
 // head stays on top after the final sort, with the tier-0 nudge preserved.
-func (r *Retriever) rerankHead(query string, cards []Card) {
+func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card) {
 	if r.rr == nil || len(cards) < 2 {
 		return
 	}
@@ -432,7 +432,7 @@ func (r *Retriever) rerankHead(query string, cards []Card) {
 			docs[i] = head[i].Title
 		}
 	}
-	res, err := r.rr.Rerank(context.Background(), query, docs)
+	res, err := r.rr.Rerank(ctx, query, docs)
 	if err != nil || len(res) != k {
 		return
 	}

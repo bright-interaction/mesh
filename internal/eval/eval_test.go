@@ -91,7 +91,7 @@ func TestVectorArmAddsParaphraseRecall(t *testing.T) {
 
 	// Lexical-only arm misses it.
 	lexical := retrieve.New(s, lg)
-	lc, err := lexical.Retrieve(query, retrieve.Options{Limit: 10, NoRerank: true})
+	lc, err := lexical.Retrieve(context.Background(), query, retrieve.Options{Limit: 10, NoRerank: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestVectorArmAddsParaphraseRecall(t *testing.T) {
 	if !vector.EnableVectors(emb, "concept", emb.Dim(), vecs) {
 		t.Fatal("EnableVectors should succeed for the concept embedder")
 	}
-	vc, err := vector.Retrieve(query, retrieve.Options{Limit: 10, WeightFTS: 0.2, WeightGraph: 0.1, WeightVec: 0.7, NoRerank: true})
+	vc, err := vector.Retrieve(context.Background(), query, retrieve.Options{Limit: 10, WeightFTS: 0.2, WeightGraph: 0.1, WeightVec: 0.7, NoRerank: true})
 	if err != nil {
 		t.Fatal(err)
 	}

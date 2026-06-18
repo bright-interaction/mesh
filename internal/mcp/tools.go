@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -86,7 +87,7 @@ func (s *Server) handleToolsList() any {
 	return map[string]any{"tools": tools}
 }
 
-func (s *Server) handleToolsCall(params json.RawMessage) (any, *rpcError) {
+func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -96,7 +97,7 @@ func (s *Server) handleToolsCall(params json.RawMessage) (any, *rpcError) {
 	}
 	switch p.Name {
 	case "mesh_search":
-		return s.toolSearch(p.Arguments)
+		return s.toolSearch(ctx, p.Arguments)
 	case "mesh_fetch":
 		return s.toolFetch(p.Arguments)
 	case "mesh_god_nodes":
@@ -116,7 +117,7 @@ func (s *Server) handleToolsCall(params json.RawMessage) (any, *rpcError) {
 	}
 }
 
-func (s *Server) toolSearch(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		Query  string `json:"query"`
 		Budget int    `json:"budget"`
@@ -127,7 +128,7 @@ func (s *Server) toolSearch(raw json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query is required"}
 	}
 	_, retriever := s.snapshot()
-	cards, err := retriever.Retrieve(a.Query, retrieve.Options{Limit: a.Limit, Budget: a.Budget})
+	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: a.Limit, Budget: a.Budget})
 	if err != nil {
 		return nil, internalErr(err)
 	}
