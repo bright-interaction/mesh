@@ -122,18 +122,15 @@ restart. Watch progress goes to stderr; stdout stays the pure JSON-RPC stream.
 Omit it for the classic behavior where the index only refreshes on the agent's
 own write-backs.
 
-## Team sync (shipped)
+## Team sync
 
-Share a vault across a team with no git on any client. One sovereign `mesh-hub`
-on your own server holds the markdown history; clients pull-reconcile.
+Share a vault across a team with no git on any client. The sync **client** is part
+of the open core; the **team-sync hub** is the commercial / pro product (hosted at
+mesh.brightinteraction.com, or self-host under a commercial license, see
+[LICENSING.md](LICENSING.md)). Clients pull-reconcile against it:
 
 ```
-# On the hub server (once):
-mesh-hub init /srv/teamvault                          # git repo + hub.db + mesh.toml
-mesh-hub invite --repo /srv/teamvault --user alice    # prints a one-time invite token
-mesh-hub serve  --repo /srv/teamvault --addr :8848    # run it (behind TLS in prod)
-
-# On each teammate's laptop:
+# On each teammate's laptop (against a hosted or licensed hub):
 mesh join https://mesh.example.com <invite-token> my-vault   # clone, no git needed
 # ... edit notes in your editor ...
 mesh sync my-vault                                    # push yours, pull theirs
@@ -169,7 +166,9 @@ path (the hub itself stays AI-free).
 | `mesh ui [vault]` | Browser graph viewer (force-graph + galaxy) over the same index, localhost |
 | `mesh join <hub> <invite> [vault]` | Join a team vault and clone it (no git) |
 | `mesh sync [vault]` | Reconcile with the hub (push local edits, pull teammates') |
-| `mesh-hub init/invite/serve` | Run the sovereign team-sync hub |
+
+The team-sync **hub** server and the BYOAI **curator** are the commercial / pro
+layer and are not in this repository (see Editions below).
 
 ## Build
 
@@ -179,3 +178,17 @@ go test ./...
 ```
 
 No cgo. Storage is pure-Go `modernc.org/sqlite` in WAL mode; the `.mesh/` index is a derived, deletable artifact, the markdown is the source of truth.
+
+## License & editions
+
+Open core, dual-licensed. This repository (the single-user vault, graph, retrieval,
+viewers, CLI, MCP surface, and the sync **client**) is **AGPL-3.0** (see `LICENSE`).
+
+The **team-sync hub** and **BYOAI sync-curator** are a commercial product:
+
+- **Hosted** at mesh.brightinteraction.com (managed team sync).
+- **Sovereign self-host** under a commercial license + support, for EU / regulated
+  orgs running the hub on their own infrastructure.
+
+A commercial license to the core is available for uses the AGPL does not fit. See
+[LICENSING.md](LICENSING.md) and [docs/OPEN-CORE.md](docs/OPEN-CORE.md).
