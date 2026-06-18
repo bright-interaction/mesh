@@ -21,7 +21,15 @@ SPLIT_BRANCH="mesh-public-split"
 
 # The pro layer: stripped from the public mirror's entire history. Keep in sync with
 # docs/OPEN-CORE.md. Paths are relative to mesh/ (the subtree-split strips the prefix).
-PRO_PATHS=(internal/hub cmd/mesh-hub internal/curator cmd/mesh-curator internal/llm)
+PRO_PATHS=(
+  internal/hub cmd/mesh-hub
+  internal/curator cmd/mesh-curator internal/llm
+  # ANN at scale: the open core uses brute-force cosine (fine well past v1 scale);
+  # HNSW is the pro "1000+ vectors" gate, wired only in the -tags pro build.
+  internal/hnsw
+  internal/retrieve/retrieve_ann_pro.go
+  internal/retrieve/retrieve_ann_pro_test.go
+)
 
 for arg in "$@"; do
   case "$arg" in

@@ -221,61 +221,6 @@ func TestEnableVectorsRefusesIndeterminateDim(t *testing.T) {
 	}
 }
 
-// TestHNSWPathMatchesBruteForce: with the ANN gate on, EnableVectors builds an
-// HNSW index and Retrieve uses it; on a small vault it must agree with the
-// brute-force top result (recall is exact at tiny N), proving the integration is
-// wired and the fallback gate works.
-func TestHNSWPathMatchesBruteForce(t *testing.T) {
-	stub := embed.Stub{D: 64}
-	// Deterministic per-note vectors in the stub's bag-of-words space, so the query
-	// "sqlite storage" is closest to note:a in BOTH arms.
-	texts := map[string]string{
-		"note:a": "sqlite storage engine modernc",
-		"note:b": "modernc cannot load native extensions",
-		"note:c": "marketing copy newsletter campaign",
-	}
-	seed := func(r *Retriever, gate int) {
-		vecs := map[string][][]float32{}
-		for id, txt := range texts {
-			ev, _ := stub.Embed(context.Background(), []string{txt})
-			vecs[id] = ev
-		}
-		r.hnswGate = gate
-		if !r.EnableVectors(stub, "stub-bow", 64, vecs) {
-			t.Fatal("EnableVectors failed")
-		}
-	}
-
-	brute := buildVault(t)
-	seed(brute, 0)
-	if brute.hnsw != nil {
-		t.Fatal("gate 0 must not build an HNSW index")
-	}
-
-	ann := buildVault(t)
-	seed(ann, 1) // 3 chunks >= 1 -> index built
-	if ann.hnsw == nil {
-		t.Fatal("gate 1 must build an HNSW index")
-	}
-
-	const q = "sqlite storage"
-	opt := Options{Limit: 10, WeightFTS: 0.1, WeightGraph: 0.1, WeightVec: 0.8, NoRerank: true}
-	bc, err := brute.Retrieve(context.Background(), q, opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ac, err := ann.Retrieve(context.Background(), q, opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(bc) == 0 || len(ac) == 0 {
-		t.Fatal("both arms should return results")
-	}
-	if ac[0].NodeID != bc[0].NodeID {
-		t.Errorf("HNSW top %q != brute-force top %q", ac[0].NodeID, bc[0].NodeID)
-	}
-}
-
 // TestEnableVectorsFromConfigToml proves the solo config.toml fallback: with no
 // MESH_EMBED_* env vars set, a persisted .mesh/config.toml drives vector activation.
 func TestEnableVectorsFromConfigToml(t *testing.T) {
