@@ -69,6 +69,7 @@ func (s *Server) statsJSON() string {
 			"live":            live,
 			"stale_or_orphan": stale, // edited or deleted notes; cleared by mesh embed
 			"fresh_pct":       freshPct,
+			"ann":             r.HNSWActive(), // HNSW index serving the scan (vs brute force)
 		},
 		"rerank": map[string]any{
 			"active": r.RerankActive(),

@@ -12,6 +12,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/hnsw"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/rerank"
@@ -73,6 +74,8 @@ type Retriever struct {
 	vecModel    string
 	vecDim      int                    // stored embedding width; pins the space (query embeddings of any other width are rejected, never silently cosined to a uniform 0)
 	vecs        map[string][][]float32 // node id -> per-section chunk vectors
+	hnsw        *hnsw.Index            // optional ANN index over vecs; nil => brute-force cosine scan
+	hnswGate    int                    // build hnsw only when chunk count >= this; 0 => never (brute force)
 	queryPrefix string                 // e.g. "search_query: " for nomic-style asymmetric models
 
 	rr          rerank.Reranker // optional cross-encoder; reorders the top-K head
@@ -147,6 +150,11 @@ func (r *Retriever) enableVectorsFromEnv() {
 	if keyEnv == "" {
 		keyEnv = "MESH_EMBED_KEY"
 	}
+	// Optional ANN: build an HNSW index past MESH_HNSW_THRESHOLD chunks (0/unset =
+	// brute force, the default; brute force is sub-5ms well past the v1 scale).
+	if v, err := strconv.Atoi(os.Getenv("MESH_HNSW_THRESHOLD")); err == nil && v > 0 {
+		r.hnswGate = v
+	}
 	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs)
 }
 
@@ -196,6 +204,10 @@ func (r *Retriever) VectorsActive() bool { return r.emb != nil && len(r.vecs) > 
 
 // VectorModel returns the active embedding model id (empty when inactive).
 func (r *Retriever) VectorModel() string { return r.vecModel }
+
+// HNSWActive reports whether the ANN index is built and serving the vector signal
+// (vs the brute-force scan). Only true past the configured MESH_HNSW_THRESHOLD.
+func (r *Retriever) HNSWActive() bool { return r.hnsw != nil }
 
 // resolveWeights picks the fusion weights: explicit Options weights win; else the
 // learned/operator defaults (SetWeights / env); else the built-in defaults. The
@@ -275,6 +287,20 @@ func (r *Retriever) EnableVectors(e embed.Embedder, model string, storedDim int,
 		return false
 	}
 	r.emb, r.vecModel, r.vecDim, r.vecs = e, model, dim, vecs
+	// Optional ANN index for large vaults. Off unless hnswGate is set; on any build
+	// error the brute-force scan stays (r.hnsw nil), so this can only speed up, never
+	// break, retrieval. Built from the same vecs map, so the vectors are identical.
+	if r.hnswGate > 0 {
+		total := 0
+		for _, chunks := range vecs {
+			total += len(chunks)
+		}
+		if total >= r.hnswGate {
+			if ix, err := hnsw.Build(vecs, hnsw.Params{}); err == nil {
+				r.hnsw = ix
+			}
+		}
+	}
 	return true
 }
 
@@ -333,17 +359,42 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		// note equally. Skip the whole vector contribution rather than emit that garbage.
 		// vecDim is always > 0 once EnableVectors succeeds, so a mismatch is a real skip.
 		if qv := r.queryVec(ctx, query); qv != nil && r.vecDim > 0 && len(qv) == r.vecDim {
-			ids := make([]string, 0, len(r.vecs))
-			sims := make([]float64, 0, len(r.vecs))
-			for id, chunks := range r.vecs {
-				best := -1.0
-				for _, v := range chunks {
-					if s := embed.Cosine(qv, v); s > best {
-						best = s
+			var ids []string
+			var sims []float64
+			if r.hnsw != nil {
+				// ANN path (large vaults): the index returns the top chunks; fold them to
+				// a per-note max, exactly the brute-force semantics, over a candidate set
+				// instead of every note. hnswK is generous so the fused/reranked head is
+				// stable even though the deep tail is approximate.
+				hnswK := opt.Limit * 4
+				if hnswK < 50 {
+					hnswK = 50
+				}
+				best := map[string]float64{}
+				for _, h := range r.hnsw.Search(qv, hnswK, 0) {
+					if cur, ok := best[h.NodeID]; !ok || h.Score > cur {
+						best[h.NodeID] = h.Score
 					}
 				}
-				ids = append(ids, id)
-				sims = append(sims, best)
+				ids = make([]string, 0, len(best))
+				sims = make([]float64, 0, len(best))
+				for id, s := range best {
+					ids = append(ids, id)
+					sims = append(sims, s)
+				}
+			} else {
+				ids = make([]string, 0, len(r.vecs))
+				sims = make([]float64, 0, len(r.vecs))
+				for id, chunks := range r.vecs {
+					bestc := -1.0
+					for _, v := range chunks {
+						if s := embed.Cosine(qv, v); s > bestc {
+							bestc = s
+						}
+					}
+					ids = append(ids, id)
+					sims = append(sims, bestc)
+				}
 			}
 			vNorm := minMax(sims)
 			for i, id := range ids {
