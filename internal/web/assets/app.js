@@ -21,6 +21,10 @@
   let sp = [];               // reused screen-position buffer
   let view = "graph";
   const cam = { x: 0, y: 0, zoom: 1 };
+  // 2D fly-into-node + lock-on (mirrors the 3D camera): while camFollow is set the
+  // layout freezes and the camera eases onto the node; camReturn eases back out.
+  let camFollow = null, camReturn = null, preFocus = null;
+  const FOCUS_ZOOM = 2.6;
   let hover = null, selected = null, query = "";
   let dpr = Math.max(1, window.devicePixelRatio || 1);
   let W = 0, H = 0;
@@ -66,6 +70,8 @@
     fitView();
     doneOverlay();
     wire();
+    // closing the note reader eases the 3D camera back out of the star it flew into.
+    if (window.Mesh) Mesh.onNoteClose = () => { if (view === "galaxy3d") { if (gl3d) gl3d.clearFocus(); } else clearFocus2d(); };
     lastInteract = now();
     requestAnimationFrame(loop);
   }
@@ -245,26 +251,38 @@
     if (document.hidden) { running = false; return; } // pause when the tab is hidden (battery)
     if (view === "galaxy3d") { if (gl3d) gl3d.frame(); requestAnimationFrame(loop); return; } // 3D owns its own render; skip the 2D sim+draw
     t += 1;
-    if (view === "graph") simStep();
-    else {
-      const idle = (now() - lastInteract) > 4000;
-      galaxyAngle += idle ? 0.0003 : 0.0007; // same cadence as the graph swirl; eases when idle
-      const decay = (n) => {
-        if (n.dispX || n.dispY) {
-          n.dispX *= 0.86; n.dispY *= 0.86;
-          if (Math.abs(n.dispX) < 0.5 && Math.abs(n.dispY) < 0.5) { n.dispX = 0; n.dispY = 0; }
-        }
-      };
-      if (drag && drag.influence) {
-        // elastic pull: the held node + its neighborhood spring toward the cursor
-        // (1-hop at 0.55, 2-hop at 0.22), the rest decay back, all keep orbiting.
-        const o = galaxyPos(drag.node), tgtX = drag.wx - o.x, tgtY = drag.wy - o.y;
-        for (const n of G.nodes) {
-          const w = drag.influence.get(n.id);
-          if (w) { n.dispX += (w * tgtX - n.dispX) * 0.32; n.dispY += (w * tgtY - n.dispY) * 0.32; }
-          else decay(n);
-        }
-      } else for (const n of G.nodes) decay(n);
+    if (!camFollow) { // the layout freezes while locked onto a note, so it holds still
+      if (view === "graph") simStep();
+      else {
+        const idle = (now() - lastInteract) > 4000;
+        galaxyAngle += idle ? 0.0003 : 0.0007; // same cadence as the graph swirl; eases when idle
+        const decay = (n) => {
+          if (n.dispX || n.dispY) {
+            n.dispX *= 0.86; n.dispY *= 0.86;
+            if (Math.abs(n.dispX) < 0.5 && Math.abs(n.dispY) < 0.5) { n.dispX = 0; n.dispY = 0; }
+          }
+        };
+        if (drag && drag.influence) {
+          // elastic pull: the held node + its neighborhood spring toward the cursor
+          // (1-hop at 0.55, 2-hop at 0.22), the rest decay back, all keep orbiting.
+          const o = galaxyPos(drag.node), tgtX = drag.wx - o.x, tgtY = drag.wy - o.y;
+          for (const n of G.nodes) {
+            const w = drag.influence.get(n.id);
+            if (w) { n.dispX += (w * tgtX - n.dispX) * 0.32; n.dispY += (w * tgtY - n.dispY) * 0.32; }
+            else decay(n);
+          }
+        } else for (const n of G.nodes) decay(n);
+      }
+    }
+    // fly-into-node lock-on / ease-back-out
+    if (camFollow) {
+      const p = pos(camFollow);
+      cam.x += (p.x - cam.x) * 0.12; cam.y += (p.y - cam.y) * 0.12;
+      cam.zoom += (FOCUS_ZOOM - cam.zoom) * 0.12;
+    } else if (camReturn) {
+      cam.x += (camReturn.x - cam.x) * 0.1; cam.y += (camReturn.y - cam.y) * 0.1;
+      cam.zoom += (camReturn.zoom - cam.zoom) * 0.1;
+      if (Math.hypot(cam.x - camReturn.x, cam.y - camReturn.y) < 2 && Math.abs(cam.zoom - camReturn.zoom) < 0.02) camReturn = null;
     }
     draw();
     requestAnimationFrame(loop);
@@ -499,6 +517,7 @@
     canvas.addEventListener("mousedown", (e) => {
       const rect = canvas.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
       moved = false; lastX = e.clientX; lastY = e.clientY; lastInteract = now();
+      camFollow = null; camReturn = null; // grabbing/panning takes manual control back
       const n = nodeAt(mx, my); // grab a node in either view; empty space pans
       if (n) {
         const w = worldAt(mx, my);
@@ -536,12 +555,13 @@
       if (moved) return;
       const rect = canvas.getBoundingClientRect();
       const n = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
-      if (n) { selected = n; setFocus(n); showCard(n); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); }
-      else { selected = null; setFocus(null); hideCard(); }
+      if (n) { focusNodeById(n.id); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); } // fly in + read
+      else { selected = null; setFocus(null); hideCard(); clearFocus2d(); if (window.Mesh && Mesh.closeNote) Mesh.closeNote(); }
     });
     canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
       lastInteract = now();
+      camFollow = null; camReturn = null; // zooming takes manual control back
       const rect = canvas.getBoundingClientRect(), sx = e.clientX - rect.left, sy = e.clientY - rect.top;
       const w = worldAt(sx, sy);
       cam.zoom = Math.max(0.08, Math.min(8, cam.zoom * Math.exp(-e.deltaY * 0.0012)));
@@ -575,7 +595,11 @@
       if (!gl3d && window.Mesh3D) {
         gl3d = window.Mesh3D.init(canvas3d, G, {
           commColor, indexId: G.meta.index_id,
-          onSelect: (n) => { selected = n; setFocus(n); if (n) { showCard(n); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); } else hideCard(); },
+          onSelect: (n) => {
+            selected = n; setFocus(n);
+            if (n) { showCard(n); if (gl3d) gl3d.focusNode(n.id); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); }
+            else { hideCard(); if (gl3d) gl3d.clearFocus(); if (window.Mesh && Mesh.closeNote) Mesh.closeNote(); }
+          },
           onHover: (n) => { if (n) showCard(n); else if (!selected) hideCard(); },
         });
       }
@@ -613,8 +637,13 @@
     const n = G.nodes.find((x) => x.id === id);
     if (!n) return;
     selected = n; setFocus(n); showCard(n);
-    if (view === "galaxy3d") { if (gl3d) gl3d.setHighlight(id); }
-    else { const p = pos(n); cam.x = p.x; cam.y = p.y; cam.zoom = Math.max(cam.zoom, 1.7); lastInteract = now(); }
+    if (view === "galaxy3d") { if (gl3d) gl3d.focusNode(id); } // fly the camera into the star
+    else { if (!camFollow) preFocus = { x: cam.x, y: cam.y, zoom: cam.zoom }; camFollow = n; camReturn = null; lastInteract = now(); }
+  }
+  function clearFocus2d() {
+    if (!camFollow) return;
+    camReturn = preFocus || { x: cam.x, y: cam.y, zoom: cam.zoom };
+    camFollow = null;
   }
   function buildExplorer() {
     const list = $("exp-list");

@@ -50,6 +50,7 @@
     if (!noteDrawer) return;
     noteDrawer.classList.add("hidden");
     noteDrawer.setAttribute("aria-hidden", "true");
+    if (typeof Mesh.onNoteClose === "function") Mesh.onNoteClose();
   };
   if (noteDrawer) {
     const x = document.getElementById("nd-close");
