@@ -447,6 +447,51 @@ body.panel-active #stage3d { display: none; }
 #mesh-toast.ok { border-color: #3a5a3a; }
 #mesh-toast.err { border-color: #6a3a3a; }
 
+/* ---- search ---- */
+.srch-box { margin-bottom: 22px; }
+.srch-box input {
+  width: 100%;
+  font-family: var(--sans);
+  font-size: 17px;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 15px 18px;
+  outline: none;
+  transition: border-color .15s;
+}
+.srch-box input::placeholder { color: var(--faint); }
+.srch-box input:focus { border-color: var(--border-strong); }
+.srch-hint, .srch-count { font-size: 12.5px; color: var(--faint); margin: 0 2px 14px; }
+.srch-results { display: flex; flex-direction: column; gap: 10px; }
+.rcard {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  cursor: pointer;
+  transition: border-color .15s, transform .08s var(--ease);
+}
+.rcard:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+.rc-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.rc-title { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; color: var(--fg); }
+.rc-score { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.t0 { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.06em; color: #e8c97a; border: 1px solid #5a4a26; border-radius: 5px; padding: 1px 6px; }
+.rc-path { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-bottom: 7px; word-break: break-all; }
+.rc-snip { font-size: 13px; color: var(--muted); line-height: 1.55; }
+.rc-snip mark { background: rgba(232,201,122,0.18); color: var(--fg); border-radius: 2px; padding: 0 1px; }
+.rc-reason { font-family: var(--mono); font-size: 10.5px; color: var(--faint); margin-top: 7px; }
+
+/* note reading pane */
+.note-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.note-bar .note-path { font-family: var(--mono); font-size: 11px; color: var(--muted); margin: 0 auto 0 4px; word-break: break-all; }
+.note-body { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 22px 24px; }
+.note-md { font-family: var(--mono); font-size: 12.5px; color: var(--fg); white-space: pre-wrap; word-break: break-word; margin: 0; line-height: 1.6; }
+
 @media (max-width: 640px) {
   .search input { width: 130px; }
   .search input:focus { width: 160px; }
