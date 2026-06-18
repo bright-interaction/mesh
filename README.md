@@ -12,7 +12,7 @@ It is one Go binary, no cgo, no external services. Retrieving from Mesh is cheap
 - **Optional BYOAI add-ons (off by default, for cost-sensitive or non-agent consumers):**
   - **Vectors (`mesh embed`)** lift recall on paraphrase queries where keyword search breaks (13/20 -> 20/20 on the Hive eval). Worth turning on when queries paraphrase the notes; can point at a cloud endpoint for zero local CPU, or be skipped (FTS keyword recall is already 23/25).
   - **Cross-encoder rerank** lifts top-1 precision for a consumer that *trusts the top result without reading the cards* (`answer@1` 3/20 -> 10/20 on paraphrase). That is not a capable agent (which reads the cards and judges); it is a cheap/small downstream model, a blind "fetch top-1" pipeline, or a multi-tenant cloud deployment where offloading ranking to a local judge saves the tenant's billed model from reading and ranking candidates. Off unless an endpoint is configured. See `docs/SPEC.md` for the matched-arm measurements and adversarial reviews.
-- **Deferred:** a TUI + web graph viewer, and team sync (a self-hosted hub). Solo, local v1 first.
+- **Also shipped:** a keyboard TUI (`mesh tui`) and a browser graph viewer (`mesh ui`) over the same index, and sovereign team sync (a self-hosted `mesh-hub`, real-time SSE push, and a BYOAI conflict curator). All optional; the solo, local core stands alone.
 
 ## Install
 
@@ -26,12 +26,18 @@ cd automations/mesh
 make install            # builds a static binary to ~/.local/bin/mesh
 ```
 
-`go install` works too, once the module is published at its path:
-- **private repo** (sovereign): `GOPRIVATE=github.com/bright-interaction/* go install github.com/bright-interaction/mesh/cmd/mesh@latest` (needs org git auth)
-- **public repo**: plain `go install github.com/bright-interaction/mesh/cmd/mesh@latest`
+Once published as its own public repo, plain `go install` works:
 
-Publishing Mesh as its own repo is a deliberate step (it exposes the source if
-public), so it stays a checkout-built tool until that call is made.
+```
+go install github.com/bright-interaction/mesh/cmd/mesh@latest
+```
+
+The module path is already `github.com/bright-interaction/mesh`, so a public
+release is a mirror of the `mesh/` subtree to its own repo plus a version tag, with
+no code changes. `docs/RELEASING.md` documents that process and
+`scripts/split-public-repo.sh` performs it. Until then, the checkout build above is
+the install path. (A private mirror also works with
+`GOPRIVATE=github.com/bright-interaction/* go install ...@latest`.)
 
 ## Quickstart
 
@@ -109,7 +115,7 @@ restart. Watch progress goes to stderr; stdout stays the pure JSON-RPC stream.
 Omit it for the classic behavior where the index only refreshes on the agent's
 own write-backs.
 
-## Team sync (Milestone S1, in progress)
+## Team sync (shipped)
 
 Share a vault across a team with no git on any client. One sovereign `mesh-hub`
 on your own server holds the markdown history; clients pull-reconcile.
@@ -129,8 +135,11 @@ mesh sync my-vault                                    # push yours, pull theirs
 Reconcile-first: `mesh sync` is a three-way merge. Two people adding blocks to the
 same page auto-merge; a true overwrite of the same lines keeps the hub version and
 saves yours to a `*.sync-conflict-*.md` sibling to resolve by hand. Deletes and
-renames propagate; the hub authors git history attributed to each user. Real-time
-push (SSE) and the BYOAI sync-curator are the next milestone (S2).
+renames propagate; the hub authors git history attributed to each user. Add
+`mesh sync --watch` for real-time SSE push (the hub's changes pull in as they
+land). A standalone `mesh-curator` worker can reconcile non-trivial conflicts with
+the team's own BYOAI model, committing the merged note back through the normal sync
+path (the hub itself stays AI-free).
 
 ## Commands
 
@@ -149,6 +158,8 @@ push (SSE) and the BYOAI sync-curator are the next milestone (S2).
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |
 | `mesh tune <cases.json>` | Learn fusion weights from labelled queries (validated on held-out) |
 | `mesh mcp [--vault] [--watch]` | Serve the agent retrieval + write-back surface (live-reindex with `--watch`) |
+| `mesh tui [vault]` | Keyboard three-pane terminal view (notes, ranked search, preview + neighbors) |
+| `mesh ui [vault]` | Browser graph viewer (force-graph + galaxy) over the same index, localhost |
 | `mesh join <hub> <invite> [vault]` | Join a team vault and clone it (no git) |
 | `mesh sync [vault]` | Reconcile with the hub (push local edits, pull teammates') |
 | `mesh-hub init/invite/serve` | Run the sovereign team-sync hub |
