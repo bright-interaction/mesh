@@ -59,6 +59,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/note/{id}", s.handleNote)
 	mux.HandleFunc("GET /api/docs", s.handleDocsList)
 	mux.HandleFunc("GET /api/docs/{slug}", s.handleDoc)
+	mux.HandleFunc("GET /api/mcp-tools", s.handleMCPTools)
+	mux.HandleFunc("GET /openapi.json", s.handleOpenAPI)
 	return s.auth.guard(mux)
 }
 

@@ -32,12 +32,13 @@ func newAuthConfig(addr, token string) (authConfig, error) {
 	return authConfig{token: strings.TrimSpace(token), loopback: lo}, nil
 }
 
-// guard wraps a handler, enforcing the bearer token when one is configured. Static
-// assets and the SPA shell stay open (they carry no vault data and the SPA needs to
-// load before it can prompt for the token); the token gates the /api surface.
+// guard wraps a handler, enforcing the bearer token when one is configured. Only
+// the SPA shell and static assets stay open (they carry no vault data and must load
+// so the SPA can prompt for the token); everything else, including the graph payload
+// and every /api route, is gated. So an exposed viewer never leaks vault data.
 func (a authConfig) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if a.token == "" || !strings.HasPrefix(r.URL.Path, "/api/") {
+		if a.token == "" || isOpenPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -48,6 +49,11 @@ func (a authConfig) guard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isOpenPath is the unauthenticated allowlist: the shell and its assets only.
+func isOpenPath(p string) bool {
+	return p == "/" || strings.HasPrefix(p, "/assets/")
 }
 
 // authRequired reports whether the SPA must present a token (used by the shell to

@@ -14,7 +14,12 @@ import (
 
 func obj(m map[string]any) map[string]any { return m }
 
-func (s *Server) handleToolsList() any {
+func (s *Server) handleToolsList() any { return map[string]any{"tools": ToolSpecs()} }
+
+// ToolSpecs returns the MCP tool definitions (name, description, inputSchema). It
+// is the single source for both the MCP tools/list response and the web app's API
+// reference, so the two never drift.
+func ToolSpecs() []map[string]any {
 	str := map[string]any{"type": "string"}
 	intp := map[string]any{"type": "integer"}
 	strList := map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
@@ -89,8 +94,12 @@ func (s *Server) handleToolsList() any {
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
 		},
 	}
-	return map[string]any{"tools": tools}
+	return tools
 }
+
+// Contract returns the agent-usage contract text (how to retrieve cheaply), shared
+// by the MCP initialize instructions and the web app's API reference.
+func Contract() string { return contractText }
 
 func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
