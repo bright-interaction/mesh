@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
@@ -93,6 +94,19 @@ func ToolSpecs() []map[string]any {
 			"description": "Re-read the vault from disk and rebuild the index NOW. Call this right after you edit note files directly in the editor or CLI so your next mesh_search/mesh_fetch/mesh_neighbors reflects the edits with no watcher lag (works even when the server was started without --watch). Returns what changed.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
 		},
+		{
+			"name":        "mesh_setup_hooks",
+			"description": "ONBOARDING. Set up Claude Code SESSION hooks so you (the agent) automatically READ the mesh at the start of every session and get nudged to WRITE BACK what you learned before finishing - the flywheel that makes Mesh compound. Call with no args (action=status) to get the current install state plus the pitch and the exact questions to ask the user; then call action=install (read_only to skip the write-back nudge; dry_run to preview the settings.json first) to wire it into the project's .claude/settings.json. Offer this the FIRST time a user connects to Mesh. These are session hooks, NOT git pre/post-push.",
+			"inputSchema": obj(map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"action":      map[string]any{"type": "string", "enum": []string{"status", "install", "uninstall"}},
+					"project_dir": str,
+					"read_only":   map[string]any{"type": "boolean"},
+					"dry_run":     map[string]any{"type": "boolean"},
+				},
+			}),
+		},
 	}
 	return tools
 }
@@ -128,6 +142,8 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return s.toolWrite(p.Arguments, "entity")
 	case "mesh_reindex":
 		return s.toolReindex()
+	case "mesh_setup_hooks":
+		return s.toolSetupHooks(p.Arguments)
 	default:
 		return nil, &rpcError{Code: codeMethodNotFound, Message: "unknown tool", Data: p.Name}
 	}
@@ -152,6 +168,72 @@ func (s *Server) toolReindex() (any, *rpcError) {
 		"edges":     g.EdgeCount(),
 		"ms":        rec.Dur.Milliseconds(),
 	}), nil
+}
+
+// toolSetupHooks drives the session-hook onboarding: status returns the pitch +
+// questions for the agent to run the conversation; install/uninstall apply it. The
+// hooks make the agent read the mesh at session start and write back at the end.
+func (s *Server) toolSetupHooks(raw json.RawMessage) (any, *rpcError) {
+	var a struct {
+		Action     string `json:"action"`
+		ProjectDir string `json:"project_dir"`
+		ReadOnly   bool   `json:"read_only"`
+		DryRun     bool   `json:"dry_run"`
+	}
+	json.Unmarshal(raw, &a)
+	proj := a.ProjectDir
+	if proj == "" {
+		proj, _ = os.Getwd()
+	}
+	if abs, err := filepath.Abs(proj); err == nil {
+		proj = abs
+	}
+	bin, _ := os.Executable()
+	if bin == "" {
+		bin = "mesh"
+	}
+	vaultAbs, _ := filepath.Abs(s.vaultRoot)
+
+	switch a.Action {
+	case "install":
+		res, err := hooks.Install(hooks.Options{ProjectDir: proj, Vault: vaultAbs, Bin: bin, EnforceWriteback: !a.ReadOnly, DryRun: a.DryRun})
+		if err != nil {
+			return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
+		}
+		out := map[string]any{"settings_path": res.SettingsPath, "added": res.Added}
+		if a.DryRun {
+			out["dry_run"] = true
+			out["preview"] = res.Preview
+		} else if len(res.Added) == 0 {
+			out["note"] = "already installed; nothing to do"
+		} else {
+			out["installed"] = true
+			out["next"] = "Tell the user to run /hooks in Claude Code to verify, then restart the session for it to take effect."
+		}
+		return textResult(out), nil
+	case "uninstall":
+		n, p, err := hooks.Uninstall(proj)
+		if err != nil {
+			return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
+		}
+		return textResult(map[string]any{"removed": n, "settings_path": p}), nil
+	default:
+		st, _ := hooks.GetStatus(proj)
+		return textResult(map[string]any{
+			"status":       st,
+			"vault":        vaultAbs,
+			"project_dir":  proj,
+			"what_it_does": "Wires two Claude Code session hooks: SessionStart runs `mesh orient` so you begin every session having read the mesh (its entry points + recent changes + how to retrieve); Stop nudges you once to write back what you learned (mesh_append_note) before finishing.",
+			"why":          "It turns Mesh from a tool you must remember to use into the default: every session starts informed and ends a little smarter, so knowledge compounds across sessions and teammates instead of being relearned. This is the flywheel, the real superpower.",
+			"clarify":      "These are Claude Code SESSION hooks, not git pre/post-push hooks (those are a separate layer for code pushes).",
+			"questions_to_ask_the_user": []string{
+				"Set up the session hooks for this project now? (recommended)",
+				"Enforce write-back too (a one-time Stop nudge per session), or read-only (just the start-of-session orientation)?",
+				"Is " + proj + " the right project directory? Its .claude/settings.json will be edited.",
+			},
+			"how_to_apply": "After they answer: call mesh_setup_hooks action=install (read_only=true for orientation-only). Pass dry_run=true first if they want to see the exact settings.json. Then they restart the session and verify with /hooks.",
+		}), nil
+	}
 }
 
 func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {

@@ -66,8 +66,8 @@ func TestInitializeAndToolsList(t *testing.T) {
 	}
 	list := call(t, s, "tools/list", map[string]any{})
 	tools, _ := list["tools"].([]map[string]any)
-	if len(tools) != 9 {
-		t.Errorf("expected 9 tools, got %d", len(tools))
+	if len(tools) != 10 {
+		t.Errorf("expected 10 tools, got %d", len(tools))
 	}
 }
 

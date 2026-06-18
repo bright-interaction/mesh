@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/spf13/cobra"
@@ -117,11 +118,10 @@ func orientText(store *index.Store, g *graph.Graph) string {
 	return b.String()
 }
 
-// hooksCmd installs/removes the Claude Code session hooks that force the read-at-
-// start / write-back-at-end discipline. These are SESSION hooks (Claude Code), not
-// git pre/post-push hooks: SessionStart injects the orientation, Stop nudges the
-// write-back once. Git push hooks are a separate layer (the vault's post-commit
-// reindex / the monorepo psync), unrelated to the agent session lifecycle.
+// hooksCmd installs/removes the Claude Code session hooks that enforce the read-at-
+// start / write-back-at-end discipline (the flywheel). These are SESSION hooks, not
+// git pre/post-push hooks. The merge logic lives in internal/hooks, shared with the
+// mesh_setup_hooks MCP onboarding tool.
 func hooksCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "hooks",
@@ -130,20 +130,6 @@ func hooksCmd() *cobra.Command {
 	}
 	c.AddCommand(hooksInstallCmd(), hooksUninstallCmd(), hooksStopCheckCmd())
 	return c
-}
-
-func cmdEntry(command string) map[string]any { return map[string]any{"type": "command", "command": command} }
-
-func appendHook(hooks map[string]any, event string, group map[string]any) {
-	arr, _ := hooks[event].([]any)
-	hooks[event] = append(arr, group)
-}
-
-// settingsHasCommand reports whether the settings already reference one of our hook
-// commands, so install is idempotent.
-func settingsHasCommand(settings map[string]any, substr string) bool {
-	data, _ := json.Marshal(settings)
-	return strings.Contains(string(data), substr)
 }
 
 func hooksInstallCmd() *cobra.Command {
@@ -170,50 +156,20 @@ func hooksInstallCmd() *cobra.Command {
 			if err != nil || bin == "" {
 				bin = "mesh"
 			}
-			orientCommand := fmt.Sprintf("%q orient --hook --vault %q", bin, vaultAbs)
-			stopCommand := fmt.Sprintf("%q hooks stop-check", bin)
-
-			settingsPath := filepath.Join(projAbs, ".claude", "settings.json")
-			settings := map[string]any{}
-			if data, err := os.ReadFile(settingsPath); err == nil {
-				if err := json.Unmarshal(data, &settings); err != nil {
-					return fmt.Errorf("existing %s is not valid JSON: %w", settingsPath, err)
-				}
+			res, err := hooks.Install(hooks.Options{ProjectDir: projAbs, Vault: vaultAbs, Bin: bin, EnforceWriteback: !readOnly, DryRun: dryRun})
+			if err != nil {
+				return err
 			}
-			hooks, _ := settings["hooks"].(map[string]any)
-			if hooks == nil {
-				hooks = map[string]any{}
-			}
-
-			var added []string
-			if !settingsHasCommand(settings, "orient --hook") {
-				appendHook(hooks, "SessionStart", map[string]any{"matcher": "startup", "hooks": []any{cmdEntry(orientCommand)}})
-				appendHook(hooks, "SessionStart", map[string]any{"matcher": "resume", "hooks": []any{cmdEntry(orientCommand)}})
-				added = append(added, "SessionStart -> mesh orient (the agent reads the mesh at session start)")
-			}
-			if !readOnly && !settingsHasCommand(settings, "hooks stop-check") {
-				appendHook(hooks, "Stop", map[string]any{"hooks": []any{cmdEntry(stopCommand)}})
-				added = append(added, "Stop -> mesh hooks stop-check (nudges write-back once before finishing)")
-			}
-			settings["hooks"] = hooks
-
-			out, _ := json.MarshalIndent(settings, "", "  ")
 			if dryRun {
-				fmt.Printf("# dry run: would write %s\n\n%s\n", settingsPath, string(out))
+				fmt.Printf("# dry run: would write %s\n\n%s\n", res.SettingsPath, res.Preview)
 				return nil
 			}
-			if len(added) == 0 {
+			if len(res.Added) == 0 {
 				fmt.Println("mesh hooks already installed (nothing to do).")
 				return nil
 			}
-			if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
-				return err
-			}
-			if err := os.WriteFile(settingsPath, append(out, '\n'), 0o644); err != nil {
-				return err
-			}
-			fmt.Printf("installed into %s:\n", settingsPath)
-			for _, a := range added {
+			fmt.Printf("installed into %s:\n", res.SettingsPath)
+			for _, a := range res.Added {
 				fmt.Printf("  + %s\n", a)
 			}
 			fmt.Println("\nRun /hooks in Claude Code to verify, then start a new session.")
@@ -233,44 +189,11 @@ func hooksUninstallCmd() *cobra.Command {
 		Short: "Remove the mesh session hooks from .claude/settings.json",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			projAbs, _ := filepath.Abs(dir)
-			settingsPath := filepath.Join(projAbs, ".claude", "settings.json")
-			data, err := os.ReadFile(settingsPath)
+			removed, p, err := hooks.Uninstall(projAbs)
 			if err != nil {
-				return fmt.Errorf("no settings at %s", settingsPath)
-			}
-			settings := map[string]any{}
-			if err := json.Unmarshal(data, &settings); err != nil {
 				return err
 			}
-			hooks, _ := settings["hooks"].(map[string]any)
-			removed := 0
-			for event, v := range hooks {
-				arr, _ := v.([]any)
-				kept := make([]any, 0, len(arr))
-				for _, g := range arr {
-					gb, _ := json.Marshal(g)
-					if strings.Contains(string(gb), "orient --hook") || strings.Contains(string(gb), "hooks stop-check") {
-						removed++
-						continue
-					}
-					kept = append(kept, g)
-				}
-				if len(kept) == 0 {
-					delete(hooks, event)
-				} else {
-					hooks[event] = kept
-				}
-			}
-			if len(hooks) == 0 {
-				delete(settings, "hooks")
-			} else {
-				settings["hooks"] = hooks
-			}
-			out, _ := json.MarshalIndent(settings, "", "  ")
-			if err := os.WriteFile(settingsPath, append(out, '\n'), 0o644); err != nil {
-				return err
-			}
-			fmt.Printf("removed %d mesh hook(s) from %s\n", removed, settingsPath)
+			fmt.Printf("removed %d mesh hook(s) from %s\n", removed, p)
 			return nil
 		},
 	}

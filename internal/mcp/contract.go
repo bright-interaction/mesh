@@ -12,5 +12,6 @@ const contractText = `Mesh retrieval contract (optimize for tokens):
 5. DELTAS: on resume, mesh_changed_since(unix) returns only notes modified since a timestamp.
 6. WRITE BACK (the flywheel): when you finish work, call mesh_append_note with type decision|gotcha|post-mortem and one-line do/dont/why so the next agent inherits what you learned. Mesh fills id, timestamp, placement, and filename - you supply only judgment. Use mesh_write_entity for a system/tool/concept page.
 7. REINDEX: if you edited note files directly in the editor/CLI (not via mesh_append_note), call mesh_reindex to make those edits queryable now, then search/fetch. mesh_append_note/mesh_write_entity already reindex themselves.
+8. ONBOARDING: if the user is new to Mesh, offer mesh_setup_hooks. It wires Claude Code session hooks so you read the mesh at session start and are nudged to write back at the end automatically (the flywheel, the real superpower). Call it with no args first for the pitch + the questions to ask, then action=install once they agree.
 
 Always prefer cards over full fetches, and always write back non-obvious decisions and gotchas.`
