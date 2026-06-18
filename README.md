@@ -164,6 +164,7 @@ path (the hub itself stays AI-free).
 | `mesh mcp [--vault] [--watch]` | Serve the agent retrieval + write-back surface (live-reindex with `--watch`) |
 | `mesh tui [vault]` | Keyboard three-pane terminal view (notes, ranked search, preview + neighbors) |
 | `mesh ui [vault]` | Browser graph viewer (force-graph + galaxy) over the same index, localhost |
+| `mesh serve-ssh [vault]` | Serve the TUI over SSH so a teammate browses the graph with `ssh`, no install (key-auth, fail-closed) |
 | `mesh join <hub> <invite> [vault]` | Join a team vault and clone it (no git) |
 | `mesh sync [vault]` | Reconcile with the hub (push local edits, pull teammates') |
 
