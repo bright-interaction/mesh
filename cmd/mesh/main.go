@@ -1218,16 +1218,20 @@ func tuiCmd() *cobra.Command {
 	}
 }
 func uiCmd() *cobra.Command {
-	var addr string
+	var addr, token string
 	c := &cobra.Command{
 		Use:   "ui [vault]",
-		Short: "Serve the localhost graph viewer (two views: Graph and Galaxy)",
-		Long:  "Open a local web view of the vault graph: an Obsidian-style force layout and a galaxy orbiting the index note. Same graph the agent reads over MCP, rendered from the single binary with no CDN. Hover a note for its card, click to open it in your editor.",
+		Short: "Serve the local web app: graph, search, settings, docs, API reference",
+		Long:  "Open the Mesh web app for a vault: the graph (force + galaxy + 3D), a search view, editable settings, in-app docs, and the API reference. Same index the agent reads over MCP, served from the single binary with no CDN. Loopback bind needs no auth; binding beyond loopback requires --token (or MESH_UI_TOKEN), fail-closed.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return web.Serve(vaultArg(args), addr)
+			if token == "" {
+				token = os.Getenv("MESH_UI_TOKEN")
+			}
+			return web.Serve(vaultArg(args), addr, token)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")
+	c.Flags().StringVar(&token, "token", "", "bearer token required for /api access (or MESH_UI_TOKEN); mandatory when binding beyond loopback")
 	return c
 }
