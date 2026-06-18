@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,10 +18,11 @@ import (
 //go:embed assets
 var assetsFS embed.FS
 
-// Server serves the localhost graph viewer for one vault.
+// Server serves the localhost graph viewer + app shell for one vault.
 type Server struct {
 	vaultRoot string
 	store     *index.Store
+	auth      authConfig
 
 	mu    sync.RWMutex
 	graph *graph.Graph
@@ -42,13 +44,15 @@ func NewServer(vaultRoot string) (*Server, error) {
 
 func (s *Server) Close() error { return s.store.Close() }
 
-// Handler wires the routes: the SPA shell, the graph payload, and embedded assets.
+// Handler wires the routes: the SPA shell, the graph payload, embedded assets, and
+// the /api surface, all behind the auth guard (a no-op on a loopback bind).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("GET /graph.json", s.handleGraph)
 	mux.HandleFunc("GET /assets/", s.handleAsset)
-	return mux
+	mux.HandleFunc("GET /api/status", s.handleStatus)
+	return s.auth.guard(mux)
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -106,16 +110,52 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// handleStatus reports index counts and which retrieval signals are active, the
+// browser equivalent of `mesh status`.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	notes, _ := s.store.Count("notes")
+	nodes, _ := s.store.Count("nodes")
+	edges, _ := s.store.Count("edges")
+	vectors, _ := s.store.Count("vectors")
+	writeJSON(w, map[string]any{
+		"vault":  s.vaultRoot,
+		"counts": map[string]int{"notes": notes, "nodes": nodes, "edges": edges, "vectors": vectors},
+		"signals": map[string]bool{
+			"fts":    true,
+			"graph":  true,
+			"vector": vectors > 0,
+			"rerank": os.Getenv("MESH_RERANK_ENDPOINT") != "",
+			"ann":    os.Getenv("MESH_HNSW_THRESHOLD") != "" && os.Getenv("MESH_HNSW_THRESHOLD") != "0",
+		},
+		"authRequired": s.auth.authRequired(),
+	})
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
 // Serve builds the server and listens on addr (e.g. 127.0.0.1:7474), printing the
-// URL. Bound to the given host only; this is a local viewer, not a public service.
-func Serve(vaultRoot, addr string) error {
+// URL. A loopback bind needs no auth; binding beyond loopback is fail-closed and
+// requires a token (see newAuthConfig).
+func Serve(vaultRoot, addr, token string) error {
+	auth, err := newAuthConfig(addr, token)
+	if err != nil {
+		return err
+	}
 	s, err := NewServer(vaultRoot)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+	s.auth = auth
 	exp := BuildExport(s.graph, vaultRoot)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))
-	fmt.Printf("serving the graph at http://%s  (Ctrl-C to stop)\n", addr)
+	if auth.authRequired() {
+		fmt.Printf("auth: token required (Authorization: Bearer ...)\n")
+	}
+	fmt.Printf("serving at http://%s  (Ctrl-C to stop)\n", addr)
 	return http.ListenAndServe(addr, s.Handler())
 }

@@ -3,32 +3,57 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Mesh graph</title>
+  <title>Mesh</title>
   <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
+  <!-- Graph engine canvases (full-window; app.js owns these, IDs unchanged) -->
   <canvas id="stage"></canvas>
   <canvas id="stage3d" hidden></canvas>
 
-  <header id="bar">
-    <div class="brand">
+  <!-- Left nav rail: floats over the canvas so the graph engine keeps full bounds -->
+  <nav id="rail" aria-label="Sections">
+    <div class="rail-brand">
       <span class="dot" aria-hidden="true"></span>
       <span class="name">mesh</span>
-      <span class="stats" id="stats"></span>
     </div>
-    <div class="views" role="tablist" aria-label="View">
-      <button id="view-graph" class="view active" role="tab" aria-selected="true">Graph</button>
-      <button id="view-galaxy" class="view" role="tab" aria-selected="false">Galaxy</button>
-      <button id="view-galaxy3d" class="view" role="tab" aria-selected="false">Galaxy 3D</button>
-    </div>
-    <div class="search">
-      <input id="q" type="search" placeholder="search notes" autocomplete="off" spellcheck="false">
-    </div>
-  </header>
+    <ul class="rail-nav">
+      <li><button class="nav active" data-view="graph" aria-current="page">Graph</button></li>
+      <li><button class="nav" data-view="search">Search</button></li>
+      <li><button class="nav" data-view="settings">Settings</button></li>
+      <li><button class="nav" data-view="docs">Docs</button></li>
+      <li><button class="nav" data-view="api">API</button></li>
+    </ul>
+    <div class="rail-foot" id="rail-status" aria-live="polite"></div>
+  </nav>
 
-  <aside id="card" class="card hidden" aria-live="polite"></aside>
+  <!-- Graph view chrome (only visible in the Graph section; IDs unchanged for app.js) -->
+  <div id="graph-chrome">
+    <header id="bar">
+      <div class="brand">
+        <span class="stats" id="stats"></span>
+      </div>
+      <div class="views" role="tablist" aria-label="View">
+        <button id="view-graph" class="view active" role="tab" aria-selected="true">Force</button>
+        <button id="view-galaxy" class="view" role="tab" aria-selected="false">Galaxy</button>
+        <button id="view-galaxy3d" class="view" role="tab" aria-selected="false">Galaxy 3D</button>
+      </div>
+      <div class="search">
+        <input id="q" type="search" placeholder="filter notes" autocomplete="off" spellcheck="false">
+      </div>
+    </header>
+    <aside id="card" class="card hidden" aria-live="polite"></aside>
+    <div id="legend" class="legend hidden"></div>
+    <footer id="hint">drag to pan &middot; scroll to zoom &middot; hover a note &middot; click to open in your editor</footer>
+  </div>
 
-  <div id="legend" class="legend hidden"></div>
+  <!-- Feature panels: shown over the canvas when their nav item is active -->
+  <main id="panel" hidden>
+    <section class="panel-view" data-panel="search" hidden></section>
+    <section class="panel-view" data-panel="settings" hidden></section>
+    <section class="panel-view" data-panel="docs" hidden></section>
+    <section class="panel-view" data-panel="api" hidden></section>
+  </main>
 
   <div id="overlay" class="overlay">
     <div class="overlay-inner">
@@ -37,9 +62,8 @@
     </div>
   </div>
 
-  <footer id="hint">drag to pan &middot; scroll to zoom &middot; hover a note &middot; click to open in your editor</footer>
-
   <script src="/assets/gl3d.js" defer></script>
   <script src="/assets/app.js" defer></script>
+  <script src="/assets/shell.js" defer></script>
 </body>
 </html>
