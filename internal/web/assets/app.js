@@ -75,6 +75,10 @@
     if (window.Mesh) Mesh.onNoteClose = () => { if (view === "galaxy3d") { if (gl3d) gl3d.clearFocus(); } else clearFocus2d(); };
     lastInteract = now();
     requestAnimationFrame(loop);
+    // Deep-link a view: ?v=galaxy3d (or galaxy) opens straight into it - shareable,
+    // and lets a headless capture land on the 3D galaxy without a click.
+    const dv = new URLSearchParams(location.search).get("v");
+    if (dv === "galaxy3d" || dv === "galaxy") setView(dv);
   }
 
   const adj = new Map();
