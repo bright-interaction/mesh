@@ -117,6 +117,14 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, err := assetsFS.ReadFile("assets/" + name)
+	// Dev-serve: when MESH_WEB_DEV points at an assets dir, read from disk so a
+	// front-end edit is live on refresh with no binary rebuild. Off in prod (env
+	// unset). name is already rejected if it contains "..", so this cannot escape.
+	if dir := os.Getenv("MESH_WEB_DEV"); dir != "" {
+		if b, e := os.ReadFile(filepath.Join(dir, name)); e == nil {
+			body, err = b, nil
+		}
+	}
 	if err != nil {
 		http.NotFound(w, r)
 		return

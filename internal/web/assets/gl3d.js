@@ -230,7 +230,7 @@
         x = c[0] + sx * local * 2 * tight; y = c[1] + sy * local * 0.7 * tight; z = c[2] + sz * local * 2 * tight;
       }
       pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
-      size[i] = isSun ? 3.4 : Math.min(2.3, Math.max(0.85, (n.size || 1) * 0.62));
+      size[i] = isSun ? 3.8 : Math.min(3.2, Math.max(1.15, (n.size || 1) * 0.78));
       const rgb = hexToRGB(commColor.get(n.community));
       color[i * 3] = rgb[0]; color[i * 3 + 1] = rgb[1]; color[i * 3 + 2] = rgb[2];
       flag[i] = isSun ? 1 : 0;
@@ -305,7 +305,7 @@
 
     // blazing core corona: concentric warm halos + a near-white centre (intensity
     // baked into the colour, since all are one instanced draw).
-    const corona = [[5, 1.0, [1.0, 0.98, 0.92]], [18, 0.72, [1.0, 0.9, 0.66]], [34, 0.42, [1.0, 0.85, 0.58]], [60, 0.2, [1.0, 0.8, 0.52]]];
+    const corona = [[6, 1.15, [1.0, 0.98, 0.92]], [22, 0.85, [1.0, 0.9, 0.66]], [46, 0.5, [1.0, 0.85, 0.58]], [86, 0.26, [1.0, 0.8, 0.52]], [140, 0.12, [1.0, 0.78, 0.5]]];
     const CORO = corona.length;
     const cpos = new Float32Array(CORO * 3), csize = new Float32Array(CORO), ccol = new Float32Array(CORO * 3), cflag = new Float32Array(CORO);
     corona.forEach((c, i) => { csize[i] = c[0]; const g = c[1]; ccol[i * 3] = c[2][0] * g; ccol[i * 3 + 1] = c[2][1] * g; ccol[i * 3 + 2] = c[2][2] * g; });
@@ -344,7 +344,7 @@
 
     // dense disc field stars tracing the arms, with DUST LANES (a dim band offset
     // from each arm ridge so the arms read as dusty, not uniform).
-    const FIELD = 3200;
+    const FIELD = 4400;
     const fpos = new Float32Array(FIELD * 3), fsize = new Float32Array(FIELD), fcol = new Float32Array(FIELD * 3), fflag = new Float32Array(FIELD);
     for (let i = 0; i < FIELD; i++) {
       const arm = i % ARMS;
@@ -359,7 +359,7 @@
       fpos[i * 3 + 2] = Math.sin(angle) * rr;
       // dust lane: a darker band a touch ahead of the arm ridge
       const lane = Math.abs(scatter - 0.16) < 0.055 ? 0.22 : 1.0;
-      fsize[i] = (0.4 + rand(i * 17) * 0.7) * (lane < 1 ? 0.7 : 1);
+      fsize[i] = (0.55 + rand(i * 17) * 0.9) * (lane < 1 ? 0.7 : 1);
       const w = (0.5 + rand(i * 23) * 0.42) * lane;
       const rad = Math.min(1, rr / DISC_R);            // 0 core .. 1 rim
       if (rand(i * 19) > 0.82) { fcol[i * 3] = w * 1.06; fcol[i * 3 + 1] = w * 0.84; fcol[i * 3 + 2] = w * 0.56; } // warm old stars
@@ -407,8 +407,8 @@
     }
 
     // --- camera (cinematic fly-in, then flick inertia) ---
-    const REST_DIST = 205;
-    const cam = { yaw: 2.0, pitch: -0.42, dist: 620, cx: 0, cy: 0, cz: 0 };
+    const REST_DIST = 84;
+    const cam = { yaw: 2.0, pitch: -0.5, dist: 560, cx: 0, cy: 0, cz: 0 };
     const vel = { yaw: 0, pitch: 0 };
     let W = 1, H = 1, dpr = 1, proj = perspective(1.05, 1, 1, 4000), vp = viewMatrix(cam.yaw, cam.pitch, cam.dist, 0, 0, 0);
     let drag = false, lx = 0, ly = 0, moved = false, hi = -1, time = 0, spinTime = 0, renderPitch = cam.pitch;
@@ -510,9 +510,9 @@
       gl.uniformMatrix4fv(su.uProj, false, proj); gl.uniformMatrix4fv(su.uView, false, vp);
       gl.uniform1f(su.uTime, time); gl.uniform1f(su.uSpinTime, spinTime); gl.uniform1f(su.uCamDist, cam.dist);
 
-      drawLayer(nebVAO, NEB, { soft: 1.0, intensity: 0.06, fog: 0.8, omega: SPIN });
+      drawLayer(nebVAO, NEB, { soft: 1.0, intensity: 0.13, fog: 0.8, omega: SPIN });
       drawLayer(starVAO, STAR, { soft: 6.0, intensity: 1.0, twinkle: 1.0, fog: 0.0, omega: 0 });
-      drawLayer(fieldVAO, FIELD, { soft: 6.0, halo: 0.08, intensity: 0.95, twinkle: 0.8, fog: 0.55, omega: SPIN });
+      drawLayer(fieldVAO, FIELD, { soft: 6.0, halo: 0.14, intensity: 1.18, twinkle: 0.8, fog: 0.55, omega: SPIN });
 
       if (lineVerts.length) {
         gl.useProgram(line);
@@ -526,7 +526,7 @@
 
       drawLayer(coronaVAO, CORO, { soft: 1.2, intensity: 1.0, fog: 0.0, omega: 0 });
       drawLayer(bulgeVAO, BULGE, { soft: 4.0, halo: 0.1, intensity: 0.8, twinkle: 0.6, fog: 0.3, omega: SPIN });
-      drawLayer(nodeVAO, N, { soft: 5.0, halo: 0.3, intensity: 1.3, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm });
+      drawLayer(nodeVAO, N, { soft: 4.4, halo: 0.48, intensity: 1.62, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm });
       gl.bindVertexArray(null);
     }
 
@@ -535,8 +535,8 @@
       if (focusIdx < 0) spinTime += 0.03; // the disc turns only when not locked on a note
       if (!introDone) {
         introT += 0.016;
-        const p = Math.min(1, introT / 2.6), e = 1 - Math.pow(1 - p, 3);
-        cam.dist = 620 - (620 - REST_DIST) * e;
+        const p = Math.min(1, introT / 2.8), e = 1 - Math.pow(1 - p, 3);
+        cam.dist = 560 - (560 - REST_DIST) * e;
         cam.yaw = 2.0 - 1.4 * e;
         if (p >= 1) introDone = true;
       } else if (anim) {
@@ -579,7 +579,7 @@
         gl.useProgram(composite);
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(cu.uScene, 0);
         gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bTex[src]); gl.uniform1i(cu.uBloom, 1);
-        gl.uniform1f(cu.uBloomStr, 1.35);
+        gl.uniform1f(cu.uBloomStr, 1.55);
         gl.bindVertexArray(fsVAO); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         gl.bindVertexArray(null); gl.activeTexture(gl.TEXTURE0);
       } else {
