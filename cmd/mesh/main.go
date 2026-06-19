@@ -47,6 +47,7 @@ func rootCmd() *cobra.Command {
 		initCmd(),
 		newCmd(),
 		indexCmd(),
+		codeCmd(),
 		embedCmd(),
 		searchCmd(),
 		evalCmd(),
@@ -736,6 +737,110 @@ func indexCmd() *cobra.Command {
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "parse and report without writing .mesh/mesh.db")
 	c.Flags().IntVar(&workers, "workers", 0, "parse workers (0 = NumCPU)")
 	return c
+}
+
+// codeCmd is the source-code index: the pure-Go graphify replacement. It walks the
+// configured code roots (separate from the note vault), extracts symbols (Go via the
+// stdlib AST with a call graph; other languages via a declaration scanner), and lets
+// mesh_code_search / mesh_code_neighbors locate definitions by name.
+func codeCmd() *cobra.Command {
+	c := &cobra.Command{Use: "code", Short: "Source-code index (the graphify replacement): locate symbols + Go call graph"}
+	c.AddCommand(codeReindexCmd(), codeSearchCmd())
+	return c
+}
+
+func codeReindexCmd() *cobra.Command {
+	var rootsFlag []string
+	var langsFlag string
+	c := &cobra.Command{
+		Use:   "reindex [vault]",
+		Short: "Walk the configured code roots and (re)build the source-code index",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := "."
+			if len(args) == 1 {
+				root = args[0]
+			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			cfg, _ := meshcfg.LoadConfig(store.MeshDir())
+			roots := rootsFlag
+			if len(roots) == 0 {
+				roots = cfg.Code.Roots
+			}
+			if env := os.Getenv("MESH_CODE_ROOTS"); env != "" && len(rootsFlag) == 0 {
+				roots = strings.Split(env, ",")
+			}
+			if len(roots) == 0 {
+				return fmt.Errorf("no code roots: set [code] roots in %s or pass --root", filepath.Join(store.MeshDir(), "config.toml"))
+			}
+			langs := cfg.Code.Languages
+			if langsFlag != "" {
+				langs = strings.Split(langsFlag, ",")
+			}
+			start := time.Now()
+			st, err := index.ReindexCode(store, roots, codeLangSet(langs))
+			if err != nil {
+				return err
+			}
+			fmt.Printf("code index: %d files, %d symbols, %d edges in %s\n  roots: %s\n  db:    %s\n",
+				st.Files, st.Symbols, st.Edges, time.Since(start).Round(time.Millisecond), strings.Join(roots, ", "), store.Path())
+			return nil
+		},
+	}
+	c.Flags().StringSliceVar(&rootsFlag, "root", nil, "code root to index (repeatable); overrides config")
+	c.Flags().StringVar(&langsFlag, "languages", "", "comma list of language tags (default: config or all)")
+	return c
+}
+
+func codeSearchCmd() *cobra.Command {
+	var vaultRoot, langs string
+	var limit int
+	c := &cobra.Command{
+		Use:   "search <query>",
+		Short: "Search the source-code symbol index (file:line results)",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := index.Open(vaultRoot)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			var langList []string
+			if langs != "" {
+				langList = strings.Split(langs, ",")
+			}
+			hits, err := store.SearchCode(strings.Join(args, " "), limit, langList)
+			if err != nil {
+				return err
+			}
+			for _, h := range hits {
+				fmt.Printf("%-9s %-40s %s:%d\n", h.Kind, h.Name, h.Path, h.Line)
+			}
+			fmt.Printf("(%d symbols)\n", len(hits))
+			return nil
+		},
+	}
+	c.Flags().StringVar(&vaultRoot, "vault", ".", "vault root (the .mesh/mesh.db location)")
+	c.Flags().IntVar(&limit, "limit", 15, "max results")
+	c.Flags().StringVar(&langs, "languages", "", "comma list of language tags to filter")
+	return c
+}
+
+func codeLangSet(langs []string) map[string]bool {
+	if len(langs) == 0 {
+		return nil
+	}
+	m := map[string]bool{}
+	for _, l := range langs {
+		if l = strings.ToLower(strings.TrimSpace(l)); l != "" {
+			m[l] = true
+		}
+	}
+	return m
 }
 
 func printStats(root string, files, parseErrs int, parseDur time.Duration, workers, communities int, notes []*index.ParsedNote, g *graph.Graph, issues []index.Issue) {

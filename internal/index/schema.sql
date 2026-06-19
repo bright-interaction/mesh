@@ -68,3 +68,47 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
 -- Persisted corpus stats so graph-BM25 does not recompute IDF/avgdl per query.
 CREATE TABLE IF NOT EXISTS corpus_stats (key TEXT PRIMARY KEY, value REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- Source-code index: the pure-Go replacement for graphify's source-code role.
+-- Self-contained (own tables + own FTS) so locating a function never pollutes the
+-- note knowledge graph or the tier-0 budget. Identity is the symbol id
+-- "code:<path>#<qualified-name>"; a file rename is delete+add by path, exactly as
+-- an untitled note is. Code roots are configured separately from the note vault.
+CREATE TABLE IF NOT EXISTS code_files (
+  path           TEXT PRIMARY KEY,           -- root-relative source path
+  lang           TEXT NOT NULL,              -- go|ts|tsx|js|jsx|svelte|astro|py
+  package        TEXT,                       -- Go package name; null for others
+  mtime          INTEGER NOT NULL,
+  retrieval_hash TEXT NOT NULL               -- SHA256 over the file's extracted symbols (drift check)
+);
+
+CREATE TABLE IF NOT EXISTS code_symbols (
+  id         TEXT PRIMARY KEY,               -- code:<path>#<qualified-name>[~<line>]
+  path       TEXT NOT NULL,
+  lang       TEXT NOT NULL,
+  name       TEXT NOT NULL,                  -- qualified: "Server.Search"
+  kind       TEXT NOT NULL,                  -- func|method|type|interface|struct|const|var|class|enum
+  start_line INTEGER NOT NULL,               -- 1-based; the editor deep-link target
+  end_line   INTEGER NOT NULL,
+  signature  TEXT,
+  doc        TEXT,
+  calls      TEXT                            -- JSON array of callee names (Go); lets edges rebuild without re-parsing
+);
+CREATE INDEX IF NOT EXISTS idx_code_symbols_path ON code_symbols(path);
+CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name);
+
+CREATE TABLE IF NOT EXISTS code_edges (
+  src_id   TEXT NOT NULL,                    -- caller symbol id
+  dst_id   TEXT NOT NULL,                    -- callee symbol id
+  relation TEXT NOT NULL,                    -- calls (Go only; the call graph)
+  PRIMARY KEY (src_id, dst_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_code_edges_dst ON code_edges(dst_id);
+
+-- FTS over symbol name (boosted), signature, and doc. The first five columns are
+-- carried unindexed so a hit returns the deep link without a second lookup.
+CREATE VIRTUAL TABLE IF NOT EXISTS code_search USING fts5(
+  symbol_id UNINDEXED, lang UNINDEXED, kind UNINDEXED, path UNINDEXED, start_line UNINDEXED,
+  name, signature, doc,
+  tokenize = 'unicode61 remove_diacritics 2'
+);

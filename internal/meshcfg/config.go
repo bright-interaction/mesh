@@ -40,10 +40,21 @@ type Retrieval struct {
 	HNSWThreshold  int
 }
 
-// Config is the full solo config.toml (embedding + retrieval).
+// Code is the [code] section: the opt-in source-code index (the graphify
+// replacement). Index gates it on; Roots are the repos to walk (separate from the
+// note vault, since source lives elsewhere); Languages is an allowlist of language
+// tags (empty = all supported). Env MESH_CODE_INDEX / MESH_CODE_ROOTS override.
+type Code struct {
+	Index     bool
+	Roots     []string
+	Languages []string
+}
+
+// Config is the full solo config.toml (embedding + retrieval + code).
 type Config struct {
 	Embedding Embedding
 	Retrieval Retrieval
+	Code      Code
 }
 
 // configName is the file under <vault>/.mesh.
@@ -99,6 +110,11 @@ func LoadConfig(meshDir string) (Config, error) {
 		RerankBlend:    sectionFloat(body, "rerank", "blend"),
 		HNSWThreshold:  int(sectionFloat(body, "ann", "hnsw_threshold")),
 	}
+	c.Code = Code{
+		Index:     sectionBool(body, "code", "index"),
+		Roots:     sectionList(body, "code", "roots"),
+		Languages: sectionList(body, "code", "languages"),
+	}
 	return c, nil
 }
 
@@ -134,6 +150,16 @@ blend = %g
 # HNSW approximate-nearest-neighbour gate: build the index past this many chunks
 # (0 = brute force). Only acts in the pro build. Env MESH_HNSW_THRESHOLD wins.
 hnsw_threshold = %d
+
+[code]
+# Source-code index (the graphify replacement). Opt-in. index=true walks the roots
+# below and lets mesh_code_search / mesh_code_neighbors locate functions, types, and
+# the Go call graph. Roots are SEPARATE from the note vault (they are other repos);
+# comma-separated. languages is a comma list of tags (go,ts,tsx,js,jsx,svelte,astro,
+# py); empty = all supported. Env MESH_CODE_INDEX / MESH_CODE_ROOTS override.
+index = %v
+roots = %q
+languages = %q
 `
 
 // Save writes the [embedding] section, preserving any other sections already in the
@@ -160,6 +186,7 @@ func SaveConfig(meshDir string, c Config) error {
 		rv.WeightFTS, rv.WeightGraph, rv.WeightVec,
 		rv.RerankEndpoint, rv.RerankModel, rv.RerankKeyEnv, rv.RerankBlend,
 		rv.HNSWThreshold,
+		c.Code.Index, strings.Join(c.Code.Roots, ","), strings.Join(c.Code.Languages, ","),
 	)
 	tmp, err := os.CreateTemp(meshDir, ".config-*.toml")
 	if err != nil {
@@ -197,6 +224,32 @@ func validEnvName(s string) bool {
 		}
 	}
 	return true
+}
+
+// sectionBool reads a boolean key from a section: true for true/1/yes/on (any
+// case), false otherwise (including absent).
+func sectionBool(toml, section, key string) bool {
+	switch strings.ToLower(sectionString(toml, section, key)) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// sectionList reads a comma-separated key into a trimmed, empty-dropped slice; nil
+// when the key is absent or blank.
+func sectionList(toml, section, key string) []string {
+	raw := sectionString(toml, section, key)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // sectionFloat reads a numeric key from a section, 0 when absent or unparseable.

@@ -28,6 +28,10 @@ type Store struct {
 // deletable artifact (the markdown vault is the source of truth), so a version
 // mismatch drops and rebuilds rather than running a migration. This is why Mesh
 // uses no goose/golang-migrate: there is no irreplaceable data to migrate.
+// Note: the source-code tables (code_files/code_symbols/code_edges/code_search)
+// were added additively via CREATE TABLE IF NOT EXISTS, so they appear on existing
+// databases without a destructive rebuild and the version stays 2. Bump this only
+// for a shape change to an existing table, which requires the drop+rebuild below.
 const SchemaVersion = 2
 
 type job struct {
@@ -86,7 +90,7 @@ func ensureSchema(db *sql.DB) error {
 	// meta may not exist yet; ignore the scan error in that case.
 	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&current)
 	if current != 0 && current != SchemaVersion {
-		for _, t := range []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta"} {
+		for _, t := range []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search"} {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				return err
 			}
