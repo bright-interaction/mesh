@@ -95,6 +95,24 @@ func ToolSpecs() []map[string]any {
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
 		},
 		{
+			"name":        "mesh_code_search",
+			"description": "Locate SOURCE-CODE symbols (functions, types, methods, classes) by name across the indexed repos, ranked by name match. Returns cards with a file:line locator and signature so you jump straight to a definition instead of grepping the tree. Use this for 'where is X defined / what's in this area of the code'. This is the code index; mesh_search is for notes/knowledge.",
+			"inputSchema": obj(map[string]any{
+				"type":       "object",
+				"required":   []string{"query"},
+				"properties": map[string]any{"query": str, "limit": intp, "languages": strList},
+			}),
+		},
+		{
+			"name":        "mesh_code_neighbors",
+			"description": "The call-graph neighborhood of a code symbol by id (an id from mesh_code_search): callees (what it calls) and callers (what calls it). Go has full edges; other languages return symbol locations without a call graph.",
+			"inputSchema": obj(map[string]any{
+				"type":       "object",
+				"required":   []string{"id"},
+				"properties": map[string]any{"id": str},
+			}),
+		},
+		{
 			"name":        "mesh_setup_hooks",
 			"description": "ONBOARDING. Set up Claude Code SESSION hooks so you (the agent) automatically READ the mesh at the start of every session and get nudged to WRITE BACK what you learned before finishing - the flywheel that makes Mesh compound. Call with no args (action=status) to get the current install state plus the pitch and the exact questions to ask the user; then call action=install (read_only to skip the write-back nudge; dry_run to preview the settings.json first) to wire it into the project's .claude/settings.json. Offer this the FIRST time a user connects to Mesh. These are session hooks, NOT git pre/post-push.",
 			"inputSchema": obj(map[string]any{
@@ -142,6 +160,10 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return s.toolWrite(p.Arguments, "entity")
 	case "mesh_reindex":
 		return s.toolReindex()
+	case "mesh_code_search":
+		return s.toolCodeSearch(p.Arguments)
+	case "mesh_code_neighbors":
+		return s.toolCodeNeighbors(p.Arguments)
 	case "mesh_setup_hooks":
 		return s.toolSetupHooks(p.Arguments)
 	default:
@@ -159,7 +181,7 @@ func (s *Server) toolReindex() (any, *rpcError) {
 		return nil, internalErr(err)
 	}
 	g, _ := s.snapshot()
-	return textResult(map[string]any{
+	out := map[string]any{
 		"reindexed": rec.Reindexed,
 		"added":     rec.Added,
 		"changed":   rec.Changed,
@@ -167,7 +189,15 @@ func (s *Server) toolReindex() (any, *rpcError) {
 		"nodes":     g.NodeCount(),
 		"edges":     g.EdgeCount(),
 		"ms":        rec.Dur.Milliseconds(),
-	}), nil
+	}
+	// Refresh the source-code index too, so one mesh_reindex catches both note and
+	// code edits. ok=false means code indexing is not enabled for this vault.
+	if cs, ok, cerr := s.reindexCode(); ok && cerr == nil {
+		out["code_files"] = cs.Files
+		out["code_symbols"] = cs.Symbols
+		out["code_edges"] = cs.Edges
+	}
+	return textResult(out), nil
 }
 
 // toolSetupHooks drives the session-hook onboarding: status returns the pitch +
