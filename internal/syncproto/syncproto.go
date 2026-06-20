@@ -69,6 +69,10 @@ type SyncResponse struct {
 	// TombstoneSeq is the hub's current delete high-water mark; the client persists it
 	// and sends it back as SyncRequest.TombstoneSeq.
 	TombstoneSeq int64 `json:"tombstone_seq,omitempty"`
+	// Rejected lists outbox paths the hub refused to accept because the client lacks
+	// write permission (viewer role, or a read-only folder ACL). The client keeps its
+	// local copy; the edit simply did not land upstream. Older clients ignore this.
+	Rejected []string `json:"rejected,omitempty"`
 }
 
 // CurationJob is a hub-recorded marker that a path had a true conflict and would
