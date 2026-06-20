@@ -398,13 +398,13 @@
     // bright foreground stars with 4-point diffraction spikes (the photographic
     // sparkle the reference shows). A handful, large, white/blue, some lifted out of
     // the disc plane so they read as nearby stars in front of the galaxy.
-    const SPK = 26;
+    const SPK = 14;
     const kpos = new Float32Array(SPK * 3), ksize = new Float32Array(SPK), kcol = new Float32Array(SPK * 3), kflag = new Float32Array(SPK);
     for (let i = 0; i < SPK; i++) {
       kpos[i * 3] = (rand(i * 91 + 1) - 0.5) * 230;       // scattered across the frame as
       kpos[i * 3 + 1] = (rand(i * 7 + 3) - 0.5) * 140;    // foreground sky stars, not tied
       kpos[i * 3 + 2] = (rand(i * 53 + 5) - 0.5) * 160;   // to the disc
-      ksize[i] = rand(i * 29) > 0.76 ? 11 + rand(i * 5) * 7 : 5 + rand(i * 5) * 5; // a few big, the rest small
+      ksize[i] = rand(i * 29) > 0.85 ? 6 + rand(i * 5) * 4 : 3 + rand(i * 5) * 2.5; // mostly small, a couple slightly bigger
       if (rand(i * 13) > 0.5) { kcol[i * 3] = 0.82; kcol[i * 3 + 1] = 0.92; kcol[i * 3 + 2] = 1.0; }
       else { kcol[i * 3] = 1.0; kcol[i * 3 + 1] = 0.97; kcol[i * 3 + 2] = 0.9; }
     }
@@ -567,7 +567,7 @@
       drawLayer(coronaVAO, CORO, { soft: 1.2, intensity: 1.0, fog: 0.0, omega: 0 });
       drawLayer(bulgeVAO, BULGE, { soft: 4.0, halo: 0.1, intensity: 0.8, twinkle: 0.6, fog: 0.3, omega: SPIN });
       drawLayer(nodeVAO, N, { soft: 4.4, halo: 0.48, intensity: 1.62, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm });
-      drawLayer(spikeVAO, SPK, { soft: 6.0, intensity: 1.7, twinkle: 0.7, fog: 0.0, omega: 0, spk: 0.95 });
+      drawLayer(spikeVAO, SPK, { soft: 6.0, intensity: 1.3, twinkle: 0.7, fog: 0.0, omega: 0, spk: 0.6 });
       gl.bindVertexArray(null);
     }
 
