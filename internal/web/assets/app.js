@@ -8,6 +8,7 @@
   const canvas = $("stage"), ctx = canvas.getContext("2d");
   const canvas3d = $("stage3d");
   let gl3d = null; // lazy WebGL2 galaxy; null until the 3D tab is first opened (or if unavailable)
+  let captureStill = false; // ?still=1 capture mode: skip the galaxy fly-in + hide the build overlay
   const overlay = $("overlay"), overlayMsg = $("overlay-msg");
   const TAU = Math.PI * 2;
   const HEX = /^#[0-9a-fA-F]{3,8}$/;
@@ -77,8 +78,11 @@
     requestAnimationFrame(loop);
     // Deep-link a view: ?v=galaxy3d (or galaxy) opens straight into it - shareable,
     // and lets a headless capture land on the 3D galaxy without a click.
-    const dv = new URLSearchParams(location.search).get("v");
+    const params = new URLSearchParams(location.search);
+    captureStill = params.get("still") === "1";
+    const dv = params.get("v");
     if (dv === "galaxy3d" || dv === "galaxy") setView(dv);
+    if (captureStill) overlay.style.display = "none"; // deterministic still capture
   }
 
   const adj = new Map();
@@ -602,7 +606,7 @@
     if (v === "galaxy3d") {
       if (!gl3d && window.Mesh3D) {
         gl3d = window.Mesh3D.init(canvas3d, G, {
-          commColor, indexId: G.meta.index_id,
+          commColor, indexId: G.meta.index_id, still: captureStill,
           onSelect: (n) => {
             selected = n; setFocus(n);
             if (n) { showCard(n); if (gl3d) gl3d.focusNode(n.id); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); }
