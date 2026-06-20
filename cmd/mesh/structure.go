@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/vault"
@@ -69,6 +70,18 @@ func structureCmd() *cobra.Command {
 						where = "(cluster)"
 					}
 					fmt.Printf("    [%s] %-16s %s\n              %s\n", f.Severity, f.Kind, where, f.Detail)
+				}
+				for _, ci := range rep.MaplessClusters {
+					fmt.Printf("\n  cluster #%d needs a map - %d notes, most-connected first:\n", ci.ID, ci.Size)
+					for i, m := range ci.Members {
+						if i >= 16 {
+							fmt.Printf("    ... and %d more\n", ci.Size-16)
+							break
+						}
+						key := filepath.Base(m.Path)
+						key = strings.TrimSuffix(key, filepath.Ext(key))
+						fmt.Printf("    %-9s [[%s]]  %s\n", m.Type, key, m.Title)
+					}
 				}
 			} else {
 				fmt.Println("  run `mesh structure --verbose` for the per-note list")

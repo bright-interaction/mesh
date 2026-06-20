@@ -41,17 +41,34 @@ type StructureFinding struct {
 	Detail   string
 }
 
+// ClusterMember is one note in a cluster, for building a map from.
+type ClusterMember struct {
+	Title  string
+	Path   string
+	Type   string
+	Degree int
+}
+
+// ClusterInfo is a cluster that needs a map: its members, most-connected first,
+// so the map can lead with the anchors.
+type ClusterInfo struct {
+	ID      int
+	Size    int
+	Members []ClusterMember
+}
+
 // StructureReport is the vault's organization grade plus the itemized findings.
 type StructureReport struct {
-	Notes    int
-	Score    int // 0-100
-	Grade    string
-	ByType   map[string]int
-	Tier0    int
-	Orphans  int
-	Clusters int
-	Mapless  int
-	Findings []StructureFinding
+	Notes           int
+	Score           int // 0-100
+	Grade           string
+	ByType          map[string]int
+	Tier0           int
+	Orphans         int
+	Clusters        int
+	Mapless         int
+	Findings        []StructureFinding
+	MaplessClusters []ClusterInfo // members of each mapless cluster, to author its map
 }
 
 // AnalyzeStructure grades the organization of a parsed vault against its built
@@ -65,6 +82,7 @@ func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote) StructureReport {
 
 	clusterSize := map[int]int{}
 	clusterHasMap := map[int]bool{}
+	clusterMembers := map[int][]ClusterMember{}
 	flagged := map[string]bool{} // note ids with a high/med finding (for the score)
 
 	flag := func(id, sev, kind, path, detail string) {
@@ -90,6 +108,9 @@ func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote) StructureReport {
 			rep.Tier0++
 		}
 		clusterSize[node.Community]++
+		clusterMembers[node.Community] = append(clusterMembers[node.Community], ClusterMember{
+			Title: strings.TrimSpace(pn.FM.Title), Path: pn.Path, Type: t, Degree: node.Degree,
+		})
 		if t == "map" {
 			clusterHasMap[node.Community] = true
 		}
@@ -119,8 +140,12 @@ func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote) StructureReport {
 			rep.Mapless++
 			rep.Findings = append(rep.Findings, StructureFinding{"med", "mapless-cluster", "",
 				fmt.Sprintf("cluster #%d has %d notes but no map; add a maps/ front-door for it", c, size)})
+			mem := append([]ClusterMember(nil), clusterMembers[c]...)
+			sort.SliceStable(mem, func(i, j int) bool { return mem[i].Degree > mem[j].Degree })
+			rep.MaplessClusters = append(rep.MaplessClusters, ClusterInfo{ID: c, Size: size, Members: mem})
 		}
 	}
+	sort.SliceStable(rep.MaplessClusters, func(i, j int) bool { return rep.MaplessClusters[i].Size > rep.MaplessClusters[j].Size })
 
 	rep.Score, rep.Grade = scoreStructure(rep.Notes, len(flagged), rep.Mapless)
 	sort.SliceStable(rep.Findings, func(i, j int) bool {
