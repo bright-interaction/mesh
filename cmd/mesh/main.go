@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1075,17 +1078,21 @@ func isKebab(filename string) bool {
 func mcpCmd() *cobra.Command {
 	var vaultDir string
 	var doWatch bool
+	var httpAddr, httpToken string
 	var debounce, reconcile time.Duration
 	c := &cobra.Command{
 		Use:   "mcp",
-		Short: "Serve the agent retrieval contract over MCP (JSON-RPC on stdio)",
-		Long:  "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Configure your agent with: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}. Add --watch so notes edited in your editor are searchable in the same session without a restart.",
+		Short: "Serve the agent retrieval contract over MCP (JSON-RPC on stdio, or HTTP with --http)",
+		Long:  "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Default transport is stdio: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}. Use --http :PORT to serve over HTTP instead (POST /mcp) so any remote MCP client (Claude, Cursor, ChatGPT, ...) connects without a local install; a bearer --token is REQUIRED when binding beyond loopback. Add --watch so editor changes are searchable in the same session.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			srv, err := mcp.NewServer(vaultDir)
 			if err != nil {
 				return err
 			}
 			defer srv.Close()
+			if httpAddr != "" {
+				return serveMCPHTTP(srv, httpAddr, httpToken, doWatch, debounce, reconcile)
+			}
 			if !doWatch {
 				return srv.ServeStdio()
 			}
@@ -1112,9 +1119,60 @@ func mcpCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
 	c.Flags().BoolVar(&doWatch, "watch", false, "live-reindex the vault in the background so editor changes are searchable without a restart")
+	c.Flags().StringVar(&httpAddr, "http", "", "serve MCP over HTTP at host:port (POST /mcp) instead of stdio")
+	c.Flags().StringVar(&httpToken, "token", "", "bearer token for --http (or MESH_MCP_TOKEN); REQUIRED when binding beyond loopback")
 	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
 	c.Flags().DurationVar(&reconcile, "reconcile", 30*time.Second, "periodic full-reconcile safety net (0 to disable)")
 	return c
+}
+
+// serveMCPHTTP serves the MCP server over HTTP (POST /mcp). Fail-closed: a
+// non-loopback bind REQUIRES a bearer token. Optionally runs the background watcher.
+func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, reconcile time.Duration) error {
+	if token == "" {
+		token = os.Getenv("MESH_MCP_TOKEN")
+	}
+	if !addrIsLoopback(addr) && token == "" {
+		return fmt.Errorf("refusing to bind %s without a token: set --token or MESH_MCP_TOKEN (fail-closed)", addr)
+	}
+	if doWatch {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, "mesh watch: "+format+"\n", a...) }
+			_ = srv.Watch(ctx, debounce, reconcile, logf)
+		}()
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /mcp", func(w http.ResponseWriter, r *http.Request) {
+		if token != "" {
+			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), []byte(token)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		srv.HandleHTTP(w, r)
+	})
+	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	fmt.Fprintf(os.Stderr, "mesh mcp: serving HTTP at %s/mcp (auth: %v)\n", addr, token != "")
+	return httpSrv.ListenAndServe()
+}
+
+// addrIsLoopback reports whether host:port binds only the loopback interface.
+func addrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" {
+		return false // ":7575" binds all interfaces
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func watchCmd() *cobra.Command {

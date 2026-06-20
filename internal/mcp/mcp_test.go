@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,6 +159,46 @@ func TestToolWriteRecordsProvenance(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("written note missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestHandleHTTPMatchesDispatch(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(http.HandlerFunc(s.HandleHTTP))
+	defer ts.Close()
+
+	body := mustJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	resp, err := http.Post(ts.URL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
+		Error *map[string]any `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error != nil {
+		t.Fatalf("rpc error: %v", *out.Error)
+	}
+	if len(out.Result.Tools) != 13 {
+		t.Fatalf("tools over HTTP = %d, want 13", len(out.Result.Tools))
+	}
+
+	// A tools/call over HTTP returns the same shape as stdio.
+	call := mustJSON(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+		"params": map[string]any{"name": "mesh_search", "arguments": map[string]any{"query": "sqlite"}}})
+	r2, err := http.Post(ts.URL, "application/json", bytes.NewReader(call))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Body.Close()
+	if r2.StatusCode != 200 {
+		t.Fatalf("tools/call over HTTP status = %d", r2.StatusCode)
 	}
 }
 
