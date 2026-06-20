@@ -26,18 +26,26 @@ func structureCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			parsed, _ := index.ParseFiles(files, 0)
+			parsed, parseErrs := index.ParseFiles(files, 0)
 			for _, pn := range parsed {
 				if rel, err := filepath.Rel(root, pn.Path); err == nil {
 					pn.Path = rel
 				}
 			}
+			for i := range parseErrs {
+				if rel, err := filepath.Rel(root, parseErrs[i].Path); err == nil {
+					parseErrs[i].Path = rel
+				}
+			}
 			g, _ := index.BuildGraph(parsed)
 			g.DetectCommunities(0)
-			rep := index.AnalyzeStructure(g, parsed)
+			rep := index.AnalyzeStructure(g, parsed, parseErrs)
 
 			fmt.Printf("structure: grade %s  (%d/100)\n", rep.Grade, rep.Score)
 			fmt.Printf("  %d notes, %d clusters, %d tier-0 (decisions/gotchas/post-mortems)\n", rep.Notes, rep.Clusters, rep.Tier0)
+			if rep.Unparseable > 0 {
+				fmt.Printf("  !! %d note(s) fail to parse and are INVISIBLE to search/the graph - fix these first (see --verbose)\n", rep.Unparseable)
+			}
 
 			fmt.Print("  types:  ")
 			for _, kv := range sortedCounts(rep.ByType) {
