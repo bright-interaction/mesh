@@ -109,12 +109,17 @@
   precision highp float;
   in vec2 vUV; in vec3 vColor; in float vGlow; in float vViewZ;
   out vec4 frag;
-  uniform float uSoft, uHalo, uIntensity, uFog, uCamDist;
+  uniform float uSoft, uHalo, uIntensity, uFog, uCamDist, uSpike;
   void main(){
     float d = length(vUV);
-    if (d > 1.0) discard;
-    float c = 1.0 - d;
+    float c = max(0.0, 1.0 - d);
     float g = pow(c, uSoft) + pow(c, 1.7) * uHalo;
+    if (uSpike > 0.0) {
+      // 4-point diffraction spikes: a thin bright cross along the sprite axes.
+      float sx = pow(max(0.0, 1.0 - abs(vUV.y) * 9.0), 2.0) * max(0.0, 1.0 - abs(vUV.x));
+      float sy = pow(max(0.0, 1.0 - abs(vUV.x) * 9.0), 2.0) * max(0.0, 1.0 - abs(vUV.y));
+      g += (sx + sy) * uSpike;
+    } else if (d > 1.0) discard;
     float fade = mix(1.0, clamp(0.5 + (uCamDist - vViewZ) / 200.0, 0.18, 1.0), uFog);
     float glow = g * vGlow * uIntensity * fade;
     frag = vec4(vColor * glow, glow);
@@ -164,7 +169,7 @@
   void main(){
     float r = length(vUv - 0.5);
     vec3 c = texture(uScene, vUv).rgb + texture(uBloom, vUv).rgb * uBloomStr;
-    c += vec3(0.014, 0.020, 0.046) * (1.0 - smoothstep(0.0, 0.78, r)); // deep-blue ambient haze
+    c += vec3(0.012, 0.026, 0.060) * (1.0 - smoothstep(0.0, 0.85, r)); // deep-blue ambient haze
     c = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);      // ACES-ish tonemap
     c *= 1.0 - 0.34 * smoothstep(0.42, 1.08, r);                       // cinematic vignette
     frag = vec4(c, 1.0);
@@ -187,7 +192,7 @@
     if (!sprite || !line) return null;
 
     const su = {};
-    ["uProj", "uView", "uHi", "uTime", "uSpinTime", "uSizeMul", "uTwinkle", "uSoft", "uHalo", "uIntensity", "uFog", "uCamDist", "uOmega", "uSpotComm"].forEach((n) => (su[n] = gl.getUniformLocation(sprite, n)));
+    ["uProj", "uView", "uHi", "uTime", "uSpinTime", "uSizeMul", "uTwinkle", "uSoft", "uHalo", "uIntensity", "uFog", "uCamDist", "uOmega", "uSpotComm", "uSpike"].forEach((n) => (su[n] = gl.getUniformLocation(sprite, n)));
     const lu = {};
     ["uProj", "uView", "uCamDist", "uSpinTime", "uOmega"].forEach((n) => (lu[n] = gl.getUniformLocation(line, n)));
 
@@ -276,7 +281,7 @@
     }
     for (let j = 0; j < 8; j++) {
       const a = rand(j * 13 + 1) * TWO_PI, r = rand(j * 7 + 2) * 18;
-      neb.push({ p: [Math.cos(a) * r, (rand(j * 5 + 3) - 0.5) * 6, Math.sin(a) * r], s: 14 + rand(j * 3) * 14, c: [0.95, 0.78, 0.5] });
+      neb.push({ p: [Math.cos(a) * r, (rand(j * 5 + 3) - 0.5) * 6, Math.sin(a) * r], s: 14 + rand(j * 3) * 14, c: [0.36, 0.8, 0.96] });
     }
     // pink HII / star-forming regions scattered along the arms (real galaxies glow
     // pink where new stars ignite the hydrogen) - a big realism + beauty lever.
@@ -285,6 +290,20 @@
       const c = centroid(comms[k]);
       const ox = (rand(k * 29 + 2) - 0.5) * 16, oz = (rand(k * 37 + 4) - 0.5) * 16;
       neb.push({ p: [c[0] + ox, c[1] + (rand(k * 5 + 1) - 0.5) * 5, c[2] + oz], s: 6 + rand(k * 9) * 9, c: [0.95, 0.42, 0.6] });
+    }
+    // continuous teal disc glow: soft cyan gas spread around the mid-disc so the
+    // arms read as a luminous sheet (the dominant Andromeda hue), not dark gaps.
+    for (let k = 0; k < 24; k++) {
+      const a = (k / 24) * TWO_PI + (rand(k * 61 + 1) - 0.5) * 0.55;
+      const rr = DISC_R * (0.32 + 0.52 * rand(k * 23 + 3));
+      neb.push({ p: [Math.cos(a) * rr, (rand(k * 7 + 2) - 0.5) * 5, Math.sin(a) * rr], s: 15 + rand(k * 13) * 16, c: [0.3, 0.78, 0.97] });
+    }
+    // pink dust-lane zone hugging the bulge: the warm magenta the reference shows
+    // between the white core and the teal arms.
+    for (let k = 0; k < 14; k++) {
+      const a = (k / 14) * TWO_PI + rand(k * 71 + 2) * 0.6;
+      const rr = DISC_R * (0.15 + 0.17 * rand(k * 19 + 5));
+      neb.push({ p: [Math.cos(a) * rr, (rand(k * 9 + 1) - 0.5) * 4, Math.sin(a) * rr], s: 9 + rand(k * 11) * 12, c: [0.96, 0.4, 0.66] });
     }
     const NEB = neb.length;
     const npos = new Float32Array(NEB * 3), nsize = new Float32Array(NEB), ncol = new Float32Array(NEB * 3), nflag = new Float32Array(NEB);
@@ -296,16 +315,16 @@
     const bpos = new Float32Array(BULGE * 3), bsize = new Float32Array(BULGE), bcol = new Float32Array(BULGE * 3), bflag = new Float32Array(BULGE);
     for (let i = 0; i < BULGE; i++) {
       const a = rand(i * 3 + 1) * TWO_PI, u = rand(i * 7 + 2), r = Math.pow(u, 0.6) * 17;
-      bpos[i * 3] = Math.cos(a) * r; bpos[i * 3 + 1] = (rand(i * 11 + 3) - 0.5) * 7 * (1 - u); bpos[i * 3 + 2] = Math.sin(a) * r;
+      bpos[i * 3] = Math.cos(a) * r * 1.18; bpos[i * 3 + 1] = (rand(i * 11 + 3) - 0.5) * 3.2 * (1 - u); bpos[i * 3 + 2] = Math.sin(a) * r;
       bsize[i] = 1.1 + rand(i * 5) * 1.8;
-      const warm = 0.88 + rand(i * 9) * 0.12;
-      bcol[i * 3] = warm; bcol[i * 3 + 1] = warm * 0.86; bcol[i * 3 + 2] = warm * 0.6;
+      const warm = 0.9 + rand(i * 9) * 0.1;
+      bcol[i * 3] = warm; bcol[i * 3 + 1] = warm * 0.94; bcol[i * 3 + 2] = warm * 0.84;
     }
     const bulgeVAO = makeSprites(bpos, bsize, bcol, bflag);
 
     // blazing core corona: concentric warm halos + a near-white centre (intensity
     // baked into the colour, since all are one instanced draw).
-    const corona = [[6, 1.15, [1.0, 0.98, 0.92]], [22, 0.85, [1.0, 0.9, 0.66]], [46, 0.5, [1.0, 0.85, 0.58]], [86, 0.26, [1.0, 0.8, 0.52]], [140, 0.12, [1.0, 0.78, 0.5]]];
+    const corona = [[6, 1.2, [1.0, 0.99, 0.97]], [19, 0.8, [1.0, 0.96, 0.88]], [40, 0.38, [1.0, 0.93, 0.82]], [72, 0.15, [0.95, 0.92, 0.86]], [115, 0.06, [0.78, 0.84, 0.95]]];
     const CORO = corona.length;
     const cpos = new Float32Array(CORO * 3), csize = new Float32Array(CORO), ccol = new Float32Array(CORO * 3), cflag = new Float32Array(CORO);
     corona.forEach((c, i) => { csize[i] = c[0]; const g = c[1]; ccol[i * 3] = c[2][0] * g; ccol[i * 3 + 1] = c[2][1] * g; ccol[i * 3 + 2] = c[2][2] * g; });
@@ -344,7 +363,7 @@
 
     // dense disc field stars tracing the arms, with DUST LANES (a dim band offset
     // from each arm ridge so the arms read as dusty, not uniform).
-    const FIELD = 4400;
+    const FIELD = 11000;
     const fpos = new Float32Array(FIELD * 3), fsize = new Float32Array(FIELD), fcol = new Float32Array(FIELD * 3), fflag = new Float32Array(FIELD);
     for (let i = 0; i < FIELD; i++) {
       const arm = i % ARMS;
@@ -362,14 +381,34 @@
       fsize[i] = (0.55 + rand(i * 17) * 0.9) * (lane < 1 ? 0.7 : 1);
       const w = (0.5 + rand(i * 23) * 0.42) * lane;
       const rad = Math.min(1, rr / DISC_R);            // 0 core .. 1 rim
-      if (rand(i * 19) > 0.82) { fcol[i * 3] = w * 1.06; fcol[i * 3 + 1] = w * 0.84; fcol[i * 3 + 2] = w * 0.56; } // warm old stars
-      else { // young blue stars, bluer toward the rim, warmer toward the core
-        fcol[i * 3] = w * (0.72 + 0.16 * (1 - rad));
-        fcol[i * 3 + 1] = w * 0.9;
-        fcol[i * 3 + 2] = w * (0.92 + 0.28 * rad);
+      const roll = rand(i * 19);
+      if (roll > 0.88) { // pink HII / dust-edge stars threaded through the arms
+        fcol[i * 3] = w * 1.0; fcol[i * 3 + 1] = w * 0.46; fcol[i * 3 + 2] = w * 0.72;
+      } else if (roll > 0.74) { // warm-white, denser toward the core
+        const ww = w * (0.86 + 0.14 * (1 - rad));
+        fcol[i * 3] = ww; fcol[i * 3 + 1] = ww * 0.95; fcol[i * 3 + 2] = ww * 0.86;
+      } else { // teal/cyan disc, cyan toward the rim (the dominant Andromeda hue)
+        fcol[i * 3] = w * (0.26 + 0.12 * (1 - rad));
+        fcol[i * 3 + 1] = w * (0.84 + 0.06 * rad);
+        fcol[i * 3 + 2] = w * (0.94 + 0.06 * rad);
       }
     }
     const fieldVAO = makeSprites(fpos, fsize, fcol, fflag);
+
+    // bright foreground stars with 4-point diffraction spikes (the photographic
+    // sparkle the reference shows). A handful, large, white/blue, some lifted out of
+    // the disc plane so they read as nearby stars in front of the galaxy.
+    const SPK = 26;
+    const kpos = new Float32Array(SPK * 3), ksize = new Float32Array(SPK), kcol = new Float32Array(SPK * 3), kflag = new Float32Array(SPK);
+    for (let i = 0; i < SPK; i++) {
+      kpos[i * 3] = (rand(i * 91 + 1) - 0.5) * 230;       // scattered across the frame as
+      kpos[i * 3 + 1] = (rand(i * 7 + 3) - 0.5) * 140;    // foreground sky stars, not tied
+      kpos[i * 3 + 2] = (rand(i * 53 + 5) - 0.5) * 160;   // to the disc
+      ksize[i] = rand(i * 29) > 0.76 ? 11 + rand(i * 5) * 7 : 5 + rand(i * 5) * 5; // a few big, the rest small
+      if (rand(i * 13) > 0.5) { kcol[i * 3] = 0.82; kcol[i * 3 + 1] = 0.92; kcol[i * 3 + 2] = 1.0; }
+      else { kcol[i * 3] = 1.0; kcol[i * 3 + 1] = 0.97; kcol[i * 3 + 2] = 0.9; }
+    }
+    const spikeVAO = makeSprites(kpos, ksize, kcol, kflag);
 
     // --- bloom FBOs (guarded; falls back to direct render) ---
     const bu = { uTex: gl.getUniformLocation(bright, "uTex"), uThresh: gl.getUniformLocation(bright, "uThresh") };
@@ -407,12 +446,12 @@
     }
 
     // --- camera (cinematic fly-in, then flick inertia) ---
-    const REST_DIST = 84;
-    const cam = { yaw: 2.0, pitch: -0.5, dist: 560, cx: 0, cy: 0, cz: 0 };
+    const REST_DIST = 98;
+    const cam = { yaw: opts.still ? 0.6 : 2.0, pitch: -0.22, dist: opts.still ? REST_DIST : 560, cx: 0, cy: 0, cz: 0 };
     const vel = { yaw: 0, pitch: 0 };
     let W = 1, H = 1, dpr = 1, proj = perspective(1.05, 1, 1, 4000), vp = viewMatrix(cam.yaw, cam.pitch, cam.dist, 0, 0, 0);
     let drag = false, lx = 0, ly = 0, moved = false, hi = -1, time = 0, spinTime = 0, renderPitch = cam.pitch;
-    let introT = 0, introDone = false, focusIdx = -1, anim = null;
+    let introT = 0, introDone = !!opts.still, focusIdx = -1, anim = null;
     const endIntro = () => { introDone = true; };
     // animate the orbit center + distance, used to fly into a note and back out.
     function startAnim(toC, toD, after) { anim = { fromC: [cam.cx, cam.cy, cam.cz], toC: toC, fromD: cam.dist, toD: toD, t: 0, after: after || null }; }
@@ -498,11 +537,12 @@
       gl.uniform1f(su.uIntensity, o.intensity); gl.uniform1f(su.uTwinkle, o.twinkle || 0);
       gl.uniform1f(su.uFog, o.fog || 0); gl.uniform1f(su.uHi, o.hi == null ? -1 : o.hi);
       gl.uniform1f(su.uOmega, o.omega || 0); gl.uniform1f(su.uSpotComm, o.spot == null ? -1 : o.spot);
+      gl.uniform1f(su.uSpike, o.spk || 0);
     }
     function drawLayer(vao, count, o) { setLayer(o); gl.bindVertexArray(vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count); }
 
     function drawScene() {
-      gl.clearColor(0.012, 0.011, 0.026, 1);
+      gl.clearColor(0.010, 0.014, 0.034, 1);
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); gl.disable(gl.DEPTH_TEST);
 
@@ -510,9 +550,9 @@
       gl.uniformMatrix4fv(su.uProj, false, proj); gl.uniformMatrix4fv(su.uView, false, vp);
       gl.uniform1f(su.uTime, time); gl.uniform1f(su.uSpinTime, spinTime); gl.uniform1f(su.uCamDist, cam.dist);
 
-      drawLayer(nebVAO, NEB, { soft: 1.0, intensity: 0.13, fog: 0.8, omega: SPIN });
+      drawLayer(nebVAO, NEB, { soft: 1.0, intensity: 0.19, fog: 0.8, omega: SPIN });
       drawLayer(starVAO, STAR, { soft: 6.0, intensity: 1.0, twinkle: 1.0, fog: 0.0, omega: 0 });
-      drawLayer(fieldVAO, FIELD, { soft: 6.0, halo: 0.14, intensity: 1.18, twinkle: 0.8, fog: 0.55, omega: SPIN });
+      drawLayer(fieldVAO, FIELD, { soft: 6.0, halo: 0.16, intensity: 1.52, twinkle: 0.8, fog: 0.55, omega: SPIN });
 
       if (lineVerts.length) {
         gl.useProgram(line);
@@ -527,6 +567,7 @@
       drawLayer(coronaVAO, CORO, { soft: 1.2, intensity: 1.0, fog: 0.0, omega: 0 });
       drawLayer(bulgeVAO, BULGE, { soft: 4.0, halo: 0.1, intensity: 0.8, twinkle: 0.6, fog: 0.3, omega: SPIN });
       drawLayer(nodeVAO, N, { soft: 4.4, halo: 0.48, intensity: 1.62, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm });
+      drawLayer(spikeVAO, SPK, { soft: 6.0, intensity: 1.7, twinkle: 0.7, fog: 0.0, omega: 0, spk: 0.95 });
       gl.bindVertexArray(null);
     }
 
@@ -562,7 +603,7 @@
         gl.disable(gl.BLEND);
         gl.bindFramebuffer(gl.FRAMEBUFFER, bFBO[0]); gl.viewport(0, 0, bw, bh);
         gl.useProgram(bright); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
-        gl.uniform1i(bu.uTex, 0); gl.uniform1f(bu.uThresh, 0.26);
+        gl.uniform1i(bu.uTex, 0); gl.uniform1f(bu.uThresh, 0.32);
         gl.bindVertexArray(fsVAO); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         // separable blur, ping-pong
         gl.useProgram(blur); gl.uniform1i(blu.uTex, 0);
@@ -579,7 +620,7 @@
         gl.useProgram(composite);
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(cu.uScene, 0);
         gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bTex[src]); gl.uniform1i(cu.uBloom, 1);
-        gl.uniform1f(cu.uBloomStr, 1.55);
+        gl.uniform1f(cu.uBloomStr, 1.34);
         gl.bindVertexArray(fsVAO); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         gl.bindVertexArray(null); gl.activeTexture(gl.TEXTURE0);
       } else {
