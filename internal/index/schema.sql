@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS notes (
   mtime          INTEGER NOT NULL,
   updated        TEXT,                        -- frontmatter when/updated
   contributor    TEXT,                        -- last author (LOCAL in v1)
+  review_by      TEXT,                        -- frontmatter review_by (lifecycle re-check date)
+  source         TEXT,                        -- frontmatter source (provenance: manual|agent|import:*)
   local_version  INTEGER NOT NULL DEFAULT 0,  -- monotonic local counter (mesh_changed_since)
   hub_version    INTEGER NOT NULL DEFAULT 0   -- DEFERRED: set only when sync (milestone S) is live
 );

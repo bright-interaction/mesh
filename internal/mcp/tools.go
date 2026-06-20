@@ -77,6 +77,9 @@ func ToolSpecs() []map[string]any {
 				"properties": map[string]any{
 					"type": str, "title": str, "do": str, "dont": str, "why": str,
 					"related": strList, "tags": strList, "status": str, "severity": str,
+					// Optional provenance. Mesh stamps the calling agent + source=agent
+					// automatically; override author/confidence/review_by when you know them.
+					"author": str, "source": str, "source_url": str, "confidence": str, "review_by": str,
 				},
 			}),
 		},
@@ -354,15 +357,20 @@ func (s *Server) toolChangedSince(raw json.RawMessage) (any, *rpcError) {
 
 func (s *Server) toolWrite(raw json.RawMessage, forceType string) (any, *rpcError) {
 	var a struct {
-		Type     string   `json:"type"`
-		Title    string   `json:"title"`
-		Do       string   `json:"do"`
-		Dont     string   `json:"dont"`
-		Why      string   `json:"why"`
-		Related  []string `json:"related"`
-		Tags     []string `json:"tags"`
-		Status   string   `json:"status"`
-		Severity string   `json:"severity"`
+		Type       string   `json:"type"`
+		Title      string   `json:"title"`
+		Do         string   `json:"do"`
+		Dont       string   `json:"dont"`
+		Why        string   `json:"why"`
+		Related    []string `json:"related"`
+		Tags       []string `json:"tags"`
+		Status     string   `json:"status"`
+		Severity   string   `json:"severity"`
+		Author     string   `json:"author"`
+		Source     string   `json:"source"`
+		SourceURL  string   `json:"source_url"`
+		Confidence string   `json:"confidence"`
+		ReviewBy   string   `json:"review_by"`
 	}
 	json.Unmarshal(raw, &a)
 	t := a.Type
@@ -372,9 +380,20 @@ func (s *Server) toolWrite(raw json.RawMessage, forceType string) (any, *rpcErro
 	if t == "" {
 		t = "note"
 	}
+	// Provenance: default source to "agent" and stamp the calling tool so the audit
+	// trail, lifecycle checks, and contributor view know who wrote this.
+	s.mu.RLock()
+	agent := s.agent
+	s.mu.RUnlock()
+	source := strings.TrimSpace(a.Source)
+	if source == "" {
+		source = "agent"
+	}
 	res, err := vault.CreateNote(s.vaultRoot, vault.NewNoteSpec{
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
 		Related: a.Related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
+		Author: a.Author, Agent: agent, Source: source, SourceURL: a.SourceURL,
+		Confidence: a.Confidence, ReviewBy: a.ReviewBy, By: agent,
 	})
 	if err != nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
