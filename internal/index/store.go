@@ -32,7 +32,8 @@ type Store struct {
 // were added additively via CREATE TABLE IF NOT EXISTS, so they appear on existing
 // databases without a destructive rebuild and the version stays 2. Bump this only
 // for a shape change to an existing table, which requires the drop+rebuild below.
-const SchemaVersion = 2
+// v3: notes gained review_by + source columns (provenance / lifecycle, Phase A).
+const SchemaVersion = 3
 
 type job struct {
 	fn    func(*sql.Tx) error

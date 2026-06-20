@@ -26,6 +26,14 @@ type NewNoteSpec struct {
 	Status   string
 	Severity string
 	By       string
+	// Provenance (all optional; recorded in the note's frontmatter).
+	Author     string
+	Agent      string
+	Source     string
+	SourceURL  string
+	Confidence string
+	ReviewBy   string
+	ImportedAt string
 }
 
 // CreateResult reports what Mesh filled in and what the author still must.
@@ -100,15 +108,22 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	date := Now().Format("2006-01-02")
 
 	fm := &Frontmatter{
-		ID:       id,
-		Type:     spec.Type,
-		Title:    title,
-		When:     date,
-		Created:  date,
-		Related:  normalizeLinks(spec.Related),
-		Tags:     normalizeTags(spec.Tags),
-		Status:   spec.Status,
-		Severity: spec.Severity,
+		ID:         id,
+		Type:       spec.Type,
+		Title:      title,
+		When:       date,
+		Created:    date,
+		Related:    normalizeLinks(spec.Related),
+		Tags:       normalizeTags(spec.Tags),
+		Status:     spec.Status,
+		Severity:   spec.Severity,
+		Author:     strings.TrimSpace(spec.Author),
+		Agent:      strings.TrimSpace(spec.Agent),
+		Source:     strings.TrimSpace(spec.Source),
+		SourceURL:  strings.TrimSpace(spec.SourceURL),
+		Confidence: strings.TrimSpace(spec.Confidence),
+		ReviewBy:   strings.TrimSpace(spec.ReviewBy),
+		ImportedAt: strings.TrimSpace(spec.ImportedAt),
 	}
 	if spec.Type.RequiresFlywheel() {
 		fm.Do = orTODO(spec.Do)

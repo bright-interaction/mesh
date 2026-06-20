@@ -76,6 +76,16 @@ type Frontmatter struct {
 	Role       string     `yaml:"role,omitempty"`
 	Stack      StringList `yaml:"stack,omitempty"`
 	RepoPath   string     `yaml:"repo_path,omitempty"`
+	// Provenance: who/what wrote this note, where it came from, when to recheck.
+	// Feeds the audit trail, the knowledge-lifecycle health checks, and the
+	// contributor/ROI views. All optional.
+	Author     string     `yaml:"author,omitempty"`     // human who authored it
+	Agent      string     `yaml:"agent,omitempty"`      // tool that wrote it, e.g. "claude-code"
+	Source     string     `yaml:"source,omitempty"`     // manual | agent | import:<connector>
+	SourceURL  string     `yaml:"source_url,omitempty"` // upstream link for imported notes
+	Confidence string     `yaml:"confidence,omitempty"` // low | med | high
+	ReviewBy   string     `yaml:"review_by,omitempty"`  // YYYY-MM-DD; lifecycle re-check date
+	ImportedAt string     `yaml:"imported_at,omitempty"`
 }
 
 // ParseFrontmatter decodes a YAML frontmatter block into the whitelisted struct

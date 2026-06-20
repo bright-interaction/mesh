@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -122,6 +123,39 @@ func TestToolWriteBackReindexes(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("written gotcha not retrievable after reload: %v", cards)
+	}
+}
+
+func TestToolWriteRecordsProvenance(t *testing.T) {
+	s := newTestServer(t)
+	// initialize first so the server learns the calling agent's name.
+	if _, rerr := s.dispatch(context.Background(), request{
+		JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "initialize",
+		Params: mustJSON(map[string]any{"clientInfo": map[string]any{"name": "claude-code"}}),
+	}); rerr != nil {
+		t.Fatalf("initialize: %v", rerr)
+	}
+	res, rerr := s.dispatch(context.Background(), request{
+		JSONRPC: "2.0", ID: json.RawMessage(`2`), Method: "tools/call",
+		Params: mustJSON(map[string]any{"name": "mesh_append_note", "arguments": map[string]any{
+			"type": "decision", "title": "Prov check note",
+			"do": "stamp provenance", "dont": "drop authorship", "why": "audit + lifecycle need it",
+			"confidence": "high", "review_by": "2027-01-01",
+		}}),
+	})
+	if rerr != nil {
+		t.Fatalf("write rpc error: %v", rerr)
+	}
+	w := toolText(t, res.(map[string]any))
+	b, err := os.ReadFile(w["path"].(string))
+	if err != nil {
+		t.Fatalf("read written note: %v", err)
+	}
+	body := string(b)
+	for _, want := range []string{"agent: claude-code", "source: agent", "confidence: high", "review_by:", "2027-01-01"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("written note missing %q:\n%s", want, body)
+		}
 	}
 }
 

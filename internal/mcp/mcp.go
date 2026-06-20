@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,8 @@ type Server struct {
 
 	reloadMu sync.Mutex       // serializes rebuilds across dispatch + watcher
 	cache    *index.NoteCache // parsed-note cache for incremental reconcile; guarded by reloadMu
+
+	agent string // calling client's name from initialize (provenance default), guarded by mu
 }
 
 // NewServer opens the vault's index and loads it into memory.
@@ -165,7 +168,7 @@ func (s *Server) ServeStdio() error {
 func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	switch req.Method {
 	case "initialize":
-		return s.handleInitialize(), nil
+		return s.handleInitialize(req.Params), nil
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
@@ -181,7 +184,21 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	}
 }
 
-func (s *Server) handleInitialize() any {
+func (s *Server) handleInitialize(params json.RawMessage) any {
+	// Capture the calling agent's name (provenance default for write-back).
+	var p struct {
+		ClientInfo struct {
+			Name string `json:"name"`
+		} `json:"clientInfo"`
+	}
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &p)
+	}
+	if name := strings.TrimSpace(p.ClientInfo.Name); name != "" {
+		s.mu.Lock()
+		s.agent = name
+		s.mu.Unlock()
+	}
 	return map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities": map[string]any{
