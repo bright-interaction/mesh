@@ -61,6 +61,7 @@ func rootCmd() *cobra.Command {
 		ingestCmd(),
 		migrateCmd(),
 		lintCmd(),
+		structureCmd(),
 		mcpCmd(),
 		watchCmd(),
 		joinCmd(),
