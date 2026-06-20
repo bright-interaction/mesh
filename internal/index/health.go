@@ -40,6 +40,11 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 		return nil, err
 	}
 	today := now.Format("2006-01-02")
+	// Directories we actually index. We only call a path dead when we index its
+	// directory but not the file (it moved/was deleted). A reference into a folder we
+	// do not index can't be judged and must NOT be flagged, or every cross-repo or
+	// illustrative filename ("Next.js", "components/X.svelte") cries wolf.
+	indexedDirs := indexedDirSet(codeFiles)
 	var findings []HealthFinding
 	for _, n := range notes {
 		body, err := os.ReadFile(filepath.Join(vaultRoot, n.path))
@@ -51,6 +56,13 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 			seen := map[string]bool{}
 			for _, m := range codePathRe.FindAllString(string(body), -1) {
 				ref := strings.TrimLeft(m, "./")
+				slash := strings.LastIndexByte(ref, '/')
+				if slash <= 0 { // bare filename / domain -> not a checkable path
+					continue
+				}
+				if !dirIndexed(indexedDirs, ref[:slash]) { // a folder we don't index -> can't judge
+					continue
+				}
 				if seen[ref] || ref == n.path {
 					continue
 				}
@@ -309,6 +321,33 @@ func (s *Store) codeFilePaths() (map[string]bool, error) {
 		out[p] = true
 	}
 	return out, rows.Err()
+}
+
+// indexedDirSet returns the directory of every indexed code file (code paths may
+// carry a root prefix, e.g. "<repo>/internal/foo/bar.go").
+func indexedDirSet(codeFiles map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for p := range codeFiles {
+		if i := strings.LastIndexByte(p, '/'); i > 0 {
+			out[p[:i]] = true
+		}
+	}
+	return out
+}
+
+// dirIndexed reports whether refDir names a directory we index. Because indexed
+// paths may carry a root prefix the note omits, an indexed dir whose tail is the
+// ref's dir counts (e.g. indexed "<repo>/internal/foo" matches ref dir "internal/foo").
+func dirIndexed(indexedDirs map[string]bool, refDir string) bool {
+	if indexedDirs[refDir] {
+		return true
+	}
+	for d := range indexedDirs {
+		if strings.HasSuffix(d, "/"+refDir) {
+			return true
+		}
+	}
+	return false
 }
 
 // codeFileKnown reports whether ref names a known source file. Code paths are
