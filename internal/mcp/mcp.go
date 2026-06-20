@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -46,12 +47,27 @@ type Server struct {
 	agent string // calling client's name from initialize (provenance default), guarded by mu
 }
 
-// NewServer opens the vault's index and loads it into memory.
+// NewServer opens the vault's index (at <vaultRoot>/.mesh) and loads it into memory.
 func NewServer(vaultRoot string) (*Server, error) {
 	store, err := index.Open(vaultRoot)
 	if err != nil {
 		return nil, err
 	}
+	return newServerWithStore(vaultRoot, store)
+}
+
+// NewServerAt is like NewServer but keeps the index in an explicit dir instead of
+// <vaultRoot>/.mesh. The hub uses it to serve hosted MCP over its vault while
+// indexing OUTSIDE the git repo (so the index never syncs to clients).
+func NewServerAt(vaultRoot, indexDir string) (*Server, error) {
+	store, err := index.OpenAt(vaultRoot, indexDir)
+	if err != nil {
+		return nil, err
+	}
+	return newServerWithStore(vaultRoot, store)
+}
+
+func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
 	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache()}
 	if err := s.reload(); err != nil {
 		store.Close()
@@ -59,6 +75,16 @@ func NewServer(vaultRoot string) (*Server, error) {
 	}
 	return s, nil
 }
+
+// Reconcile re-reads the vault and rebuilds the in-memory index (authoritative).
+// The hub calls this after a sync lands so hosted MCP serves fresh results.
+func (s *Server) Reconcile() error {
+	_, err := s.reconcileOnce(true)
+	return err
+}
+
+// NotePath resolves a note id to its vault-relative path (for the hub's ACL gate).
+func (s *Server) NotePath(id string) (string, error) { return s.store.NotePath(id) }
 
 func (s *Server) Close() error { return s.store.Close() }
 
@@ -163,6 +189,41 @@ func (s *Server) ServeStdio() error {
 			return err
 		}
 	}
+}
+
+// HandleHTTP serves ONE JSON-RPC request over HTTP (MCP Streamable HTTP, the
+// request/response shape; no SSE stream). Same dispatch as stdio, so a remote agent
+// gets identical results. Stateless per call; auth + transport live in the caller
+// (cmd/mesh `mesh mcp --http` or the hub's /mcp route). The body cap mirrors the
+// largest sane tool call.
+func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	var req request
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+		writeRPC(w, response{JSONRPC: "2.0", Error: &rpcError{Code: codeInvalidParams, Message: "bad request"}})
+		return
+	}
+	// Notifications (no id) get a bare 202 with no body.
+	if len(req.ID) == 0 || string(req.ID) == "null" {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	result, rerr := s.dispatch(r.Context(), req)
+	resp := response{JSONRPC: "2.0", ID: req.ID}
+	if rerr != nil {
+		resp.Error = rerr
+	} else {
+		resp.Result = result
+	}
+	writeRPC(w, resp)
+}
+
+func writeRPC(w http.ResponseWriter, resp response) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {

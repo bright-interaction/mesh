@@ -47,7 +47,13 @@ func dsn(path string) string {
 // Open creates (or opens) <vaultRoot>/.mesh/mesh.db, applies the schema, and
 // starts the writer goroutine.
 func Open(vaultRoot string) (*Store, error) {
-	meshDir := filepath.Join(vaultRoot, ".mesh")
+	return OpenAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"))
+}
+
+// OpenAt is like Open but stores the index in an explicit directory instead of
+// <vaultRoot>/.mesh. The hub uses this to index its served vault into a dir OUTSIDE
+// the git repo, so the index is never synced to clients.
+func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 	if err := os.MkdirAll(meshDir, 0o755); err != nil {
 		return nil, err
 	}
