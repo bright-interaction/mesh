@@ -107,6 +107,20 @@ CREATE TABLE IF NOT EXISTS code_edges (
 );
 CREATE INDEX IF NOT EXISTS idx_code_edges_dst ON code_edges(dst_id);
 
+-- note_health: knowledge-lifecycle findings (dead_ref|overdue|contradiction) the
+-- health pass writes, surfaced by mesh_health + the web dashboard. Derived +
+-- rebuildable; cleared and rewritten on each pass.
+CREATE TABLE IF NOT EXISTS note_health (
+  id          INTEGER PRIMARY KEY,
+  note_id     TEXT NOT NULL,                 -- the flagged note's frontmatter id
+  path        TEXT NOT NULL,
+  issue       TEXT NOT NULL,                 -- dead_ref | overdue | contradiction
+  detail      TEXT NOT NULL DEFAULT '',      -- the missing ref / partner note / date
+  detected_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_note_health_issue ON note_health(issue);
+CREATE INDEX IF NOT EXISTS idx_note_health_note ON note_health(note_id);
+
 -- FTS over symbol name (boosted), signature, and doc. The first five columns are
 -- carried unindexed so a hit returns the deep link without a second lookup.
 CREATE VIRTUAL TABLE IF NOT EXISTS code_search USING fts5(

@@ -123,6 +123,55 @@ func buildVault(t *testing.T) *Retriever {
 	return New(s, lg)
 }
 
+func TestFreshnessDecayReordersTie(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(path, body string) *index.ParsedNote {
+		pn, err := index.Parse(path, []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pn
+	}
+	// Two plain notes with identical searchable text (equal FTS score). Without
+	// freshness, the tie-break is NodeID ascending so note:astale wins. The fresh
+	// note has a later id, so if it ranks first, freshness decay did the reordering.
+	notes := []*index.ParsedNote{
+		mk("astale.md", "---\nid: astale\ntype: note\nwhen: 2015-01-01\nupdated: 2015-01-01\n---\n# Stale\nalpha beta gamma delta epsilon\n"),
+		mk("zfresh.md", "---\nid: zfresh\ntype: note\nwhen: 2026-06-20\nupdated: 2026-06-20\n---\n# Fresh\nalpha beta gamma delta epsilon\n"),
+	}
+	g, _ := index.BuildGraph(notes)
+	g.DetectCommunities(0)
+	s, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if _, err := s.IndexVault(notes, g); err != nil {
+		t.Fatal(err)
+	}
+	lg, _ := s.LoadGraph()
+
+	// Freshness off: tie-break puts astale first.
+	r := New(s, lg)
+	cards, err := r.Retrieve(context.Background(), "alpha beta gamma delta epsilon", Options{Limit: 10, NoRerank: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards) < 2 || cards[0].NodeID != "note:astale" {
+		t.Fatalf("freshness off: want astale first, got %v", cards)
+	}
+	// Freshness on: the fresh note overtakes the stale one.
+	r2 := New(s, lg)
+	r2.freshHalfLife = 30
+	cards2, err := r2.Retrieve(context.Background(), "alpha beta gamma delta epsilon", Options{Limit: 10, NoRerank: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cards2) < 2 || cards2[0].NodeID != "note:zfresh" {
+		t.Fatalf("freshness on: want zfresh first, got %v", cards2)
+	}
+}
+
 func TestRetrieveFusesAndBoostsTier0(t *testing.T) {
 	r := buildVault(t)
 	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
