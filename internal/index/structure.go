@@ -33,6 +33,10 @@ var tier0Structure = map[string]bool{"decision": true, "gotcha": true, "post-mor
 // degree, so a note that links only to hubs gains nothing from the graph signal.
 const godDegreeStruct = 24
 
+// bloatedBodyLines is the body-length over which a note reads as a log-dump rather
+// than an atomic page (the LLM-wiki principle is one screen per note).
+const bloatedBodyLines = 160
+
 // StructureFinding is one organization problem on one note (or cluster).
 type StructureFinding struct {
 	Severity string // high | med | low
@@ -65,6 +69,7 @@ type StructureReport struct {
 	ByType          map[string]int
 	Tier0           int
 	Orphans         int
+	Unparseable     int // notes whose frontmatter/markdown fails to parse (invisible to the graph)
 	Clusters        int
 	Mapless         int
 	Findings        []StructureFinding
@@ -72,8 +77,12 @@ type StructureReport struct {
 }
 
 // AnalyzeStructure grades the organization of a parsed vault against its built
-// graph (run DetectCommunities first so cluster checks work). Pure; no I/O.
-func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote) StructureReport {
+// graph (run DetectCommunities first so cluster checks work). parseErrs are the
+// files Walk found but ParseFiles could not parse: they are the worst structural
+// failure (a note that fails to parse is invisible to search and the graph, with
+// no other signal), so they are surfaced as high-severity and counted against the
+// grade. Pure; no I/O.
+func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote, parseErrs []FileError) StructureReport {
 	rep := StructureReport{ByType: map[string]int{}}
 	deg := map[string]int{}
 	for _, n := range g.Nodes() {
@@ -132,6 +141,18 @@ func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote) StructureReport {
 		case hubOnly:
 			flag(nodeID, "med", "hub-only", pn.Path, "links only to hub notes (index/log/big maps); expansion skips hubs, link the specific note")
 		}
+
+		// An entity should be tight current-state. A long entity body is the log-dump
+		// anti-pattern: accumulated dated entries that belong in log.md, plus buried
+		// decisions/gotchas/post-mortems that should be discrete tier-0 notes. Concepts
+		// and maps may be comprehensive, so only entities are checked. Low severity (it
+		// surfaces the restructuring candidates without tanking the grade).
+		if t == "entity" {
+			if n := strings.Count(pn.Body, "\n"); n > bloatedBodyLines {
+				flag(nodeID, "low", "bloated", pn.Path,
+					fmt.Sprintf("%d-line entity; keep it tight current-state - move dated history to log.md and pull buried decisions/gotchas/post-mortems into discrete tier-0 notes", n))
+			}
+		}
 	}
 
 	for c, size := range clusterSize {
@@ -147,7 +168,16 @@ func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote) StructureReport {
 	}
 	sort.SliceStable(rep.MaplessClusters, func(i, j int) bool { return rep.MaplessClusters[i].Size > rep.MaplessClusters[j].Size })
 
-	rep.Score, rep.Grade = scoreStructure(rep.Notes, len(flagged), rep.Mapless)
+	// An unparseable note never reached the graph, so the checks above could not
+	// see it. Surface each one as a high-severity finding and count it as both a
+	// note and a flagged note, so a vault hiding broken files cannot score clean.
+	for _, fe := range parseErrs {
+		rep.Unparseable++
+		rep.Findings = append(rep.Findings, StructureFinding{"high", "unparseable", fe.Path,
+			"frontmatter/markdown fails to parse, so the note is invisible to search and the graph: " + fe.Err.Error()})
+	}
+
+	rep.Score, rep.Grade = scoreStructure(rep.Notes+rep.Unparseable, len(flagged)+rep.Unparseable, rep.Mapless)
 	sort.SliceStable(rep.Findings, func(i, j int) bool {
 		if sevRank(rep.Findings[i].Severity) != sevRank(rep.Findings[j].Severity) {
 			return sevRank(rep.Findings[i].Severity) < sevRank(rep.Findings[j].Severity)

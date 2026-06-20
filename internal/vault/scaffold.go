@@ -217,6 +217,12 @@ func bodyTemplate(t NoteType) string {
 		return tmplGotcha
 	case TypePostMortem:
 		return tmplPostMortem
+	case TypeEntity:
+		return tmplEntity
+	case TypeConcept:
+		return tmplConcept
+	case TypeMap:
+		return tmplMap
 	default:
 		return tmplNote
 	}
@@ -263,4 +269,48 @@ const tmplNote = `## Overview
 
 ## Related
 <!-- linked notes from the related: field render in the graph -->
+`
+
+// tmplEntity / tmplConcept / tmplMap follow the LLM-wiki (Karpathy) shape: a bold
+// one-line card up top (the atomic summary that also becomes the retrieval snippet),
+// then a few dense, type-specific sections, then Related links. The AI fills the
+// <!-- TODO --> guidance; everything else is derived.
+
+const tmplEntity = `**One-liner.** <!-- TODO: what this is and why it matters, in one sentence -->
+
+## What it does
+<!-- TODO: the core function, plainly -->
+
+## How it works
+<!-- TODO: architecture, the moving parts, where it runs -->
+
+## Key facts
+<!-- TODO: the non-obvious things a teammate needs (constraints, gotchas, status, repo) -->
+
+## Related
+<!-- link the concepts it uses and the decisions that shaped it: [[note-id]] (also fill related: above) -->
+`
+
+const tmplConcept = `**One-liner.** <!-- TODO: the idea in one sentence -->
+
+## The idea
+<!-- TODO: what it is and why it matters -->
+
+## How it works
+<!-- TODO: the mechanism, the model, the steps -->
+
+## How it applies to our work
+<!-- TODO: where we use it, with [[links]] to the entities that apply it -->
+
+## Related
+<!-- [[note-id]] -->
+`
+
+const tmplMap = `**One-liner.** <!-- TODO: the domain this maps, in one sentence -->
+
+<!-- One paragraph of context, then grouped links. A map is mostly links: if you are
+     writing long prose here it wants to be a concept instead. -->
+
+## <!-- TODO: a section per sub-area -->
+- [[note-id]] - <!-- why it matters -->
 `
