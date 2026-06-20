@@ -643,6 +643,10 @@
     if (!top.length) return;
     const el = $("legend");
     el.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "legend-head";
+    head.textContent = "Clusters";
+    el.appendChild(head);
     top.forEach((c) => {
       const b = document.createElement("button");
       b.className = "row" + (spotlight === c.id ? " active" : "");
