@@ -315,6 +315,7 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	if err != nil {
 		return nil, internalErr(err)
 	}
+	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)
 	return textResult(map[string]any{"cards": cards, "tokens": retrieve.TotalTokens(cards)}), nil
 }
 
@@ -336,6 +337,8 @@ func (s *Server) toolFetch(raw json.RawMessage) (any, *rpcError) {
 	if a.Anchor != "" {
 		body = sectionByAnchor(body, a.Anchor)
 	}
+	_ = s.store.IncrMetric("fetches", 1)         // ROI telemetry (best-effort)
+	_ = s.store.IncrMetric("fetch:"+a.ID, 1)     // per-note reuse (most-reused list)
 	return rawText(body), nil
 }
 
@@ -432,6 +435,7 @@ func (s *Server) toolWrite(raw json.RawMessage, forceType string) (any, *rpcErro
 	if err := s.reload(); err != nil {
 		return nil, internalErr(err)
 	}
+	_ = s.store.IncrMetric("writes", 1) // ROI telemetry (best-effort)
 	return textResult(map[string]any{"id": res.ID, "path": res.Path, "when": res.When, "todo": res.TODOs}), nil
 }
 

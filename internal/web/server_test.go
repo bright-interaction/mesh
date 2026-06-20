@@ -85,3 +85,38 @@ func TestServerRoutes(t *testing.T) {
 		t.Fatalf("unknown asset should 404, got %d", code)
 	}
 }
+
+func TestDashboardAPI(t *testing.T) {
+	ts := testServer(t)
+	// A search bumps the queries counter the dashboard reports.
+	if code, _, _ := get(t, ts, "/api/search?q=alpha"); code != 200 {
+		t.Fatalf("search status %d", code)
+	}
+	code, body, _ := get(t, ts, "/api/dashboard")
+	if code != 200 {
+		t.Fatalf("dashboard status %d", code)
+	}
+	var d struct {
+		Usage struct {
+			Queries int `json:"queries"`
+			Notes   int `json:"notes"`
+		} `json:"usage"`
+		EstTokensSaved int            `json:"est_tokens_saved"`
+		Coverage       map[string]int `json:"coverage"`
+	}
+	if err := json.Unmarshal([]byte(body), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Usage.Queries < 1 {
+		t.Errorf("queries counter = %d, want >= 1", d.Usage.Queries)
+	}
+	if d.Usage.Notes != 3 {
+		t.Errorf("notes = %d, want 3", d.Usage.Notes)
+	}
+	if d.EstTokensSaved < 1 {
+		t.Errorf("est_tokens_saved = %d, want > 0 after a query", d.EstTokensSaved)
+	}
+	if d.Coverage["note"] != 3 {
+		t.Errorf("coverage[note] = %d, want 3", d.Coverage["note"])
+	}
+}

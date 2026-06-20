@@ -91,6 +91,8 @@ func ensureSchema(db *sql.DB) error {
 	// meta may not exist yet; ignore the scan error in that case.
 	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&current)
 	if current != 0 && current != SchemaVersion {
+		// metrics is intentionally NOT dropped: usage counters are accumulated, not
+		// re-derivable, so they survive a schema-version rebuild.
 		for _, t := range []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health"} {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				return err
