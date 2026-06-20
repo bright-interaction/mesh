@@ -53,6 +53,7 @@ func rootCmd() *cobra.Command {
 		evalCmd(),
 		tuneCmd(),
 		statusCmd(),
+		healthCmd(),
 		migrateCmd(),
 		lintCmd(),
 		mcpCmd(),
@@ -618,6 +619,50 @@ func statusCmd() *cobra.Command {
 				fmt.Printf("  weights      learned fts=%.2f graph=%.2f vec=%.2f (MESH_WEIGHT_*)\n", wf, wg, wv)
 			} else {
 				fmt.Println("  weights      built-in defaults (run: mesh tune <cases.json> to fit your corpus)")
+			}
+			return nil
+		},
+	}
+}
+
+func healthCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "health [vault]",
+		Short: "Check knowledge lifecycle: dead source refs, overdue reviews, contradictions",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := "."
+			if len(args) == 1 {
+				root = args[0]
+			}
+			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
+				return fmt.Errorf("no index (run: mesh index %s)", root)
+			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			now := time.Now()
+			if _, err := store.ComputeHealth(root, now); err != nil {
+				return err
+			}
+			if _, err := store.ComputeContradictions(now); err != nil {
+				return err
+			}
+			counts, _ := store.HealthCounts()
+			findings, err := store.ListHealth("")
+			if err != nil {
+				return err
+			}
+			if len(findings) == 0 {
+				fmt.Println("vault healthy: no dead refs, overdue reviews, or contradictions")
+				return nil
+			}
+			fmt.Printf("health: %d dead refs, %d overdue, %d contradictions\n\n",
+				counts["dead_ref"], counts["overdue"], counts["contradiction"])
+			for _, f := range findings {
+				fmt.Printf("  [%s] %s - %s\n", f.Issue, f.Path, f.Detail)
 			}
 			return nil
 		},

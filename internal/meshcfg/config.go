@@ -38,6 +38,11 @@ type Retrieval struct {
 	RerankKeyEnv   string
 	RerankBlend    float64
 	HNSWThreshold  int
+	// FreshnessHalfLifeDays decays non-institutional notes in ranking by age (0 =
+	// off, the default, so nothing changes silently). Env MESH_FRESHNESS_HALFLIFE_DAYS
+	// wins. Tier-0 (decisions/gotchas/post-mortems) + entities/concepts/maps never
+	// decay; only note/status notes do, floored so an old note is demoted, not buried.
+	FreshnessHalfLifeDays int
 }
 
 // Code is the [code] section: the opt-in source-code index (the graphify
@@ -107,8 +112,9 @@ func LoadConfig(meshDir string) (Config, error) {
 		RerankEndpoint: sectionString(body, "rerank", "endpoint"),
 		RerankModel:    sectionString(body, "rerank", "model"),
 		RerankKeyEnv:   sectionString(body, "rerank", "key_env"),
-		RerankBlend:    sectionFloat(body, "rerank", "blend"),
-		HNSWThreshold:  int(sectionFloat(body, "ann", "hnsw_threshold")),
+		RerankBlend:           sectionFloat(body, "rerank", "blend"),
+		HNSWThreshold:         int(sectionFloat(body, "ann", "hnsw_threshold")),
+		FreshnessHalfLifeDays: int(sectionFloat(body, "retrieval", "freshness_half_life_days")),
 	}
 	c.Code = Code{
 		Index:     sectionBool(body, "code", "index"),
@@ -138,6 +144,9 @@ doc_prefix = %q
 weight_fts = %g
 weight_graph = %g
 weight_vec = %g
+# Age-decay non-institutional notes in ranking (0 = off). Tier-0 + entities/concepts
+# never decay. Env MESH_FRESHNESS_HALFLIFE_DAYS wins.
+freshness_half_life_days = 0
 
 [rerank]
 # Cross-encoder rerank (BYOAI). Empty endpoint/model = off. Env MESH_RERANK_* wins.

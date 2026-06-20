@@ -91,7 +91,7 @@ func ensureSchema(db *sql.DB) error {
 	// meta may not exist yet; ignore the scan error in that case.
 	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&current)
 	if current != 0 && current != SchemaVersion {
-		for _, t := range []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search"} {
+		for _, t := range []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health"} {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				return err
 			}
@@ -112,6 +112,30 @@ func (s *Store) Path() string { return s.dbPath }
 // MeshDir returns the vault's .mesh directory (where mesh.db and the solo
 // config.toml live).
 func (s *Store) MeshDir() string { return s.dir }
+
+// NoteDate carries the lifecycle dates retrieval needs for freshness decay.
+type NoteDate struct {
+	Updated  string // frontmatter updated/when (YYYY-MM-DD)
+	ReviewBy string // frontmatter review_by (YYYY-MM-DD), if any
+}
+
+// NoteDates returns id -> lifecycle dates for every note, for freshness decay.
+func (s *Store) NoteDates() (map[string]NoteDate, error) {
+	rows, err := s.readDB.Query(`SELECT id, COALESCE(updated,''), COALESCE(review_by,'') FROM notes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]NoteDate{}
+	for rows.Next() {
+		var id, upd, rev string
+		if err := rows.Scan(&id, &upd, &rev); err != nil {
+			return nil, err
+		}
+		out[id] = NoteDate{Updated: upd, ReviewBy: rev}
+	}
+	return out, rows.Err()
+}
 
 func (s *Store) writer() {
 	for {

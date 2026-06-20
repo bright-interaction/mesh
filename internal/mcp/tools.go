@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/retrieve"
@@ -98,6 +99,11 @@ func ToolSpecs() []map[string]any {
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
 		},
 		{
+			"name":        "mesh_health",
+			"description": "Run the knowledge-lifecycle health check NOW and return what is rotting: notes that cite a source file no longer in the code index (dead_ref), notes past their review_by date (overdue), plus any contradiction findings. Use this to keep the vault trustworthy; fix or update the flagged notes. Returns findings grouped by issue + counts.",
+			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{"issue": str}}),
+		},
+		{
 			"name":        "mesh_code_search",
 			"description": "Locate SOURCE-CODE symbols (functions, types, methods, classes) by name across the indexed repos, ranked by name match. Returns cards with a file:line locator and signature so you jump straight to a definition instead of grepping the tree. Use this for 'where is X defined / what's in this area of the code'. This is the code index; mesh_search is for notes/knowledge.",
 			"inputSchema": obj(map[string]any{
@@ -163,6 +169,8 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return s.toolWrite(p.Arguments, "entity")
 	case "mesh_reindex":
 		return s.toolReindex()
+	case "mesh_health":
+		return s.toolHealth(p.Arguments)
 	case "mesh_code_search":
 		return s.toolCodeSearch(p.Arguments)
 	case "mesh_code_neighbors":
@@ -201,6 +209,29 @@ func (s *Server) toolReindex() (any, *rpcError) {
 		out["code_edges"] = cs.Edges
 	}
 	return textResult(out), nil
+}
+
+// toolHealth runs the lifecycle health pass (dead refs + overdue reviews) and
+// returns the findings grouped by issue plus the current counts (incl. any
+// contradiction rows the curator wrote).
+func (s *Server) toolHealth(raw json.RawMessage) (any, *rpcError) {
+	var a struct {
+		Issue string `json:"issue"`
+	}
+	_ = json.Unmarshal(raw, &a)
+	now := time.Now()
+	if _, err := s.store.ComputeHealth(s.vaultRoot, now); err != nil {
+		return nil, internalErr(err)
+	}
+	if _, err := s.store.ComputeContradictions(now); err != nil {
+		return nil, internalErr(err)
+	}
+	findings, err := s.store.ListHealth(strings.TrimSpace(a.Issue))
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	counts, _ := s.store.HealthCounts()
+	return textResult(map[string]any{"findings": findings, "counts": counts}), nil
 }
 
 // toolSetupHooks drives the session-hook onboarding: status returns the pitch +

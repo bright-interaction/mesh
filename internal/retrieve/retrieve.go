@@ -5,10 +5,12 @@ package retrieve
 
 import (
 	"context"
+	"math"
 	"os"
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/graph"
@@ -87,6 +89,10 @@ type Retriever struct {
 
 	qvec   map[string][]float32 // query-embedding cache (keyed by prefixed query)
 	qvecMu sync.Mutex
+
+	freshHalfLife int                        // freshness decay half-life in days; 0 = off
+	freshDates    map[string]index.NoteDate  // note id -> lifecycle dates, lazy-loaded
+	freshOnce     sync.Once
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
@@ -136,6 +142,10 @@ func (r *Retriever) loadWeights(rv meshcfg.Retrieval) {
 		pick("MESH_WEIGHT_GRAPH", rv.WeightGraph),
 		pick("MESH_WEIGHT_VEC", rv.WeightVec),
 	)
+	r.freshHalfLife = rv.FreshnessHalfLifeDays
+	if v, err := strconv.Atoi(os.Getenv("MESH_FRESHNESS_HALFLIFE_DAYS")); err == nil && v >= 0 {
+		r.freshHalfLife = v
+	}
 }
 
 // enableVectorsFromEnv turns on the semantic signal when the vault has stored
@@ -466,6 +476,9 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		if c.Tier0 {
 			c.Score *= tier0Mult
 		}
+		if r.freshHalfLife > 0 {
+			c.Score *= r.freshnessMult(c)
+		}
 		cards = append(cards, c)
 	}
 	sortCards(cards)
@@ -598,6 +611,46 @@ func (r *Retriever) card(id string) Card {
 		c.Tier0 = tier0Types[t]
 	}
 	return c
+}
+
+// freshnessTypes are NON-institutional notes that decay with age. Decisions,
+// gotchas, post-mortems (tier-0) and entities/concepts/maps are structural memory
+// and never decay; only loose notes + status pages do.
+var freshnessTypes = map[string]bool{"note": true, "status": true, "": true}
+
+// freshnessMult returns a [floor,1] multiplier from a note's age. Institutional
+// types return 1 (no decay). An overdue review_by applies a small extra penalty.
+// 0.5^(age/halfLife), floored at 0.6 so an old note is demoted, never buried.
+func (r *Retriever) freshnessMult(c Card) float64 {
+	r.freshOnce.Do(func() {
+		if d, err := r.store.NoteDates(); err == nil {
+			r.freshDates = d
+		}
+	})
+	d, ok := r.freshDates[c.NoteID]
+	if !ok {
+		return 1
+	}
+	now := time.Now()
+	mult := 1.0
+	if freshnessTypes[c.Type] {
+		if t, err := time.Parse("2006-01-02", d.Updated); err == nil {
+			ageDays := now.Sub(t).Hours() / 24
+			if ageDays > 0 {
+				mult = math.Pow(0.5, ageDays/float64(r.freshHalfLife))
+				if mult < 0.6 {
+					mult = 0.6
+				}
+			}
+		}
+	}
+	// Overdue review: a small nudge down regardless of type (it asked to be rechecked).
+	if d.ReviewBy != "" {
+		if t, err := time.Parse("2006-01-02", d.ReviewBy); err == nil && now.After(t) {
+			mult *= 0.85
+		}
+	}
+	return mult
 }
 
 func (r *Retriever) title(id string) string {
