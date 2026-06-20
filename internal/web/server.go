@@ -72,6 +72,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/docs", s.handleDocsList)
 	mux.HandleFunc("GET /api/docs/{slug}", s.handleDoc)
 	mux.HandleFunc("GET /api/mcp-tools", s.handleMCPTools)
+	mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /openapi.json", s.handleOpenAPI)
 	var h http.Handler = s.auth.guard(mux)
 	if s.basePath != "" {

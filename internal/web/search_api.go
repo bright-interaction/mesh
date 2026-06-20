@@ -31,6 +31,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "search failed", http.StatusInternalServerError)
 		return
 	}
+	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)
 	writeJSON(w, map[string]any{"cards": cards, "tokens": retrieve.TotalTokens(cards)})
 }
 

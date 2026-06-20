@@ -121,6 +121,14 @@ CREATE TABLE IF NOT EXISTS note_health (
 CREATE INDEX IF NOT EXISTS idx_note_health_issue ON note_health(issue);
 CREATE INDEX IF NOT EXISTS idx_note_health_note ON note_health(note_id);
 
+-- metrics: monotonic usage counters for the ROI dashboard (queries served, notes
+-- fetched/written, plus per-note fetch counts keyed "fetch:<id>"). Derived usage
+-- telemetry, local only.
+CREATE TABLE IF NOT EXISTS metrics (
+  key   TEXT PRIMARY KEY,
+  value INTEGER NOT NULL DEFAULT 0
+);
+
 -- FTS over symbol name (boosted), signature, and doc. The first five columns are
 -- carried unindexed so a hit returns the deep link without a second lookup.
 CREATE VIRTUAL TABLE IF NOT EXISTS code_search USING fts5(

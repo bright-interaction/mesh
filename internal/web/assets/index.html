@@ -24,6 +24,7 @@
     <ul class="rail-nav">
       <li><button class="nav active" data-view="graph" aria-current="page">Graph</button></li>
       <li><button class="nav" data-view="search">Search</button></li>
+      <li><button class="nav" data-view="dashboard">Dashboard</button></li>
       <li><button class="nav" data-view="settings">Settings</button></li>
       <li><button class="nav" data-view="docs">Docs</button></li>
       <li><button class="nav" data-view="api">API</button></li>
@@ -74,6 +75,7 @@
   <!-- Feature panels: shown over the canvas when their nav item is active -->
   <main id="panel" hidden>
     <section class="panel-view" data-panel="search" hidden></section>
+    <section class="panel-view" data-panel="dashboard" hidden></section>
     <section class="panel-view" data-panel="settings" hidden></section>
     <section class="panel-view" data-panel="docs" hidden></section>
     <section class="panel-view" data-panel="api" hidden></section>
@@ -113,6 +115,7 @@
   <script src="assets/gl3d.js" defer></script>
   <script src="assets/app.js" defer></script>
   <script src="assets/search.js" defer></script>
+  <script src="assets/dashboard.js" defer></script>
   <script src="assets/settings.js" defer></script>
   <script src="assets/docs.js" defer></script>
   <script src="assets/api.js" defer></script>
