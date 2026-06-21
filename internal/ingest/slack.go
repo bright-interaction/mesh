@@ -21,6 +21,7 @@ type Slack struct {
 }
 
 func (s *Slack) Name() string { return "slack" }
+func (s *Slack) Key() string  { return "slack:" + s.Channel }
 
 type slackResp struct {
 	OK       bool   `json:"ok"`

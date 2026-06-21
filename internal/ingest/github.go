@@ -22,6 +22,7 @@ type GitHub struct {
 }
 
 func (g *GitHub) Name() string { return "github" }
+func (g *GitHub) Key() string  { return "github:" + g.Owner + "/" + g.Repo }
 
 type ghIssue struct {
 	Number      int        `json:"number"`

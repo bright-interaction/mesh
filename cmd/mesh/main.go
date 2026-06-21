@@ -21,7 +21,6 @@ import (
 	"github.com/bright-interaction/mesh/internal/eval"
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
-	"github.com/bright-interaction/mesh/internal/ingest"
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/retrieve"
@@ -634,76 +633,10 @@ func statusCmd() *cobra.Command {
 func ingestCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "ingest",
-		Short: "Pull external knowledge (GitHub, Slack) into the vault as provenance-stamped notes",
-		Long:  "Sovereign ingestion: import from where your team already keeps knowledge, into YOUR vault on YOUR hardware. Each item becomes a note under imported/<source>/ with source/source_url/imported_at provenance, upserted (a re-pull updates, never duplicates). Tokens come from env (never flags): MESH_INGEST_GITHUB_TOKEN, MESH_INGEST_SLACK_TOKEN.",
+		Short: "Pull external knowledge (GitHub, Slack, Linear, Jira, Notion) into the vault",
+		Long:  "Sovereign ingestion: import from where your team already keeps knowledge, into YOUR vault on YOUR hardware. Each item becomes a note under imported/<source>/ with source/source_url/imported_at provenance, upserted (a re-pull updates, never duplicates). Pulls are incremental (a high-water mark per source in .mesh/ingest-state.json); --full re-pulls everything, --watch <dur> keeps pulling on a schedule, and `ingest all` runs every source listed in .mesh/ingest.json. Tokens come from env (never flags/config): MESH_INGEST_{GITHUB,SLACK,LINEAR,JIRA,NOTION}_TOKEN.",
 	}
-	c.AddCommand(ingestGitHubCmd(), ingestSlackCmd())
-	return c
-}
-
-func runIngest(vaultRoot string, conn ingest.Connector) error {
-	res, err := ingest.Run(context.Background(), vaultRoot, conn, time.Time{})
-	if err != nil {
-		return err
-	}
-	fmt.Printf("ingested %d %s item(s) -> %s/ (%d written)\n", res.Pulled, conn.Name(), res.Folder, res.Written)
-	// Make the imports queryable now (mirror `mesh index`).
-	files, err := vault.Walk(vaultRoot)
-	if err != nil {
-		return err
-	}
-	notes, _ := index.ParseFiles(files, 0)
-	for _, pn := range notes {
-		if rel, err := filepath.Rel(vaultRoot, pn.Path); err == nil {
-			pn.Path = rel
-		}
-	}
-	g, _ := index.BuildGraph(notes)
-	g.DetectCommunities(0)
-	store, err := index.Open(vaultRoot)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	if _, err := store.IndexVault(notes, g); err != nil {
-		return err
-	}
-	fmt.Println("reindexed; imported notes are searchable")
-	return nil
-}
-
-func ingestGitHubCmd() *cobra.Command {
-	var vaultDir, owner, repo string
-	c := &cobra.Command{
-		Use:   "github",
-		Short: "Import GitHub issues + pull requests for a repo",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if owner == "" || repo == "" {
-				return fmt.Errorf("--owner and --repo are required")
-			}
-			return runIngest(vaultDir, &ingest.GitHub{Owner: owner, Repo: repo, Token: os.Getenv("MESH_INGEST_GITHUB_TOKEN")})
-		},
-	}
-	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
-	c.Flags().StringVar(&owner, "owner", "", "GitHub repo owner")
-	c.Flags().StringVar(&repo, "repo", "", "GitHub repo name")
-	return c
-}
-
-func ingestSlackCmd() *cobra.Command {
-	var vaultDir, channel string
-	c := &cobra.Command{
-		Use:   "slack",
-		Short: "Import a Slack channel's recent messages",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if channel == "" {
-				return fmt.Errorf("--channel (a channel id) is required")
-			}
-			return runIngest(vaultDir, &ingest.Slack{Channel: channel, Token: os.Getenv("MESH_INGEST_SLACK_TOKEN")})
-		},
-	}
-	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
-	c.Flags().StringVar(&channel, "channel", "", "Slack channel id, e.g. C0123456")
+	c.AddCommand(ingestGitHubCmd(), ingestSlackCmd(), ingestLinearCmd(), ingestJiraCmd(), ingestNotionCmd(), ingestAllCmd())
 	return c
 }
 
