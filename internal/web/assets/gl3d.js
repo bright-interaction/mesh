@@ -270,16 +270,20 @@
         // rotation (an arc at near-constant radius) with a little radial thickness, so
         // the cluster lies along the orbital flow instead of pointing at the center like
         // a spoke. Its center still sits on the spiral arm, so the arms still wind.
+        // Spread each note WIDELY along its spiral arm so the dots scatter through the
+        // galaxy and float among the field stars instead of forming a tight clump. The
+        // angle winds with the note's own radius (armAngle), so the scatter follows the
+        // arm's curve (aligned with rotation, not a spoke), with gentle cross-arm jitter
+        // for body. Same spiral formula as the field stars, so the notes intermix.
         const cg = clusterGeom(g);
-        const tight = 0.5 + 0.7 * ((n.orbit || 0) / maxOrbit);
-        const arcLen = 18 + (g % 4) * 5;                              // tangential half-length (world units)
-        const u = (rand(i * 3 + 1) - 0.5) + (rand(i * 5 + 9) - 0.5);  // ~triangular: denser mid-arc
-        const dtheta = (u * arcLen * tight) / cg.rCenter;            // offset ALONG rotation (tangential)
-        const rr = Math.max(10, cg.rCenter + (rand(i * 7 + 2) - 0.5) * (8 + 5 * tight)); // small radial thickness
-        const a = armAngle(cg.armBase, cg.rCenter) + dtheta;
+        const tight = 0.6 + 0.6 * ((n.orbit || 0) / maxOrbit);
+        const ur = (rand(i * 3 + 1) - 0.5) + (rand(i * 13 + 4) - 0.5);  // radial, ~triangular
+        const rr = Math.max(12, cg.rCenter + ur * (24 + 14 * tight));   // wide radius band along the arm
+        const dtheta = (rand(i * 5 + 9) - 0.5) * (0.13 + 0.07 * tight); // gentle cross-arm jitter
+        const a = armAngle(cg.armBase, rr) + dtheta;                    // follows the spiral as radius varies
         const rad = Math.min(1, rr / DISC_R);
         x = Math.cos(a) * rr;
-        y = (rand(i * 11 + 5) - 0.5) * DISC_THICK * (0.4 + 0.6 * (1 - rad));
+        y = (rand(i * 11 + 5) - 0.5) * DISC_THICK * (0.5 + 0.6 * (1 - rad));
         z = Math.sin(a) * rr;
       }
       pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
