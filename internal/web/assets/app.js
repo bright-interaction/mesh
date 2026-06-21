@@ -46,6 +46,70 @@
 
   const safeColor = (c) => (HEX.test(c) ? c : "#7c766e");
 
+  // ---- topic domains: an alternate grouping to the emergent link communities ----
+  // Each note is bucketed into a business-area domain from its tags, so the galaxy can
+  // be grouped + colored by topic (Engineering, Infra, Marketing, ...) with stable
+  // colors and clean labels. This is a VIEW only: retrieval + the community graph are
+  // untouched. A note's domain = the domain its tags vote for most (ties: first listed).
+  const DOMAIN_DEFS = [
+    { label: "Engineering", color: "#6ea8ff", tags: ["mesh","brightcrm","atomicsite","cookieproof","arachne","mithras","site-inspector","svar","frontend","backend","sqlc","mcp","webgl","workflow"] },
+    { label: "Infra / DevOps", color: "#54c489", tags: ["dockyard","hephaestus","deploy","self-hosted","docker","tailscale","infra","dns","proxy","monitoring","coolify","zitadel"] },
+    { label: "Marketing / SEO", color: "#f0a93b", tags: ["marketing","seo","cro","content","social","geo","aeo","growth","newsletter","copywriting","hormozi"] },
+    { label: "Sales / Outreach", color: "#e8629a", tags: ["sales","outreach","leads","prospecting","law","advokat","crm"] },
+    { label: "Security / Compliance", color: "#e0524e", tags: ["security","gdpr","audit","compliance","owasp","pii","encryption","secrets","vault","trustissues"] },
+    { label: "Design", color: "#38c5d0", tags: ["design","branding","typography","visual","taste","css","font"] },
+    { label: "Knowledge / Learning", color: "#b08cf0", tags: ["claude-skill","learning","networking","fundamentals","reference","concept","skill","basics","guide","patterns"] },
+    { label: "General", color: "#8a8f9a", tags: [] },
+  ];
+  const GENERAL_DOMAIN = DOMAIN_DEFS.length - 1;
+  const DOMAIN_TAG = new Map();
+  DOMAIN_DEFS.forEach((d, i) => d.tags.forEach((t) => DOMAIN_TAG.set(t, i)));
+  const domainColor = new Map();
+  let grouping = "community"; // "community" (emergent link clusters) | "domain" (topic)
+
+  function domainIndexFor(n) {
+    // vote from tags + tokens of the id/title (so untagged notes that name their
+    // project, e.g. "hephaestus-log", still classify).
+    const idt = ((n.id || "") + " " + (n.label || "")).toLowerCase().split(/[^a-z0-9]+/);
+    const toks = (n.tags || []).map((t) => String(t).toLowerCase()).concat(idt);
+    const score = {};
+    let best = -1, bestS = 0;
+    for (const t of toks) {
+      const di = DOMAIN_TAG.get(t);
+      if (di == null) continue;
+      score[di] = (score[di] || 0) + 1;
+      if (score[di] > bestS) { bestS = score[di]; best = di; }
+    }
+    return best < 0 ? GENERAL_DOMAIN : best;
+  }
+  function computeDomains() {
+    for (const n of G.nodes) n.domain = domainIndexFor(n);
+    // pass 2: a note that matched nothing inherits its community's dominant domain
+    // (communities are topical, so an untagged note in the Dockyard cluster is Infra).
+    const byComm = new Map();
+    for (const n of G.nodes) {
+      if (n.domain === GENERAL_DOMAIN) continue;
+      const m = byComm.get(n.community) || {};
+      m[n.domain] = (m[n.domain] || 0) + 1; byComm.set(n.community, m);
+    }
+    const commDom = new Map();
+    for (const [comm, m] of byComm) {
+      let best = -1, bs = 0;
+      for (const k in m) if (m[k] > bs) { bs = m[k]; best = +k; }
+      if (best >= 0) commDom.set(comm, best);
+    }
+    for (const n of G.nodes) if (n.domain === GENERAL_DOMAIN && commDom.has(n.community)) n.domain = commDom.get(n.community);
+    const counts = new Array(DOMAIN_DEFS.length).fill(0);
+    for (const n of G.nodes) counts[n.domain]++;
+    G.domains = DOMAIN_DEFS.map((d, i) => ({ id: i, color: d.color, label: d.label, size: counts[i] }))
+      .filter((d) => d.size > 0).sort((a, b) => b.size - a.size);
+    domainColor.clear();
+    for (const d of G.domains) domainColor.set(d.id, d.color);
+  }
+  const activeGroups = () => (grouping === "domain" ? (G.domains || []) : G.communities);
+  const groupKeyOf = (n) => (grouping === "domain" ? n.domain : n.community);
+  const groupColorOf = (n) => (grouping === "domain" ? domainColor : commColor).get(groupKeyOf(n)) || "#7c766e";
+
   fetch("graph.json").then((r) => {
     if (!r.ok) throw new Error("graph.json " + r.status);
     return r.json();
@@ -59,6 +123,7 @@
     if (!G.nodes || G.nodes.length === 0) return showEmpty();
     for (const c of G.communities) { c.color = safeColor(c.color); commColor.set(c.id, c.color); }
     G.nodes.forEach((n, i) => { byId.set(n.id, n); nodeIndex.set(n.id, i); n.vx = 0; n.vy = 0; n.dispX = 0; n.dispY = 0; });
+    computeDomains(); // assign each note a topic domain for the alternate grouping
     sp = new Array(G.nodes.length);
     buildAdjacency();
     labelOrder = G.nodes.map((_, i) => i).sort((a, b) =>
@@ -112,6 +177,7 @@
   // ---- glow sprites (built once per community color; drawn additively) ----
   function buildSprites() {
     for (const c of G.communities) sprites.set(c.color, haloSprite(c.color));
+    for (const d of DOMAIN_DEFS) sprites.set(d.color, haloSprite(d.color)); // topic-grouping colors
     sprites.set("#7c766e", haloSprite("#7c766e"));
     sunSprite = haloSprite("#fff1dc", true);
   }
@@ -356,7 +422,7 @@
       } else {
         let halo = core * (2.5 + Math.min(1.6, n.degree * 0.022)); // a bit more reach
         if (z <= 0.6) halo *= 0.7;
-        blit(sprites.get(commColor.get(n.community)) || sprites.get("#7c766e"), s, halo, dim ? 0.06 : 0.3);
+        blit(sprites.get(groupColorOf(n)) || sprites.get("#7c766e"), s, halo, dim ? 0.06 : 0.3);
       }
     }
     ctx.globalCompositeOperation = "source-over";
@@ -368,7 +434,7 @@
       const dim = dimmed(n);
       const r = coreR(n, z);
       ctx.globalAlpha = dim ? 0.18 : 1;
-      ctx.fillStyle = n.id === G.meta.index_id ? "#fff6e8" : lighten(commColor.get(n.community) || "#7c766e", 0.6);
+      ctx.fillStyle = n.id === G.meta.index_id ? "#fff6e8" : lighten(groupColorOf(n), 0.6);
       ctx.beginPath(); ctx.arc(s.x, s.y, r, 0, TAU); ctx.fill();
     }
     ctx.globalAlpha = 1;
@@ -454,7 +520,7 @@
   function nodeRadius(n) { return Math.max(1.4, (n.size || 1) * 1.7); }
   function isFocus(id) { if (!neighborSet) return false; const f = selected || hover; return neighborSet.has(id) || (f && id === f.id); }
   // a node is dimmed by a text filter, a focus neighborhood, or a legend spotlight.
-  function dimmed(n) { return (query && !matches(n)) || (neighborSet && !isFocus(n.id)) || (spotlight != null && n.community !== spotlight); }
+  function dimmed(n) { return (query && !matches(n)) || (neighborSet && !isFocus(n.id)) || (spotlight != null && groupKeyOf(n) !== spotlight); }
   function clearSpotlight() { if (spotlight == null) return; spotlight = null; if (gl3d) gl3d.setSpotlight(null); buildLegend(); }
 
   // ---- camera ----
@@ -489,8 +555,8 @@
   function setFocus(n) { neighborSet = n ? new Set(adj.get(n.id) || []) : null; }
   function showCard(n) {
     const card = $("card");
-    const color = commColor.get(n.community) || "#7c766e";
-    const comm = G.communities.find((c) => c.id === n.community) || {};
+    const color = groupColorOf(n);
+    const comm = activeGroups().find((c) => c.id === groupKeyOf(n)) || {};
     const editor = "vscode://file/" + joinPath(G.meta.vault, n.path) + ":" + (n.line || 1);
     const tags = (n.tags || []).map((x) => `<span class="chip">#${esc(x)}</span>`).join("");
     card.innerHTML = `
@@ -499,7 +565,7 @@
       <div class="meta">
         ${n.type ? `<span><span class="chip">${esc(n.type)}</span></span>` : ""}
         <span>links <b>${n.degree | 0}</b></span>
-        <span>cluster <b>${esc(comm.label || ("#" + n.community))}</b></span>
+        <span>${grouping === "domain" ? "topic" : "cluster"} <b>${esc(comm.label || ("#" + groupKeyOf(n)))}</b></span>
         <span>orbit <b>${n.orbit | 0}</b></span>
       </div>
       ${tags ? `<div class="tags">${tags}</div>` : ""}
@@ -601,20 +667,28 @@
       el.setAttribute("aria-selected", id === v ? "true" : "false");
     }
   }
+  // Create the 3D galaxy for the active grouping. The galaxy bakes node positions +
+  // colors from the grouping at init, so switching grouping disposes + recalls this.
+  function initGl3d() {
+    if (!window.Mesh3D) return;
+    const dom = grouping === "domain";
+    gl3d = window.Mesh3D.init(canvas3d, G, {
+      commColor: dom ? domainColor : commColor,
+      groups: dom ? G.domains : G.communities,
+      groupField: dom ? "domain" : "community",
+      indexId: G.meta.index_id, still: captureStill,
+      onSelect: (n) => {
+        selected = n; setFocus(n);
+        if (n) { showCard(n); if (gl3d) gl3d.focusNode(n.id); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); }
+        else { hideCard(); if (gl3d) gl3d.clearFocus(); if (window.Mesh && Mesh.closeNote) Mesh.closeNote(); }
+      },
+      onHover: (n) => { if (n) showCard(n); else if (!selected) hideCard(); },
+    });
+  }
   function setView(v) {
     if (v === view) return;
     if (v === "galaxy3d") {
-      if (!gl3d && window.Mesh3D) {
-        gl3d = window.Mesh3D.init(canvas3d, G, {
-          commColor, indexId: G.meta.index_id, still: captureStill,
-          onSelect: (n) => {
-            selected = n; setFocus(n);
-            if (n) { showCard(n); if (gl3d) gl3d.focusNode(n.id); if (window.Mesh && Mesh.openNote) Mesh.openNote(n.id); }
-            else { hideCard(); if (gl3d) gl3d.clearFocus(); if (window.Mesh && Mesh.closeNote) Mesh.closeNote(); }
-          },
-          onHover: (n) => { if (n) showCard(n); else if (!selected) hideCard(); },
-        });
-      }
+      if (!gl3d) initGl3d();
       if (!gl3d) { // no WebGL2: disable the tab and fall back to the 2D galaxy
         const tab = $("view-galaxy3d");
         if (tab) { tab.disabled = true; tab.title = "WebGL2 unavailable"; }
@@ -637,25 +711,45 @@
   }
 
   // ---- chrome / states ----
-  function setStats() { $("stats").textContent = `${G.meta.node_count} notes / ${G.meta.edge_count} links / ${G.communities.length} clusters`; }
+  function setStats() { $("stats").textContent = `${G.meta.node_count} notes / ${G.meta.edge_count} links / ${activeGroups().length} ${grouping === "domain" ? "topics" : "clusters"}`; }
   function buildLegend() {
-    const top = G.communities.slice(0, 8).filter((c) => c.label);
+    const top = activeGroups().slice(0, 9).filter((c) => c.label);
     if (!top.length) return;
     const el = $("legend");
     el.innerHTML = "";
+    // header doubles as a Clusters | Topics grouping switch
     const head = document.createElement("div");
     head.className = "legend-head";
-    head.textContent = "Clusters";
+    head.style.cssText = "display:flex;gap:6px;align-items:center;padding:0";
+    [["community", "Clusters"], ["domain", "Topics"]].forEach(([g, lbl]) => {
+      const t = document.createElement("button");
+      t.textContent = lbl;
+      t.title = g === "domain" ? "Group by topic domain (Engineering, Marketing, Sales, ...)" : "Group by the emergent link clusters";
+      t.style.cssText = "flex:1;padding:3px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.14);font:inherit;font-size:11px;cursor:pointer;color:inherit;background:" + (grouping === g ? "rgba(255,255,255,.16)" : "transparent");
+      t.onclick = () => setGrouping(g);
+      head.appendChild(t);
+    });
     el.appendChild(head);
     top.forEach((c) => {
       const b = document.createElement("button");
       b.className = "row" + (spotlight === c.id ? " active" : "");
-      b.title = "Spotlight this cluster (dim the rest). Click again to clear.";
+      b.title = "Spotlight this " + (grouping === "domain" ? "topic" : "cluster") + " (dim the rest). Click again to clear.";
       b.innerHTML = `<i style="background:${esc(c.color)}"></i><span>${esc(c.label)} (${c.size | 0})</span>`;
       b.onclick = () => { spotlight = (spotlight === c.id) ? null : c.id; if (gl3d) gl3d.setSpotlight(spotlight); buildLegend(); };
       el.appendChild(b);
     });
     el.classList.remove("hidden");
+  }
+  // Switch the active grouping (emergent clusters <-> topic domains). The 3D galaxy
+  // bakes positions + colors at init, so it is disposed and recreated; the 2D views
+  // re-read colors via groupColorOf on the next frame.
+  function setGrouping(g) {
+    if (g === grouping) return;
+    grouping = g;
+    spotlight = null;
+    if (gl3d) { gl3d.dispose(); gl3d = null; }
+    if (view === "galaxy3d") { initGl3d(); if (gl3d) { gl3d.resize(); if (selected) gl3d.setHighlight(selected.id); } }
+    buildLegend(); setStats();
   }
   // ---- clusters explorer: browse communities + their notes, click to read ----
   function focusNodeById(id) {
