@@ -547,7 +547,7 @@
       const m = mul(proj, v);
       let best = -1, bestD = Infinity;
       for (let i = 0; i < N; i++) {
-        const sp = orbitJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, orbitSpeed[i]);
+        const sp = spinJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, SPIN);
         const cx = m[0] * sp[0] + m[4] * sp[1] + m[8] * sp[2] + m[12];
         const cy = m[1] * sp[0] + m[5] * sp[1] + m[9] * sp[2] + m[13];
         const cw = m[3] * sp[0] + m[7] * sp[1] + m[11] * sp[2] + m[15];
@@ -599,7 +599,7 @@
       const i = (id != null && idIndex.has(id)) ? idIndex.get(id) : -1;
       if (i < 0) return;
       hi = i; focusIdx = i; endIntro();
-      const sp = orbitJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, orbitSpeed[i]);
+      const sp = spinJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, SPIN);
       startAnim([sp[0], sp[1], sp[2]], 42);
     }
     function clearFocus() {
@@ -634,7 +634,7 @@
         gl.useProgram(line);
         gl.uniformMatrix4fv(lu.uProj, false, proj); gl.uniformMatrix4fv(lu.uView, false, vp);
         gl.uniform1f(lu.uCamDist, cam.dist); gl.uniform1f(lu.uSpinTime, spinTime); gl.uniform1f(lu.uOmega, SPIN);
-        gl.uniform1f(lu.uOrbitMode, 1); // edges ride their endpoints' orbits
+        gl.uniform1f(lu.uOrbitMode, 0); // edges spin with their endpoints (same as the field)
         gl.bindVertexArray(lvao); gl.drawArrays(gl.LINES, 0, lineVerts.length / 3);
         gl.useProgram(sprite);
         gl.uniformMatrix4fv(su.uProj, false, proj); gl.uniformMatrix4fv(su.uView, false, vp);
@@ -643,7 +643,7 @@
 
       drawLayer(coronaVAO, CORO, { soft: 1.2, intensity: 1.0, fog: 0.0, omega: 0 });
       drawLayer(bulgeVAO, BULGE, { soft: 4.0, halo: 0.1, intensity: 0.8, twinkle: 0.6, fog: 0.3, omega: SPIN });
-      drawLayer(nodeVAO, N, { soft: 6.2, halo: 0.18, intensity: 1.55, twinkle: 0.85, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm, orbitMode: 1 }); // crisp, twinkling star profile
+      drawLayer(nodeVAO, N, { soft: 6.2, halo: 0.18, intensity: 1.55, twinkle: 0.85, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm }); // crisp star profile, same spin as the field stars
       drawLayer(spikeVAO, SPK, { soft: 6.0, intensity: 1.3, twinkle: 0.7, fog: 0.0, omega: 0, spk: 0.6 });
       gl.bindVertexArray(null);
     }
