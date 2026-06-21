@@ -29,8 +29,11 @@ type Doc struct {
 }
 
 // Connector pulls docs from one external source since a timestamp (zero = all).
+// Key is a stable per-instance id (e.g. "github:owner/repo") used to remember the
+// last successful pull for incremental sync.
 type Connector interface {
 	Name() string
+	Key() string
 	Pull(ctx context.Context, since time.Time) ([]Doc, error)
 }
 
@@ -81,6 +84,34 @@ func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (R
 		written++
 	}
 	return Result{Connector: c.Name(), Pulled: len(docs), Written: written, Folder: folder}, nil
+}
+
+// Opts controls an incremental run.
+type Opts struct {
+	Full  bool      // ignore stored high-water mark; pull everything
+	Since time.Time // explicit override (wins over stored state when non-zero)
+}
+
+// RunIncremental pulls only what changed since the connector's last successful run
+// (a high-water mark persisted in <vault>/.mesh/ingest-state.json), then advances
+// the mark. --full or an explicit Since override the stored mark. The mark is
+// stamped from BEFORE the pull, so anything that lands mid-pull is caught next time.
+func RunIncremental(ctx context.Context, vaultRoot string, c Connector, opts Opts) (Result, error) {
+	st, _ := loadState(vaultRoot)
+	since := opts.Since
+	if since.IsZero() && !opts.Full {
+		if ts := st.LastRun[c.Key()]; ts > 0 {
+			since = time.Unix(ts, 0)
+		}
+	}
+	startedAt := time.Now()
+	res, err := Run(ctx, vaultRoot, c, since)
+	if err != nil {
+		return res, err
+	}
+	st.LastRun[c.Key()] = startedAt.Unix()
+	_ = saveState(vaultRoot, st)
+	return res, nil
 }
 
 func renderImported(fm *vault.Frontmatter, body string) (string, error) {

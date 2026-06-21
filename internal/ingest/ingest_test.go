@@ -96,3 +96,118 @@ func TestSlackIngest(t *testing.T) {
 		t.Errorf("slack note missing provenance/body:\n%s", b)
 	}
 }
+
+func TestLinearIngest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "lin_api_test" {
+			t.Errorf("Linear auth header = %q, want raw key (no Bearer)", got)
+		}
+		w.Write([]byte(`{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"Ship connectors","description":"do it","url":"https://linear.app/x/issue/ENG-7","createdAt":"2026-05-01T10:00:00Z","creator":{"name":"alex"}}]}}}`))
+	}))
+	defer srv.Close()
+	apiBaseOverride = srv.URL
+	t.Cleanup(func() { apiBaseOverride = "" })
+
+	vault := t.TempDir()
+	res, err := Run(context.Background(), vault, &Linear{Token: "lin_api_test", Client: srv.Client()}, time.Time{})
+	if err != nil || res.Written != 1 {
+		t.Fatalf("linear run: written=%d err=%v", res.Written, err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(vault, "imported", "linear"))
+	if len(entries) != 1 {
+		t.Fatalf("want 1 linear note, got %d", len(entries))
+	}
+	b, _ := os.ReadFile(filepath.Join(vault, "imported", "linear", entries[0].Name()))
+	for _, want := range []string{"source: import:linear", "ENG-7", "author: alex", "linear.app/x/issue/ENG-7"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("linear note missing %q", want)
+		}
+	}
+}
+
+func TestJiraIngestADF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/3/search/jql" {
+			t.Errorf("jira path = %q, want /rest/api/3/search/jql", r.URL.Path)
+		}
+		w.Write([]byte(`{"issues":[{"key":"OPS-3","fields":{"summary":"Rotate keys","created":"2026-04-02T08:00:00.000+0000","creator":{"displayName":"sam"},"description":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"rotate the shared key"}]}]}}}]}`))
+	}))
+	defer srv.Close()
+	apiBaseOverride = srv.URL
+	t.Cleanup(func() { apiBaseOverride = "" })
+
+	vault := t.TempDir()
+	res, err := Run(context.Background(), vault, &Jira{Site: "https://acme.atlassian.net", Email: "me@acme.com", Token: "t", Client: srv.Client()}, time.Time{})
+	if err != nil || res.Written != 1 {
+		t.Fatalf("jira run: written=%d err=%v", res.Written, err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(vault, "imported", "jira"))
+	b, _ := os.ReadFile(filepath.Join(vault, "imported", "jira", entries[0].Name()))
+	body := string(b)
+	for _, want := range []string{"source: import:jira", "OPS-3", "author: sam", "rotate the shared key"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("jira note missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestNotionIngestTitle(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Notion-Version") == "" {
+			t.Error("Notion-Version header missing")
+		}
+		w.Write([]byte(`{"results":[{"id":"page-1","url":"https://notion.so/page-1","created_time":"2026-03-01T00:00:00.000Z","last_edited_time":"2026-06-01T00:00:00.000Z","properties":{"Name":{"type":"title","title":[{"plain_text":"Launch plan"}]}}}]}`))
+	}))
+	defer srv.Close()
+	apiBaseOverride = srv.URL
+	t.Cleanup(func() { apiBaseOverride = "" })
+
+	vault := t.TempDir()
+	res, err := Run(context.Background(), vault, &Notion{Token: "t", Client: srv.Client()}, time.Time{})
+	if err != nil || res.Written != 1 {
+		t.Fatalf("notion run: written=%d err=%v", res.Written, err)
+	}
+	entries, _ := os.ReadDir(filepath.Join(vault, "imported", "notion"))
+	b, _ := os.ReadFile(filepath.Join(vault, "imported", "notion", entries[0].Name()))
+	for _, want := range []string{"source: import:notion", "Launch plan", "notion.so/page-1"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("notion note missing %q", want)
+		}
+	}
+}
+
+type fakeConn struct{ sinces []time.Time }
+
+func (f *fakeConn) Name() string { return "fake" }
+func (f *fakeConn) Key() string  { return "fake:1" }
+func (f *fakeConn) Pull(_ context.Context, since time.Time) ([]Doc, error) {
+	f.sinces = append(f.sinces, since)
+	return []Doc{{ExternalID: "x", Title: "X", CreatedAt: "2026-01-01"}}, nil
+}
+
+func TestIncrementalHighWaterMark(t *testing.T) {
+	vault := t.TempDir()
+	fc := &fakeConn{}
+	if _, err := RunIncremental(context.Background(), vault, fc, Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	if !fc.sinces[0].IsZero() {
+		t.Fatalf("first run since = %v, want zero (full)", fc.sinces[0])
+	}
+	if _, err := RunIncremental(context.Background(), vault, fc, Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	if fc.sinces[1].IsZero() {
+		t.Fatalf("second run since is zero; high-water mark not applied")
+	}
+	// --full ignores the mark.
+	if _, err := RunIncremental(context.Background(), vault, fc, Opts{Full: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !fc.sinces[2].IsZero() {
+		t.Fatalf("--full run since = %v, want zero", fc.sinces[2])
+	}
+	if _, err := os.Stat(statePath(vault)); err != nil {
+		t.Fatalf("state file not written: %v", err)
+	}
+}
