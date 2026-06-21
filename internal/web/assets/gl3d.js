@@ -707,12 +707,15 @@
       }
     }
 
-    function dispose() {
+    // keepContext: detach listeners but KEEP the live WebGL context, so the caller can
+    // immediately re-init on the same canvas (used by the Clusters/Topics toggle). Losing
+    // the context here would leave the next init rendering onto a dead context (white).
+    function dispose(keepContext) {
       canvas.removeEventListener("mousedown", onDown);
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("mousemove", onMove);
       canvas.removeEventListener("wheel", onWheel);
-      const ext = gl.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext();
+      if (!keepContext) { const ext = gl.getExtension("WEBGL_lose_context"); if (ext) ext.loseContext(); }
     }
 
     return { frame, resize, dispose, setHighlight, setSpotlight, focusNode, clearFocus, setData() {} };
