@@ -283,7 +283,7 @@
         z = Math.sin(a) * rr;
       }
       pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
-      size[i] = isSun ? 5.4 : Math.min(4.8, Math.max(1.8, (n.size || 1) * 1.1)); // bumped for the further camera
+      size[i] = isSun ? 4.4 : Math.min(3.0, Math.max(1.25, (n.size || 1) * 0.82)); // small + crisp, like the field stars
       const rgb = hexToRGB(commColor.get(g));
       color[i * 3] = rgb[0]; color[i * 3 + 1] = rgb[1]; color[i * 3 + 2] = rgb[2];
       flag[i] = isSun ? 1 : 0;
@@ -639,7 +639,7 @@
 
       drawLayer(coronaVAO, CORO, { soft: 1.2, intensity: 1.0, fog: 0.0, omega: 0 });
       drawLayer(bulgeVAO, BULGE, { soft: 4.0, halo: 0.1, intensity: 0.8, twinkle: 0.6, fog: 0.3, omega: SPIN });
-      drawLayer(nodeVAO, N, { soft: 4.4, halo: 0.48, intensity: 1.62, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm, orbitMode: 1 });
+      drawLayer(nodeVAO, N, { soft: 6.2, halo: 0.18, intensity: 1.55, twinkle: 0.85, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm, orbitMode: 1 }); // crisp, twinkling star profile
       drawLayer(spikeVAO, SPK, { soft: 6.0, intensity: 1.3, twinkle: 0.7, fog: 0.0, omega: 0, spk: 0.6 });
       gl.bindVertexArray(null);
     }
