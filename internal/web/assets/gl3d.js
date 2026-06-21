@@ -205,6 +205,10 @@
     opts = opts || {};
     const commColor = opts.commColor || new Map();
     const indexId = opts.indexId || (G.meta && G.meta.index_id) || "";
+    // grouping: which per-node field drives arm placement + color (the emergent
+    // 'community' by default, or 'domain' for the topic view). grp() reads it.
+    const groupField = opts.groupField || "community";
+    const grp = (n) => n[groupField] || 0;
 
     const sprite = program(gl, SPRITE_VS, SPRITE_FS);
     const line = program(gl, LINE_VS, LINE_FS);
@@ -224,41 +228,63 @@
     nodes.forEach((n, i) => idIndex.set(n.id, i));
 
     const maxOrbit = Math.max(1, (G.meta && G.meta.max_orbit) || 1);
-    const comms = (G.communities || []).map((c) => c.id);
+    const groupList = opts.groups || G.communities || [];
+    const comms = groupList.map((c) => c.id);
     const commRank = new Map(comms.map((id, i) => [id, i]));
     const C = Math.max(1, comms.length);
-    const DISC_R = 92, DISC_THICK = 13;
+    const DISC_R = 165, DISC_THICK = 13, ARM_WIND = 2.2; // ARM_WIND matches the field-star spiral
     const ARMS = Math.max(2, Math.min(4, Math.round(Math.sqrt(C))));
     const ARM_LEN = Math.ceil(C / ARMS);
     const TWO_PI = Math.PI * 2;
-    function centroid(commId) {
+    // A cluster owns an arm and a radius band along it. armAngle() winds the angle with
+    // radius on the SAME spiral as the field stars, so nodes spread along the band trace
+    // the arm (the gravitational flow) instead of forming an isolated ball. The inner
+    // ring is pushed out of the core so the disc reads spread, not piled at the center.
+    function clusterGeom(commId) {
       const k = commRank.has(commId) ? commRank.get(commId) : C - 1;
       const arm = k % ARMS;
       const along = Math.floor(k / ARMS);
       const rf = (along + 0.6) / ARM_LEN;
-      const radius = DISC_R * (0.16 + 0.84 * rf);
-      const theta = arm * (TWO_PI / ARMS) + rf * 2.2 + (rand(k * 13 + 1) - 0.5) * 0.18;
-      const cy = (rand(k * 7 + 3) - 0.5) * DISC_THICK * (0.35 + 0.65 * (1 - rf));
-      return [Math.cos(theta) * radius, cy, Math.sin(theta) * radius];
+      const rCenter = DISC_R * (0.30 + 0.70 * rf);
+      const armBase = arm * (TWO_PI / ARMS) + (rand(k * 13 + 1) - 0.5) * 0.14;
+      return { k, arm, rf, rCenter, armBase };
+    }
+    function armAngle(armBase, r) { return armBase + (r / DISC_R) * ARM_WIND; }
+    function centroid(commId) {
+      const g = clusterGeom(commId);
+      const a = armAngle(g.armBase, g.rCenter);
+      const cy = (rand(g.k * 7 + 3) - 0.5) * DISC_THICK * (0.35 + 0.65 * (1 - g.rf));
+      return [Math.cos(a) * g.rCenter, cy, Math.sin(a) * g.rCenter];
     }
 
     const pos = new Float32Array(N * 3), size = new Float32Array(N), color = new Float32Array(N * 3), flag = new Float32Array(N), comm = new Float32Array(N);
     for (let i = 0; i < N; i++) {
       const n = nodes[i];
-      comm[i] = n.community || 0;
+      const g = grp(n);
+      comm[i] = g;
       const isSun = n.id === indexId;
       let x, y, z;
       if (isSun) { x = 0; y = 0; z = 0; }
       else {
-        const c = centroid(n.community);
-        const local = 5 + (n.community % 4) * 1.4;
-        const tight = 0.45 + 0.55 * ((n.orbit || 0) / maxOrbit);
-        const sx = rand(i * 3 + 1) - 0.5, sy = rand(i * 7 + 2) - 0.5, sz = rand(i * 11 + 5) - 0.5;
-        x = c[0] + sx * local * 2 * tight; y = c[1] + sy * local * 0.7 * tight; z = c[2] + sz * local * 2 * tight;
+        // Each cluster is a TANGENTIAL arc: its notes spread along the direction of
+        // rotation (an arc at near-constant radius) with a little radial thickness, so
+        // the cluster lies along the orbital flow instead of pointing at the center like
+        // a spoke. Its center still sits on the spiral arm, so the arms still wind.
+        const cg = clusterGeom(g);
+        const tight = 0.5 + 0.7 * ((n.orbit || 0) / maxOrbit);
+        const arcLen = 18 + (g % 4) * 5;                              // tangential half-length (world units)
+        const u = (rand(i * 3 + 1) - 0.5) + (rand(i * 5 + 9) - 0.5);  // ~triangular: denser mid-arc
+        const dtheta = (u * arcLen * tight) / cg.rCenter;            // offset ALONG rotation (tangential)
+        const rr = Math.max(10, cg.rCenter + (rand(i * 7 + 2) - 0.5) * (8 + 5 * tight)); // small radial thickness
+        const a = armAngle(cg.armBase, cg.rCenter) + dtheta;
+        const rad = Math.min(1, rr / DISC_R);
+        x = Math.cos(a) * rr;
+        y = (rand(i * 11 + 5) - 0.5) * DISC_THICK * (0.4 + 0.6 * (1 - rad));
+        z = Math.sin(a) * rr;
       }
       pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z;
-      size[i] = isSun ? 3.8 : Math.min(3.2, Math.max(1.15, (n.size || 1) * 0.78));
-      const rgb = hexToRGB(commColor.get(n.community));
+      size[i] = isSun ? 5.4 : Math.min(4.8, Math.max(1.8, (n.size || 1) * 1.1)); // bumped for the further camera
+      const rgb = hexToRGB(commColor.get(g));
       color[i * 3] = rgb[0]; color[i * 3 + 1] = rgb[1]; color[i * 3 + 2] = rgb[2];
       flag[i] = isSun ? 1 : 0;
     }
@@ -268,18 +294,18 @@
     // inner clusters faster (Keplerian-ish: speed falls off with radius). The center
     // note (the gravity well) does not move. Tuned so the inner clusters take ~30s a
     // revolution and the rim ~70s: clearly orbiting, never frantic.
-    const ORBIT_BASE = 6.0;
+    const ORBIT_BASE = 9.5;
     const commSpeed = new Map();
     function orbitSpeedFor(commId) {
       if (commSpeed.has(commId)) return commSpeed.get(commId);
       const c = centroid(commId), r = Math.hypot(c[0], c[2]);
-      const v = ORBIT_BASE / (r + 30);
+      const v = ORBIT_BASE / (r + 40);
       commSpeed.set(commId, v);
       return v;
     }
     const orbitSpeed = new Float32Array(N);
     for (let i = 0; i < N; i++) {
-      orbitSpeed[i] = nodes[i].id === indexId ? 0 : orbitSpeedFor(nodes[i].community || 0);
+      orbitSpeed[i] = nodes[i].id === indexId ? 0 : orbitSpeedFor(grp(nodes[i]));
     }
 
     const quad = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
@@ -492,8 +518,8 @@
     }
 
     // --- camera (cinematic fly-in, then flick inertia) ---
-    const REST_DIST = 98;
-    const cam = { yaw: opts.still ? 0.6 : 2.0, pitch: -0.22, dist: opts.still ? REST_DIST : 560, cx: 0, cy: 0, cz: 0 };
+    const REST_DIST = 175;
+    const cam = { yaw: opts.still ? 0.6 : 2.0, pitch: -0.22, dist: opts.still ? REST_DIST : 820, cx: 0, cy: 0, cz: 0 };
     const vel = { yaw: 0, pitch: 0 };
     let W = 1, H = 1, dpr = 1, proj = perspective(1.05, 1, 1, 4000), vp = viewMatrix(cam.yaw, cam.pitch, cam.dist, 0, 0, 0);
     let drag = false, lx = 0, ly = 0, moved = false, hi = -1, time = 0, spinTime = 0, renderPitch = cam.pitch;
@@ -554,7 +580,7 @@
         canvas.style.cursor = i >= 0 ? "pointer" : "grab";
       }
     }
-    function onWheel(e) { e.preventDefault(); endIntro(); cam.dist *= Math.exp(e.deltaY * 0.001); cam.dist = Math.max(20, Math.min(1100, cam.dist)); }
+    function onWheel(e) { e.preventDefault(); endIntro(); cam.dist *= Math.exp(e.deltaY * 0.001); cam.dist = Math.max(20, Math.min(1800, cam.dist)); }
     canvas.addEventListener("mousedown", onDown);
     window.addEventListener("mouseup", onUp);
     window.addEventListener("mousemove", onMove);
@@ -624,7 +650,7 @@
       if (!introDone) {
         introT += 0.016;
         const p = Math.min(1, introT / 2.8), e = 1 - Math.pow(1 - p, 3);
-        cam.dist = 560 - (560 - REST_DIST) * e;
+        cam.dist = 820 - (820 - REST_DIST) * e;
         cam.yaw = 2.0 - 1.4 * e;
         if (p >= 1) introDone = true;
       } else if (anim) {
