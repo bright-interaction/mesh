@@ -747,7 +747,7 @@
     if (g === grouping) return;
     grouping = g;
     spotlight = null;
-    if (gl3d) { gl3d.dispose(); gl3d = null; }
+    if (gl3d) { gl3d.dispose(true); gl3d = null; } // keep the GL context for the immediate re-init
     if (view === "galaxy3d") { initGl3d(); if (gl3d) { gl3d.resize(); if (selected) gl3d.setHighlight(selected.id); } }
     buildLegend(); setStats();
   }
