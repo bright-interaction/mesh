@@ -76,6 +76,24 @@
     return [x * c - z * s, y, x * s + z * c];
   }
 
+  // a rigid orbit about Y at a FIXED angular speed: every note in a cluster shares
+  // its cluster's speed, so the cluster revolves around the center as one body and
+  // never winds apart the way differential shear does. Inner clusters get a higher
+  // speed (Keplerian), so the dots clearly orbit the central gravity well. The SAME
+  // math runs in the shaders and in JS picking, so clicks stay accurate.
+  const ORBIT_GLSL = `
+  vec3 orbit(vec3 p, float t, float speed){
+    if (speed == 0.0) return p;
+    float a = t * speed;
+    float c = cos(a), s = sin(a);
+    return vec3(p.x * c - p.z * s, p.y, p.x * s + p.z * c);
+  }`;
+  function orbitJS(x, y, z, t, speed) {
+    if (speed === 0) return [x, y, z];
+    const a = t * speed, c = Math.cos(a), s = Math.sin(a);
+    return [x * c - z * s, y, x * s + z * c];
+  }
+
   const SPRITE_VS = `#version 300 es
   layout(location=0) in vec2 corner;
   layout(location=1) in vec3 iPos;
@@ -83,12 +101,14 @@
   layout(location=3) in vec3 iColor;
   layout(location=4) in float iFlag;
   layout(location=5) in float iComm;
+  layout(location=6) in float iOrbit;
   uniform mat4 uProj, uView;
-  uniform float uHi, uTime, uSpinTime, uSizeMul, uTwinkle, uOmega, uSpotComm;
+  uniform float uHi, uTime, uSpinTime, uSizeMul, uTwinkle, uOmega, uSpotComm, uOrbitMode;
   out vec2 vUV; out vec3 vColor; out float vGlow; out float vViewZ;
   ${SPIN_GLSL}
+  ${ORBIT_GLSL}
   void main(){
-    vec3 wp = spin(iPos, uSpinTime, uOmega);
+    vec3 wp = uOrbitMode > 0.5 ? orbit(iPos, uSpinTime, iOrbit) : spin(iPos, uSpinTime, uOmega);
     vec4 vp = uView * vec4(wp, 1.0);
     float size = iSize * uSizeMul;
     bool sun = iFlag > 0.5;
@@ -128,11 +148,13 @@
   const LINE_VS = `#version 300 es
   layout(location=0) in vec3 aPos;
   layout(location=1) in vec3 aColor;
+  layout(location=2) in float aOrbit;
   uniform mat4 uProj, uView;
-  uniform float uSpinTime, uOmega;
+  uniform float uSpinTime, uOmega, uOrbitMode;
   out vec3 vC; out float vZ;
   ${SPIN_GLSL}
-  void main(){ vec3 wp = spin(aPos, uSpinTime, uOmega); vec4 vp = uView * vec4(wp, 1.0); vZ = -vp.z; gl_Position = uProj * vp; vC = aColor; }`;
+  ${ORBIT_GLSL}
+  void main(){ vec3 wp = uOrbitMode > 0.5 ? orbit(aPos, uSpinTime, aOrbit) : spin(aPos, uSpinTime, uOmega); vec4 vp = uView * vec4(wp, 1.0); vZ = -vp.z; gl_Position = uProj * vp; vC = aColor; }`;
   const LINE_FS = `#version 300 es
   precision highp float;
   in vec3 vC; in float vZ; out vec4 frag;
@@ -192,9 +214,9 @@
     if (!sprite || !line) return null;
 
     const su = {};
-    ["uProj", "uView", "uHi", "uTime", "uSpinTime", "uSizeMul", "uTwinkle", "uSoft", "uHalo", "uIntensity", "uFog", "uCamDist", "uOmega", "uSpotComm", "uSpike"].forEach((n) => (su[n] = gl.getUniformLocation(sprite, n)));
+    ["uProj", "uView", "uHi", "uTime", "uSpinTime", "uSizeMul", "uTwinkle", "uSoft", "uHalo", "uIntensity", "uFog", "uCamDist", "uOmega", "uSpotComm", "uSpike", "uOrbitMode"].forEach((n) => (su[n] = gl.getUniformLocation(sprite, n)));
     const lu = {};
-    ["uProj", "uView", "uCamDist", "uSpinTime", "uOmega"].forEach((n) => (lu[n] = gl.getUniformLocation(line, n)));
+    ["uProj", "uView", "uCamDist", "uSpinTime", "uOmega", "uOrbitMode"].forEach((n) => (lu[n] = gl.getUniformLocation(line, n)));
 
     const nodes = G.nodes || [];
     const N = nodes.length;
@@ -241,6 +263,25 @@
       flag[i] = isSun ? 1 : 0;
     }
 
+    // Per-node orbital angular speed. A node inherits its CLUSTER's speed (from the
+    // cluster centroid radius), so the whole cluster orbits the center as one body,
+    // inner clusters faster (Keplerian-ish: speed falls off with radius). The center
+    // note (the gravity well) does not move. Tuned so the inner clusters take ~30s a
+    // revolution and the rim ~70s: clearly orbiting, never frantic.
+    const ORBIT_BASE = 6.0;
+    const commSpeed = new Map();
+    function orbitSpeedFor(commId) {
+      if (commSpeed.has(commId)) return commSpeed.get(commId);
+      const c = centroid(commId), r = Math.hypot(c[0], c[2]);
+      const v = ORBIT_BASE / (r + 30);
+      commSpeed.set(commId, v);
+      return v;
+    }
+    const orbitSpeed = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      orbitSpeed[i] = nodes[i].id === indexId ? 0 : orbitSpeedFor(nodes[i].community || 0);
+    }
+
     const quad = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
     function makeSprites(p, s, c, f) {
       const vao = gl.createVertexArray();
@@ -261,6 +302,8 @@
     gl.bindVertexArray(nodeVAO);
     const cb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cb); gl.bufferData(gl.ARRAY_BUFFER, comm, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 1, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(5, 1);
+    const ob = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, ob); gl.bufferData(gl.ARRAY_BUFFER, orbitSpeed, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 1, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(6, 1);
     gl.bindVertexArray(null);
 
     // fullscreen quad VAO (for the bloom passes)
@@ -332,20 +375,23 @@
 
     // edges -> tinted line buffer
     const edges = G.edges || [];
-    const lp = [], lc = [];
+    const lp = [], lc = [], lo = [];
     for (const e of edges) {
       const a = idIndex.get(e.source), b = idIndex.get(e.target);
       if (a === undefined || b === undefined) continue;
       lp.push(pos[a * 3], pos[a * 3 + 1], pos[a * 3 + 2], pos[b * 3], pos[b * 3 + 1], pos[b * 3 + 2]);
       lc.push(color[a * 3], color[a * 3 + 1], color[a * 3 + 2], color[b * 3], color[b * 3 + 1], color[b * 3 + 2]);
+      lo.push(orbitSpeed[a], orbitSpeed[b]); // each endpoint rides its own node's orbit
     }
-    const lineVerts = new Float32Array(lp), lineCols = new Float32Array(lc);
+    const lineVerts = new Float32Array(lp), lineCols = new Float32Array(lc), lineOrb = new Float32Array(lo);
     const lvao = gl.createVertexArray();
     gl.bindVertexArray(lvao);
     const lb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, lb); gl.bufferData(gl.ARRAY_BUFFER, lineVerts, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
     const lcb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, lcb); gl.bufferData(gl.ARRAY_BUFFER, lineCols, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    const lob = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, lob); gl.bufferData(gl.ARRAY_BUFFER, lineOrb, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
     // background starfield (does NOT spin: the far sky)
@@ -471,7 +517,7 @@
       const m = mul(proj, v);
       let best = -1, bestD = Infinity;
       for (let i = 0; i < N; i++) {
-        const sp = spinJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, SPIN);
+        const sp = orbitJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, orbitSpeed[i]);
         const cx = m[0] * sp[0] + m[4] * sp[1] + m[8] * sp[2] + m[12];
         const cy = m[1] * sp[0] + m[5] * sp[1] + m[9] * sp[2] + m[13];
         const cw = m[3] * sp[0] + m[7] * sp[1] + m[11] * sp[2] + m[15];
@@ -523,7 +569,7 @@
       const i = (id != null && idIndex.has(id)) ? idIndex.get(id) : -1;
       if (i < 0) return;
       hi = i; focusIdx = i; endIntro();
-      const sp = spinJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, SPIN);
+      const sp = orbitJS(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], spinTime, orbitSpeed[i]);
       startAnim([sp[0], sp[1], sp[2]], 42);
     }
     function clearFocus() {
@@ -537,7 +583,7 @@
       gl.uniform1f(su.uIntensity, o.intensity); gl.uniform1f(su.uTwinkle, o.twinkle || 0);
       gl.uniform1f(su.uFog, o.fog || 0); gl.uniform1f(su.uHi, o.hi == null ? -1 : o.hi);
       gl.uniform1f(su.uOmega, o.omega || 0); gl.uniform1f(su.uSpotComm, o.spot == null ? -1 : o.spot);
-      gl.uniform1f(su.uSpike, o.spk || 0);
+      gl.uniform1f(su.uSpike, o.spk || 0); gl.uniform1f(su.uOrbitMode, o.orbitMode ? 1 : 0);
     }
     function drawLayer(vao, count, o) { setLayer(o); gl.bindVertexArray(vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count); }
 
@@ -558,6 +604,7 @@
         gl.useProgram(line);
         gl.uniformMatrix4fv(lu.uProj, false, proj); gl.uniformMatrix4fv(lu.uView, false, vp);
         gl.uniform1f(lu.uCamDist, cam.dist); gl.uniform1f(lu.uSpinTime, spinTime); gl.uniform1f(lu.uOmega, SPIN);
+        gl.uniform1f(lu.uOrbitMode, 1); // edges ride their endpoints' orbits
         gl.bindVertexArray(lvao); gl.drawArrays(gl.LINES, 0, lineVerts.length / 3);
         gl.useProgram(sprite);
         gl.uniformMatrix4fv(su.uProj, false, proj); gl.uniformMatrix4fv(su.uView, false, vp);
@@ -566,7 +613,7 @@
 
       drawLayer(coronaVAO, CORO, { soft: 1.2, intensity: 1.0, fog: 0.0, omega: 0 });
       drawLayer(bulgeVAO, BULGE, { soft: 4.0, halo: 0.1, intensity: 0.8, twinkle: 0.6, fog: 0.3, omega: SPIN });
-      drawLayer(nodeVAO, N, { soft: 4.4, halo: 0.48, intensity: 1.62, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm });
+      drawLayer(nodeVAO, N, { soft: 4.4, halo: 0.48, intensity: 1.62, twinkle: 0.5, fog: 0.6, sizeMul: 1.0, hi: hi, omega: SPIN, spot: spotComm, orbitMode: 1 });
       drawLayer(spikeVAO, SPK, { soft: 6.0, intensity: 1.3, twinkle: 0.7, fog: 0.0, omega: 0, spk: 0.6 });
       gl.bindVertexArray(null);
     }
