@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -27,7 +28,7 @@ type neighborRef struct {
 
 // toolNeighbors returns the typed neighborhood of a note out to a small depth, so
 // an agent can walk the graph one hop at a time instead of fetching whole files.
-func (s *Server) toolNeighbors(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolNeighbors(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		ID    string `json:"id"`
 		Depth int    `json:"depth"`
@@ -41,9 +42,10 @@ func (s *Server) toolNeighbors(raw json.RawMessage) (any, *rpcError) {
 	limit := clampLimit(a.Limit, 50, 200)
 
 	g, _ := s.snapshot()
+	sf := scopeFromCtx(ctx)
 	centerID := notePrefix + a.ID
 	center, ok := g.Node(centerID)
-	if !ok {
+	if !ok || !sf.allowsNode(center) {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: a.ID}
 	}
 
@@ -67,6 +69,11 @@ func (s *Server) toolNeighbors(raw json.RawMessage) (any, *rpcError) {
 				return
 			}
 			visited[other] = true
+			// Scope: hide note neighbors the caller cannot read, and do not traverse
+			// THROUGH them (so a forbidden note can't bridge to its other links).
+			if nn, ok := g.Node(other); ok && nn.Kind == "note" && !sf.allowsNode(nn) {
+				return
+			}
 			if ref, ok := refFor(g, other, relation, dir, d); ok {
 				gathered = append(gathered, ref)
 				next = append(next, other)
@@ -157,35 +164,36 @@ type communitySummary struct {
 
 // toolCommunity returns one note's community + its members (when id is given), or
 // the community overview (when it is not), for orienting before a search.
-func (s *Server) toolCommunity(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolCommunity(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		ID    string `json:"id"`
 		Limit int    `json:"limit"`
 	}
 	json.Unmarshal(raw, &a)
 	g, _ := s.snapshot()
+	sf := scopeFromCtx(ctx)
 
 	if strings.TrimSpace(a.ID) != "" {
 		center, ok := g.Node(notePrefix + a.ID)
-		if !ok {
+		if !ok || !sf.allowsNode(center) {
 			return nil, &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: a.ID}
 		}
-		members, total := communityMembers(g, center.Community, clampLimit(a.Limit, 50, 500))
+		members, total := communityMembers(g, center.Community, clampLimit(a.Limit, 50, 500), sf)
 		return textResult(map[string]any{
 			"community": center.Community,
 			"size":      total,
 			"members":   members,
 		}), nil
 	}
-	overview := communityOverview(g, clampLimit(a.Limit, 24, 200))
+	overview := communityOverview(g, clampLimit(a.Limit, 24, 200), sf)
 	return textResult(map[string]any{"communities": overview, "count": len(overview)}), nil
 }
 
-// communityMembers returns the notes in a community (highest-degree first, capped)
-// plus the true total count.
-func communityMembers(g *graph.Graph, comm, limit int) (members []memberRef, total int) {
+// communityMembers returns the readable notes in a community (highest-degree first,
+// capped) plus the true total readable count.
+func communityMembers(g *graph.Graph, comm, limit int, sf *ScopeFilter) (members []memberRef, total int) {
 	for _, n := range g.Nodes() {
-		if n.Kind != "note" || n.Community != comm {
+		if n.Kind != "note" || n.Community != comm || !sf.allowsNode(n) {
 			continue
 		}
 		total++
@@ -205,10 +213,10 @@ func communityMembers(g *graph.Graph, comm, limit int) (members []memberRef, tot
 
 // communityOverview groups notes by community, largest first, with each
 // community's top-degree exemplar and a few top members.
-func communityOverview(g *graph.Graph, limit int) []communitySummary {
+func communityOverview(g *graph.Graph, limit int, sf *ScopeFilter) []communitySummary {
 	byComm := map[int][]*graph.Node{}
 	for _, n := range g.Nodes() {
-		if n.Kind != "note" {
+		if n.Kind != "note" || !sf.allowsNode(n) {
 			continue
 		}
 		byComm[n.Community] = append(byComm[n.Community], n)

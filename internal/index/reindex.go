@@ -2,6 +2,7 @@ package index
 
 import (
 	"path/filepath"
+	"strings"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/vault"
@@ -73,4 +74,25 @@ func (s *Store) NotePath(id string) (string, error) {
 	var p string
 	err := s.readDB.QueryRow(`SELECT path FROM notes WHERE id = ?`, id).Scan(&p)
 	return p, err
+}
+
+// NoteScope returns a note's access scope(s) by id. Used to scope-check a direct
+// fetch (which resolves id -> path -> file, bypassing the retriever's card filter).
+// A missing scope falls back to the fail-safe default (dev-only).
+func (s *Store) NoteScope(id string) ([]string, error) {
+	var sc string
+	err := s.readDB.QueryRow(`SELECT scope FROM notes WHERE id = ?`, id).Scan(&sc)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range strings.Split(sc, ",") {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"dev"}
+	}
+	return out, nil
 }

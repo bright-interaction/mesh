@@ -239,7 +239,7 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	case "resources/list":
 		return s.handleResourcesList(), nil
 	case "resources/read":
-		return s.handleResourcesRead(req.Params)
+		return s.handleResourcesRead(ctx, req.Params)
 	default:
 		return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found", Data: req.Method}
 	}

@@ -43,7 +43,7 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 			}
 		}
 
-		insNote, err := tx.Prepare(`INSERT INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+		insNote, err := tx.Prepare(`INSERT INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
@@ -55,11 +55,11 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 		defer insFTS.Close()
 
 		for _, pn := range notes {
-			id, title, fmJSON, updated, reviewBy, source, mtime, err := noteRowValues(pn)
+			id, title, fmJSON, updated, reviewBy, source, scope, mtime, err := noteRowValues(pn)
 			if err != nil {
 				return err
 			}
-			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source); err != nil {
+			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source, scope); err != nil {
 				return err
 			}
 			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
@@ -97,7 +97,7 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 			}
 		}
 
-		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
@@ -109,7 +109,7 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 		defer insFTS.Close()
 
 		for _, pn := range upserts {
-			id, title, fmJSON, updated, reviewBy, source, mtime, err := noteRowValues(pn)
+			id, title, fmJSON, updated, reviewBy, source, scope, mtime, err := noteRowValues(pn)
 			if err != nil {
 				return err
 			}
@@ -118,7 +118,7 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 			if _, err := tx.Exec(`DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
 				return err
 			}
-			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source); err != nil {
+			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source, scope); err != nil {
 				return err
 			}
 			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
@@ -136,22 +136,23 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 
 // noteRowValues derives the notes-table column values for a parsed note. Shared by
 // the full and incremental index paths so they can never drift.
-func noteRowValues(pn *ParsedNote) (id, title, fmJSON, updated, reviewBy, source string, mtime int64, err error) {
+func noteRowValues(pn *ParsedNote) (id, title, fmJSON, updated, reviewBy, source, scope string, mtime int64, err error) {
 	id = effectiveID(pn)
 	title = titleOf(pn)
 	b, err := json.Marshal(pn.FM)
 	if err != nil {
-		return "", "", "", "", "", "", 0, err
+		return "", "", "", "", "", "", "", 0, err
 	}
 	fmJSON = string(b)
 	updated = pn.FM.When
 	if pn.FM.Updated != "" {
 		updated = pn.FM.Updated
 	}
-	reviewBy = pn.FM.ReviewBy // lifecycle re-check date (Phase C)
-	source = pn.FM.Source     // provenance origin (Phase A/D)
-	mtime = pn.Mtime          // captured by ParseFile from the on-disk file (CWD-independent)
-	return id, title, fmJSON, updated, reviewBy, source, mtime, nil
+	reviewBy = pn.FM.ReviewBy                              // lifecycle re-check date (Phase C)
+	source = pn.FM.Source                                 // provenance origin (Phase A/D)
+	scope = strings.Join(pn.FM.EffectiveScopes(), ",")    // access-control scope(s); absent = dev
+	mtime = pn.Mtime                                      // captured by ParseFile from the on-disk file (CWD-independent)
+	return id, title, fmJSON, updated, reviewBy, source, scope, mtime, nil
 }
 
 // writeGraphTables wipes and rewrites the nodes + edges tables from the in-memory

@@ -1,6 +1,9 @@
 package mcp
 
-import "encoding/json"
+import (
+	"context"
+	"encoding/json"
+)
 
 func (s *Server) handleResourcesList() any {
 	return map[string]any{
@@ -13,7 +16,7 @@ func (s *Server) handleResourcesList() any {
 	}
 }
 
-func (s *Server) handleResourcesRead(params json.RawMessage) (any, *rpcError) {
+func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		URI string `json:"uri"`
 	}
@@ -25,7 +28,7 @@ func (s *Server) handleResourcesRead(params json.RawMessage) (any, *rpcError) {
 		return contents(p.URI, "text/markdown", contractText), nil
 	case "mesh://community":
 		g, _ := s.snapshot()
-		b, _ := json.Marshal(map[string]any{"communities": communityOverview(g, 50)})
+		b, _ := json.Marshal(map[string]any{"communities": communityOverview(g, 50, scopeFromCtx(ctx))})
 		return contents(p.URI, "application/json", string(b)), nil
 	case "mesh://stats":
 		return contents(p.URI, "application/json", s.statsJSON()), nil
