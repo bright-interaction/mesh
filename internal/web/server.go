@@ -29,6 +29,9 @@ type Server struct {
 	// graph/search/note surfaces are filtered per member. nil (standalone `mesh ui`) =
 	// unrestricted, so the loopback single-user viewer is unchanged.
 	scopeResolver func(*http.Request) map[string]bool
+	// member, when set (mesh ui --hub-db), puts the app in per-member auth mode: each
+	// request authenticates as a hub client instead of the single shared token.
+	member *memberAuth
 
 	mu    sync.RWMutex
 	graph *graph.Graph
@@ -94,7 +97,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mcp-tools", s.handleMCPTools)
 	mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /openapi.json", s.handleOpenAPI)
-	var h http.Handler = s.auth.guard(mux)
+	var h http.Handler
+	if s.member != nil {
+		h = s.memberGuard(mux) // per-member auth (mesh ui --hub-db)
+	} else {
+		h = s.auth.guard(mux) // single shared token (standalone)
+	}
 	if s.basePath != "" {
 		// Serve the whole app under the path: strip it before the inner mux (so its
 		// root-relative routes match) and let the subtree pattern redirect /app -> /app/.
@@ -186,7 +194,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"rerank": os.Getenv("MESH_RERANK_ENDPOINT") != "",
 			"ann":    os.Getenv("MESH_HNSW_THRESHOLD") != "" && os.Getenv("MESH_HNSW_THRESHOLD") != "0",
 		},
-		"authRequired": s.auth.authRequired(),
+		"authRequired": s.auth.authRequired() || s.member != nil,
 	})
 }
 
@@ -209,10 +217,19 @@ func writeJSON(w http.ResponseWriter, v any) {
 // Serve builds the server and listens on addr (e.g. 127.0.0.1:7474), printing the
 // URL. A loopback bind needs no auth; binding beyond loopback is fail-closed and
 // requires a token (see newAuthConfig).
-func Serve(vaultRoot, addr, token, basePath string) error {
-	auth, err := newAuthConfig(addr, token)
-	if err != nil {
-		return err
+// Serve builds the server and listens. When verify != nil the app runs in per-member
+// mode (each request authenticates as a hub client and is scoped to them); member auth
+// is then the fail-closed gate, so the single-token requirement is skipped. Otherwise
+// it is the standalone single-token viewer (loopback needs no token).
+func Serve(vaultRoot, addr, token, basePath string, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool) error {
+	memberMode := verify != nil
+	var auth authConfig
+	if !memberMode {
+		a, err := newAuthConfig(addr, token)
+		if err != nil {
+			return err
+		}
+		auth = a
 	}
 	s, err := NewServer(vaultRoot)
 	if err != nil {
@@ -221,9 +238,14 @@ func Serve(vaultRoot, addr, token, basePath string) error {
 	defer s.Close()
 	s.auth = auth
 	s.basePath = normalizeBasePath(basePath)
+	if memberMode {
+		s.SetMemberAuth(verify, scopesFor)
+	}
 	exp := BuildExport(s.graph, vaultRoot, nil)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))
-	if auth.authRequired() {
+	if memberMode {
+		fmt.Printf("auth: per-member (hub client token; views scoped per member)\n")
+	} else if auth.authRequired() {
 		fmt.Printf("auth: token required (Authorization: Bearer ...)\n")
 	}
 	fmt.Printf("serving at http://%s%s  (Ctrl-C to stop)\n", addr, s.baseHref())
