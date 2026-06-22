@@ -61,15 +61,35 @@ type ExportComm struct {
 	Label string `json:"label"` // exemplar (highest-degree member) title
 }
 
-// BuildExport projects the in-memory graph into the SPA payload.
-func BuildExport(g *graph.Graph, vaultRoot string) Export {
+// scopeVisible reports whether a note node is visible under an allowed-scope set.
+// allowed==nil means unrestricted (standalone viewer). Absent scope = dev (fail-safe).
+func scopeVisible(n *graph.Node, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true
+	}
+	sc, _ := n.Attrs["scope"].(string)
+	if strings.TrimSpace(sc) == "" {
+		return allowed["dev"]
+	}
+	for _, s := range strings.Split(sc, ",") {
+		if allowed[strings.TrimSpace(s)] {
+			return true
+		}
+	}
+	return false
+}
+
+// BuildExport projects the in-memory graph into the SPA payload. allowed (nil =
+// unrestricted) filters notes to the caller's readable scopes; an excluded note drops
+// out of nodes, so its edges and orbit fall away with it.
+func BuildExport(g *graph.Graph, vaultRoot string, allowed map[string]bool) Export {
 	all := g.Nodes()
 
 	// Note nodes only, and a quick membership set for filtering edges/adjacency.
 	notes := make([]*graph.Node, 0, len(all))
 	isNote := make(map[string]bool)
 	for _, n := range all {
-		if n.Kind == "note" {
+		if n.Kind == "note" && scopeVisible(n, allowed) {
 			notes = append(notes, n)
 			isNote[n.ID] = true
 		}
