@@ -26,7 +26,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	g := s.graph
 	s.mu.RUnlock()
 	rt := retrieve.NewFromEnv(s.store, g)
-	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget})
+	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r)})
 	if err != nil {
 		http.Error(w, "search failed", http.StatusInternalServerError)
 		return
@@ -45,6 +45,15 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown note id", http.StatusNotFound)
 		return
 	}
+	// Scope read check: opaque 404 (same as a missing note) so a scoped member cannot
+	// probe which ids exist outside their scope.
+	if allowed := s.allowedScopes(r); allowed != nil {
+		sc, serr := s.store.NoteScope(id)
+		if serr != nil || !scopeIntersect(sc, allowed) {
+			http.Error(w, "unknown note id", http.StatusNotFound)
+			return
+		}
+	}
 	data, err := os.ReadFile(filepath.Join(s.vaultRoot, rel))
 	if err != nil {
 		http.Error(w, "read failed", http.StatusInternalServerError)
@@ -53,6 +62,20 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 	// html is server-rendered (gomarkdown, same as docs) so every reader shows nicely
 	// formatted prose instead of raw markdown; markdown is kept for any raw consumer.
 	writeJSON(w, map[string]any{"id": id, "path": rel, "markdown": string(data), "html": renderMD(data)})
+}
+
+// scopeIntersect reports whether a note's scopes intersect the allowed set. Empty
+// scopes = the dev fail-safe default.
+func scopeIntersect(scopes []string, allowed map[string]bool) bool {
+	if len(scopes) == 0 {
+		return allowed["dev"]
+	}
+	for _, s := range scopes {
+		if allowed[s] {
+			return true
+		}
+	}
+	return false
 }
 
 func atoiOr(s string, def int) int {

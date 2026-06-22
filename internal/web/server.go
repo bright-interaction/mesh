@@ -25,9 +25,29 @@ type Server struct {
 	auth      authConfig
 	basePath  string // "" for root, or "/app" when served under a path
 
+	// scopeResolver, when set, maps a request to the caller's allowed-scope set so the
+	// graph/search/note surfaces are filtered per member. nil (standalone `mesh ui`) =
+	// unrestricted, so the loopback single-user viewer is unchanged.
+	scopeResolver func(*http.Request) map[string]bool
+
 	mu    sync.RWMutex
 	graph *graph.Graph
 }
+
+// allowedScopes returns the caller's readable-scope set (nil = unrestricted).
+func (s *Server) allowedScopes(r *http.Request) map[string]bool {
+	if s.scopeResolver == nil {
+		return nil
+	}
+	return s.scopeResolver(r)
+}
+
+// SetScopeResolver installs the per-request scope resolver (used by the hub to serve
+// the app under per-member identity).
+func (s *Server) SetScopeResolver(f func(*http.Request) map[string]bool) { s.scopeResolver = f }
+
+// Store exposes the index store (for a host that needs NoteScope etc.).
+func (s *Server) Store() *index.Store { return s.store }
 
 // baseHref is the value injected into the SPA's <base> tag, so every relative
 // asset and fetch resolves under the configured path. Always ends in "/".
@@ -105,7 +125,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	g := s.graph
 	s.mu.RUnlock()
-	exp := BuildExport(g, s.vaultRoot)
+	exp := BuildExport(g, s.vaultRoot, s.allowedScopes(r))
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
 	_ = json.NewEncoder(w).Encode(exp)
@@ -201,7 +221,7 @@ func Serve(vaultRoot, addr, token, basePath string) error {
 	defer s.Close()
 	s.auth = auth
 	s.basePath = normalizeBasePath(basePath)
-	exp := BuildExport(s.graph, vaultRoot)
+	exp := BuildExport(s.graph, vaultRoot, nil)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))
 	if auth.authRequired() {
 		fmt.Printf("auth: token required (Authorization: Bearer ...)\n")
