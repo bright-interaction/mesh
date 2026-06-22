@@ -13,6 +13,27 @@ import (
 // path (reachable unauthenticated) and validates the key itself, constant-time.
 // Accepts the key as JSON {"key":"..."} or a "key" form field.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	// Member mode (mesh ui --hub-db): the key is a hub client token; on success set a
+	// client-bound cookie so the member's view is scoped to them.
+	if s.member != nil {
+		key := loginKey(w, r)
+		id, _, ok := s.member.verify(key)
+		if !ok {
+			http.Error(w, "invalid access key", http.StatusUnauthorized)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     memberCookie,
+			Value:    s.member.sign(id),
+			Path:     s.cookiePath(),
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			MaxAge:   60 * 60 * 24 * 30, // 30 days
+		})
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if !s.auth.authRequired() {
 		// No auth configured (loopback bind): nothing to sign into.
 		w.WriteHeader(http.StatusNoContent)
@@ -35,10 +56,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleLogout clears the session cookie.
+// handleLogout clears the session cookie (both the shared-token and member cookies).
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	name := sessionCookie
+	if s.member != nil {
+		name = memberCookie
+	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
+		Name:     name,
 		Value:    "",
 		Path:     s.cookiePath(),
 		HttpOnly: true,

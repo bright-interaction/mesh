@@ -20,6 +20,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/eval"
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/hub"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
@@ -1494,11 +1495,11 @@ func tuiCmd() *cobra.Command {
 	}
 }
 func uiCmd() *cobra.Command {
-	var addr, token, basePath string
+	var addr, token, basePath, hubDB string
 	c := &cobra.Command{
 		Use:   "ui [vault]",
 		Short: "Serve the local web app: graph, search, settings, docs, API reference",
-		Long:  "Open the Mesh web app for a vault: the graph (force + galaxy + 3D), a search view, editable settings, in-app docs, and the API reference. Same index the agent reads over MCP, served from the single binary with no CDN. Loopback bind needs no auth; binding beyond loopback requires --token (or MESH_UI_TOKEN), fail-closed. Use --base-path to serve under a path (e.g. behind a reverse proxy at /app).",
+		Long:  "Open the Mesh web app for a vault: the graph (force + galaxy + 3D), a search view, editable settings, in-app docs, and the API reference. Same index the agent reads over MCP, served from the single binary with no CDN. Loopback bind needs no auth; binding beyond loopback requires --token (or MESH_UI_TOKEN), fail-closed. Use --base-path to serve under a path (e.g. behind a reverse proxy at /app). Pass --hub-db <hub.db> to serve a TEAM: each member signs in with their own client token and the graph/search/note views are scoped to them.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if token == "" {
@@ -1507,11 +1508,53 @@ func uiCmd() *cobra.Command {
 			if basePath == "" {
 				basePath = os.Getenv("MESH_UI_BASE_PATH")
 			}
-			return web.Serve(vaultArg(args), addr, token, basePath)
+			if hubDB == "" {
+				hubDB = os.Getenv("MESH_UI_HUB_DB")
+			}
+			// Standalone single-token mode.
+			if hubDB == "" {
+				return web.Serve(vaultArg(args), addr, token, basePath, nil, nil)
+			}
+			// Per-member mode: authenticate each request against the hub's client store
+			// (shared volume) and scope reads to the signed-in member.
+			store, err := hub.Open(hubDB)
+			if err != nil {
+				return fmt.Errorf("open hub db %q: %w", hubDB, err)
+			}
+			defer store.Close()
+			verify := func(tok string) (int64, string, bool) {
+				// Break-glass: the shared MESH_UI_TOKEN still works as an unrestricted
+				// admin login (id -1), so flipping a live app to member mode never locks
+				// anyone out before members have joined. Members use their own client token.
+				if token != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(tok)), []byte(token)) == 1 {
+					return -1, "admin", true
+				}
+				c, err := store.ClientByToken(tok)
+				if err != nil {
+					return 0, "", false
+				}
+				return c.ID, c.User, true
+			}
+			scopesFor := func(id int64) map[string]bool {
+				if id < 0 {
+					return nil // shared-token admin: unrestricted
+				}
+				c, err := store.ClientByID(id)
+				if err != nil {
+					return map[string]bool{} // unknown client -> deny all
+				}
+				allowed, err := store.AllowedReadScopesForClient(c)
+				if err != nil {
+					return map[string]bool{}
+				}
+				return allowed // nil = unrestricted (scoping not configured)
+			}
+			return web.Serve(vaultArg(args), addr, token, basePath, verify, scopesFor)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")
 	c.Flags().StringVar(&token, "token", "", "bearer token required for /api access (or MESH_UI_TOKEN); mandatory when binding beyond loopback")
 	c.Flags().StringVar(&basePath, "base-path", "", "serve the app under a path, e.g. /app (or MESH_UI_BASE_PATH), for a reverse proxy")
+	c.Flags().StringVar(&hubDB, "hub-db", "", "hub.db path (or MESH_UI_HUB_DB): serve a team with per-member login + scoped views")
 	return c
 }
