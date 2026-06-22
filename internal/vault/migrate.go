@@ -97,6 +97,46 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 	return res, nil
 }
 
+// BackfillScopeFile stamps `scope: <scope>` onto a note that declares no scope yet,
+// idempotently (a note that already has a scope is left untouched). Unlabeled notes
+// already behave as dev by the EffectiveScopes fail-safe; this just makes that
+// explicit so a note can be deliberately relabeled into another scope later.
+func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	fmText, body, had := SplitFrontmatter(string(data))
+	_, raw, err := ParseFrontmatter([]byte(fmText))
+	if err != nil {
+		return nil, err
+	}
+	res := &MigrateResult{Path: path}
+	if _, ok := raw["scope"]; ok {
+		return res, nil // already labeled: idempotent no-op
+	}
+	if strings.TrimSpace(scope) == "" {
+		scope = DefaultScope
+	}
+	res.Changed = true
+	res.Actions = append(res.Actions, "added scope "+scope)
+	if dryRun {
+		return res, nil
+	}
+	newFM := "scope: " + scope
+	if fmText != "" {
+		newFM += "\n" + fmText
+	}
+	out := "---\n" + newFM + "\n---\n" + body
+	if !had {
+		out = "---\n" + newFM + "\n---\n\n" + body
+	}
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 func fileMtimeDate(path string) string {
 	fi, err := os.Stat(path)
 	if err != nil {

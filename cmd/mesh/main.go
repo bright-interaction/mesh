@@ -59,6 +59,7 @@ func rootCmd() *cobra.Command {
 		healthCmd(),
 		ingestCmd(),
 		migrateCmd(),
+		scopeCmd(),
 		lintCmd(),
 		structureCmd(),
 		mcpCmd(),
@@ -1002,6 +1003,58 @@ func migrateCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without writing")
+	return c
+}
+
+func scopeCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "scope",
+		Short: "Access-scope tools (label notes for the team scope model)",
+	}
+	c.AddCommand(scopeBackfillCmd())
+	return c
+}
+
+func scopeBackfillCmd() *cobra.Command {
+	var dryRun bool
+	var scope string
+	c := &cobra.Command{
+		Use:   "backfill [vault]",
+		Short: "Stamp an explicit scope on every note that has none (idempotent; default dev)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := vaultArg(args)
+			if strings.TrimSpace(scope) == "" {
+				scope = "dev"
+			}
+			files, err := vault.Walk(root)
+			if err != nil {
+				return err
+			}
+			var changed, errored int
+			for _, f := range files {
+				res, err := vault.BackfillScopeFile(f, scope, dryRun)
+				if err != nil {
+					errored++
+					fmt.Fprintf(os.Stderr, "backfill %s: %v\n", f, err)
+					continue
+				}
+				if res.Changed {
+					changed++
+				}
+			}
+			verb := "labeled"
+			if dryRun {
+				verb = "would label"
+			}
+			fmt.Printf("%s %d of %d notes with scope %q (%d already scoped, %d errored)\n",
+				verb, changed, len(files), scope, len(files)-changed-errored, errored)
+			fmt.Println("note: unlabeled notes already behave as dev by the fail-safe; this just makes it explicit so they can be relabeled.")
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	c.Flags().StringVar(&scope, "scope", "dev", "scope to stamp on unlabeled notes")
 	return c
 }
 
