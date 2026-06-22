@@ -34,6 +34,9 @@ type NewNoteSpec struct {
 	Confidence string
 	ReviewBy   string
 	ImportedAt string
+	// Scope is the access-control partition(s) to stamp on the new note. Empty leaves
+	// the note unlabeled (= dev-only by the EffectiveScopes default).
+	Scope []string
 }
 
 // CreateResult reports what Mesh filled in and what the author still must.
@@ -124,6 +127,7 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		Confidence: strings.TrimSpace(spec.Confidence),
 		ReviewBy:   strings.TrimSpace(spec.ReviewBy),
 		ImportedAt: strings.TrimSpace(spec.ImportedAt),
+		Scope:      normalizeTags(spec.Scope),
 	}
 	if spec.Type.RequiresFlywheel() {
 		fm.Do = orTODO(spec.Do)

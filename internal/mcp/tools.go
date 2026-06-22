@@ -154,19 +154,19 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	case "mesh_search":
 		return s.toolSearch(ctx, p.Arguments)
 	case "mesh_fetch":
-		return s.toolFetch(p.Arguments)
+		return s.toolFetch(ctx, p.Arguments)
 	case "mesh_god_nodes":
-		return s.toolGodNodes(p.Arguments)
+		return s.toolGodNodes(ctx, p.Arguments)
 	case "mesh_changed_since":
 		return s.toolChangedSince(p.Arguments)
 	case "mesh_neighbors":
-		return s.toolNeighbors(p.Arguments)
+		return s.toolNeighbors(ctx, p.Arguments)
 	case "mesh_community":
-		return s.toolCommunity(p.Arguments)
+		return s.toolCommunity(ctx, p.Arguments)
 	case "mesh_append_note":
-		return s.toolWrite(p.Arguments, "")
+		return s.toolWrite(ctx, p.Arguments, "")
 	case "mesh_write_entity":
-		return s.toolWrite(p.Arguments, "entity")
+		return s.toolWrite(ctx, p.Arguments, "entity")
 	case "mesh_reindex":
 		return s.toolReindex()
 	case "mesh_health":
@@ -311,7 +311,11 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query is required"}
 	}
 	_, retriever := s.snapshot()
-	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: a.Limit, Budget: a.Budget})
+	var allowed map[string]bool
+	if sf := scopeFromCtx(ctx); sf != nil {
+		allowed = sf.AllowedRead // nil-safe: nil => retriever does not filter
+	}
+	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: a.Limit, Budget: a.Budget, AllowedScopes: allowed})
 	if err != nil {
 		return nil, internalErr(err)
 	}
@@ -319,7 +323,7 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	return textResult(map[string]any{"cards": cards, "tokens": retrieve.TotalTokens(cards)}), nil
 }
 
-func (s *Server) toolFetch(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		ID     string `json:"id"`
 		Anchor string `json:"anchor"`
@@ -328,6 +332,15 @@ func (s *Server) toolFetch(raw json.RawMessage) (any, *rpcError) {
 	rel, err := s.store.NotePath(a.ID)
 	if err != nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: a.ID}
+	}
+	// Scope read check: a direct fetch resolves id -> path -> file, bypassing the
+	// retriever's filter, so gate it here. Return the SAME opaque "unknown note id" a
+	// missing note returns, so a scoped caller can't probe which ids exist.
+	if sf := scopeFromCtx(ctx); sf != nil {
+		sc, serr := s.store.NoteScope(a.ID)
+		if serr != nil || !sf.allowsRead(sc) {
+			return nil, &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: a.ID}
+		}
 	}
 	data, err := os.ReadFile(filepath.Join(s.vaultRoot, rel))
 	if err != nil {
@@ -342,7 +355,7 @@ func (s *Server) toolFetch(raw json.RawMessage) (any, *rpcError) {
 	return rawText(body), nil
 }
 
-func (s *Server) toolGodNodes(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolGodNodes(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		Limit int `json:"limit"`
 	}
@@ -358,9 +371,13 @@ func (s *Server) toolGodNodes(raw json.RawMessage) (any, *rpcError) {
 		Community int    `json:"community"`
 	}
 	g, _ := s.snapshot()
+	sf := scopeFromCtx(ctx)
 	var hubs []hub
 	for _, n := range g.Nodes() {
 		if n.Kind != "note" {
+			continue
+		}
+		if !sf.allowsNode(n) { // hide hubs the caller cannot read (no title enumeration)
 			continue
 		}
 		hubs = append(hubs, hub{n.NoteID, n.Label, n.NotePath, n.Degree, n.Community})
@@ -389,7 +406,7 @@ func (s *Server) toolChangedSince(raw json.RawMessage) (any, *rpcError) {
 	return textResult(map[string]any{"changed": refs}), nil
 }
 
-func (s *Server) toolWrite(raw json.RawMessage, forceType string) (any, *rpcError) {
+func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType string) (any, *rpcError) {
 	var a struct {
 		Type       string   `json:"type"`
 		Title      string   `json:"title"`
@@ -405,8 +422,26 @@ func (s *Server) toolWrite(raw json.RawMessage, forceType string) (any, *rpcErro
 		SourceURL  string   `json:"source_url"`
 		Confidence string   `json:"confidence"`
 		ReviewBy   string   `json:"review_by"`
+		Scope      string   `json:"scope"`
 	}
 	json.Unmarshal(raw, &a)
+	// Scope write gate: a scoped caller may only create notes in a scope they can
+	// write, and the new note is stamped with that scope. A nil filter (solo / no-scope
+	// hub) leaves noteScope empty so the note carries no scope frontmatter (= dev).
+	var noteScope []string
+	if sf := scopeFromCtx(ctx); sf != nil {
+		want := strings.TrimSpace(a.Scope)
+		if want == "" {
+			want = sf.WriteScope
+		}
+		if want == "" {
+			return nil, &rpcError{Code: codeInvalidParams, Message: "your account is not in a single scope; pass an explicit `scope`"}
+		}
+		if sf.CanWrite == nil || !sf.CanWrite(want) {
+			return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: you cannot write notes in scope " + want}
+		}
+		noteScope = []string{want}
+	}
 	t := a.Type
 	if forceType != "" {
 		t = forceType
@@ -427,7 +462,7 @@ func (s *Server) toolWrite(raw json.RawMessage, forceType string) (any, *rpcErro
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
 		Related: a.Related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
 		Author: a.Author, Agent: agent, Source: source, SourceURL: a.SourceURL,
-		Confidence: a.Confidence, ReviewBy: a.ReviewBy, By: agent,
+		Confidence: a.Confidence, ReviewBy: a.ReviewBy, By: agent, Scope: noteScope,
 	})
 	if err != nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}

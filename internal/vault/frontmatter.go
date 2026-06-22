@@ -86,6 +86,31 @@ type Frontmatter struct {
 	Confidence string     `yaml:"confidence,omitempty"` // low | med | high
 	ReviewBy   string     `yaml:"review_by,omitempty"`  // YYYY-MM-DD; lifecycle re-check date
 	ImportedAt string     `yaml:"imported_at,omitempty"`
+	// Scope is the access-control partition(s) this note belongs to (dev, sales, ...).
+	// A note may carry several. ABSENCE means dev-only (the fail-safe): an unlabeled
+	// note is never accidentally exposed to or writable by a non-dev scope. Read
+	// EffectiveScopes() rather than this field directly so the default lives in one place.
+	Scope StringList `yaml:"scope,omitempty"`
+}
+
+// DefaultScope is the scope an unlabeled note belongs to. Unlabeled = dev-only, so a
+// note that predates scoping (or forgets the field) is never leaked to a non-dev scope.
+const DefaultScope = "dev"
+
+// EffectiveScopes returns the note's access scopes, defaulting to {DefaultScope} when
+// none are declared. This is the single source of the fail-safe default; every read
+// and write check must go through it.
+func (f *Frontmatter) EffectiveScopes() []string {
+	var out []string
+	for _, s := range f.Scope {
+		if t := strings.TrimSpace(s); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return []string{DefaultScope}
+	}
+	return out
 }
 
 // ParseFrontmatter decodes a YAML frontmatter block into the whitelisted struct

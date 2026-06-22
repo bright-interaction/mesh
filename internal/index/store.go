@@ -33,7 +33,8 @@ type Store struct {
 // databases without a destructive rebuild and the version stays 2. Bump this only
 // for a shape change to an existing table, which requires the drop+rebuild below.
 // v3: notes gained review_by + source columns (provenance / lifecycle, Phase A).
-const SchemaVersion = 3
+// v4: notes gained a scope column (access-control partition; absent = dev).
+const SchemaVersion = 4
 
 type job struct {
 	fn    func(*sql.Tx) error

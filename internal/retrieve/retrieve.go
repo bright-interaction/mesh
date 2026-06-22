@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +51,7 @@ type Card struct {
 	Title   string
 	Path    string
 	Type    string
+	Scope   string // access-control scope(s), comma-joined (for the scope read filter)
 	Snippet string
 	Score   float64
 	Tier0   bool
@@ -64,6 +66,11 @@ type Options struct {
 	WeightGraph float64
 	WeightVec   float64
 	NoRerank    bool // skip the cross-encoder stage even when configured (for tuning the fusion itself)
+	// AllowedScopes, when non-nil, restricts results to notes whose scope intersects
+	// the set (access control). nil = unrestricted (solo / no-ACL fast path). This is
+	// THE read boundary: it is applied at the card loop below so it covers FTS, graph,
+	// vector, and 1-hop expansion in one place, and before the reranker reads any doc.
+	AllowedScopes map[string]bool
 }
 
 type Retriever struct {
@@ -362,11 +369,17 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	vectorsActive := r.emb != nil && len(r.vecs) > 0
 	wFTS, wGraph, wVec := r.resolveWeights(opt, vectorsActive)
 
-	ftsHits, err := r.store.Search(query, opt.Limit)
+	// When a scope filter is active, over-fetch candidates so the allowed head still
+	// fills after forbidden notes are dropped at the card loop.
+	fetchLimit := opt.Limit
+	if opt.AllowedScopes != nil {
+		fetchLimit *= 4
+	}
+	ftsHits, err := r.store.Search(query, fetchLimit)
 	if err != nil {
 		return nil, err
 	}
-	graphHits := r.ranker.Score(query, opt.Limit)
+	graphHits := r.ranker.Score(query, fetchLimit)
 
 	fused := map[string]float64{}
 	snippet := map[string]string{}
@@ -470,6 +483,11 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	cards := make([]Card, 0, len(fused))
 	for id, score := range fused {
 		c := r.card(id)
+		// Scope read boundary: drop notes the caller may not read BEFORE they reach
+		// the head, the reranker, or the budget packer. Covers every signal at once.
+		if !scopeAllowed(c.Scope, opt.AllowedScopes) {
+			continue
+		}
 		c.Score = score
 		c.Snippet = snippet[id]
 		c.Reason = reason[id]
@@ -610,7 +628,29 @@ func (r *Retriever) card(id string) Card {
 		c.Type = t
 		c.Tier0 = tier0Types[t]
 	}
+	if sc, ok := n.Attrs["scope"].(string); ok {
+		c.Scope = sc
+	}
 	return c
+}
+
+// scopeAllowed reports whether a card may be returned given an allowed-scope set.
+// allowed==nil means unrestricted (the solo / no-ACL fast path). A card with no
+// scope attr is treated as the fail-safe default (dev-only).
+func scopeAllowed(cardScope string, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true
+	}
+	cs := cardScope
+	if strings.TrimSpace(cs) == "" {
+		cs = "dev"
+	}
+	for _, s := range strings.Split(cs, ",") {
+		if allowed[strings.TrimSpace(s)] {
+			return true
+		}
+	}
+	return false
 }
 
 // freshnessTypes are NON-institutional notes that decay with age. Decisions,

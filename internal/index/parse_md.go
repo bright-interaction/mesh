@@ -235,7 +235,7 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		if title == "" {
 			title = n.Key
 		}
-		attrs := map[string]any{"type": string(n.FM.Type)}
+		attrs := map[string]any{"type": string(n.FM.Type), "scope": strings.Join(n.FM.EffectiveScopes(), ",")}
 		for k, v := range map[string]string{"when": n.FM.When, "do": n.FM.Do, "dont": n.FM.Dont, "why": n.FM.Why} {
 			if v != "" {
 				attrs[k] = v
