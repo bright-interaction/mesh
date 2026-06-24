@@ -56,6 +56,18 @@ func renderMD(src []byte) string {
 	return string(markdown.Render(doc, r))
 }
 
+// renderMDSafe turns UNTRUSTED markdown into HTML. Note bodies can embed raw HTML
+// ingested from GitHub/Jira/Linear/Notion/Slack, so a stored <script> or
+// javascript: link would execute in a reader's browser if rendered with renderMD.
+// SkipHTML drops inline HTML and Safelink neutralises unsafe link schemes. Use this
+// for anything that flows in from a connector; renderMD stays for our embedded docs.
+func renderMDSafe(src []byte) string {
+	p := parser.NewWithExtensions(parser.CommonExtensions | parser.AutoHeadingIDs)
+	doc := p.Parse(src)
+	r := html.NewRenderer(html.RendererOptions{Flags: html.CommonFlags | html.SkipHTML | html.Safelink})
+	return string(markdown.Render(doc, r))
+}
+
 func (s *Server) handleDocsList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"pages": docList()})
 }
