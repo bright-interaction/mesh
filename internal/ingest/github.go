@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -25,18 +24,18 @@ func (g *GitHub) Name() string { return "github" }
 func (g *GitHub) Key() string  { return "github:" + g.Owner + "/" + g.Repo }
 
 type ghIssue struct {
-	Number      int        `json:"number"`
-	Title       string     `json:"title"`
-	Body        string     `json:"body"`
-	HTMLURL     string     `json:"html_url"`
-	CreatedAt   time.Time  `json:"created_at"`
+	Number      int                    `json:"number"`
+	Title       string                 `json:"title"`
+	Body        string                 `json:"body"`
+	HTMLURL     string                 `json:"html_url"`
+	CreatedAt   time.Time              `json:"created_at"`
 	User        struct{ Login string } `json:"user"`
-	PullRequest *struct{}  `json:"pull_request"`
+	PullRequest *struct{}              `json:"pull_request"`
 }
 
-func (g *GitHub) Pull(ctx context.Context, since time.Time) ([]Doc, error) {
+func (g *GitHub) Pull(ctx context.Context, since time.Time) ([]Doc, bool, error) {
 	if g.Owner == "" || g.Repo == "" {
-		return nil, fmt.Errorf("github: owner and repo are required")
+		return nil, false, fmt.Errorf("github: owner and repo are required")
 	}
 	cl := g.Client
 	if cl == nil {
@@ -46,33 +45,42 @@ func (g *GitHub) Pull(ctx context.Context, since time.Time) ([]Doc, error) {
 	if b := strings.TrimRight(apiBaseOverride, "/"); b != "" {
 		base = b
 	}
-	maxPages := g.MaxPages
-	if maxPages <= 0 {
-		maxPages = 5
+	// Page to exhaustion (a short page ends it). g.MaxPages, when set, is an explicit
+	// cap; either way maxIngestPages is the hard safety bound. Previously the default
+	// 5-page cap silently dropped any backlog over 500 items because the high-water
+	// mark advanced past the unread overflow.
+	pageCap := g.MaxPages
+	if pageCap <= 0 || pageCap > maxIngestPages {
+		pageCap = maxIngestPages
 	}
 	var docs []Doc
-	for page := 1; page <= maxPages; page++ {
+	for page := 1; page <= pageCap; page++ {
 		url := fmt.Sprintf("%s/repos/%s/%s/issues?state=all&per_page=100&page=%d", base, g.Owner, g.Repo, page)
 		if !since.IsZero() {
 			url += "&since=" + since.UTC().Format(time.RFC3339)
 		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, false, err
+		}
 		req.Header.Set("Accept", "application/vnd.github+json")
 		if g.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+g.Token)
 		}
 		resp, err := cl.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		body, err := readBody(resp)
+		if err != nil {
+			return nil, false, err
+		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, httpError("github", resp.StatusCode, body)
+			return nil, false, httpError("github", resp.StatusCode, body)
 		}
 		var issues []ghIssue
 		if err := json.Unmarshal(body, &issues); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if len(issues) == 0 {
 			break
@@ -92,10 +100,13 @@ func (g *GitHub) Pull(ctx context.Context, since time.Time) ([]Doc, error) {
 			})
 		}
 		if len(issues) < 100 {
-			break
+			break // last page
+		}
+		if page == pageCap {
+			return docs, true, nil // a full page at the cap: more remains upstream
 		}
 	}
-	return docs, nil
+	return docs, false, nil
 }
 
 // apiBaseOverride lets tests point connectors at a fake server. Empty in prod.

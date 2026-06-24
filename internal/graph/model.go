@@ -106,6 +106,20 @@ func (g *Graph) AddEdge(e Edge) {
 	}
 }
 
+// RecomputeDegrees sets every node's Degree from its adjacency lists, making the
+// value independent of node/edge insertion order. AddEdge only bumps endpoints that
+// already exist at insertion time, so a graph assembled by interleaving AddNode and
+// AddEdge (BuildGraph: a references edge to a not-yet-added later note never counts
+// that note's inbound degree) would otherwise disagree with one built nodes-first
+// (LoadGraph). Call this once after the graph is fully assembled so both paths agree.
+func (g *Graph) RecomputeDegrees() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id, n := range g.nodes {
+		n.Degree = len(g.adj[id]) + len(g.rev[id])
+	}
+}
+
 func (g *Graph) Node(id string) (*Node, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()

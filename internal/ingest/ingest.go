@@ -9,6 +9,8 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,11 +33,22 @@ type Doc struct {
 // Connector pulls docs from one external source since a timestamp (zero = all).
 // Key is a stable per-instance id (e.g. "github:owner/repo") used to remember the
 // last successful pull for incremental sync.
+//
+// Pull MUST paginate the source to exhaustion for the window. It returns truncated=
+// true only when it could not (it hit maxIngestPages with more data still upstream);
+// in that case the caller must NOT advance the high-water mark, so the un-pulled tail
+// is re-fetched next run instead of being silently skipped forever.
 type Connector interface {
 	Name() string
 	Key() string
-	Pull(ctx context.Context, since time.Time) ([]Doc, error)
+	Pull(ctx context.Context, since time.Time) (docs []Doc, truncated bool, err error)
 }
+
+// maxIngestPages bounds a single connector pull so a misbehaving cursor cannot loop
+// forever. At the per-page sizes connectors use (100-200) this is ~20-40k items per
+// incremental run, far above any real delta; hitting it sets truncated=true so the
+// mark is held and the rest is pulled next run.
+const maxIngestPages = 200
 
 // Result reports what a run wrote.
 type Result struct {
@@ -43,13 +56,14 @@ type Result struct {
 	Pulled    int    `json:"pulled"`
 	Written   int    `json:"written"`
 	Folder    string `json:"folder"`
+	Truncated bool   `json:"truncated"` // hit the page cap; mark not advanced, more to pull
 }
 
 // Run pulls from c and upserts each doc as a provenance-stamped note under
 // imported/<connector>/ in vaultRoot. Idempotent: a re-pull overwrites the same
 // deterministic file, so source_url dedupe is automatic.
 func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (Result, error) {
-	docs, err := c.Pull(ctx, since)
+	docs, truncated, err := c.Pull(ctx, since)
 	if err != nil {
 		return Result{}, err
 	}
@@ -83,7 +97,7 @@ func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (R
 		}
 		written++
 	}
-	return Result{Connector: c.Name(), Pulled: len(docs), Written: written, Folder: folder}, nil
+	return Result{Connector: c.Name(), Pulled: len(docs), Written: written, Folder: folder, Truncated: truncated}, nil
 }
 
 // Opts controls an incremental run.
@@ -109,8 +123,16 @@ func RunIncremental(ctx context.Context, vaultRoot string, c Connector, opts Opt
 	if err != nil {
 		return res, err
 	}
-	st.LastRun[c.Key()] = startedAt.Unix()
-	_ = saveState(vaultRoot, st)
+	// Only advance the high-water mark when the whole window was pulled. If the pull
+	// was truncated (hit the page cap), holding the mark means the un-pulled tail is
+	// re-fetched next run (upserts are idempotent) instead of being skipped forever
+	// because the mark jumped past it.
+	if !res.Truncated {
+		st.LastRun[c.Key()] = startedAt.Unix()
+		if serr := saveState(vaultRoot, st); serr != nil {
+			return res, fmt.Errorf("ingest: pull succeeded but persisting the high-water mark failed (next run will re-pull): %w", serr)
+		}
+	}
 	return res, nil
 }
 
@@ -142,6 +164,17 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// maxResponseBytes caps a single connector HTTP response so a hostile or
+// misconfigured endpoint cannot OOM the process (the client timeouts bound time,
+// not bytes). 32 MiB comfortably holds a full page of issues/messages.
+const maxResponseBytes = 32 << 20
+
+// readBody reads an HTTP response body with a hard size cap, closing it.
+func readBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	return io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 }
 
 // httpError is a small helper for connectors to format non-2xx responses.

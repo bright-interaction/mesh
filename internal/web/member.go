@@ -66,10 +66,9 @@ func (m *memberAuth) clientFromRequest(r *http.Request) (int64, bool) {
 			return id, true
 		}
 	}
+	// Bearer header only; the ?token= query fallback was removed so a member's client
+	// token never lands in access/proxy logs, history, or a Referer header.
 	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
-	if tok == "" {
-		tok = r.URL.Query().Get("token")
-	}
 	if tok != "" {
 		if id, _, ok := m.verify(tok); ok {
 			return id, true

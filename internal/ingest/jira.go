@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -39,11 +38,13 @@ type jiraResp struct {
 			} `json:"creator"`
 		} `json:"fields"`
 	} `json:"issues"`
+	NextPageToken string `json:"nextPageToken"`
+	IsLast        bool   `json:"isLast"`
 }
 
-func (j *Jira) Pull(ctx context.Context, since time.Time) ([]Doc, error) {
+func (j *Jira) Pull(ctx context.Context, since time.Time) ([]Doc, bool, error) {
 	if j.Site == "" {
-		return nil, fmt.Errorf("jira: site is required")
+		return nil, false, fmt.Errorf("jira: site is required")
 	}
 	cl := j.Client
 	if cl == nil {
@@ -65,45 +66,65 @@ func (j *Jira) Pull(ctx context.Context, since time.Time) ([]Doc, error) {
 	if max <= 0 {
 		max = 100
 	}
-	q := url.Values{}
-	q.Set("jql", jql)
-	q.Set("maxResults", fmt.Sprint(max))
-	q.Set("fields", "summary,description,created,creator")
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/rest/api/3/search/jql?"+q.Encode(), nil)
-	req.Header.Set("Accept", "application/json")
-	if j.Email != "" || j.Token != "" {
-		cred := base64.StdEncoding.EncodeToString([]byte(j.Email + ":" + j.Token))
-		req.Header.Set("Authorization", "Basic "+cred)
-	}
-	resp, err := cl.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, httpError("jira", resp.StatusCode, body)
-	}
-	var jr jiraResp
-	if err := json.Unmarshal(body, &jr); err != nil {
-		return nil, err
-	}
+	// Paginate the enhanced /search/jql endpoint to exhaustion via nextPageToken; a
+	// single page otherwise silently drops everything past maxResults.
 	var docs []Doc
-	for _, is := range jr.Issues {
-		created := is.Fields.Created
-		if len(created) >= 10 {
-			created = created[:10]
+	pageToken := ""
+	for page := 0; ; page++ {
+		if page >= maxIngestPages {
+			return docs, true, nil // truncated: caller holds the high-water mark
 		}
-		docs = append(docs, Doc{
-			ExternalID: is.Key,
-			Title:      "[" + is.Key + "] " + is.Fields.Summary,
-			Body:       adfText(is.Fields.Description),
-			Author:     is.Fields.Creator.DisplayName,
-			SourceURL:  base + "/browse/" + is.Key,
-			CreatedAt:  created,
-		})
+		q := url.Values{}
+		q.Set("jql", jql)
+		q.Set("maxResults", fmt.Sprint(max))
+		q.Set("fields", "summary,description,created,creator")
+		if pageToken != "" {
+			q.Set("nextPageToken", pageToken)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/rest/api/3/search/jql?"+q.Encode(), nil)
+		if err != nil {
+			return nil, false, err
+		}
+		req.Header.Set("Accept", "application/json")
+		if j.Email != "" || j.Token != "" {
+			cred := base64.StdEncoding.EncodeToString([]byte(j.Email + ":" + j.Token))
+			req.Header.Set("Authorization", "Basic "+cred)
+		}
+		resp, err := cl.Do(req)
+		if err != nil {
+			return nil, false, err
+		}
+		body, err := readBody(resp)
+		if err != nil {
+			return nil, false, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, false, httpError("jira", resp.StatusCode, body)
+		}
+		var jr jiraResp
+		if err := json.Unmarshal(body, &jr); err != nil {
+			return nil, false, err
+		}
+		for _, is := range jr.Issues {
+			created := is.Fields.Created
+			if len(created) >= 10 {
+				created = created[:10]
+			}
+			docs = append(docs, Doc{
+				ExternalID: is.Key,
+				Title:      "[" + is.Key + "] " + is.Fields.Summary,
+				Body:       adfText(is.Fields.Description),
+				Author:     is.Fields.Creator.DisplayName,
+				SourceURL:  base + "/browse/" + is.Key,
+				CreatedAt:  created,
+			})
+		}
+		if jr.IsLast || jr.NextPageToken == "" {
+			break
+		}
+		pageToken = jr.NextPageToken
 	}
-	return docs, nil
+	return docs, false, nil
 }
 
 // adfText flattens Atlassian Document Format (a nested JSON doc) to plain text by

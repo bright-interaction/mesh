@@ -43,7 +43,14 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 			}
 		}
 
-		insNote, err := tx.Prepare(`INSERT INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+		// INSERT OR REPLACE (not a plain INSERT) so a duplicate effectiveID does not
+		// abort the whole reindex. Two files that share a basename and carry no
+		// frontmatter id resolve to the same effectiveID; a plain INSERT hit the
+		// notes.id PRIMARY KEY and rolled back the entire transaction, taking the whole
+		// index offline. This converges the full path with IndexVaultIncremental (which
+		// already uses OR REPLACE) and BuildGraph (which collapses the node): last-wins,
+		// while BuildGraph still raises a duplicate-id Issue surfaced by index/doctor/lint.
+		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
@@ -54,10 +61,22 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 		}
 		defer insFTS.Close()
 
+		seen := make(map[string]bool, len(notes))
 		for _, pn := range notes {
 			id, title, fmJSON, updated, reviewBy, source, scope, mtime, err := noteRowValues(pn)
 			if err != nil {
 				return err
+			}
+			// On a duplicate effectiveID within this reindex, drop the FTS row already
+			// written for this node (FTS5 has no PK upsert) so we never leave two FTS
+			// rows for one node; only count distinct notes.
+			if seen[id] {
+				if _, err := tx.Exec(`DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
+					return err
+				}
+			} else {
+				seen[id] = true
+				count++
 			}
 			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source, scope); err != nil {
 				return err
@@ -65,7 +84,6 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
 				return err
 			}
-			count++
 		}
 
 		if err := writeGraphTables(tx, g); err != nil {
@@ -148,10 +166,10 @@ func noteRowValues(pn *ParsedNote) (id, title, fmJSON, updated, reviewBy, source
 	if pn.FM.Updated != "" {
 		updated = pn.FM.Updated
 	}
-	reviewBy = pn.FM.ReviewBy                              // lifecycle re-check date (Phase C)
-	source = pn.FM.Source                                 // provenance origin (Phase A/D)
-	scope = strings.Join(pn.FM.EffectiveScopes(), ",")    // access-control scope(s); absent = dev
-	mtime = pn.Mtime                                      // captured by ParseFile from the on-disk file (CWD-independent)
+	reviewBy = pn.FM.ReviewBy                          // lifecycle re-check date (Phase C)
+	source = pn.FM.Source                              // provenance origin (Phase A/D)
+	scope = strings.Join(pn.FM.EffectiveScopes(), ",") // access-control scope(s); absent = dev
+	mtime = pn.Mtime                                   // captured by ParseFile from the on-disk file (CWD-independent)
 	return id, title, fmJSON, updated, reviewBy, source, scope, mtime, nil
 }
 

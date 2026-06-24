@@ -77,6 +77,7 @@ type Summary struct {
 	ConflictSiblings []string // merge conflicts: our pushed version parked here
 	Protected        []string // external-editor race: incoming hub version parked here
 	Dropped          []string // full-reconcile: locals removed because deleted upstream
+	Rejected         []string // hub refused these (viewer/ACL/scope/oversize); kept dirty to retry
 }
 
 func contentHash(b []byte) string {
@@ -259,6 +260,34 @@ func dropFullReconcileOrphans(vaultDir string, deltas []syncproto.Delta, tombsto
 	return dropped, nil
 }
 
+// dropTombstoned removes local notes named in an incremental tombstone drop-list,
+// content-safely: only a file byte-identical to the EXACT version we last synced
+// (base[rel]) is removed. A path never synced locally, locally edited, or recreated
+// since fails the gate and is kept, so an unacknowledged local change is never lost.
+// This is the incremental sibling of dropFullReconcileOrphans' safety gate.
+func dropTombstoned(vaultDir string, tombstones []string, base map[string]string) ([]string, error) {
+	var dropped []string
+	for _, rel := range tombstones {
+		baseHash, ok := base[rel]
+		if !ok {
+			continue // never synced here: nothing to prune
+		}
+		abs := filepath.Join(vaultDir, filepath.FromSlash(rel))
+		onDisk, err := os.ReadFile(abs)
+		if err != nil {
+			continue // already gone or unreadable
+		}
+		if contentHash(onDisk) != baseHash {
+			continue // locally edited or recreated since last sync: keep it
+		}
+		if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+			return dropped, err
+		}
+		dropped = append(dropped, rel)
+	}
+	return dropped, nil
+}
+
 // writeConflictSiblings preserves the client's losing version of each conflicted
 // path in a local sibling BEFORE applyDeltas overwrites the path with the hub's
 // winning version. Siblings are local resolution artifacts, never pushed.
@@ -338,6 +367,14 @@ func SyncVault(vaultDir string) (Summary, error) {
 		if err != nil {
 			return Summary{}, err
 		}
+	} else if len(resp.Tombstones) > 0 {
+		// Incremental drop-list: prune notes the hub deleted since our last seq, content-
+		// safely. A scoped client may never receive the delete delta, so without this it
+		// keeps the deleted note locally (serving stale knowledge) and can resurrect it.
+		dropped, err = dropTombstoned(vaultDir, resp.Tombstones, state.Hashes)
+		if err != nil {
+			return Summary{}, err
+		}
 	}
 	// Recompute hashes from disk so the next outbox reflects the canonical (post-
 	// merge) hub state, not what we optimistically pushed; then keep any
@@ -347,10 +384,23 @@ func SyncVault(vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	keepParkedDirty(current, state.Hashes, parked)
+	// Hub-rejected paths (viewer role, folder ACL, out-of-scope, or oversize/binary
+	// content) were NOT landed by the hub. Keep them dirty exactly like a parked path
+	// so the next sync re-attempts the push, and never record the local (un-landed)
+	// bytes as the synced base. Without this the rejected edit is silently treated as
+	// synced, is invisible to the team forever, and is never retried when the user
+	// later gains write permission.
+	for _, rel := range resp.Rejected {
+		if old, ok := state.Hashes[rel]; ok {
+			current[rel] = old
+		} else {
+			delete(current, rel)
+		}
+	}
 	if err := writeState(vaultDir, syncState{HeadSHA: resp.HeadSHA, Hashes: current, TombSeq: resp.TombstoneSeq}); err != nil {
 		return Summary{}, err
 	}
-	sum := Summary{Pushed: len(outbox), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped}
+	sum := Summary{Pushed: len(outbox) - len(resp.Rejected), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped, Rejected: resp.Rejected}
 	for _, c := range resp.Conflicts {
 		sum.ConflictSiblings = append(sum.ConflictSiblings, c.SiblingPath)
 	}

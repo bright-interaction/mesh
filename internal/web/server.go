@@ -13,6 +13,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/retrieve"
 )
 
 //go:embed assets
@@ -33,8 +34,39 @@ type Server struct {
 	// request authenticates as a hub client instead of the single shared token.
 	member *memberAuth
 
-	mu    sync.RWMutex
-	graph *graph.Graph
+	mu              sync.RWMutex
+	graph           *graph.Graph
+	cachedRetriever *retrieve.Retriever // built lazily over graph; nil = rebuild needed
+
+	configMu sync.Mutex // serializes config.toml read-modify-write (PUT /api/config)
+}
+
+// retriever returns a fused retriever over the current graph, building it lazily and
+// caching it. Previously every /api/search rebuilt the retriever (LoadVectors from
+// disk + an ANN rebuild in pro) per request: a latency cliff and a DoS amplifier.
+// It is invalidated on a graph swap (reindex) and a config change, so a Settings edit
+// still takes effect on the next search.
+func (s *Server) retriever() *retrieve.Retriever {
+	s.mu.RLock()
+	rt := s.cachedRetriever
+	s.mu.RUnlock()
+	if rt != nil {
+		return rt
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cachedRetriever == nil {
+		s.cachedRetriever = retrieve.NewFromEnv(s.store, s.graph)
+	}
+	return s.cachedRetriever
+}
+
+// invalidateRetriever drops the cached retriever so the next search rebuilds it
+// (after a config change). Caller must NOT already hold s.mu.
+func (s *Server) invalidateRetriever() {
+	s.mu.Lock()
+	s.cachedRetriever = nil
+	s.mu.Unlock()
 }
 
 // allowedScopes returns the caller's readable-scope set (nil = unrestricted).
@@ -110,7 +142,20 @@ func (s *Server) Handler() http.Handler {
 		outer.Handle(s.basePath+"/", http.StripPrefix(s.basePath, h))
 		h = outer
 	}
-	return h
+	return securityHeaders(h)
+}
+
+// securityHeaders sets the standard hardening headers on every response. In
+// particular Referrer-Policy: no-referrer keeps any token that ends up in a URL out
+// of the Referer header on outbound navigations; responses carry private vault data
+// so they are also marked no-store and non-framable.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {

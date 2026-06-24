@@ -86,12 +86,11 @@ func (a authConfig) tokenOK(r *http.Request) bool {
 			return true
 		}
 	}
-	// Bearer header (CLI) or ?token= for EventSource/links that cannot set headers.
+	// Bearer header (CLI). The ?token= query fallback was removed: a secret in the URL
+	// leaks to access/proxy logs, history, and the Referer header. The SPA uses the
+	// cookie; the CLI uses the Authorization header.
 	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
-	if got == "" {
-		got = r.URL.Query().Get("token")
-	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
 }
 
 // isLoopbackAddr reports whether a host:port bind address is loopback-only. A bare

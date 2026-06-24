@@ -110,6 +110,11 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	// Serialize the whole load-modify-save: it is a read-modify-write of one file, so
+	// two concurrent PUTs (member mode shares one .mesh dir) would otherwise each load
+	// the same base and the second SaveConfig would clobber the first's field.
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	// editable set, so an env-overridden field is rejected (writing the file would
 	// have no effect while the env var is set).
 	editable := map[string]bool{}
@@ -135,6 +140,9 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "save failed", http.StatusInternalServerError)
 		return
 	}
+	// Retrieval weights / embedding endpoint may have changed; drop the cached
+	// retriever so the next search reflects the new config.
+	s.invalidateRetriever()
 	writeJSON(w, map[string]any{"fields": s.effectiveConfig(), "saved": true})
 }
 
@@ -232,6 +240,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.graph = g
+	s.cachedRetriever = nil // rebuild over the fresh graph on the next search
 	s.mu.Unlock()
 	notes, _ := s.store.Count("notes")
 	nodes, _ := s.store.Count("nodes")

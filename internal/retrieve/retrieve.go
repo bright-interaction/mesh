@@ -97,8 +97,8 @@ type Retriever struct {
 	qvec   map[string][]float32 // query-embedding cache (keyed by prefixed query)
 	qvecMu sync.Mutex
 
-	freshHalfLife int                        // freshness decay half-life in days; 0 = off
-	freshDates    map[string]index.NoteDate  // note id -> lifecycle dates, lazy-loaded
+	freshHalfLife int                       // freshness decay half-life in days; 0 = off
+	freshDates    map[string]index.NoteDate // note id -> lifecycle dates, lazy-loaded
 	freshOnce     sync.Once
 }
 
@@ -302,9 +302,18 @@ func (r *Retriever) queryVec(ctx context.Context, query string) []float32 {
 	if err != nil || len(qv) != 1 {
 		return nil
 	}
+	// Bound the cache: a long-lived shared Retriever (the SSH viewer builds one and
+	// never swaps it) under a high-cardinality query stream would otherwise grow this
+	// map forever. A query-embedding cache tolerates a coarse reset on overflow.
+	if len(r.qvec) >= maxQvecEntries {
+		r.qvec = make(map[string][]float32, maxQvecEntries)
+	}
 	r.qvec[key] = qv[0]
 	return qv[0]
 }
+
+// maxQvecEntries caps the per-Retriever query-embedding cache.
+const maxQvecEntries = 4096
 
 // EnableVectors turns on the semantic signal. It is a no-op unless the query
 // embedder's model matches the vault's stored model AND its vector width matches

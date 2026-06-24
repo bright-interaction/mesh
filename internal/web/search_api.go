@@ -12,8 +12,8 @@ import (
 
 // handleSearch runs the same fused retrieval the agent gets over MCP and returns
 // ranked cards, so a human can search the vault from the browser. The retriever is
-// built per request from the current config (so a Settings change takes effect on
-// the next search) over the latest graph.
+// cached (built lazily, invalidated on reindex/config change) instead of rebuilt per
+// request, so a search no longer pays a full LoadVectors + ANN rebuild every time.
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
@@ -22,10 +22,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := atoiOr(r.URL.Query().Get("limit"), 12)
 	budget := atoiOr(r.URL.Query().Get("budget"), 0)
-	s.mu.RLock()
-	g := s.graph
-	s.mu.RUnlock()
-	rt := retrieve.NewFromEnv(s.store, g)
+	rt := s.retriever()
 	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r)})
 	if err != nil {
 		http.Error(w, "search failed", http.StatusInternalServerError)
