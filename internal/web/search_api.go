@@ -56,9 +56,10 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read failed", http.StatusInternalServerError)
 		return
 	}
-	// html is server-rendered (gomarkdown, same as docs) so every reader shows nicely
-	// formatted prose instead of raw markdown; markdown is kept for any raw consumer.
-	writeJSON(w, map[string]any{"id": id, "path": rel, "markdown": string(data), "html": renderMD(data)})
+	// html is server-rendered (gomarkdown) so every reader shows formatted prose. Note
+	// bodies are UNTRUSTED (ingested connector content can carry raw HTML), so render
+	// with the sanitising path; markdown is kept verbatim for any raw consumer.
+	writeJSON(w, map[string]any{"id": id, "path": rel, "markdown": string(data), "html": renderMDSafe(data)})
 }
 
 // scopeIntersect reports whether a note's scopes intersect the allowed set. Empty

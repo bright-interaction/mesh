@@ -158,7 +158,7 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	case "mesh_god_nodes":
 		return s.toolGodNodes(ctx, p.Arguments)
 	case "mesh_changed_since":
-		return s.toolChangedSince(p.Arguments)
+		return s.toolChangedSince(ctx, p.Arguments)
 	case "mesh_neighbors":
 		return s.toolNeighbors(ctx, p.Arguments)
 	case "mesh_community":
@@ -170,7 +170,7 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	case "mesh_reindex":
 		return s.toolReindex()
 	case "mesh_health":
-		return s.toolHealth(p.Arguments)
+		return s.toolHealth(ctx, p.Arguments)
 	case "mesh_code_search":
 		return s.toolCodeSearch(p.Arguments)
 	case "mesh_code_neighbors":
@@ -221,7 +221,7 @@ func (s *Server) toolReindex() (any, *rpcError) {
 // toolHealth runs the lifecycle health pass (dead refs + overdue reviews) and
 // returns the findings grouped by issue plus the current counts (incl. any
 // contradiction rows the curator wrote).
-func (s *Server) toolHealth(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		Issue string `json:"issue"`
 	}
@@ -238,6 +238,24 @@ func (s *Server) toolHealth(raw json.RawMessage) (any, *rpcError) {
 		return nil, internalErr(err)
 	}
 	counts, _ := s.store.HealthCounts()
+	// Scope read check: findings carry a note id + path, so an unfiltered health pass
+	// leaks the existence and paths of notes outside the caller's scope (and the global
+	// counts do the same in aggregate). Drop out-of-scope findings and recompute counts
+	// from what is left. A nil filter (solo / no-scope hub) leaves both untouched.
+	if sf := scopeFromCtx(ctx); sf != nil {
+		kept := findings[:0]
+		scoped := make(map[string]int, len(counts))
+		for _, f := range findings {
+			sc, serr := s.store.NoteScope(f.NoteID)
+			if serr != nil || !sf.allowsRead(sc) {
+				continue
+			}
+			kept = append(kept, f)
+			scoped[f.Issue]++
+		}
+		findings = kept
+		counts = scoped
+	}
 	return textResult(map[string]any{"findings": findings, "counts": counts}), nil
 }
 
@@ -401,7 +419,7 @@ func (s *Server) toolGodNodes(ctx context.Context, raw json.RawMessage) (any, *r
 	return textResult(map[string]any{"hubs": hubs}), nil
 }
 
-func (s *Server) toolChangedSince(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolChangedSince(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		Since int64 `json:"since"`
 	}
@@ -409,6 +427,20 @@ func (s *Server) toolChangedSince(raw json.RawMessage) (any, *rpcError) {
 	refs, err := s.store.ChangedSince(a.Since)
 	if err != nil {
 		return nil, internalErr(err)
+	}
+	// Scope read check: each ref exposes a note id, path and mtime, so an unfiltered
+	// delta lets a scoped caller enumerate notes outside their scope. Drop the ones
+	// they cannot read. A nil filter (solo / no-scope hub) leaves the list untouched.
+	if sf := scopeFromCtx(ctx); sf != nil {
+		kept := refs[:0]
+		for _, r := range refs {
+			sc, serr := s.store.NoteScope(r.ID)
+			if serr != nil || !sf.allowsRead(sc) {
+				continue
+			}
+			kept = append(kept, r)
+		}
+		refs = kept
 	}
 	return textResult(map[string]any{"changed": refs}), nil
 }

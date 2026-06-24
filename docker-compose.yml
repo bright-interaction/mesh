@@ -53,6 +53,11 @@ services:
       - "7474"
     environment:
       - MESH_UI_TOKEN=${MESH_UI_TOKEN:?set MESH_UI_TOKEN in /opt/mesh-hub/.env}
+      # Per-member login: point the UI at the hub's member DB so each teammate signs
+      # in with their own scoped account (instead of the shared MESH_UI_TOKEN). Must
+      # match the hub's vault.hub.db sibling. Omitting this silently falls back to the
+      # shared-token single login, so it stays pinned here to stop a deploy regressing it.
+      - MESH_UI_HUB_DB=/var/lib/mesh-hub/vault.hub.db
     volumes:
       - /var/lib/mesh-hub:/var/lib/mesh-hub
     healthcheck:
