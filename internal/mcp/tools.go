@@ -191,7 +191,14 @@ func (s *Server) toolReindex() (any, *rpcError) {
 	if err != nil {
 		return nil, internalErr(err)
 	}
-	g, _ := s.snapshot()
+	// Count from the graph THIS reconcile produced, not a fresh snapshot() that a
+	// concurrent watcher tick could have swapped underneath us, so the reported counts
+	// always describe this call's result. Fall back to the snapshot on a no-op pass
+	// (rec.Graph is nil when nothing changed).
+	g := rec.Graph
+	if g == nil {
+		g, _ = s.snapshot()
+	}
 	out := map[string]any{
 		"reindexed": rec.Reindexed,
 		"added":     rec.Added,
@@ -350,8 +357,8 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 	if a.Anchor != "" {
 		body = sectionByAnchor(body, a.Anchor)
 	}
-	_ = s.store.IncrMetric("fetches", 1)         // ROI telemetry (best-effort)
-	_ = s.store.IncrMetric("fetch:"+a.ID, 1)     // per-note reuse (most-reused list)
+	_ = s.store.IncrMetric("fetches", 1)     // ROI telemetry (best-effort)
+	_ = s.store.IncrMetric("fetch:"+a.ID, 1) // per-note reuse (most-reused list)
 	return rawText(body), nil
 }
 
@@ -479,7 +486,15 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 func sectionByAnchor(body, anchor string) string {
 	lines := strings.Split(body, "\n")
 	start, level := -1, 0
+	inFence := false
 	for i, ln := range lines {
+		if isCodeFence(ln) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue // a '#' line inside a code block is not a heading
+		}
 		h := strings.TrimLeft(ln, "#")
 		lvl := len(ln) - len(h)
 		if lvl >= 1 && lvl <= 6 && strings.HasPrefix(h, " ") {
@@ -493,8 +508,16 @@ func sectionByAnchor(body, anchor string) string {
 		return body // anchor not found; hand back the whole note
 	}
 	end := len(lines)
+	inFence = false
 	for i := start + 1; i < len(lines); i++ {
 		ln := lines[i]
+		if isCodeFence(ln) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue // do not let a '#' inside a fenced block end the section early
+		}
 		h := strings.TrimLeft(ln, "#")
 		lvl := len(ln) - len(h)
 		if lvl >= 1 && lvl <= level && strings.HasPrefix(h, " ") {
@@ -503,6 +526,12 @@ func sectionByAnchor(body, anchor string) string {
 		}
 	}
 	return strings.Join(lines[start:end], "\n")
+}
+
+// isCodeFence reports whether a line opens or closes a fenced code block (``` / ~~~).
+func isCodeFence(ln string) bool {
+	t := strings.TrimLeft(ln, " \t")
+	return strings.HasPrefix(t, "```") || strings.HasPrefix(t, "~~~")
 }
 
 func slugify(s string) string {

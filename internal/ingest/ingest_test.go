@@ -176,13 +176,16 @@ func TestNotionIngestTitle(t *testing.T) {
 	}
 }
 
-type fakeConn struct{ sinces []time.Time }
+type fakeConn struct {
+	sinces    []time.Time
+	truncated bool // when true, Pull reports a truncated window
+}
 
 func (f *fakeConn) Name() string { return "fake" }
 func (f *fakeConn) Key() string  { return "fake:1" }
-func (f *fakeConn) Pull(_ context.Context, since time.Time) ([]Doc, error) {
+func (f *fakeConn) Pull(_ context.Context, since time.Time) ([]Doc, bool, error) {
 	f.sinces = append(f.sinces, since)
-	return []Doc{{ExternalID: "x", Title: "X", CreatedAt: "2026-01-01"}}, nil
+	return []Doc{{ExternalID: "x", Title: "X", CreatedAt: "2026-01-01"}}, f.truncated, nil
 }
 
 func TestIncrementalHighWaterMark(t *testing.T) {
@@ -209,5 +212,35 @@ func TestIncrementalHighWaterMark(t *testing.T) {
 	}
 	if _, err := os.Stat(statePath(vault)); err != nil {
 		t.Fatalf("state file not written: %v", err)
+	}
+}
+
+// A truncated pull (the connector hit its page cap with more upstream) must NOT
+// advance the high-water mark, so the un-pulled tail is re-fetched next run instead
+// of being silently skipped forever. Regression test for the ingest data-loss bug.
+func TestIncrementalTruncatedDoesNotAdvanceMark(t *testing.T) {
+	vault := t.TempDir()
+	fc := &fakeConn{truncated: true}
+	if _, err := RunIncremental(context.Background(), vault, fc, Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RunIncremental(context.Background(), vault, fc, Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	// Both runs must see a zero `since`: a truncated first run must not have stamped a
+	// mark, so the second run still pulls the whole window.
+	if !fc.sinces[0].IsZero() || !fc.sinces[1].IsZero() {
+		t.Fatalf("truncated pull advanced the mark: sinces=%v, want both zero", fc.sinces)
+	}
+	// Once the connector reports a complete window, the mark advances again.
+	fc.truncated = false
+	if _, err := RunIncremental(context.Background(), vault, fc, Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RunIncremental(context.Background(), vault, fc, Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	if fc.sinces[3].IsZero() {
+		t.Fatalf("mark not applied after a complete (non-truncated) pull")
 	}
 }

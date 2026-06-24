@@ -42,5 +42,7 @@ func (s *Store) LoadGraph() (*graph.Graph, error) {
 		}
 		g.AddEdge(e)
 	}
+	// Match BuildGraph: recompute degrees in a final pass so both paths agree exactly.
+	g.RecomputeDegrees()
 	return g, erows.Err()
 }

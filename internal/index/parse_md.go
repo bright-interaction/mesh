@@ -289,6 +289,11 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			addRef(r, 0)
 		}
 	}
+	// Degrees are computed in a final pass so they do not depend on the interleaved
+	// AddNode/AddEdge order above (an edge to a later note would otherwise undercount
+	// that note's inbound degree). This keeps BuildGraph's degrees identical to
+	// LoadGraph's, so the MCP (BuildGraph) and CLI (LoadGraph) retrieval paths agree.
+	g.RecomputeDegrees()
 	return g, issues
 }
 

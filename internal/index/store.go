@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -22,6 +23,7 @@ type Store struct {
 	readDB  *sql.DB
 	jobs    chan job
 	done    chan struct{}
+	wg      sync.WaitGroup // tracks the writer goroutine so Close can join it
 }
 
 // SchemaVersion bumps whenever schema.sql changes shape. The index is a derived,
@@ -86,9 +88,20 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		jobs:    make(chan job),
 		done:    make(chan struct{}),
 	}
+	s.wg.Add(1)
 	go s.writer()
 	return s, nil
 }
+
+// dropOnVersionChange lists the tables wiped and rebuilt on a schema-version change.
+// It must be every table in schema.sql EXCEPT those in schemaKeep. A test asserts it
+// stays in sync with schema.sql so a newly-added table cannot silently leak stale
+// rows (or an orphaned renamed table) on a version bump.
+var dropOnVersionChange = []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health"}
+
+// schemaKeep are tables deliberately preserved across a schema-version rebuild:
+// metrics holds accumulated usage counters that are NOT re-derivable from the vault.
+var schemaKeep = map[string]bool{"metrics": true}
 
 // ensureSchema applies the schema, dropping and rebuilding if the stored version
 // differs. No data is lost that matters: everything is re-derivable from the
@@ -98,9 +111,7 @@ func ensureSchema(db *sql.DB) error {
 	// meta may not exist yet; ignore the scan error in that case.
 	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&current)
 	if current != 0 && current != SchemaVersion {
-		// metrics is intentionally NOT dropped: usage counters are accumulated, not
-		// re-derivable, so they survive a schema-version rebuild.
-		for _, t := range []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health"} {
+		for _, t := range dropOnVersionChange {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				return err
 			}
@@ -147,6 +158,7 @@ func (s *Store) NoteDates() (map[string]NoteDate, error) {
 }
 
 func (s *Store) writer() {
+	defer s.wg.Done()
 	for {
 		select {
 		case <-s.done:
@@ -163,6 +175,16 @@ func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
 		return err
 	}
 	defer func() {
+		// A panic in fn (a nil deref on malformed parsed data, a panic inside Exec)
+		// must never kill the single writer goroutine: a dead writer would leave every
+		// future Write blocked forever on the jobs channel. Recover it into an error so
+		// the writer keeps serving and the caller is told what happened. This mirrors
+		// the hub Store, which already guards this.
+		if r := recover(); r != nil {
+			_ = tx.Rollback()
+			err = fmt.Errorf("index write panicked: %v", r)
+			return
+		}
 		if err != nil {
 			_ = tx.Rollback()
 		}
@@ -192,10 +214,12 @@ func (s *Store) Count(table string) (int, error) {
 	return n, err
 }
 
-// Close stops the writer goroutine and closes both pools. Callers must ensure no
-// Write is in flight (M0 indexing is sequential; the watcher will own lifecycle).
+// Close stops the writer goroutine and closes both pools. It waits for the writer to
+// drain any in-flight transaction before closing the pools, so a write racing
+// shutdown completes cleanly instead of hitting a closed DB.
 func (s *Store) Close() error {
 	close(s.done)
+	s.wg.Wait()
 	errW := s.writeDB.Close()
 	errR := s.readDB.Close()
 	if errW != nil {

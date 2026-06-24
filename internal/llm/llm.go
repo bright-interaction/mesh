@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -26,6 +27,10 @@ import (
 	"strings"
 	"time"
 )
+
+// maxLLMResponseBytes bounds an LLM endpoint's response so a hostile/misconfigured
+// (operator-editable) endpoint cannot OOM the process; a chat completion is small.
+const maxLLMResponseBytes = 32 << 20
 
 // ErrRateLimited (429) is transient: the caller should back off and retry the
 // whole pass later, not hammer the rest of the batch.
@@ -226,7 +231,7 @@ func (a *anthropic) Complete(ctx context.Context, system, user string) (string, 
 			Text string `json:"text"`
 		} `json:"content"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxLLMResponseBytes)).Decode(&out); err != nil {
 		return "", fmt.Errorf("anthropic decode: %w", err)
 	}
 	if out.StopReason == "max_tokens" {
@@ -287,7 +292,7 @@ func (o *openaiCompat) Complete(ctx context.Context, system, user string) (strin
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxLLMResponseBytes)).Decode(&out); err != nil {
 		return "", fmt.Errorf("local llm decode: %w", err)
 	}
 	if len(out.Choices) == 0 || strings.TrimSpace(out.Choices[0].Message.Content) == "" {

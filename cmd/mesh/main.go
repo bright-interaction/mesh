@@ -1220,7 +1220,18 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 		}
 		srv.HandleHTTP(w, r)
 	})
-	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// Full timeouts (mirroring the hub server) so a slow/idle client cannot pin a
+	// connection: ReadHeaderTimeout alone leaves a byte-by-byte body unreaped and
+	// keep-alive connections accumulating.
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 16,
+	}
 	fmt.Fprintf(os.Stderr, "mesh mcp: serving HTTP at %s/mcp (auth: %v)\n", addr, token != "")
 	return httpSrv.ListenAndServe()
 }
@@ -1374,6 +1385,9 @@ func syncCmd() *cobra.Command {
 				for _, sib := range sum.Protected {
 					fmt.Printf("  protected your unsaved local edit; incoming hub version saved at %s\n", sib)
 				}
+				for _, rej := range sum.Rejected {
+					fmt.Printf("  rejected by hub (no write permission, scope, or too large): %s -- kept local, will retry\n", rej)
+				}
 				return nil
 			}
 
@@ -1416,13 +1430,16 @@ func syncCmd() *cobra.Command {
 					// Log a sync-centric line ourselves only when something moved, then
 					// return Reindexed:false so the watcher does not also log its
 					// generic reindex line.
-					if sum.Pushed > 0 || sum.Pulled > 0 || sum.Conflicts > 0 || len(sum.Protected) > 0 {
+					if sum.Pushed > 0 || sum.Pulled > 0 || sum.Conflicts > 0 || len(sum.Protected) > 0 || len(sum.Rejected) > 0 {
 						logf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
 						for _, sib := range sum.ConflictSiblings {
 							logf("  conflict: hub version kept; your version saved at %s", sib)
 						}
 						for _, sib := range sum.Protected {
 							logf("  protected your local edit; incoming hub version saved at %s", sib)
+						}
+						for _, rej := range sum.Rejected {
+							logf("  rejected by hub (permission/scope/too large): %s -- kept local, will retry", rej)
 						}
 					}
 					return watch.Result{Reindexed: false}, nil

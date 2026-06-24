@@ -8,6 +8,8 @@
 // CodeFile values and lets the index package persist them.
 package code
 
+import "unicode/utf8"
+
 // CodeFile is one parsed source file. Identity is the root-relative path; source
 // files carry no stable frontmatter id, so a rename is a delete+add that the drift
 // reconciler resolves by path, exactly as it does for an untitled note.
@@ -38,10 +40,17 @@ type Symbol struct {
 const sigMax = 240
 
 // truncSig collapses whitespace in a raw declaration slice and caps its length.
+// The cap walks back to a rune boundary so a multibyte rune is never sliced in half,
+// which would store invalid UTF-8 into the code_search FTS5 table (the note path's
+// NoteDocs already does this; this mirrors it).
 func truncSig(s string) string {
 	out := collapseWS(s)
-	if len(out) > sigMax {
-		return out[:sigMax] + "..."
+	if len(out) <= sigMax {
+		return out
 	}
-	return out
+	cut := sigMax
+	for cut > 0 && !utf8.RuneStart(out[cut]) {
+		cut--
+	}
+	return out[:cut] + "..."
 }

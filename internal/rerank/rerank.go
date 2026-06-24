@@ -14,11 +14,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 )
+
+// maxRerankResponseBytes bounds a rerank endpoint's response (a small score list);
+// the operator-configurable endpoint must not be able to OOM the process.
+const maxRerankResponseBytes = 16 << 20
 
 // Result is one document's rerank score. Index is the document's position in the
 // slice passed to Rerank; Score is the cross-encoder relevance (higher = more
@@ -95,7 +100,7 @@ func (h *HTTP) Rerank(ctx context.Context, query string, docs []string) ([]Resul
 			RelevanceScore float64 `json:"relevance_score"`
 		} `json:"results"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxRerankResponseBytes)).Decode(&out); err != nil {
 		return nil, err
 	}
 	results := make([]Result, 0, len(out.Results))

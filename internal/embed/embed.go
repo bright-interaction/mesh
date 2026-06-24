@@ -10,12 +10,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
+
+// maxEmbedResponseBytes bounds an embedding endpoint's response. A batch of vectors
+// is large (N texts x dim floats as JSON), so this is generous, but it still stops an
+// unbounded/hostile body from OOMing the process (the client timeout bounds time only).
+const maxEmbedResponseBytes = 256 << 20
 
 // Embedder turns text into vectors. Implementations must be deterministic for a
 // given model so a vault's vectors stay comparable. Dim() is the vector width;
@@ -98,7 +104,9 @@ func (h *HTTP) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 			Index     int       `json:"index"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	// Cap the response read: the endpoint is operator/config-controlled (and editable
+	// at runtime via the web config API), so an unbounded body could OOM the process.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxEmbedResponseBytes)).Decode(&out); err != nil {
 		return nil, err
 	}
 	if len(out.Data) != len(texts) {
