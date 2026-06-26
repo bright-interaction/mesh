@@ -35,6 +35,45 @@ type ConnectorConfig struct {
 	JQL     string `json:"jql,omitempty"`     // jira (optional)
 }
 
+// InstanceKey is the stable per-instance id, matching the built connector's Key().
+// It needs no token, so callers (e.g. the hub Integrations UI) can look up a
+// connector's saved high-water mark / last-run without constructing the connector.
+func (cc ConnectorConfig) InstanceKey() string {
+	switch cc.Type {
+	case "github":
+		return "github:" + cc.Owner + "/" + cc.Repo
+	case "slack":
+		return "slack:" + cc.Channel
+	case "jira":
+		return "jira:" + cc.Site
+	case "linear":
+		return "linear"
+	case "notion":
+		return "notion"
+	default:
+		return cc.Type
+	}
+}
+
+// TokenEnv names the env var that holds this connector type's token (so a UI can
+// report whether it is configured without ever reading the value).
+func TokenEnv(connectorType string) string {
+	switch connectorType {
+	case "github":
+		return "MESH_INGEST_GITHUB_TOKEN"
+	case "slack":
+		return "MESH_INGEST_SLACK_TOKEN"
+	case "linear":
+		return "MESH_INGEST_LINEAR_TOKEN"
+	case "jira":
+		return "MESH_INGEST_JIRA_TOKEN"
+	case "notion":
+		return "MESH_INGEST_NOTION_TOKEN"
+	default:
+		return ""
+	}
+}
+
 // LoadConfig reads .mesh/ingest.json (absent = empty config, not an error).
 func LoadConfig(vaultRoot string) (Config, error) {
 	var c Config
