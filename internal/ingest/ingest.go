@@ -72,32 +72,46 @@ func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (R
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return Result{}, err
 	}
-	now := time.Now().Format("2006-01-02")
+	_ = dir // ensured above; RenderDoc returns a path under it
 	written := 0
 	for _, d := range docs {
-		id := c.Name() + "-" + vault.Slugify(d.ExternalID)
-		fm := &vault.Frontmatter{
-			ID:         id,
-			Type:       vault.TypeNote,
-			Title:      d.Title,
-			When:       firstNonEmpty(d.CreatedAt, now),
-			Created:    firstNonEmpty(d.CreatedAt, now),
-			Tags:       vault.StringList{"imported", c.Name()},
-			Author:     d.Author,
-			Source:     "import:" + c.Name(),
-			SourceURL:  d.SourceURL,
-			ImportedAt: now,
-		}
-		content, err := renderImported(fm, d.Body)
+		rel, content, err := RenderDoc(c.Name(), d)
 		if err != nil {
 			return Result{}, err
 		}
-		if err := os.WriteFile(filepath.Join(dir, id+".md"), []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(vaultRoot, rel), content, 0o644); err != nil {
 			return Result{}, err
 		}
 		written++
 	}
 	return Result{Connector: c.Name(), Pulled: len(docs), Written: written, Folder: folder, Truncated: truncated}, nil
+}
+
+// RenderDoc renders one imported Doc to its vault-relative path and provenance-
+// stamped markdown, WITHOUT touching disk. The hub uses this to commit imports
+// through its git repo (a Change) instead of writing files; Run uses it for the
+// local CLI path. The path is deterministic per (connector, ExternalID) so a
+// re-pull upserts the same note.
+func RenderDoc(connectorName string, d Doc) (relPath string, content []byte, err error) {
+	now := time.Now().Format("2006-01-02")
+	id := connectorName + "-" + vault.Slugify(d.ExternalID)
+	fm := &vault.Frontmatter{
+		ID:         id,
+		Type:       vault.TypeNote,
+		Title:      d.Title,
+		When:       firstNonEmpty(d.CreatedAt, now),
+		Created:    firstNonEmpty(d.CreatedAt, now),
+		Tags:       vault.StringList{"imported", connectorName},
+		Author:     d.Author,
+		Source:     "import:" + connectorName,
+		SourceURL:  d.SourceURL,
+		ImportedAt: now,
+	}
+	s, err := renderImported(fm, d.Body)
+	if err != nil {
+		return "", nil, err
+	}
+	return filepath.ToSlash(filepath.Join("imported", connectorName, id+".md")), []byte(s), nil
 }
 
 // Opts controls an incremental run.
