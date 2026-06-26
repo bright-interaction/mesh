@@ -244,3 +244,4 @@ func TestIncrementalTruncatedDoesNotAdvanceMark(t *testing.T) {
 		t.Fatalf("mark not applied after a complete (non-truncated) pull")
 	}
 }
+

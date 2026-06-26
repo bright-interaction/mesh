@@ -48,7 +48,7 @@ type linearResp struct {
 func (l *Linear) Pull(ctx context.Context, since time.Time) ([]Doc, bool, error) {
 	cl := l.Client
 	if cl == nil {
-		cl = &http.Client{Timeout: 30 * time.Second}
+		cl = safeClient(30 * time.Second)
 	}
 	endpoint := "https://api.linear.app/graphql"
 	if b := strings.TrimRight(apiBaseOverride, "/"); b != "" {

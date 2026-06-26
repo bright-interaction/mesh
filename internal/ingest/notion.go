@@ -46,7 +46,7 @@ type notionProperty struct {
 func (n *Notion) Pull(ctx context.Context, since time.Time) ([]Doc, bool, error) {
 	cl := n.Client
 	if cl == nil {
-		cl = &http.Client{Timeout: 30 * time.Second}
+		cl = safeClient(30 * time.Second)
 	}
 	endpoint := "https://api.notion.com/v1/search"
 	if b := strings.TrimRight(apiBaseOverride, "/"); b != "" {

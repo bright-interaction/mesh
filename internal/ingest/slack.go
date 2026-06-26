@@ -42,7 +42,7 @@ func (s *Slack) Pull(ctx context.Context, since time.Time) ([]Doc, bool, error) 
 	}
 	cl := s.Client
 	if cl == nil {
-		cl = &http.Client{Timeout: 30 * time.Second}
+		cl = safeClient(30 * time.Second)
 	}
 	base := "https://slack.com/api"
 	if b := strings.TrimRight(apiBaseOverride, "/"); b != "" {

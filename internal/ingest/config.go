@@ -3,6 +3,7 @@ package ingest
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 )
@@ -107,6 +108,11 @@ func (cc ConnectorConfig) Build() (Connector, error) {
 	case "jira":
 		if cc.Site == "" {
 			return nil, fmt.Errorf("jira connector needs site")
+		}
+		// Reject anything but an https URL with a host at save time (UX + a first
+		// guard); the runtime safeClient is what actually blocks SSRF to private IPs.
+		if u, err := url.Parse(cc.Site); err != nil || u.Scheme != "https" || u.Host == "" {
+			return nil, fmt.Errorf("jira site must be an https URL, e.g. https://acme.atlassian.net")
 		}
 		return &Jira{Site: cc.Site, Email: cc.Email, Token: os.Getenv("MESH_INGEST_JIRA_TOKEN"), JQL: cc.JQL}, nil
 	case "notion":
