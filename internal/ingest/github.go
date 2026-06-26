@@ -39,7 +39,7 @@ func (g *GitHub) Pull(ctx context.Context, since time.Time) ([]Doc, bool, error)
 	}
 	cl := g.Client
 	if cl == nil {
-		cl = &http.Client{Timeout: 30 * time.Second}
+		cl = safeClient(30 * time.Second)
 	}
 	base := "https://api.github.com"
 	if b := strings.TrimRight(apiBaseOverride, "/"); b != "" {
