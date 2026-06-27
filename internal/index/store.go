@@ -97,11 +97,16 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 // It must be every table in schema.sql EXCEPT those in schemaKeep. A test asserts it
 // stays in sync with schema.sql so a newly-added table cannot silently leak stale
 // rows (or an orphaned renamed table) on a version bump.
-var dropOnVersionChange = []string{"notes", "nodes", "edges", "vectors", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health"}
+var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health"}
 
 // schemaKeep are tables deliberately preserved across a schema-version rebuild:
-// metrics holds accumulated usage counters that are NOT re-derivable from the vault.
-var schemaKeep = map[string]bool{"metrics": true}
+//   - metrics: accumulated usage counters, NOT re-derivable from the vault.
+//   - vectors: BYOAI embeddings + the content-hash embed cache. These ARE derivable
+//     but only by RE-EMBEDDING every chunk (a paid API call), and reindex does not
+//     re-embed; they stay keyed by the same note ids and the note_hash staleness
+//     check excludes any whose content changed. So a notes-shape bump must not wipe
+//     them. (If the vectors table's OWN shape ever changes, drop it for that release.)
+var schemaKeep = map[string]bool{"metrics": true, "vectors": true}
 
 // ensureSchema applies the schema, dropping and rebuilding if the stored version
 // differs. No data is lost that matters: everything is re-derivable from the
