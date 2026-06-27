@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // scopedServer builds a server over a vault with two notes in distinct scopes, each
@@ -86,6 +88,114 @@ func TestHealthScopeFilter(t *testing.T) {
 	counts, _ := res["counts"].(map[string]any)
 	if counts["overdue"] != float64(1) {
 		t.Fatalf("scoped overdue count = %v, want 1", counts["overdue"])
+	}
+}
+
+// seedCode indexes one source symbol so the code tools have something to return, and
+// returns the symbol name to query for.
+func seedCode(t *testing.T, s *Server) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "x.go"), []byte("package x\n\nfunc UniqueWidgetMaker() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.ReindexCode(s.store, []string{root}, nil); err != nil {
+		t.Fatal(err)
+	}
+	return "UniqueWidgetMaker"
+}
+
+func codeCount(t *testing.T, out any) int {
+	t.Helper()
+	res := toolJSON(t, out)
+	if c, ok := res["count"].(float64); ok {
+		return int(c)
+	}
+	return len(asList(res["symbols"]))
+}
+
+// TestCodeSearchScopeGate: the source-code index is unscoped (dev-scoped) content, so
+// a scope-confined caller who cannot read the dev scope must get NO code symbols,
+// while an unrestricted or dev-scope caller still does. This is the leak the audit
+// flagged: code_search/neighbors predated scopes and took no ctx, bypassing the gate.
+func TestCodeSearchScopeGate(t *testing.T) {
+	s := scopedServer(t)
+	q := seedCode(t, s)
+
+	// Unrestricted (nil filter) finds the symbol.
+	out, rerr := s.toolCodeSearch(context.Background(), json.RawMessage(`{"query":"`+q+`"}`))
+	if rerr != nil {
+		t.Fatalf("unrestricted code search: %v", rerr)
+	}
+	if n := codeCount(t, out); n < 1 {
+		t.Fatalf("unrestricted code search = %d, want >=1", n)
+	}
+
+	// A dev-scope caller may read code (code is dev-scoped content).
+	dev := WithScopeFilter(context.Background(), &ScopeFilter{AllowedRead: map[string]bool{"dev": true}})
+	out, _ = s.toolCodeSearch(dev, json.RawMessage(`{"query":"`+q+`"}`))
+	if n := codeCount(t, out); n < 1 {
+		t.Fatalf("dev-scope code search = %d, want >=1", n)
+	}
+
+	// A non-dev scoped caller must NOT see code symbols.
+	teamA := WithScopeFilter(context.Background(), &ScopeFilter{AllowedRead: map[string]bool{"team-a": true}})
+	out, rerr = s.toolCodeSearch(teamA, json.RawMessage(`{"query":"`+q+`"}`))
+	if rerr != nil {
+		t.Fatalf("scoped code search: %v", rerr)
+	}
+	if n := codeCount(t, out); n != 0 {
+		t.Fatalf("scoped code search leaked %d symbols across scope", n)
+	}
+}
+
+// TestCodeNeighborsScopeGate: a non-dev scoped caller gets no call-graph neighbors.
+func TestCodeNeighborsScopeGate(t *testing.T) {
+	s := scopedServer(t)
+	seedCode(t, s)
+
+	teamA := WithScopeFilter(context.Background(), &ScopeFilter{AllowedRead: map[string]bool{"team-a": true}})
+	out, rerr := s.toolCodeNeighbors(teamA, json.RawMessage(`{"id":"code:x/x.go#UniqueWidgetMaker"}`))
+	if rerr != nil {
+		t.Fatalf("scoped code neighbors: %v", rerr)
+	}
+	res := toolJSON(t, out)
+	if len(asList(res["callers"])) != 0 || len(asList(res["callees"])) != 0 {
+		t.Fatalf("scoped code neighbors leaked edges: %v", res)
+	}
+	if res["note"] != "the source-code index is not in your access scope" {
+		t.Fatalf("scoped code neighbors missing deny note: %v", res)
+	}
+}
+
+// TestReindexCodeCountsScopeGate: mesh_reindex must not report code corpus volume to a
+// scope-confined caller (the aggregate-count leak the audit flagged). Code indexing is
+// enabled via env so reindexCode actually returns counts.
+func TestReindexCodeCountsScopeGate(t *testing.T) {
+	s := scopedServer(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "x.go"), []byte("package x\n\nfunc UniqueWidgetMaker() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MESH_CODE_INDEX", "1")
+	t.Setenv("MESH_CODE_ROOTS", root)
+
+	// A non-dev scoped caller must not learn the code corpus volume.
+	teamA := WithScopeFilter(context.Background(), &ScopeFilter{AllowedRead: map[string]bool{"team-a": true}})
+	out, rerr := s.toolReindex(teamA)
+	if rerr != nil {
+		t.Fatalf("scoped reindex: %v", rerr)
+	}
+	res := toolJSON(t, out)
+	if _, ok := res["code_symbols"]; ok {
+		t.Fatalf("scoped reindex leaked code counts: %v", res)
+	}
+
+	// An unrestricted caller still gets the counts.
+	out, _ = s.toolReindex(context.Background())
+	res = toolJSON(t, out)
+	if _, ok := res["code_symbols"]; !ok {
+		t.Fatalf("unrestricted reindex missing code counts: %v", res)
 	}
 }
 
