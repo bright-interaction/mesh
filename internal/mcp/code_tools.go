@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,12 +11,29 @@ import (
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 )
 
+// codeScopeDenied reports whether a scope-confined caller must be denied the
+// source-code index. Code symbols carry no per-note scope, so the whole index is
+// unscoped (dev-scoped) content, exactly like a note with no scope: a caller who
+// cannot read the dev scope must not be able to enumerate symbols, paths,
+// signatures, snippets, or the call graph for code outside their scope. A nil filter
+// (solo run, hub with no scoping, or an admin's unrestricted filter) denies nothing.
+func codeScopeDenied(ctx context.Context) bool {
+	sf := scopeFromCtx(ctx)
+	return sf != nil && !sf.allowsRead(nil) // allowsRead(nil) => AllowedRead["dev"]
+}
+
 // toolCodeSearch is the graphify replacement: FTS over the source-code symbol
 // index, ranked by name match. It returns symbol cards with a file:line locator so
 // an agent can jump straight to a definition instead of grepping the tree. It is
 // deliberately separate from mesh_search so locating a function never competes with
 // note retrieval or the tier-0 budget.
-func (s *Server) toolCodeSearch(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolCodeSearch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
+	if codeScopeDenied(ctx) {
+		return textResult(map[string]any{
+			"symbols": []map[string]any{}, "count": 0,
+			"note": "the source-code index is not in your access scope",
+		}), nil
+	}
 	var a struct {
 		Query     string   `json:"query"`
 		Limit     int      `json:"limit"`
@@ -47,13 +65,19 @@ func (s *Server) toolCodeSearch(raw json.RawMessage) (any, *rpcError) {
 // toolCodeNeighbors returns the call-graph neighbors of a symbol id: what it calls
 // (callees) and what calls it (callers). Edges exist for Go; other languages return
 // empty lists (the declaration scanner locates symbols but does not trace calls).
-func (s *Server) toolCodeNeighbors(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolCodeNeighbors(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		ID string `json:"id"`
 	}
 	json.Unmarshal(raw, &a)
 	if strings.TrimSpace(a.ID) == "" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "id required"}
+	}
+	if codeScopeDenied(ctx) {
+		return textResult(map[string]any{
+			"id": a.ID, "callers": []map[string]any{}, "callees": []map[string]any{},
+			"note": "the source-code index is not in your access scope",
+		}), nil
 	}
 	callers, callees, err := s.store.CodeNeighbors(a.ID)
 	if err != nil {

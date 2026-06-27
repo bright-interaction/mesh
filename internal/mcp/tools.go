@@ -168,13 +168,13 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	case "mesh_write_entity":
 		return s.toolWrite(ctx, p.Arguments, "entity")
 	case "mesh_reindex":
-		return s.toolReindex()
+		return s.toolReindex(ctx)
 	case "mesh_health":
 		return s.toolHealth(ctx, p.Arguments)
 	case "mesh_code_search":
-		return s.toolCodeSearch(p.Arguments)
+		return s.toolCodeSearch(ctx, p.Arguments)
 	case "mesh_code_neighbors":
-		return s.toolCodeNeighbors(p.Arguments)
+		return s.toolCodeNeighbors(ctx, p.Arguments)
 	case "mesh_setup_hooks":
 		return s.toolSetupHooks(p.Arguments)
 	default:
@@ -186,7 +186,7 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 // directly (via the editor or CLI) can make its edits queryable on demand, instead
 // of waiting on the --watch debounce or restarting a no-watch server. Authoritative
 // = full content-hash check, so it also catches an edit that did not move the mtime.
-func (s *Server) toolReindex() (any, *rpcError) {
+func (s *Server) toolReindex(ctx context.Context) (any, *rpcError) {
 	rec, err := s.reconcileOnce(true)
 	if err != nil {
 		return nil, internalErr(err)
@@ -209,8 +209,11 @@ func (s *Server) toolReindex() (any, *rpcError) {
 		"ms":        rec.Dur.Milliseconds(),
 	}
 	// Refresh the source-code index too, so one mesh_reindex catches both note and
-	// code edits. ok=false means code indexing is not enabled for this vault.
-	if cs, ok, cerr := s.reindexCode(); ok && cerr == nil {
+	// code edits. ok=false means code indexing is not enabled for this vault. The
+	// counts are only returned to callers who may read the (dev-scoped) code index;
+	// a scope-confined caller must not learn the code corpus volume (still refreshed,
+	// just not reported), mirroring the code_search/neighbors gate.
+	if cs, ok, cerr := s.reindexCode(); ok && cerr == nil && !codeScopeDenied(ctx) {
 		out["code_files"] = cs.Files
 		out["code_symbols"] = cs.Symbols
 		out["code_edges"] = cs.Edges
