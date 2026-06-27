@@ -191,6 +191,27 @@ func (s *Server) toolCommunity(ctx context.Context, raw json.RawMessage) (any, *
 
 // communityMembers returns the readable notes in a community (highest-degree first,
 // capped) plus the true total readable count.
+// scopedGraphCounts returns the node count and edge count VISIBLE to a scoped caller:
+// only readable nodes, and only edges whose endpoints are both readable (so an edge
+// never reveals an out-of-scope node exists). Used by mesh_reindex to report the
+// caller's own view instead of leaking global volume across scopes.
+func scopedGraphCounts(g *graph.Graph, sf *ScopeFilter) (nodes, edges int) {
+	readable := map[string]bool{}
+	for _, n := range g.Nodes() {
+		if sf.allowsNode(n) {
+			readable[n.ID] = true
+		}
+	}
+	for id := range readable {
+		for _, e := range g.Neighbors(id) {
+			if readable[e.Target] {
+				edges++
+			}
+		}
+	}
+	return len(readable), edges
+}
+
 func communityMembers(g *graph.Graph, comm, limit int, sf *ScopeFilter) (members []memberRef, total int) {
 	for _, n := range g.Nodes() {
 		if n.Kind != "note" || n.Community != comm || !sf.allowsNode(n) {

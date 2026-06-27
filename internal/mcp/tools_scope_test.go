@@ -199,6 +199,45 @@ func TestReindexCodeCountsScopeGate(t *testing.T) {
 	}
 }
 
+// TestReindexNoteCountsScopeGate: mesh_reindex must report only the caller's readable
+// graph view and omit the global reconcile deltas, so a scoped caller cannot learn the
+// volume of notes outside their scope.
+func TestReindexNoteCountsScopeGate(t *testing.T) {
+	s := scopedServer(t) // note-a (team-a) + note-b (team-b)
+
+	// Unrestricted: full graph totals + deltas present.
+	out, rerr := s.toolReindex(context.Background())
+	if rerr != nil {
+		t.Fatalf("unrestricted reindex: %v", rerr)
+	}
+	full := toolJSON(t, out)
+	if _, ok := full["added"]; !ok {
+		t.Fatalf("unrestricted reindex missing deltas: %v", full)
+	}
+	globalNodes, ok := full["nodes"].(float64)
+	if !ok || globalNodes < 2 {
+		t.Fatalf("unrestricted nodes = %v, want >=2 (both notes)", full["nodes"])
+	}
+
+	// team-a: readable view only, no global deltas.
+	teamA := WithScopeFilter(context.Background(), &ScopeFilter{AllowedRead: map[string]bool{"team-a": true}})
+	out, rerr = s.toolReindex(teamA)
+	if rerr != nil {
+		t.Fatalf("scoped reindex: %v", rerr)
+	}
+	scoped := toolJSON(t, out)
+	if _, ok := scoped["added"]; ok {
+		t.Fatalf("scoped reindex leaked global deltas: %v", scoped)
+	}
+	sn, ok := scoped["nodes"].(float64)
+	if !ok || sn < 1 {
+		t.Fatalf("scoped nodes = %v, want >=1 (team-a sees its own note)", scoped["nodes"])
+	}
+	if sn >= globalNodes {
+		t.Fatalf("scoped nodes=%v should be < global=%v (note-b's subgraph hidden)", sn, globalNodes)
+	}
+}
+
 func changedIDs(t *testing.T, out any) []string {
 	t.Helper()
 	res := toolJSON(t, out)

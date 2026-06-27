@@ -201,12 +201,20 @@ func (s *Server) toolReindex(ctx context.Context) (any, *rpcError) {
 	}
 	out := map[string]any{
 		"reindexed": rec.Reindexed,
-		"added":     rec.Added,
-		"changed":   rec.Changed,
-		"removed":   rec.Removed,
-		"nodes":     g.NodeCount(),
-		"edges":     g.EdgeCount(),
 		"ms":        rec.Dur.Milliseconds(),
+	}
+	// A scope-confined caller must not learn out-of-scope volume: the global graph
+	// totals AND the reconcile deltas (added/changed/removed, which span every scope)
+	// leak it. Report only the caller's readable view; an unrestricted caller (nil
+	// filter or nil AllowedRead, e.g. an admin or a solo run) gets the full numbers.
+	if sf := scopeFromCtx(ctx); sf != nil && sf.AllowedRead != nil {
+		out["nodes"], out["edges"] = scopedGraphCounts(g, sf)
+	} else {
+		out["added"] = rec.Added
+		out["changed"] = rec.Changed
+		out["removed"] = rec.Removed
+		out["nodes"] = g.NodeCount()
+		out["edges"] = g.EdgeCount()
 	}
 	// Refresh the source-code index too, so one mesh_reindex catches both note and
 	// code edits. ok=false means code indexing is not enabled for this vault. The
