@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/bright-interaction/mesh/internal/buildinfo"
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/retrieve"
@@ -168,7 +169,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusInternalServerError)
 		return
 	}
-	body = []byte(strings.ReplaceAll(string(body), "__MESH_BASE__", s.baseHref()))
+	html := strings.ReplaceAll(string(body), "__MESH_BASE__", s.baseHref())
+	html = strings.ReplaceAll(html, "__MESH_AGPL__", buildinfo.FooterInline())
+	body = []byte(html)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(body)
