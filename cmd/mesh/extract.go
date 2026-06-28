@@ -26,6 +26,7 @@ func extractCmd() *cobra.Command {
 	var n, concurrency, maxChars int
 	var asJSON bool
 	var toPending, dedupVault string
+	var recurring bool
 	c := &cobra.Command{
 		Use:   "extract [transcript.jsonl]",
 		Short: "Extract candidate write-back notes from a session transcript (--benchmark to grade vs manual write-back)",
@@ -40,6 +41,12 @@ func extractCmd() *cobra.Command {
 					return fmt.Errorf("--benchmark needs a directory of transcripts")
 				}
 				return runExtractBenchmark(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON, dedupVault)
+			}
+			if recurring {
+				if len(args) < 1 {
+					return fmt.Errorf("--recurring needs a directory of transcripts")
+				}
+				return runRecurring(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON)
 			}
 			if len(args) < 1 {
 				return fmt.Errorf("usage: mesh extract <transcript.jsonl>  (or --benchmark <dir>)")
@@ -67,7 +74,87 @@ func extractCmd() *cobra.Command {
 	c.Flags().BoolVar(&asJSON, "json", false, "benchmark: emit JSON instead of a report")
 	c.Flags().StringVar(&toPending, "to-pending", "", "persist extracted candidates to this vault's review queue instead of printing")
 	c.Flags().StringVar(&dedupVault, "dedup-vault", "", "benchmark: dedup candidates against this vault and report fresh vs already-known")
+	c.Flags().BoolVar(&recurring, "recurring", false, "find problems that RECUR across sessions (systemic issues), not one-offs")
 	return c
+}
+
+// runRecurring extracts candidates from many transcripts and clusters them by
+// similarity to surface SYSTEMIC issues: a learning that recurs across multiple
+// sessions is worth a permanent fix, not just another write-back.
+func runRecurring(ctx context.Context, client llm.Client, dir string, n, concurrency, maxChars int, asJSON bool) error {
+	files, err := sampleTranscripts(dir, n)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no usable transcripts in %s", dir)
+	}
+	if concurrency < 1 {
+		concurrency = 4
+	}
+	if !asJSON {
+		fmt.Fprintf(os.Stderr, "extracting from %d transcripts via %s...\n", len(files), client.Describe())
+	}
+	var mu sync.Mutex
+	var occs []extract.Occurrence
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, f := range files {
+		wg.Add(1)
+		go func(f string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			digest, _, e := extract.Digest(f, maxChars)
+			if e != nil {
+				return
+			}
+			cands, e := extract.Extract(ctx, client, digest)
+			if e != nil {
+				return
+			}
+			sess := filepath.Base(f)
+			mu.Lock()
+			for _, c := range cands {
+				occs = append(occs, extract.Occurrence{Cand: c, Session: sess})
+			}
+			mu.Unlock()
+		}(f)
+	}
+	wg.Wait()
+
+	clusters := extract.ClusterRecurring(occs, extract.DuplicateThreshold)
+	var recurringClusters []extract.Cluster
+	for _, c := range clusters {
+		if c.Count >= 2 {
+			recurringClusters = append(recurringClusters, c)
+		}
+	}
+	if asJSON {
+		b, _ := json.MarshalIndent(map[string]any{
+			"sessions": len(files), "candidates": len(occs),
+			"recurring": recurringClusters,
+		}, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+	fmt.Printf("\nRecurring problems across %d sessions (%d candidates extracted):\n", len(files), len(occs))
+	if len(recurringClusters) == 0 {
+		fmt.Println("  none yet: no learning recurred across 2+ sessions in this sample.")
+		return nil
+	}
+	for _, c := range recurringClusters {
+		fmt.Printf("\n* [%s] %s\n  recurred in %d sessions; a permanent fix beats re-learning it:\n", c.Rep.Type, c.Rep.Title, c.Count)
+		seen := map[string]bool{}
+		for _, m := range c.Members {
+			if seen[m.Title] {
+				continue
+			}
+			seen[m.Title] = true
+			fmt.Printf("    - %s\n", m.Title)
+		}
+	}
+	return nil
 }
 
 // writeToPending opens the vault index and stores extracted candidates in the review

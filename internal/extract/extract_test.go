@@ -86,6 +86,26 @@ func TestTitleSimilarity(t *testing.T) {
 	}
 }
 
+func TestClusterRecurring(t *testing.T) {
+	occs := []Occurrence{
+		{Cand: Candidate{Type: "gotcha", Title: "SSRF denylist must include Tailscale CGNAT range"}, Session: "s1"},
+		{Cand: Candidate{Type: "gotcha", Title: "SSRF denylists must include 100.64.0.0/10 for Tailscale"}, Session: "s2"},
+		{Cand: Candidate{Type: "decision", Title: "Mollie webhooks require re-fetch not signatures"}, Session: "s1"},
+	}
+	clusters := ClusterRecurring(occs, DuplicateThreshold)
+	if len(clusters) != 2 {
+		t.Fatalf("got %d clusters, want 2", len(clusters))
+	}
+	// The SSRF pair recurs across 2 sessions and sorts first.
+	if clusters[0].Count != 2 {
+		t.Fatalf("top cluster session count = %d, want 2 (%+v)", clusters[0].Count, clusters[0])
+	}
+	// The Mollie one is a one-off.
+	if clusters[1].Count != 1 {
+		t.Fatalf("second cluster count = %d, want 1", clusters[1].Count)
+	}
+}
+
 func TestExtractAndJudgeWithStub(t *testing.T) {
 	stub := llm.Func(func(_ context.Context, system, _ string) (string, error) {
 		if strings.Contains(system, "reviewing one candidate") {
