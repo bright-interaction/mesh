@@ -53,9 +53,14 @@ You are looking at `mesh ui`, the web app over one vault. The left rail:
   filters which nodes are visible by name.
 - **Search** runs the exact ranking an agent gets over the full text of every note,
   so you can see what it sees. (This is the real search; the graph box is just a filter.)
+- **Ask** answers a plain-language question from your notes and code, with citations.
+- **Dashboard** shows usage, tokens saved, knowledge health, and the flywheel reuse
+  rate (whether your written-back notes actually get used again).
+- **Review** is the queue of auto-extracted candidate notes to keep or discard, when
+  auto-extraction is enabled.
 - **Settings** is optional tuning (semantic search, ranking, rerank). Mesh works with
   none of it.
-- **Docs** is what you are reading now.
+- **Docs** is what you are reading now (start with the Overview for the full picture).
 - **API** documents the agent (MCP) tools and the HTTP API, with a copy-paste config.
 
 The viewer binds to `127.0.0.1` by default, so it is private to your machine. To

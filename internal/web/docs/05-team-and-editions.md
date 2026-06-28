@@ -15,6 +15,24 @@ to a `*.sync-conflict-*.md` sibling to resolve by hand. Deletes and renames
 propagate, and the hub authors git history attributed to each user. Add
 `mesh sync --watch` for real-time push.
 
+## Trust and access (team hub)
+
+A team hub is fail-closed and built for regulated teams:
+
+- **Roles**: owner > admin > member > viewer, enforced on every write and admin action.
+- **Access scopes**: horizontal partitions (for example `dev` and `sales`) so a member
+  only ever retrieves, syncs, or is answered from the notes in their scope. Every read
+  surface (search, fetch, neighbors, deltas, health, code tools, ask) is scope-filtered.
+- **Audit log**: joins, role changes, invites, syncs, and curation are recorded.
+- **GDPR**: per-user export and "forget" (revoke, tombstone authored notes, purge the
+  user's audit rows).
+- **SSO**: pluggable OIDC (Zitadel, Google, Okta, Entra, Auth0, any compliant issuer).
+- **Per-member web login**: each teammate signs in with their own scoped account.
+
+Everything runs on your own hardware (or an EU-resident hosted hub). The members and
+their seats are managed from the `/team` page; this app and an agent reach every
+capability with no shell.
+
 ## Editions
 
 Mesh is open core, dual-licensed:
