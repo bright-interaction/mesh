@@ -72,6 +72,20 @@ func TestParseCandidates(t *testing.T) {
 	}
 }
 
+func TestTitleSimilarity(t *testing.T) {
+	// A near-restatement of an existing note scores above the duplicate threshold.
+	cand := "SSRF denylists must include 100.64.0.0/10 for Tailscale"
+	existing := "SSRF denylist must include 100.64.0.0/10 (Tailscale); the backup repo script had drifted"
+	if s := TitleSimilarity(cand, existing); s < DuplicateThreshold {
+		t.Errorf("near-duplicate similarity = %.2f, want >= %.2f", s, DuplicateThreshold)
+	}
+	// A distinct note scores below it.
+	other := "Mollie webhooks require re-fetch, not signature verification"
+	if s := TitleSimilarity(cand, other); s >= DuplicateThreshold {
+		t.Errorf("distinct-note similarity = %.2f, want < %.2f", s, DuplicateThreshold)
+	}
+}
+
 func TestExtractAndJudgeWithStub(t *testing.T) {
 	stub := llm.Func(func(_ context.Context, system, _ string) (string, error) {
 		if strings.Contains(system, "reviewing one candidate") {
