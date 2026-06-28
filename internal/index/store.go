@@ -108,7 +108,9 @@ var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "c
 //     them. (If the vectors table's OWN shape ever changes, drop it for that release.)
 //   - note_reuse: the flywheel measurement (authoring time + observed reuse events),
 //     accumulated at runtime and NOT re-derivable from the vault.
-var schemaKeep = map[string]bool{"metrics": true, "vectors": true, "note_reuse": true}
+//   - pending_notes: auto-extracted write-back candidates awaiting review, not yet in
+//     the vault, so they would be lost on a rebuild if dropped.
+var schemaKeep = map[string]bool{"metrics": true, "vectors": true, "note_reuse": true, "pending_notes": true}
 
 // ensureSchema applies the schema, dropping and rebuilding if the stored version
 // differs. No data is lost that matters: everything is re-derivable from the

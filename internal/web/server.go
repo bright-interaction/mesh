@@ -132,6 +132,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/docs/{slug}", s.handleDoc)
 	mux.HandleFunc("GET /api/mcp-tools", s.handleMCPTools)
 	mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
+	mux.HandleFunc("GET /api/pending", s.handlePendingList)
+	mux.HandleFunc("POST /api/pending/promote", s.handlePendingPromote)
+	mux.HandleFunc("POST /api/pending/discard", s.handlePendingDiscard)
 	mux.HandleFunc("GET /openapi.json", s.handleOpenAPI)
 	var h http.Handler
 	if s.member != nil {

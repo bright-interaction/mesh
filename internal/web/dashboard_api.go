@@ -25,6 +25,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	top, _ := s.store.TopFetched(8)
 	health, _ := s.store.HealthCounts()
 	flywheel, _ := s.store.FlywheelStats()
+	pending, _ := s.store.PendingCount()
 
 	// Contributor leaderboard (top 8 by authored notes).
 	contribMap, _ := s.store.ContributorCounts()
@@ -52,5 +53,6 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"contributors":           contrib,
 		"health":                 health,
 		"flywheel":               flywheel,
+		"pending_review":         pending,
 	})
 }
