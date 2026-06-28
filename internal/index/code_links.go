@@ -42,35 +42,58 @@ func distinctive(tok string) bool {
 	return hasUpper && hasLower // mixedCase identifier
 }
 
-// LinkNotesToCode rebuilds note_code_links from note bodies + the code index. A token
-// links to a symbol when it equals the symbol name or its last segment (so a bare
-// `RecordReuse` matches `Store.RecordReuse`). Best-effort, capped per token to avoid a
-// common name fanning out to dozens of symbols. No-op when the code index is empty.
+// identRe pulls identifier-like tokens (Foo, Foo.Bar) out of a note TITLE, which is
+// short and high-signal, so a symbol it names links even without backticks.
+var identRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*`)
+
+// LinkNotesToCode rebuilds note_code_links from note titles + bodies + the code index.
+// A distinctive token links to a symbol when it equals the symbol name or its last
+// segment (so a bare `RecordReuse` matches `Store.RecordReuse`). Titles are scanned in
+// full (high signal); bodies only inside backticks (prose would be too noisy). Capped
+// per token so a common name does not fan out. No-op when the code index is empty.
 func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 	if n, _ := s.Count("code_symbols"); n == 0 {
 		_ = s.Write(func(tx *sql.Tx) error { _, e := tx.Exec(`DELETE FROM note_code_links`); return e })
 		return 0, nil
 	}
-	notes, err := s.noteList()
+	rows, err := s.readDB.Query(`SELECT id, path, title FROM notes`)
 	if err != nil {
 		return 0, err
 	}
+	type noteMeta struct{ id, path, title string }
+	var notes []noteMeta
+	for rows.Next() {
+		var nm noteMeta
+		if err := rows.Scan(&nm.id, &nm.path, &nm.title); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		notes = append(notes, nm)
+	}
+	rows.Close()
+
 	type link struct{ noteID, symID, name string }
 	var links []link
 	for _, n := range notes {
-		body, err := os.ReadFile(filepath.Join(vaultRoot, n.path))
-		if err != nil {
-			continue
-		}
 		seen := map[string]bool{}
-		for _, m := range backtickRe.FindAllStringSubmatch(string(body), -1) {
-			tok := strings.TrimSpace(m[1])
+		consider := func(tok string) {
+			tok = strings.TrimSpace(tok)
 			if seen[tok] || !distinctive(tok) {
-				continue
+				return
 			}
 			seen[tok] = true
 			for _, sym := range s.symbolsByName(tok, 5) {
 				links = append(links, link{n.id, sym.id, sym.name})
+			}
+		}
+		// Title: scan every identifier-like token (the note's subject).
+		for _, tok := range identRe.FindAllString(n.title, -1) {
+			consider(tok)
+		}
+		// Body: only backtick code spans (prose is too noisy for a full scan).
+		if body, err := os.ReadFile(filepath.Join(vaultRoot, n.path)); err == nil {
+			for _, m := range backtickRe.FindAllStringSubmatch(string(body), -1) {
+				consider(m[1])
 			}
 		}
 	}
