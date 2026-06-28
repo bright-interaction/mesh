@@ -386,8 +386,9 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 	if a.Anchor != "" {
 		body = sectionByAnchor(body, a.Anchor)
 	}
-	_ = s.store.IncrMetric("fetches", 1)     // ROI telemetry (best-effort)
-	_ = s.store.IncrMetric("fetch:"+a.ID, 1) // per-note reuse (most-reused list)
+	_ = s.store.IncrMetric("fetches", 1)            // ROI telemetry (best-effort)
+	_ = s.store.IncrMetric("fetch:"+a.ID, 1)        // per-note reuse (most-reused list)
+	_ = s.store.RecordReuse(a.ID, flywheelReuseGap) // flywheel: a later fetch = the next run inheriting it
 	return rawText(body), nil
 }
 
@@ -520,9 +521,15 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	if err := s.reload(); err != nil {
 		return nil, internalErr(err)
 	}
-	_ = s.store.IncrMetric("writes", 1) // ROI telemetry (best-effort)
+	_ = s.store.IncrMetric("writes", 1)         // ROI telemetry (best-effort)
+	_ = s.store.RecordWriteback(res.ID, source) // flywheel: stamp authoring time for reuse measurement
 	return textResult(map[string]any{"id": res.ID, "path": res.Path, "when": res.When, "todo": res.TODOs}), nil
 }
+
+// flywheelReuseGap is how long after a write-back a fetch must land to count as reuse
+// by a LATER session rather than a re-read inside the same work burst (the
+// cross-session proxy that works for both the solo CLI and the long-lived hub).
+const flywheelReuseGap = 600 // seconds (10 min)
 
 // sectionByAnchor returns the markdown of the heading section whose slug matches
 // anchor (from that heading until the next heading of the same or higher level).

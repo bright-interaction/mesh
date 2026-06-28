@@ -36,6 +36,34 @@
     return '<h2 class="panel-h" style="margin-top:1.6rem">' + esc(title) + "</h2>" + rows;
   }
 
+  // flywheelCard: the headline that says whether the flywheel actually compounds, i.e.
+  // whether written notes get reused by a LATER session (not just asserted to).
+  function flywheelCard(f) {
+    f = f || {};
+    if (!f.authored) {
+      return (
+        '<div style="border:1px solid #21262d;border-radius:12px;padding:1rem 1.1rem;margin-top:1.4rem">' +
+        '<div style="font:600 1.1rem/1 ui-monospace,monospace;color:#9da7b3">Flywheel: no write-backs tracked yet</div>' +
+        '<div style="font-size:.82rem;color:#6e7681;margin-top:.3rem">Once agents call mesh_append_note, this shows whether those notes get reused by later sessions.</div></div>'
+      );
+    }
+    const rate = (f.reuse_rate_pct || 0).toFixed(0);
+    const reused = (f.reuse_rate_pct || 0) > 0;
+    const accent = reused ? "#3fb950" : "#d29922";
+    const ttr = f.median_hours_to_reuse || 0;
+    const ttrLabel = ttr <= 0 ? "n/a" : ttr < 48 ? ttr.toFixed(1) + "h" : (ttr / 24).toFixed(1) + "d";
+    return (
+      '<div style="border:1px solid ' + (reused ? "#1f6f3a" : "#3a2a1b") + ';background:' + (reused ? "#0f1f15" : "#1a160e") + ';border-radius:12px;padding:1rem 1.1rem;margin-top:1.4rem">' +
+      '<div style="font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:#7d8590">The flywheel</div>' +
+      '<div style="font:600 1.8rem/1 ui-monospace,monospace;color:' + accent + ';margin-top:.4rem">' + rate + "% reuse rate</div>" +
+      '<div style="font-size:.85rem;color:#9da7b3;margin-top:.35rem">' + n(f.reused) + " of " + n(f.authored) + " written-back notes were fetched again in a later session" +
+      (ttr > 0 ? " &middot; median " + esc(ttrLabel) + " to first reuse" : "") +
+      " &middot; " + n(f.total_reuses) + " total reuses</div>" +
+      '<div style="font-size:.8rem;color:#6e7681;margin-top:.3rem">Write-back input: ' + (f.writes_per_100_reads || 0).toFixed(1) + " write-backs per 100 reads. " +
+      (reused ? "Knowledge is compounding." : "Notes are being written but not yet reused; give it time or check the nudge is firing.") + "</div></div>"
+    );
+  }
+
   Mesh.views.dashboard = function (el, M) {
     const inner = document.createElement("div");
     inner.className = "panel-inner";
@@ -84,7 +112,7 @@
             '<span style="color:#db61a2">' + n(h.contradiction || 0) + " contradictions</span></div>" +
             '<p style="font-size:.8rem;color:#6e7681;margin-top:.3rem">Run <code>mesh health</code> or the mesh_health tool for details.</p>');
 
-      body.innerHTML = grid + saved + bars("Coverage by type", d.coverage, "#2ea043") + topFetched + contrib + health;
+      body.innerHTML = grid + flywheelCard(d.flywheel) + saved + bars("Coverage by type", d.coverage, "#2ea043") + topFetched + contrib + health;
     }).catch(function (e) {
       body.innerHTML = '<p class="srch-hint">Could not load dashboard: ' + esc(e.message) + "</p>";
     });

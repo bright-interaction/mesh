@@ -105,6 +105,9 @@ func NewServer(vaultRoot string) (*Server, error) {
 		store.Close()
 		return nil, err
 	}
+	// Seed the flywheel measurement from the existing agent-authored corpus once, so the
+	// Dashboard shows a real reuse number immediately even if no mesh mcp ran (idempotent).
+	_, _ = store.BackfillWritebacks()
 	return &Server{vaultRoot: vaultRoot, store: store, graph: g}, nil
 }
 
