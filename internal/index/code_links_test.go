@@ -58,3 +58,35 @@ func TestLinkNotesToCode(t *testing.T) {
 		t.Fatalf("NoteCountForSymbol = %d, want 1", c)
 	}
 }
+
+// A note that names a symbol only in its TITLE (no backticks in the body) still links.
+func TestLinkFromTitle(t *testing.T) {
+	dir := t.TempDir()
+	// Title names renderMDSafe; the body never backticks it.
+	note := "---\nid: xss-note\ntype: gotcha\ntitle: renderMDSafe must sanitize ingested note HTML\n---\n# renderMDSafe must sanitize ingested note HTML\nUntrusted note bodies need the safe renderer to avoid stored XSS.\n"
+	if err := os.WriteFile(filepath.Join(dir, "xss.md"), []byte(note), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := Reindex(store, dir); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "render.go"), []byte("package x\n\nfunc renderMDSafe() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReindexCode(store, []string{root}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LinkNotesToCode(dir); err != nil {
+		t.Fatal(err)
+	}
+	notes, _ := store.NotesForSymbolName("renderMDSafe")
+	if len(notes) != 1 || notes[0].NoteID != "xss-note" {
+		t.Fatalf("title-only reference did not link: %+v", notes)
+	}
+}
