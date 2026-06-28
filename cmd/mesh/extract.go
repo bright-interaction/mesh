@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/extract"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/llm"
+	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/spf13/cobra"
 )
 
@@ -23,7 +25,7 @@ func extractCmd() *cobra.Command {
 	var benchmark bool
 	var n, concurrency, maxChars int
 	var asJSON bool
-	var toPending string
+	var toPending, dedupVault string
 	c := &cobra.Command{
 		Use:   "extract [transcript.jsonl]",
 		Short: "Extract candidate write-back notes from a session transcript (--benchmark to grade vs manual write-back)",
@@ -37,7 +39,7 @@ func extractCmd() *cobra.Command {
 				if len(args) < 1 {
 					return fmt.Errorf("--benchmark needs a directory of transcripts")
 				}
-				return runExtractBenchmark(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON)
+				return runExtractBenchmark(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON, dedupVault)
 			}
 			if len(args) < 1 {
 				return fmt.Errorf("usage: mesh extract <transcript.jsonl>  (or --benchmark <dir>)")
@@ -64,28 +66,75 @@ func extractCmd() *cobra.Command {
 	c.Flags().IntVar(&maxChars, "max-chars", 48000, "max digest size fed to the model")
 	c.Flags().BoolVar(&asJSON, "json", false, "benchmark: emit JSON instead of a report")
 	c.Flags().StringVar(&toPending, "to-pending", "", "persist extracted candidates to this vault's review queue instead of printing")
+	c.Flags().StringVar(&dedupVault, "dedup-vault", "", "benchmark: dedup candidates against this vault and report fresh vs already-known")
 	return c
 }
 
 // writeToPending opens the vault index and stores extracted candidates in the review
-// queue (pending_notes), idempotently. Used by the Stop hook's auto-extraction.
+// queue (pending_notes), skipping any that restate a note already in the vault (so the
+// queue surfaces only NEW knowledge). Idempotent. Used by the Stop hook's extraction.
 func writeToPending(vaultRoot, transcript string, cands []extract.Candidate) error {
 	store, err := index.Open(vaultRoot)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	rtr, closeRtr := buildVaultRetriever(store, vaultRoot) // best-effort dedup context
+	defer closeRtr()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	src := filepath.Base(transcript)
+	queued, dupes := 0, 0
 	for _, cnd := range cands {
+		if known, of := knownInVault(ctx, rtr, cnd); known {
+			dupes++
+			fmt.Printf("skip (already known): %q ~ %q\n", cnd.Title, of)
+			continue
+		}
 		if err := store.AddPending(index.PendingNote{
 			Type: cnd.Type, Title: cnd.Title, Do: cnd.Do, Dont: cnd.Dont,
 			Why: cnd.Why, Confidence: cnd.Confidence, Source: src,
 		}); err != nil {
 			return err
 		}
+		queued++
 	}
-	fmt.Printf("queued %d candidate(s) for review in %s\n", len(cands), vaultRoot)
+	fmt.Printf("queued %d candidate(s) for review in %s (%d skipped as already-known)\n", queued, vaultRoot, dupes)
 	return nil
+}
+
+// buildVaultRetriever builds a retriever over the vault for dedup. Best-effort: any
+// failure returns a nil retriever (dedup is then skipped, candidates all queue).
+func buildVaultRetriever(store *index.Store, vaultRoot string) (*retrieve.Retriever, func()) {
+	if _, err := index.Reconcile(store, vaultRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "dedup disabled (reindex %s: %v)\n", vaultRoot, err)
+		return nil, func() {}
+	}
+	g, err := store.LoadGraph()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dedup disabled (load graph: %v)\n", err)
+		return nil, func() {}
+	}
+	return retrieve.NewFromEnv(store, g), func() {}
+}
+
+// knownInVault reports whether a candidate restates a note already in the vault, by
+// retrieving its topical neighbors and comparing titles. Returns the matched title.
+func knownInVault(ctx context.Context, rtr *retrieve.Retriever, c extract.Candidate) (bool, string) {
+	if rtr == nil {
+		return false, ""
+	}
+	cards, err := rtr.Retrieve(ctx, c.Title+" "+c.Do, retrieve.Options{Limit: 5})
+	if err != nil {
+		return false, ""
+	}
+	for _, card := range cards {
+		if extract.TitleSimilarity(c.Title, card.Title) >= extract.DuplicateThreshold {
+			return true, card.Title
+		}
+	}
+	return false, ""
 }
 
 type benchRow struct {
@@ -93,7 +142,8 @@ type benchRow struct {
 	SizeKB       int64  `json:"size_kb"`
 	HadWriteback bool   `json:"had_writeback"`
 	Candidates   int    `json:"candidates"`
-	Kept         int    `json:"kept"`
+	Duplicates   int    `json:"duplicates"` // candidates that restate an existing vault note (dedup)
+	Kept         int    `json:"kept"`       // fresh candidates a strict judge would keep
 	Err          string `json:"err,omitempty"`
 }
 
@@ -131,13 +181,22 @@ func sampleTranscripts(dir string, n int) ([]string, error) {
 	return out, nil
 }
 
-func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, concurrency, maxChars int, asJSON bool) error {
+func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, concurrency, maxChars int, asJSON bool, dedupVault string) error {
 	files, err := sampleTranscripts(dir, n)
 	if err != nil {
 		return err
 	}
 	if len(files) == 0 {
 		return fmt.Errorf("no usable transcripts in %s", dir)
+	}
+	// Optional dedup context: a retriever over an existing vault, so a candidate that
+	// restates a note already there is counted separately from genuinely fresh ones.
+	var rtr *retrieve.Retriever
+	if dedupVault != "" {
+		if vs, e := index.Open(dedupVault); e == nil {
+			defer vs.Close()
+			rtr, _ = buildVaultRetriever(vs, dedupVault)
+		}
 	}
 	if !asJSON {
 		fmt.Fprintf(os.Stderr, "grading %d transcripts via %s (this calls the LLM per transcript)...\n", len(files), client.Describe())
@@ -173,6 +232,10 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 			}
 			row.Candidates = len(cands)
 			for _, cnd := range cands {
+				if known, _ := knownInVault(ctx, rtr, cnd); known {
+					row.Duplicates++ // restates a note already in the vault; not judged as fresh
+					continue
+				}
 				keep, _, je := extract.Judge(ctx, client, cnd)
 				if je != nil {
 					row.Err = "judge: " + je.Error()
@@ -184,14 +247,15 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 			}
 			rows[i] = row
 			if !asJSON {
-				fmt.Fprintf(os.Stderr, "  %-40s writeback=%-5v candidates=%d kept=%d %s\n", row.File, row.HadWriteback, row.Candidates, row.Kept, row.Err)
+				fmt.Fprintf(os.Stderr, "  %-40s writeback=%-5v cands=%d dup=%d kept=%d %s\n", row.File, row.HadWriteback, row.Candidates, row.Duplicates, row.Kept, row.Err)
 			}
 		}(i, f)
 	}
 	wg.Wait()
 
-	// Tally.
-	var manual, extractCov, totalC, totalK, errs int
+	// Tally. "Fresh" = candidates that are not duplicates of an existing vault note;
+	// precision is measured on the fresh set (what a reviewer actually sees).
+	var manual, extractCov, totalC, totalDup, totalK, errs int
 	for _, r := range rows {
 		if r.Err != "" && r.Candidates == 0 {
 			errs++
@@ -199,16 +263,18 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 		if r.HadWriteback {
 			manual++
 		}
-		if r.Candidates > 0 {
+		if r.Candidates-r.Duplicates > 0 {
 			extractCov++
 		}
 		totalC += r.Candidates
+		totalDup += r.Duplicates
 		totalK += r.Kept
 	}
 	N := len(rows)
+	fresh := totalC - totalDup
 	precision := 0.0
-	if totalC > 0 {
-		precision = float64(totalK) / float64(totalC) * 100
+	if fresh > 0 {
+		precision = float64(totalK) / float64(fresh) * 100
 	}
 	verdict := "STOP (precision < 60%: the review queue would be a spam filter)"
 	switch {
@@ -222,8 +288,8 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 		b, _ := json.MarshalIndent(map[string]any{
 			"sampled": N, "errors": errs,
 			"manual_writeback_sessions": manual, "extraction_coverage_sessions": extractCov,
-			"candidates": totalC, "kept": totalK, "precision_pct": precision,
-			"verdict": verdict, "rows": rows,
+			"candidates": totalC, "duplicates": totalDup, "fresh": fresh, "kept": totalK,
+			"precision_pct": precision, "verdict": verdict, "rows": rows,
 		}, "", "  ")
 		fmt.Println(string(b))
 		return nil
@@ -240,9 +306,13 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 	fmt.Printf("\nCURRENT ALGO (manual write-back, Stop-hook nudge)\n")
 	fmt.Printf("  sessions that wrote back:        %d / %d   (%.0f%% coverage)\n", manual, N, pct(manual, N))
 	fmt.Printf("\nAUTO-EXTRACTION\n")
-	fmt.Printf("  sessions yielding >=1 candidate: %d / %d   (%.0f%% coverage)\n", extractCov, N, pct(extractCov, N))
-	fmt.Printf("  candidate notes:                 %d   (%.1f per session)\n", totalC, func() float64 { return float64(totalC) / float64(max1(N)) }())
-	fmt.Printf("  judged keep-worthy:              %d / %d   (PRECISION %.0f%%)\n", totalK, totalC, precision)
+	fmt.Printf("  sessions yielding >=1 fresh note: %d / %d   (%.0f%% coverage)\n", extractCov, N, pct(extractCov, N))
+	fmt.Printf("  candidate notes:                 %d   (%.1f per session)\n", totalC, float64(totalC)/float64(max1(N)))
+	if dedupVault != "" {
+		fmt.Printf("  already-known (deduped out):     %d   (%.0f%% of candidates)\n", totalDup, pct(totalDup, max1(totalC)))
+		fmt.Printf("  fresh (reach review):            %d\n", fresh)
+	}
+	fmt.Printf("  judged keep-worthy (of fresh):   %d / %d   (PRECISION %.0f%%)\n", totalK, fresh, precision)
 	lift := "n/a"
 	if manual > 0 {
 		lift = fmt.Sprintf("%.1fx", pct(extractCov, N)/pct(manual, N))

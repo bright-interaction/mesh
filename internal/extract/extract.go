@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/bright-interaction/mesh/internal/llm"
 )
@@ -174,6 +175,8 @@ A note QUALIFIES only if it is ALL of:
 
 DO NOT emit a note for: routine task completion, restating the obvious, project trivia, generic best practices everyone knows, or speculation. Prefer returning [] over a weak note. Quality over quantity; 0 is a valid and common answer.
 
+The most common mistake is recording a SINGLE INCIDENT as if it were a rule ("found a stale prod container once"). Only emit a note that states a recurring, transferable rule with a concrete mechanism (e.g. "Mollie does not HMAC webhooks, so re-fetch the payment by id"), not a story about this one session. A duplicate-detector and a human reviewer sit after you, so lean toward surfacing a genuinely useful pattern rather than withholding it.
+
 Each field is ONE line:
 - title: specific, under 12 words (e.g. "pgx NULL vs empty string breaks $1='' filters", not "Database note").
 - do: the action to take, imperative.
@@ -240,6 +243,53 @@ func looksEmpty(s string) bool {
 	l := strings.ToLower(s)
 	return l == "" || l == "[]" || strings.Contains(l, "no durable") || strings.Contains(l, "nothing worth") || strings.Contains(l, "no notes")
 }
+
+// dedupeStop are low-signal title words excluded from the similarity token set so two
+// titles match on their substantive terms, not their filler.
+var dedupeStop = map[string]bool{
+	"the": true, "and": true, "for": true, "with": true, "must": true, "not": true,
+	"are": true, "was": true, "via": true, "use": true, "when": true, "into": true,
+	"that": true, "this": true, "from": true, "your": true, "you": true, "all": true,
+	"per": true, "but": true, "its": true, "needs": true, "need": true,
+}
+
+func titleTokens(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, f := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	}) {
+		if len(f) >= 3 && !dedupeStop[f] {
+			out[f] = true
+		}
+	}
+	return out
+}
+
+// TitleSimilarity is the overlap coefficient of two titles' substantive tokens (0..1):
+// intersection over the SMALLER token set. Overlap (not Jaccard) is the right measure
+// for "does this candidate restate an existing note", because an existing note's title
+// is often longer/compound (extra clauses) which would unfairly sink a Jaccard score.
+func TitleSimilarity(a, b string) float64 {
+	ta, tb := titleTokens(a), titleTokens(b)
+	if len(ta) == 0 || len(tb) == 0 {
+		return 0
+	}
+	inter := 0
+	for t := range ta {
+		if tb[t] {
+			inter++
+		}
+	}
+	small := len(ta)
+	if len(tb) < small {
+		small = len(tb)
+	}
+	return float64(inter) / float64(small)
+}
+
+// DuplicateThreshold is the title-similarity at or above which a candidate is treated
+// as already-known (tuned so near-restatements match but distinct notes do not).
+const DuplicateThreshold = 0.5
 
 const judgeSystem = `You are a senior engineer reviewing one candidate note for a team knowledge base. KEEP it only if it is genuinely non-obvious, reusable beyond one task, and durable (still true next month) - i.e. you would be glad the next engineer inherited it. REJECT routine task notes, restated obvious facts, project trivia, generic best practices, and speculation. Be strict; most weak notes should be rejected.
 
