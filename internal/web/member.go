@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -27,14 +29,32 @@ type memberAuth struct {
 const memberCookie = "mesh_member"
 
 func newMemberAuth(verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool) *memberAuth {
-	key := make([]byte, 32)
-	_, _ = rand.Read(key)
-	return &memberAuth{verify: verify, scopesFor: scopesFor, key: key}
+	return &memberAuth{verify: verify, scopesFor: scopesFor, key: stableMemberKey()}
 }
 
-// sign returns the client-bound cookie value "<id>.<hmac>". A per-process key means
-// cookies invalidate on restart (members re-sign-in), which is acceptable and avoids a
-// server-side session store.
+// stableMemberKey derives the cookie-signing key from a STABLE server secret so a
+// signed-in member survives a server restart/redeploy instead of being logged out
+// every time (the 30-day cookie then actually lasts 30 days). It is HMAC-derived and
+// domain-separated, so the secret itself is never exposed and a member cookie cannot be
+// forged without it. Priority: MESH_UI_COOKIE_SECRET, then MESH_UI_TOKEN (set on a
+// hosted hub). With neither, it falls back to a random per-process key (sessions then
+// end on restart) and logs how to make them persist.
+func stableMemberKey() []byte {
+	for _, env := range []string{"MESH_UI_COOKIE_SECRET", "MESH_UI_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+			mac := hmac.New(sha256.New, []byte(v))
+			mac.Write([]byte("mesh-ui-member-cookie-v1"))
+			return mac.Sum(nil)
+		}
+	}
+	key := make([]byte, 32)
+	_, _ = rand.Read(key)
+	slog.Warn("mesh ui: member cookies use an ephemeral signing key, so members re-login after every restart; set MESH_UI_COOKIE_SECRET (or MESH_UI_TOKEN) to keep them signed in")
+	return key
+}
+
+// sign returns the client-bound cookie value "<id>.<hmac>", signed with the stable key
+// so it stays valid across restarts.
 func (m *memberAuth) sign(id int64) string {
 	ids := strconv.FormatInt(id, 10)
 	mac := hmac.New(sha256.New, m.key)
