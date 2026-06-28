@@ -77,6 +77,7 @@ func rootCmd() *cobra.Command {
 		hooksCmd(),
 		extractCmd(),
 		guardsCmd(),
+		askCmd(),
 		doctorCmd(),
 	)
 	return root
