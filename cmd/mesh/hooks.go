@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
@@ -402,7 +401,7 @@ func spawnExtraction(vault, transcript string) {
 	if lf != nil {
 		cmd.Stdout, cmd.Stderr = lf, lf
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // detach from the hook's group
+	cmd.SysProcAttr = detachAttr() // detach from the hook's process group (platform-specific)
 	if err := cmd.Start(); err != nil {
 		if lf != nil {
 			fmt.Fprintf(lf, "spawn extraction failed: %v\n", err)
