@@ -160,6 +160,18 @@ CREATE TABLE IF NOT EXISTS pending_notes (
   created_at INTEGER NOT NULL
 );
 
+-- note_code_links: which notes reference which code symbols (the note<->code bridge).
+-- Derived from note bodies + the code index at reindex (rebuilt, not kept), so an
+-- agent can go from a symbol to the institutional knowledge about it and back.
+CREATE TABLE IF NOT EXISTS note_code_links (
+  note_id   TEXT NOT NULL,
+  symbol_id TEXT NOT NULL,
+  name      TEXT NOT NULL, -- the code symbol's (qualified) name, denormalized for display
+  PRIMARY KEY (note_id, symbol_id)
+);
+CREATE INDEX IF NOT EXISTS idx_note_code_links_symbol ON note_code_links(symbol_id);
+CREATE INDEX IF NOT EXISTS idx_note_code_links_name ON note_code_links(name);
+
 -- FTS over symbol name (boosted), signature, and doc. The first five columns are
 -- carried unindexed so a hit returns the deep link without a second lookup.
 CREATE VIRTUAL TABLE IF NOT EXISTS code_search USING fts5(

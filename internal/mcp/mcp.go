@@ -76,6 +76,7 @@ func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
 	// Seed the flywheel measurement from the existing agent-authored corpus once, so
 	// the reuse number reflects accumulated knowledge from day one (idempotent).
 	_, _ = store.BackfillWritebacks()
+	_, _ = store.LinkNotesToCode(vaultRoot) // build the note<->code bridge if a code index exists
 	return s, nil
 }
 

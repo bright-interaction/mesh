@@ -808,7 +808,7 @@ func indexCmd() *cobra.Command {
 // mesh_code_search / mesh_code_neighbors locate definitions by name.
 func codeCmd() *cobra.Command {
 	c := &cobra.Command{Use: "code", Short: "Source-code index (the graphify replacement): locate symbols + Go call graph"}
-	c.AddCommand(codeReindexCmd(), codeSearchCmd())
+	c.AddCommand(codeReindexCmd(), codeSearchCmd(), codeContextCmd())
 	return c
 }
 
@@ -849,8 +849,9 @@ func codeReindexCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("code index: %d files, %d symbols, %d edges in %s\n  roots: %s\n  db:    %s\n",
-				st.Files, st.Symbols, st.Edges, time.Since(start).Round(time.Millisecond), strings.Join(roots, ", "), store.Path())
+			links, _ := store.LinkNotesToCode(root) // refresh the note<->code bridge
+			fmt.Printf("code index: %d files, %d symbols, %d edges, %d note links in %s\n  roots: %s\n  db:    %s\n",
+				st.Files, st.Symbols, st.Edges, links, time.Since(start).Round(time.Millisecond), strings.Join(roots, ", "), store.Path())
 			return nil
 		},
 	}
@@ -890,6 +891,43 @@ func codeSearchCmd() *cobra.Command {
 	c.Flags().StringVar(&vaultRoot, "vault", ".", "vault root (the .mesh/mesh.db location)")
 	c.Flags().IntVar(&limit, "limit", 15, "max results")
 	c.Flags().StringVar(&langs, "languages", "", "comma list of language tags to filter")
+	return c
+}
+
+// codeContextCmd: "what do we know about this code" - symbols + the notes that
+// reference them (the note<->code bridge).
+func codeContextCmd() *cobra.Command {
+	var vaultRoot string
+	var limit int
+	c := &cobra.Command{
+		Use:   "context <query>",
+		Short: "Show code symbols together with the notes that reference them",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store, err := index.Open(vaultRoot)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			q := strings.Join(args, " ")
+			hits, err := store.SearchCode(q, limit, nil)
+			if err != nil {
+				return err
+			}
+			fmt.Println("code:")
+			for _, h := range hits {
+				fmt.Printf("  %-9s %-40s %s:%d\n", h.Kind, h.Name, h.Path, h.Line)
+			}
+			notes, _ := store.NotesForSymbolName(q)
+			fmt.Printf("notes about %q (%d):\n", q, len(notes))
+			for _, nt := range notes {
+				fmt.Printf("  - [%s] %s (%s)\n", nt.Type, nt.Title, nt.Path)
+			}
+			return nil
+		},
+	}
+	c.Flags().StringVar(&vaultRoot, "vault", ".", "vault root (the .mesh/mesh.db location)")
+	c.Flags().IntVar(&limit, "limit", 8, "max symbols")
 	return c
 }
 

@@ -49,11 +49,17 @@ func (s *Server) toolCodeSearch(ctx context.Context, raw json.RawMessage) (any, 
 	}
 	cards := make([]map[string]any, 0, len(hits))
 	for _, h := range hits {
-		cards = append(cards, map[string]any{
+		card := map[string]any{
 			"id": h.ID, "name": h.Name, "kind": h.Kind, "lang": h.Lang,
 			"loc": fmt.Sprintf("%s:%d", h.Path, h.Line), "path": h.Path, "line": h.Line,
 			"signature": h.Signature, "snippet": h.Snippet, "score": h.Score,
-		})
+		}
+		// Surface the note<->code bridge: if notes reference this symbol, hint that
+		// mesh_code_context will return the institutional knowledge about it.
+		if nc := s.store.NoteCountForSymbol(h.ID); nc > 0 {
+			card["notes"] = nc
+		}
+		cards = append(cards, card)
 	}
 	out := map[string]any{"symbols": cards, "count": len(cards)}
 	if len(cards) == 0 && !s.store.CodeIndexed() {
@@ -90,6 +96,61 @@ func (s *Server) toolCodeNeighbors(ctx context.Context, raw json.RawMessage) (an
 	}), nil
 }
 
+// toolCodeContext fuses the two indexes: it resolves a symbol like mesh_code_search,
+// then for each match returns the NOTES that reference it (decisions/gotchas about that
+// code). This is "what do we know about this function" - code plus the institutional
+// knowledge around it, in one call. Linked notes are scope-filtered like any read.
+func (s *Server) toolCodeContext(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
+	if codeScopeDenied(ctx) {
+		return textResult(map[string]any{"symbols": []map[string]any{}, "count": 0,
+			"note": "the source-code index is not in your access scope"}), nil
+	}
+	var a struct {
+		Query string `json:"query"`
+		Limit int    `json:"limit"`
+	}
+	json.Unmarshal(raw, &a)
+	if strings.TrimSpace(a.Query) == "" {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "query required"}
+	}
+	limit := a.Limit
+	if limit <= 0 || limit > 10 {
+		limit = 5
+	}
+	hits, err := s.store.SearchCode(a.Query, limit, nil)
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	sf := scopeFromCtx(ctx)
+	readable := func(noteID string) bool {
+		if sf == nil {
+			return true
+		}
+		sc, e := s.store.NoteScope(noteID)
+		return e == nil && sf.allowsRead(sc)
+	}
+	cards := make([]map[string]any, 0, len(hits))
+	for _, h := range hits {
+		cards = append(cards, map[string]any{
+			"id": h.ID, "name": h.Name, "kind": h.Kind, "lang": h.Lang,
+			"loc": fmt.Sprintf("%s:%d", h.Path, h.Line), "signature": h.Signature,
+		})
+	}
+	// Notes about anything matching the query name (type OR its methods), so a search
+	// that lands on a method still surfaces notes filed against the type.
+	notes, _ := s.store.NotesForSymbolName(a.Query)
+	noteCards := make([]map[string]any, 0, len(notes))
+	for _, nt := range notes {
+		if !readable(nt.NoteID) {
+			continue
+		}
+		noteCards = append(noteCards, map[string]any{
+			"id": nt.NoteID, "title": nt.Title, "path": nt.Path, "type": nt.Type,
+		})
+	}
+	return textResult(map[string]any{"symbols": cards, "notes": noteCards, "count": len(cards)}), nil
+}
+
 func codeRefCards(refs []index.CodeRef) []map[string]any {
 	out := make([]map[string]any, 0, len(refs))
 	for _, r := range refs {
@@ -121,6 +182,9 @@ func (s *Server) reindexCode() (stats index.CodeStats, ok bool, err error) {
 		return index.CodeStats{}, false, nil
 	}
 	stats, err = index.ReindexCode(s.store, roots, langSet(cfg.Code.Languages))
+	if err == nil {
+		_, _ = s.store.LinkNotesToCode(s.vaultRoot) // refresh the note<->code bridge (best-effort)
+	}
 	return stats, true, err
 }
 

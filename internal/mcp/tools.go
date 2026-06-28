@@ -122,6 +122,15 @@ func ToolSpecs() []map[string]any {
 			}),
 		},
 		{
+			"name":        "mesh_code_context",
+			"description": "What do we KNOW about this code: resolve a symbol by name (like mesh_code_search) and return each match together with the team's notes that reference it (decisions/gotchas/post-mortems about that function or type). Use this before changing a function to inherit the institutional knowledge around it, not just its signature.",
+			"inputSchema": obj(map[string]any{
+				"type":       "object",
+				"required":   []string{"query"},
+				"properties": map[string]any{"query": str, "limit": intp},
+			}),
+		},
+		{
 			"name":        "mesh_setup_hooks",
 			"description": "ONBOARDING. Set up Claude Code SESSION hooks so you (the agent) automatically READ the mesh at the start of every session and get nudged to WRITE BACK what you learned before finishing - the flywheel that makes Mesh compound. Call with no args (action=status) to get the current install state plus the pitch and the exact questions to ask the user; then call action=install (read_only to skip the write-back nudge; dry_run to preview the settings.json first) to wire it into the project's .claude/settings.json. Offer this the FIRST time a user connects to Mesh. These are session hooks, NOT git pre/post-push.",
 			"inputSchema": obj(map[string]any{
@@ -173,6 +182,8 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return s.toolHealth(ctx, p.Arguments)
 	case "mesh_code_search":
 		return s.toolCodeSearch(ctx, p.Arguments)
+	case "mesh_code_context":
+		return s.toolCodeContext(ctx, p.Arguments)
 	case "mesh_code_neighbors":
 		return s.toolCodeNeighbors(ctx, p.Arguments)
 	case "mesh_setup_hooks":

@@ -70,8 +70,8 @@ func TestInitializeAndToolsList(t *testing.T) {
 	}
 	list := call(t, s, "tools/list", map[string]any{})
 	tools, _ := list["tools"].([]map[string]any)
-	if len(tools) != 13 {
-		t.Errorf("expected 13 tools, got %d", len(tools))
+	if len(tools) != 14 {
+		t.Errorf("expected 14 tools, got %d", len(tools))
 	}
 }
 
@@ -185,8 +185,8 @@ func TestHandleHTTPMatchesDispatch(t *testing.T) {
 	if out.Error != nil {
 		t.Fatalf("rpc error: %v", *out.Error)
 	}
-	if len(out.Result.Tools) != 13 {
-		t.Fatalf("tools over HTTP = %d, want 13", len(out.Result.Tools))
+	if len(out.Result.Tools) != 14 {
+		t.Fatalf("tools over HTTP = %d, want 14", len(out.Result.Tools))
 	}
 
 	// A tools/call over HTTP returns the same shape as stdio.
