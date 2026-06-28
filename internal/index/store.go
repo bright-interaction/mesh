@@ -106,7 +106,9 @@ var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "c
 //     re-embed; they stay keyed by the same note ids and the note_hash staleness
 //     check excludes any whose content changed. So a notes-shape bump must not wipe
 //     them. (If the vectors table's OWN shape ever changes, drop it for that release.)
-var schemaKeep = map[string]bool{"metrics": true, "vectors": true}
+//   - note_reuse: the flywheel measurement (authoring time + observed reuse events),
+//     accumulated at runtime and NOT re-derivable from the vault.
+var schemaKeep = map[string]bool{"metrics": true, "vectors": true, "note_reuse": true}
 
 // ensureSchema applies the schema, dropping and rebuilding if the stored version
 // differs. No data is lost that matters: everything is re-derivable from the

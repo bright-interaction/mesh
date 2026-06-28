@@ -130,6 +130,20 @@ CREATE TABLE IF NOT EXISTS metrics (
   value INTEGER NOT NULL DEFAULT 0
 );
 
+-- note_reuse: the flywheel measurement. One row per agent write-back, stamped at
+-- authoring time, so we can prove (not assert) that written notes get reused by a
+-- LATER session. A fetch at least reuse_gap after authored_at counts as reuse (the
+-- cross-session proxy). Accumulated runtime telemetry, NOT re-derivable from the
+-- vault (the reuse events are observed live), so it is kept across a schema rebuild.
+CREATE TABLE IF NOT EXISTS note_reuse (
+  note_id     TEXT PRIMARY KEY,
+  authored_at INTEGER NOT NULL,           -- unix secs the note was written back
+  source      TEXT,                       -- 'agent' | 'manual' | ...
+  reuse_count INTEGER NOT NULL DEFAULT 0, -- qualifying (cross-session) fetches
+  first_reuse INTEGER,                    -- first qualifying fetch (NULL = never reused)
+  last_reuse  INTEGER
+);
+
 -- FTS over symbol name (boosted), signature, and doc. The first five columns are
 -- carried unindexed so a hit returns the deep link without a second lookup.
 CREATE VIRTUAL TABLE IF NOT EXISTS code_search USING fts5(

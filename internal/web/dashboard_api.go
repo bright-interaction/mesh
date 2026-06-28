@@ -24,6 +24,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	byType, _ := s.store.NotesByType()
 	top, _ := s.store.TopFetched(8)
 	health, _ := s.store.HealthCounts()
+	flywheel, _ := s.store.FlywheelStats()
 
 	// Contributor leaderboard (top 8 by authored notes).
 	contribMap, _ := s.store.ContributorCounts()
@@ -44,11 +45,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"usage": map[string]any{
 			"queries": queries, "fetches": fetches, "writes": writes, "notes": notes,
 		},
-		"est_tokens_saved":         estTokensSaved,
-		"tokens_saved_per_query":   tokensSavedPerQuery,
-		"coverage":                 byType,
-		"top_fetched":              top,
-		"contributors":             contrib,
-		"health":                   health,
+		"est_tokens_saved":       estTokensSaved,
+		"tokens_saved_per_query": tokensSavedPerQuery,
+		"coverage":               byType,
+		"top_fetched":            top,
+		"contributors":           contrib,
+		"health":                 health,
+		"flywheel":               flywheel,
 	})
 }

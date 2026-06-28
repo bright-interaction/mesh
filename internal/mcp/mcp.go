@@ -73,6 +73,9 @@ func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
 		store.Close()
 		return nil, err
 	}
+	// Seed the flywheel measurement from the existing agent-authored corpus once, so
+	// the reuse number reflects accumulated knowledge from day one (idempotent).
+	_, _ = store.BackfillWritebacks()
 	return s, nil
 }
 
