@@ -97,7 +97,7 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 // It must be every table in schema.sql EXCEPT those in schemaKeep. A test asserts it
 // stays in sync with schema.sql so a newly-added table cannot silently leak stale
 // rows (or an orphaned renamed table) on a version bump.
-var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health"}
+var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health", "note_code_links"}
 
 // schemaKeep are tables deliberately preserved across a schema-version rebuild:
 //   - metrics: accumulated usage counters, NOT re-derivable from the vault.
