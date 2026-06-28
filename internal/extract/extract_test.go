@@ -1,0 +1,90 @@
+package extract
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/bright-interaction/mesh/internal/llm"
+)
+
+func writeTranscript(t *testing.T, lines ...string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "t.jsonl")
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestDigest(t *testing.T) {
+	p := writeTranscript(t,
+		`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"fix the deploy"}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"editing the Dockerfile"},{"type":"tool_use","name":"Bash","input":{"command":"go build ./..."}}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden reasoning"},{"type":"tool_use","name":"mesh_append_note","input":{"title":"x"}}]}}`,
+		`{"type":"summary","summary":"noise"}`,
+	)
+	d, st, err := Digest(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"USER: fix the deploy", "ASSISTANT: editing the Dockerfile", "TOOL Bash(command=go build ./...)", "TOOL mesh_append_note("} {
+		if !strings.Contains(d, want) {
+			t.Errorf("digest missing %q in:\n%s", want, d)
+		}
+	}
+	if strings.Contains(d, "hidden reasoning") {
+		t.Error("thinking blocks should be excluded from the digest")
+	}
+	if !st.HadWriteback {
+		t.Error("HadWriteback should be true (mesh_append_note was called)")
+	}
+	if st.UserMsgs != 1 || st.AsstMsgs != 1 || st.ToolCalls != 2 {
+		t.Errorf("stats = %+v", st)
+	}
+}
+
+func TestParseCandidates(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int
+	}{
+		{"clean", `[{"type":"gotcha","title":"T","do":"d","dont":"x","why":"w","confidence":"high"}]`, 1},
+		{"fenced", "```json\n[{\"type\":\"decision\",\"title\":\"T\"}]\n```", 1},
+		{"prose-wrapped", `Here you go: [{"type":"post-mortem","title":"T"}] hope that helps`, 1},
+		{"empty-array", `[]`, 0},
+		{"prose-empty", `No durable, reusable knowledge in this session.`, 0},
+		{"drops-bad-type", `[{"type":"note","title":"T"},{"type":"gotcha","title":"Keep"}]`, 1},
+		{"drops-no-title", `[{"type":"gotcha","title":""}]`, 0},
+	}
+	for _, c := range cases {
+		got, err := parseCandidates(c.in)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if len(got) != c.want {
+			t.Errorf("%s: got %d candidates, want %d (%+v)", c.name, len(got), c.want, got)
+		}
+	}
+}
+
+func TestExtractAndJudgeWithStub(t *testing.T) {
+	stub := llm.Func(func(_ context.Context, system, _ string) (string, error) {
+		if strings.Contains(system, "reviewing one candidate") {
+			return `{"keep": true, "reason": "non-obvious + reusable"}`, nil
+		}
+		return `[{"type":"gotcha","title":"Bun not npm after migration","do":"use bun","dont":"npm silently breaks","why":"lockfile","confidence":"high"}]`, nil
+	})
+	cands, err := Extract(context.Background(), stub, "digest")
+	if err != nil || len(cands) != 1 {
+		t.Fatalf("extract = %v, %v", cands, err)
+	}
+	keep, reason, err := Judge(context.Background(), stub, cands[0])
+	if err != nil || !keep || reason == "" {
+		t.Fatalf("judge = %v %q %v", keep, reason, err)
+	}
+}

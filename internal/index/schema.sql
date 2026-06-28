@@ -144,6 +144,22 @@ CREATE TABLE IF NOT EXISTS note_reuse (
   last_reuse  INTEGER
 );
 
+-- pending_notes: auto-extracted write-back candidates awaiting one-click human review
+-- (the input side of the flywheel: notes pulled from a finished session the agent did
+-- not write back itself). NOT part of retrieval until promoted to a real note.
+-- Accumulated runtime data, kept across a schema rebuild.
+CREATE TABLE IF NOT EXISTS pending_notes (
+  id         TEXT PRIMARY KEY,    -- content-derived id (dedupes re-extraction)
+  type       TEXT NOT NULL,       -- decision | gotcha | post-mortem
+  title      TEXT NOT NULL,
+  do_text    TEXT,
+  dont_text  TEXT,
+  why        TEXT,
+  confidence TEXT,
+  source     TEXT,                -- session id / transcript that produced it
+  created_at INTEGER NOT NULL
+);
+
 -- FTS over symbol name (boosted), signature, and doc. The first five columns are
 -- carried unindexed so a hit returns the deep link without a second lookup.
 CREATE VIRTUAL TABLE IF NOT EXISTS code_search USING fts5(

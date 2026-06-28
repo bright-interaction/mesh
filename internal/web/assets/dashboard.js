@@ -112,7 +112,12 @@
             '<span style="color:#db61a2">' + n(h.contradiction || 0) + " contradictions</span></div>" +
             '<p style="font-size:.8rem;color:#6e7681;margin-top:.3rem">Run <code>mesh health</code> or the mesh_health tool for details.</p>');
 
-      body.innerHTML = grid + flywheelCard(d.flywheel) + saved + bars("Coverage by type", d.coverage, "#2ea043") + topFetched + contrib + health;
+      const pending = d.pending_review || 0;
+      const reviewNudge = pending > 0
+        ? '<div style="border:1px solid #3a2516;background:#1a160e;border-radius:12px;padding:.8rem 1.1rem;margin-top:1rem;font-size:.9rem;color:#fb923c">' +
+          n(pending) + ' auto-extracted note' + (pending === 1 ? "" : "s") + ' awaiting review &middot; open the <b>Review</b> tab to keep or discard them</div>'
+        : "";
+      body.innerHTML = grid + flywheelCard(d.flywheel) + reviewNudge + saved + bars("Coverage by type", d.coverage, "#2ea043") + topFetched + contrib + health;
     }).catch(function (e) {
       body.innerHTML = '<p class="srch-hint">Could not load dashboard: ' + esc(e.message) + "</p>";
     });

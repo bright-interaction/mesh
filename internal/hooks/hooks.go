@@ -121,6 +121,7 @@ type Options struct {
 	Vault            string // absolute vault path the agent should orient from
 	Bin              string // absolute mesh binary path the hooks invoke
 	EnforceWriteback bool   // also add the Stop write-back nudge
+	AutoExtract      bool   // Stop hook also auto-extracts candidates when the agent did not write back (spawns the BYOAI LLM per such session)
 	DryRun           bool   // do not write; return the would-be settings in Preview
 }
 
@@ -139,11 +140,21 @@ type Status struct {
 	WriteHook    bool   `json:"write_hook"`
 }
 
-func settingsPath(projectDir string) string { return filepath.Join(projectDir, ".claude", "settings.json") }
+func settingsPath(projectDir string) string {
+	return filepath.Join(projectDir, ".claude", "settings.json")
+}
 func orientCommand(bin, vault string) string {
 	return fmt.Sprintf("%q orient --hook --vault %q", bin, vault)
 }
-func stopCommand(bin string) string { return fmt.Sprintf("%q hooks stop-check", bin) }
+func stopCommand(bin, vault string, autoExtract bool) string {
+	s := fmt.Sprintf("%q hooks stop-check", bin)
+	if autoExtract {
+		// Auto-extract the session's learnings into the review queue when the agent
+		// did not write back itself. Spawns the BYOAI LLM (claude -p) per such session.
+		s += fmt.Sprintf(" --vault %q --extract", vault)
+	}
+	return s
+}
 
 func load(projectDir string) (map[string]any, string, error) {
 	p := settingsPath(projectDir)
@@ -156,7 +167,9 @@ func load(projectDir string) (map[string]any, string, error) {
 	return s, p, nil
 }
 
-func cmdEntry(command string) map[string]any { return map[string]any{"type": "command", "command": command} }
+func cmdEntry(command string) map[string]any {
+	return map[string]any{"type": "command", "command": command}
+}
 func appendHook(hooks map[string]any, event string, group map[string]any) {
 	arr, _ := hooks[event].([]any)
 	hooks[event] = append(arr, group)
@@ -189,8 +202,12 @@ func Install(o Options) (Result, error) {
 		res.Added = append(res.Added, "SessionStart -> mesh orient (the agent reads the mesh at session start)")
 	}
 	if o.EnforceWriteback && !has(settings, "hooks stop-check") {
-		appendHook(hooks, "Stop", map[string]any{"hooks": []any{cmdEntry(stopCommand(o.Bin))}})
-		res.Added = append(res.Added, "Stop -> mesh hooks stop-check (nudges write-back once before finishing)")
+		appendHook(hooks, "Stop", map[string]any{"hooks": []any{cmdEntry(stopCommand(o.Bin, o.Vault, o.AutoExtract))}})
+		msg := "Stop -> mesh hooks stop-check (nudges write-back once before finishing)"
+		if o.AutoExtract {
+			msg = "Stop -> mesh hooks stop-check --extract (nudges write-back, then auto-extracts candidates for review if the agent did not)"
+		}
+		res.Added = append(res.Added, msg)
 	}
 	settings["hooks"] = hooks
 	out, _ := json.MarshalIndent(settings, "", "  ")

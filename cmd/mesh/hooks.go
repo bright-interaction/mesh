@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
@@ -257,7 +259,7 @@ func hooksCmd() *cobra.Command {
 
 func hooksInstallCmd() *cobra.Command {
 	var dir string
-	var readOnly, dryRun bool
+	var readOnly, dryRun, autoExtract bool
 	c := &cobra.Command{
 		Use:   "install [vault]",
 		Short: "Wire SessionStart (read Mesh) + Stop (nudge write-back) into .claude/settings.json",
@@ -279,7 +281,7 @@ func hooksInstallCmd() *cobra.Command {
 			if err != nil || bin == "" {
 				bin = "mesh"
 			}
-			res, err := hooks.Install(hooks.Options{ProjectDir: projAbs, Vault: vaultAbs, Bin: bin, EnforceWriteback: !readOnly, DryRun: dryRun})
+			res, err := hooks.Install(hooks.Options{ProjectDir: projAbs, Vault: vaultAbs, Bin: bin, EnforceWriteback: !readOnly, AutoExtract: autoExtract, DryRun: dryRun})
 			if err != nil {
 				return err
 			}
@@ -301,6 +303,7 @@ func hooksInstallCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&dir, "dir", ".", "project dir whose .claude/settings.json to edit")
 	c.Flags().BoolVar(&readOnly, "read-only", false, "only the SessionStart read hook; skip the Stop write-back nudge")
+	c.Flags().BoolVar(&autoExtract, "extract", false, "Stop hook auto-extracts session learnings into the review queue when the agent did not write back (spawns the BYOAI LLM per such session)")
 	c.Flags().BoolVar(&dryRun, "dry-run", false, "print what would be written without changing anything")
 	return c
 }
@@ -329,6 +332,8 @@ func hooksUninstallCmd() *cobra.Command {
 // a reminder to call mesh_append_note, so the discipline is enforced without an
 // infinite loop.
 func hooksStopCheckCmd() *cobra.Command {
+	var vault string
+	var autoExtract bool
 	c := &cobra.Command{
 		Use:    "stop-check",
 		Short:  "Internal: a Stop hook that nudges write-back to Mesh once per session",
@@ -342,7 +347,7 @@ func hooksStopCheckCmd() *cobra.Command {
 			_ = json.Unmarshal(data, &in)
 
 			if in.TranscriptPath != "" && transcriptHasWriteback(in.TranscriptPath) {
-				return nil // already wrote back: let it stop
+				return nil // already wrote back: let it stop, nothing to extract
 			}
 			sid := in.SessionID
 			if sid == "" {
@@ -350,7 +355,17 @@ func hooksStopCheckCmd() *cobra.Command {
 			}
 			marker := filepath.Join(os.TempDir(), "mesh-stop-"+sanitizeID(sid))
 			if _, err := os.Stat(marker); err == nil {
-				return nil // already nudged this session: do not loop
+				// Already nudged this session and the agent still has not written back.
+				// As the fallback, auto-extract the session's learnings into the review
+				// queue (once per session), if enabled. Never blocks the stop.
+				if autoExtract && vault != "" && in.TranscriptPath != "" {
+					exMarker := filepath.Join(os.TempDir(), "mesh-extracted-"+sanitizeID(sid))
+					if _, err := os.Stat(exMarker); err != nil {
+						_ = os.WriteFile(exMarker, []byte("1"), 0o644)
+						spawnExtraction(vault, in.TranscriptPath)
+					}
+				}
+				return nil // do not loop
 			}
 			_ = os.WriteFile(marker, []byte("1"), 0o644)
 			out, _ := json.Marshal(map[string]any{
@@ -365,7 +380,39 @@ func hooksStopCheckCmd() *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().StringVar(&vault, "vault", "", "vault to queue auto-extracted candidates into (enables the fallback extractor)")
+	c.Flags().BoolVar(&autoExtract, "extract", false, "auto-extract session learnings into the review queue when the agent did not write back")
 	return c
+}
+
+// spawnExtraction launches `mesh extract --to-pending <vault> <transcript>` as a
+// detached background process so the Stop hook returns immediately (the extraction
+// runs the BYOAI LLM, which takes seconds). Best-effort: failures are logged to the
+// vault's .mesh/extract.log, never surfaced to the hook's stdout (that is the hook
+// protocol channel). Runs in its own process group so it outlives the hook.
+func spawnExtraction(vault, transcript string) {
+	self, err := os.Executable()
+	if err != nil || self == "" {
+		self = "mesh"
+	}
+	logPath := filepath.Join(vault, ".mesh", "extract.log")
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+	lf, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	cmd := exec.Command(self, "extract", "--to-pending", vault, transcript)
+	if lf != nil {
+		cmd.Stdout, cmd.Stderr = lf, lf
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // detach from the hook's group
+	if err := cmd.Start(); err != nil {
+		if lf != nil {
+			fmt.Fprintf(lf, "spawn extraction failed: %v\n", err)
+		}
+		return
+	}
+	_ = cmd.Process.Release() // do not wait; let it finish in the background
+	if lf != nil {
+		_ = lf.Close()
+	}
 }
 
 // transcriptHasWriteback scans a session transcript for an actual mesh write TOOL
