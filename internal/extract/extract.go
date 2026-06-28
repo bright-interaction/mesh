@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -290,6 +291,63 @@ func TitleSimilarity(a, b string) float64 {
 // DuplicateThreshold is the title-similarity at or above which a candidate is treated
 // as already-known (tuned so near-restatements match but distinct notes do not).
 const DuplicateThreshold = 0.5
+
+// Occurrence is one extracted candidate tagged with the session it came from, the
+// input to recurring-problem detection across many sessions.
+type Occurrence struct {
+	Cand    Candidate
+	Session string
+}
+
+// Cluster is a group of similar candidates that recur across sessions: a candidate
+// learning that shows up again and again is a SYSTEMIC issue worth a permanent fix,
+// not a one-off write-back.
+type Cluster struct {
+	Rep      Candidate   `json:"rep"`      // the representative (first-seen) candidate
+	Sessions []string    `json:"sessions"` // distinct sessions it appeared in
+	Count    int         `json:"count"`    // distinct session count
+	Members  []Candidate `json:"members"`  // all candidates in the cluster
+}
+
+// ClusterRecurring greedily groups occurrences by title similarity (>= threshold) and
+// returns the clusters sorted by distinct-session count, descending. A cluster spanning
+// multiple sessions is a recurring problem.
+func ClusterRecurring(occs []Occurrence, threshold float64) []Cluster {
+	if threshold <= 0 {
+		threshold = DuplicateThreshold
+	}
+	var clusters []Cluster
+	for _, o := range occs {
+		placed := false
+		for i := range clusters {
+			if TitleSimilarity(clusters[i].Rep.Title, o.Cand.Title) >= threshold {
+				clusters[i].Members = append(clusters[i].Members, o.Cand)
+				if !contains(clusters[i].Sessions, o.Session) {
+					clusters[i].Sessions = append(clusters[i].Sessions, o.Session)
+				}
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			clusters = append(clusters, Cluster{Rep: o.Cand, Members: []Candidate{o.Cand}, Sessions: []string{o.Session}})
+		}
+	}
+	for i := range clusters {
+		clusters[i].Count = len(clusters[i].Sessions)
+	}
+	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Count > clusters[j].Count })
+	return clusters
+}
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
 
 const judgeSystem = `You are a senior engineer reviewing one candidate note for a team knowledge base. KEEP it only if it is genuinely non-obvious, reusable beyond one task, and durable (still true next month) - i.e. you would be glad the next engineer inherited it. REJECT routine task notes, restated obvious facts, project trivia, generic best practices, and speculation. Be strict; most weak notes should be rejected.
 
