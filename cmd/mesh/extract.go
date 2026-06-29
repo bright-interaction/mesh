@@ -171,6 +171,13 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate) err
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Review items already queued, so a candidate that restates one (from an earlier run
+	// or another session) is suppressed. The exact-title PendingID is not enough: the LLM
+	// rephrases the same learning differently each run, so two reruns hash to different
+	// ids and would both pile up. Compare by title similarity, the same bar used against
+	// the vault, so the queue cannot flood with reworded duplicates.
+	queuedTitles, _ := store.ListPending()
+
 	src := filepath.Base(transcript)
 	queued, dupes := 0, 0
 	for _, cnd := range cands {
@@ -179,16 +186,35 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate) err
 			fmt.Printf("skip (already known): %q ~ %q\n", cnd.Title, of)
 			continue
 		}
+		if of, dup := nearDuplicatePending(cnd.Title, queuedTitles); dup {
+			dupes++
+			fmt.Printf("skip (already queued): %q ~ %q\n", cnd.Title, of)
+			continue
+		}
 		if err := store.AddPending(index.PendingNote{
 			Type: cnd.Type, Title: cnd.Title, Do: cnd.Do, Dont: cnd.Dont,
 			Why: cnd.Why, Confidence: cnd.Confidence, Source: src,
 		}); err != nil {
 			return err
 		}
+		// Track it so two near-duplicate candidates in the SAME batch also collapse.
+		queuedTitles = append(queuedTitles, index.PendingNote{Type: cnd.Type, Title: cnd.Title})
 		queued++
 	}
-	fmt.Printf("queued %d candidate(s) for review in %s (%d skipped as already-known)\n", queued, vaultRoot, dupes)
+	fmt.Printf("queued %d candidate(s) for review in %s (%d skipped as duplicate)\n", queued, vaultRoot, dupes)
 	return nil
+}
+
+// nearDuplicatePending reports whether a candidate title restates a review item already
+// in the queue, by the same title-similarity bar used to dedup against the vault. This
+// stops the queue from filling with the LLM's slightly reworded reruns of one learning.
+func nearDuplicatePending(title string, existing []index.PendingNote) (string, bool) {
+	for _, p := range existing {
+		if extract.TitleSimilarity(title, p.Title) >= extract.DuplicateThreshold {
+			return p.Title, true
+		}
+	}
+	return "", false
 }
 
 // buildVaultRetriever builds a retriever over the vault for dedup. Best-effort: any

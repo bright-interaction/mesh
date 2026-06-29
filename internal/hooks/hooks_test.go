@@ -56,6 +56,52 @@ func TestInstallIdempotentAndUninstall(t *testing.T) {
 	}
 }
 
+// TestUpgradeNudgeToExtract: a project that already has the plain write-back nudge
+// can turn auto-extraction on by re-running install with --extract. The existing Stop
+// command is rewritten in place (not duplicated), idempotently.
+func TestUpgradeNudgeToExtract(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. plain nudge install: Stop command has no --extract.
+	if _, err := Install(opts(dir, true)); err != nil {
+		t.Fatal(err)
+	}
+	p := settingsPath(dir)
+	if data, _ := os.ReadFile(p); strings.Contains(string(data), "--extract") {
+		t.Fatal("plain install should not enable --extract")
+	}
+
+	// 2. re-run with AutoExtract: upgrades the existing Stop command in place.
+	o := opts(dir, true)
+	o.AutoExtract = true
+	r, err := Install(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Added) != 1 {
+		t.Fatalf("upgrade should report exactly the Stop change, got %v", r.Added)
+	}
+	data, _ := os.ReadFile(p)
+	s := string(data)
+	if !strings.Contains(s, "hooks stop-check") || !strings.Contains(s, "--extract") || !strings.Contains(s, "--vault") {
+		t.Fatalf("upgraded Stop command missing --extract/--vault:\n%s", s)
+	}
+	// the Stop hook must not be duplicated, and the read hooks must survive.
+	if strings.Count(s, "hooks stop-check") != 1 {
+		t.Errorf("upgrade duplicated the Stop hook; stop-check count = %d", strings.Count(s, "hooks stop-check"))
+	}
+	st, _ := GetStatus(dir)
+	if !st.ReadHook || !st.WriteHook {
+		t.Errorf("status after upgrade = %+v (read+write must both stay true)", st)
+	}
+
+	// 3. idempotent: re-running --extract again changes nothing.
+	r2, _ := Install(o)
+	if len(r2.Added) != 0 {
+		t.Errorf("second --extract install should be a no-op, got %v", r2.Added)
+	}
+}
+
 func TestReadOnlyInstall(t *testing.T) {
 	dir := t.TempDir()
 	r, _ := Install(opts(dir, false)) // enforceWriteback=false

@@ -182,6 +182,35 @@ func has(settings map[string]any, substr string) bool {
 	return strings.Contains(string(data), substr)
 }
 
+// upgradeStopExtract rewrites an existing nudge-only Stop hook command
+// (`mesh hooks stop-check`) to the auto-extract variant in place, so re-running
+// `mesh hooks install --extract` turns extraction on for a project that already had
+// the plain nudge. Returns whether it changed a command. It mutates the maps under
+// settings["hooks"], so the caller's marshal of settings reflects the change.
+func upgradeStopExtract(hooks map[string]any, bin, vault string) bool {
+	groups, _ := hooks["Stop"].([]any)
+	want := stopCommand(bin, vault, true)
+	changed := false
+	for _, g := range groups {
+		gm, _ := g.(map[string]any)
+		if gm == nil {
+			continue
+		}
+		entries, _ := gm["hooks"].([]any)
+		for _, e := range entries {
+			em, _ := e.(map[string]any)
+			if em == nil {
+				continue
+			}
+			if cmd, _ := em["command"].(string); strings.Contains(cmd, "hooks stop-check") && !strings.Contains(cmd, "--extract") {
+				em["command"] = want
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
 // Install merges the Mesh session hooks into the project's .claude/settings.json,
 // preserving any existing settings/hooks. Idempotent.
 func Install(o Options) (Result, error) {
@@ -201,13 +230,21 @@ func Install(o Options) (Result, error) {
 		appendHook(hooks, "SessionStart", map[string]any{"matcher": "resume", "hooks": []any{cmdEntry(oc)}})
 		res.Added = append(res.Added, "SessionStart -> mesh orient (the agent reads the mesh at session start)")
 	}
-	if o.EnforceWriteback && !has(settings, "hooks stop-check") {
+	switch {
+	case o.EnforceWriteback && !has(settings, "hooks stop-check"):
 		appendHook(hooks, "Stop", map[string]any{"hooks": []any{cmdEntry(stopCommand(o.Bin, o.Vault, o.AutoExtract))}})
 		msg := "Stop -> mesh hooks stop-check (nudges write-back once before finishing)"
 		if o.AutoExtract {
 			msg = "Stop -> mesh hooks stop-check --extract (nudges write-back, then auto-extracts candidates for review if the agent did not)"
 		}
 		res.Added = append(res.Added, msg)
+	case o.AutoExtract && has(settings, "hooks stop-check") && !has(settings, "--extract"):
+		// Upgrade path: the project already has the plain write-back nudge, so the
+		// bare-substring guard above would skip it and leave --extract silently off.
+		// Rewrite the existing Stop command in place to turn auto-extraction on.
+		if upgradeStopExtract(hooks, o.Bin, o.Vault) {
+			res.Added = append(res.Added, "Stop -> mesh hooks stop-check --extract (upgraded the existing write-back nudge to also auto-extract review candidates)")
+		}
 	}
 	settings["hooks"] = hooks
 	out, _ := json.MarshalIndent(settings, "", "  ")
