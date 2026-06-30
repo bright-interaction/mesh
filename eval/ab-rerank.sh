@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Bright Interaction AB
 # Deterministic A/B for the BYOAI cross-encoder rerank stage.
 #
 # Runs `mesh eval` twice on a labelled case set, rerank OFF then ON, with only

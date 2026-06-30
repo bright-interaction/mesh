@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package meshcfg reads and writes a solo vault's local embedding config at
 // <vault>/.mesh/config.toml. It is the solo counterpart to a team vault's
 // hub-authoritative mesh.toml: it pins the embedding endpoint/model/dim so
@@ -106,12 +109,12 @@ func LoadConfig(meshDir string) (Config, error) {
 	}
 	body := string(b)
 	c.Retrieval = Retrieval{
-		WeightFTS:      sectionFloat(body, "retrieval", "weight_fts"),
-		WeightGraph:    sectionFloat(body, "retrieval", "weight_graph"),
-		WeightVec:      sectionFloat(body, "retrieval", "weight_vec"),
-		RerankEndpoint: sectionString(body, "rerank", "endpoint"),
-		RerankModel:    sectionString(body, "rerank", "model"),
-		RerankKeyEnv:   sectionString(body, "rerank", "key_env"),
+		WeightFTS:             sectionFloat(body, "retrieval", "weight_fts"),
+		WeightGraph:           sectionFloat(body, "retrieval", "weight_graph"),
+		WeightVec:             sectionFloat(body, "retrieval", "weight_vec"),
+		RerankEndpoint:        sectionString(body, "rerank", "endpoint"),
+		RerankModel:           sectionString(body, "rerank", "model"),
+		RerankKeyEnv:          sectionString(body, "rerank", "key_env"),
 		RerankBlend:           sectionFloat(body, "rerank", "blend"),
 		HNSWThreshold:         int(sectionFloat(body, "ann", "hnsw_threshold")),
 		FreshnessHalfLifeDays: int(sectionFloat(body, "retrieval", "freshness_half_life_days")),

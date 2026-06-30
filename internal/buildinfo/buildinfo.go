@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package buildinfo exposes the running Mesh version and its AGPL section 13
 // Corresponding Source offer. It is shared by every network-served surface (the
 // hub's human pages, the hub /about endpoint, and the web app shell) so the offer is

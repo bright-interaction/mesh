@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package syncproto holds the JSON wire types for the Mesh sync protocol, shared
 // by the hub (internal/hub) and the client (pkg/meshclient) so there is one
 // definition of the contract. Content travels base64-encoded so arbitrary note

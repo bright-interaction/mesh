@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package rerank is the BYOAI cross-encoder layer. Like embeddings, Mesh never
 // runs inference itself: it POSTs (query, candidate documents) to an endpoint
 // the operator controls and gets back a relevance score per document. A

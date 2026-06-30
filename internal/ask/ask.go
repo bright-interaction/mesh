@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package ask answers a natural-language question from the team's own knowledge: it
 // retrieves the relevant notes (the graph) plus the relevant code symbols (the code
 // index), hands them to the BYOAI LLM as the ONLY allowed context, and returns the

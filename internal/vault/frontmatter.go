@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 package vault
 
 import (
@@ -79,13 +82,13 @@ type Frontmatter struct {
 	// Provenance: who/what wrote this note, where it came from, when to recheck.
 	// Feeds the audit trail, the knowledge-lifecycle health checks, and the
 	// contributor/ROI views. All optional.
-	Author     string     `yaml:"author,omitempty"`     // human who authored it
-	Agent      string     `yaml:"agent,omitempty"`      // tool that wrote it, e.g. "claude-code"
-	Source     string     `yaml:"source,omitempty"`     // manual | agent | import:<connector>
-	SourceURL  string     `yaml:"source_url,omitempty"` // upstream link for imported notes
-	Confidence string     `yaml:"confidence,omitempty"` // low | med | high
-	ReviewBy   string     `yaml:"review_by,omitempty"`  // YYYY-MM-DD; lifecycle re-check date
-	ImportedAt string     `yaml:"imported_at,omitempty"`
+	Author     string `yaml:"author,omitempty"`     // human who authored it
+	Agent      string `yaml:"agent,omitempty"`      // tool that wrote it, e.g. "claude-code"
+	Source     string `yaml:"source,omitempty"`     // manual | agent | import:<connector>
+	SourceURL  string `yaml:"source_url,omitempty"` // upstream link for imported notes
+	Confidence string `yaml:"confidence,omitempty"` // low | med | high
+	ReviewBy   string `yaml:"review_by,omitempty"`  // YYYY-MM-DD; lifecycle re-check date
+	ImportedAt string `yaml:"imported_at,omitempty"`
 	// Scope is the access-control partition(s) this note belongs to (dev, sales, ...).
 	// A note may carry several. ABSENCE means dev-only (the fail-safe): an unlabeled
 	// note is never accidentally exposed to or writable by a non-dev scope. Read

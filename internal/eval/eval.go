@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package eval is the Gate-1 measurement harness. An adversarial review of the
 // first version found two fatal defects: it compared a 1-body Mesh arm against a
 // 3-body baseline (so the "saving" was mostly body-count, not fusion), and it

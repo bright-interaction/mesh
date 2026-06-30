@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package graph holds Mesh's in-memory knowledge graph. The node/edge shape is
 // lifted from dockyard's internal/knowledge graph and adapted for markdown:
 // identity is the frontmatter id (node id "note:<id>"), never the file path, so

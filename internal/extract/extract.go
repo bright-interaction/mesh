@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package extract turns a coding-agent session transcript into candidate write-back
 // notes. It is the input side of the flywheel: today write-back is opt-in (the Stop
 // hook nudges once and ~most sessions still write nothing), so this lets Mesh pull the

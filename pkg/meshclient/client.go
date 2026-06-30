@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package meshclient is the Mesh team-sync client: the low-level RPC transport to
 // a mesh-hub plus the high-level vault orchestration (join + reconcile) that
 // reads and writes a vault's local sync state. It never runs git; it speaks the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package hooks installs the Claude Code SESSION hooks that make an agent use Mesh
 // automatically: read the mesh at session start, and get nudged to write back what
 // it learned before finishing. Shared by the `mesh hooks` CLI and the

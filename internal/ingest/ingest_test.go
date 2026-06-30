@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 package ingest
 
 import (
@@ -244,4 +247,3 @@ func TestIncrementalTruncatedDoesNotAdvanceMark(t *testing.T) {
 		t.Fatalf("mark not applied after a complete (non-truncated) pull")
 	}
 }
-

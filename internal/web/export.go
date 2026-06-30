@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package web serves `mesh ui`: a sovereign, single-binary localhost graph viewer
 // (no CDN, no third-party JS, self-hosted fonts). It exposes the same in-memory
 // graph the agent reads over MCP, as one /graph.json the SPA renders in two views
