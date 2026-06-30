@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Bright Interaction AB
 # Open-core boundary guard. Fails if any OPEN package imports a PRO package in the
 # default (open) build, which would make the published AGPL mirror fail to compile
 # once split-public-repo.sh strips the pro paths.

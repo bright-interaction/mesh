@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package guards turns institutional gotchas into candidate enforcement: for a gotcha
 // with a concrete anti-pattern, the BYOAI LLM proposes a grep-style pre-commit check
 // (pattern + file globs + message). The human pastes the ones that fit into the hook,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package tokenize counts tokens with a real BPE tokenizer: the cl100k_base
 // vocabulary (the GPT-4 / GPT-3.5 tokenizer), a reproducible public standard.
 // Mesh budgets retrieval to this count and the eval harness measures

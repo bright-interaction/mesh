@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package watch keeps a Mesh index live with the vault on disk. It is the
 // local-first, Obsidian-like immediacy of Milestone S0: edit a note in your
 // editor and it is searchable at once, no commit, no manual `mesh index`.

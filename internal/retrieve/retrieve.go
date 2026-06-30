@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package retrieve is the wedge: it fuses the FTS5 and graph-BM25 signals,
 // expands one hop along the graph, boosts the institutional-memory tier, and
 // packs the result to a token budget. The agent calls this, not raw search.

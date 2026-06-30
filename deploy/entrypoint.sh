@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Bright Interaction AB
 # mesh-hub container entrypoint. `init` is idempotent (it reuses an existing
 # vault_id and leaves existing files), so it is safe to run on every boot: the
 # first boot bootstraps the repo + hub.db on the mounted volume, later boots are

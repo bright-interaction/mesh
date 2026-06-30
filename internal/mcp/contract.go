@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 package mcp
 
 // contractText is the agent-usage contract: how any agent should retrieve from

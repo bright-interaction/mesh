@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package tui is `mesh tui`: a keyboard-driven terminal view of the vault over
 // the same index + graph + retriever the agent uses. Three panes: a notes list,
 // ranked search results, and a markdown preview with the note's neighbors. Built

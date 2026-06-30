@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package llm is the Mesh BYOAI chat boundary for the sync-curator (S2.1). It is
 // stdlib-only (no SDK) and speaks three backends behind one Complete interface:
 //

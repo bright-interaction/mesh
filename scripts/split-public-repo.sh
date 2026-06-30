@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Bright Interaction AB
 # Produce the public AGPL-3.0 mirror of Mesh's open core at
 # github.com/bright-interaction/mesh, so `go install
 # github.com/bright-interaction/mesh/cmd/mesh@latest` resolves. See
@@ -100,7 +102,14 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 CLONE="$WORK/mesh-public"
 echo "Cloning $SPLIT_BRANCH -> $CLONE for filtering ..."
-git clone --quiet --branch "$SPLIT_BRANCH" "file://$ROOT" "$CLONE"
+# --single-branch + --no-tags so the throwaway clone holds ONLY the disjoint mesh
+# subtree history, never the monorepo's other branches. Those branches carry unrelated
+# project secrets (mithras/hephaestus CI keys etc.); a plain clone drags them in, and
+# while `git push HEAD:main` would not send unreachable objects, keeping them out of the
+# clone entirely removes the footgun and makes the secret scan below authoritative.
+# file:// already disables the local hardlink optimization, so only objects reachable
+# from the split branch are transferred.
+git clone --quiet --single-branch --no-tags --branch "$SPLIT_BRANCH" "file://$ROOT" "$CLONE"
 
 FR_ARGS=()
 for p in "${PRO_PATHS[@]}"; do FR_ARGS+=(--path "$p"); done
@@ -124,6 +133,23 @@ if command -v go >/dev/null 2>&1; then
   ( cd "$CLONE" && go test -run='^$' ./... >/dev/null ) && echo "  open core tests compile: OK"
 else
   echo "  (go not found; skipping build check)" >&2
+fi
+
+# Secret scan: refuse to publish if any credential appears anywhere in the mirror's
+# history. The clone is single-branch (only the publish payload), so this scans exactly
+# what --push sends. This is in addition to the coarse regex guard above; gitleaks has a
+# far broader ruleset. Gated on gitleaks being installed.
+if command -v gitleaks >/dev/null 2>&1; then
+  echo "Scanning the mirror history for secrets (gitleaks) ..."
+  if ! ( cd "$CLONE" && gitleaks detect --source . --no-banner --redact >/dev/null 2>&1 ); then
+    echo "REFUSING: gitleaks found a secret in the mirror history. Audit before any push:" >&2
+    ( cd "$CLONE" && gitleaks detect --source . --no-banner --redact ) >&2 || true
+    exit 1
+  fi
+  echo "  no secrets in the mirror history: OK"
+else
+  echo "  (gitleaks not installed; skipping the secret-scan gate. Install it with" >&2
+  echo "   'go install github.com/zricethezav/gitleaks/v8@latest' to enforce this.)" >&2
 fi
 
 if [ "$PUSH" -eq 0 ]; then

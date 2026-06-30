@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package textdiff renders a bounded, hand-rolled unified line diff (stdlib only,
 // no diff library). It backs `mesh conflicts diff` and `mesh curator show`, which
 // show a parked loser against the current note. Bounded by design: it refuses to

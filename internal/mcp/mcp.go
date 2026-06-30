@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package mcp serves Mesh's retrieval + write-back surface to a coding agent
 // over JSON-RPC 2.0 on stdio. A local agent (Claude Code / Codex) spawns
 // `mesh mcp` and talks to it directly; no port or auth surface. The JSON-RPC

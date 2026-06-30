@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package ingest pulls knowledge from where a team already keeps it (GitHub, Slack,
 // ...) into THEIR vault, on THEIR hardware - the sovereign version of what cloud
 // search tools do. Each imported item becomes a markdown note with provenance

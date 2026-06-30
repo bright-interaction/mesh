@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package code parses source files into a lightweight symbol graph so Mesh can
 // answer "where does this function live / what calls it" without a separate code
 // indexer. It is the pure-Go replacement for graphify's source-code role: Go is

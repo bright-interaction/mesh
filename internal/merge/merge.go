@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Bright Interaction AB
+
 // Package merge is the pure, deterministic three-way reconcile engine at the
 // heart of Milestone S1 team sync. Given a path's three versions (the client's
 // base ancestor, the hub's current HEAD, and the client's incoming change) it
