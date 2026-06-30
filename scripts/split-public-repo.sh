@@ -20,15 +20,36 @@ PREFIX="mesh"
 SPLIT_BRANCH="mesh-public-split"
 
 # The pro layer: stripped from the public mirror's entire history. Keep in sync with
-# docs/OPEN-CORE.md. Paths are relative to mesh/ (the subtree-split strips the prefix).
+# docs/OPEN-CORE.md and scripts/check-open-core-boundary.sh. Paths are relative to
+# mesh/ (the subtree-split strips the prefix).
+#
+# NOTE: internal/llm is OPEN core, not pro. It is a thin BYOAI client shim (claude -p
+# / Anthropic / OpenAI-compatible) with no defensible moat, and the flywheel features
+# that use it (mesh ask / extract / guards) are the open product. Only the curator's
+# conflict-merge logic (internal/curator, still pro) wraps it on the pro side; pro
+# importing open is fine.
 PRO_PATHS=(
   internal/hub cmd/mesh-hub
-  internal/curator cmd/mesh-curator internal/llm
+  internal/curator cmd/mesh-curator
+  # Team mode for `mesh ui --hub-db` reads the pro hub store. The open build ships the
+  # ui_hubteam_stub.go variant (refuses team mode); this pro impl is the only cmd/mesh
+  # file importing internal/hub, so it is stripped (build-tag seam, like HNSW below).
+  cmd/mesh/ui_hubteam_pro.go
   # ANN at scale: the open core uses brute-force cosine (fine well past v1 scale);
   # HNSW is the pro "1000+ vectors" gate, wired only in the -tags pro build.
   internal/hnsw
   internal/retrieve/retrieve_ann_pro.go
   internal/retrieve/retrieve_ann_pro_test.go
+  # Hub-harness integration tests: they stand up a real hub (httptest) to exercise the
+  # open sync client / conflicts command, so they need the pro hub and ship with it.
+  # The production code they cover (pkg/meshclient, the conflicts command) stays open.
+  # The meshclient set must be stripped together: e2e_test.go defines the setupHub
+  # helper that events_test.go + tombstone_test.go reuse, so dropping one orphans the
+  # others (the post-strip test-compile gate below catches that).
+  cmd/mesh/conflicts_test.go
+  pkg/meshclient/e2e_test.go
+  pkg/meshclient/events_test.go
+  pkg/meshclient/tombstone_test.go
 )
 
 for arg in "$@"; do
@@ -53,6 +74,13 @@ if [ ! -d "$PREFIX" ]; then
   echo "error: $PREFIX/ not found at repo root $ROOT" >&2
   exit 1
 fi
+
+# Pre-flight: fail fast if the open build imports a pro package. Stripping the pro
+# paths below would then leave the mirror unable to compile, which the post-strip
+# build check catches too - but this gives a precise, early "which import leaked"
+# instead of an opaque downstream build error.
+echo "Checking open-core boundary (no open package may import a pro package) ..."
+( cd "$PREFIX" && bash scripts/check-open-core-boundary.sh )
 
 # Guard: refuse to mirror if a secret ever landed under mesh/ (defense before an
 # outward, irreversible public push).
@@ -90,6 +118,10 @@ done
 echo "Build-checking the filtered open core ..."
 if command -v go >/dev/null 2>&1; then
   ( cd "$CLONE" && go build ./... ) && echo "  open core builds standalone: OK"
+  # Also compile the tests (go build skips _test.go). This catches a stripped test
+  # file that orphaned a helper another kept test still uses - e.g. dropping
+  # e2e_test.go without its siblings leaves events_test.go referencing setupHub.
+  ( cd "$CLONE" && go test -run='^$' ./... >/dev/null ) && echo "  open core tests compile: OK"
 else
   echo "  (go not found; skipping build check)" >&2
 fi
