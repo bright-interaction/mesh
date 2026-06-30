@@ -39,5 +39,5 @@ changes), a commercial license to the core is available. Contact Bright Interact
 
 Contributions to the open core are welcome under a Contributor License Agreement
 that lets Bright Interaction continue to offer the dual (AGPL + commercial) license.
-By opening a PR you agree your contribution may be distributed under both. The CLA
-is recorded in `CONTRIBUTING.md` (added with the public repo).
+By opening a PR you agree your contribution may be distributed under both. The full
+terms are in [`CONTRIBUTING.md`](CONTRIBUTING.md).
