@@ -20,7 +20,6 @@ import (
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/eval"
 	"github.com/bright-interaction/mesh/internal/graph"
-	"github.com/bright-interaction/mesh/internal/hub"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
@@ -1573,40 +1572,17 @@ func uiCmd() *cobra.Command {
 			if hubDB == "" {
 				return web.Serve(vaultArg(args), addr, token, basePath, nil, nil)
 			}
-			// Per-member mode: authenticate each request against the hub's client store
-			// (shared volume) and scope reads to the signed-in member.
-			store, err := hub.Open(hubDB)
+			// Per-member team mode: resolve each request against the hub's client
+			// store and scope reads to the signed-in member. The hub store is the
+			// commercial layer, so this is wired only in the pro build (openHubTeam);
+			// the open core returns a clear "needs the pro build" error here. Break-glass
+			// (the shared MESH_UI_TOKEN as an unrestricted admin login) is preserved by
+			// the pro impl so flipping a live app to member mode never locks anyone out.
+			verify, scopesFor, closeHub, err := openHubTeam(hubDB, token)
 			if err != nil {
-				return fmt.Errorf("open hub db %q: %w", hubDB, err)
+				return err
 			}
-			defer store.Close()
-			verify := func(tok string) (int64, string, bool) {
-				// Break-glass: the shared MESH_UI_TOKEN still works as an unrestricted
-				// admin login (id -1), so flipping a live app to member mode never locks
-				// anyone out before members have joined. Members use their own client token.
-				if token != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(tok)), []byte(token)) == 1 {
-					return -1, "admin", true
-				}
-				c, err := store.ClientByToken(tok)
-				if err != nil {
-					return 0, "", false
-				}
-				return c.ID, c.User, true
-			}
-			scopesFor := func(id int64) map[string]bool {
-				if id < 0 {
-					return nil // shared-token admin: unrestricted
-				}
-				c, err := store.ClientByID(id)
-				if err != nil {
-					return map[string]bool{} // unknown client -> deny all
-				}
-				allowed, err := store.AllowedReadScopesForClient(c)
-				if err != nil {
-					return map[string]bool{}
-				}
-				return allowed // nil = unrestricted (scoping not configured)
-			}
+			defer closeHub()
 			return web.Serve(vaultArg(args), addr, token, basePath, verify, scopesFor)
 		},
 	}

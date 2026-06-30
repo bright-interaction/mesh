@@ -5,9 +5,13 @@ is the source of truth for what lives where and how the public mirror is produce
 
 ## The boundary
 
-The split is a pure package boundary: **nothing in the core imports the pro
-packages**, so the core builds and ships on its own. Verified by the import graph
-(`go list`): the pro packages are only imported by their own binaries.
+The split is a pure package boundary: **nothing in the open core imports the pro
+packages**, so the core builds and ships on its own. This is enforced, not assumed:
+`scripts/check-open-core-boundary.sh` walks the open build's import graph (`go list
+-deps`) and fails if any open package imports a pro package. It runs as a pre-flight
+gate in `split-public-repo.sh` and in the repo pre-commit hook, so the boundary
+cannot silently rot (it did once, 2026-06-30: the flywheel features pulled in
+`internal/llm` and `mesh ui --hub-db` pulled in `internal/hub`; see the fix below).
 
 ### Open core (public repo, AGPL-3.0)
 
@@ -16,6 +20,8 @@ The whole single-user + hub-client experience:
 - `cmd/mesh`: the CLI (`index`, `search`, `mcp`, `tui`, `ui`, `watch`, `join`, `sync`, `doctor`, `tune`, `migrate`).
 - `internal/vault`, `internal/index`, `internal/graph`: parse, the in-memory graph, Louvain communities.
 - `internal/retrieve`, `internal/rerank`, `internal/embed`, `internal/tokenize`: fused FTS + graph-BM25 + BYOAI vectors/rerank retrieval. The open core uses brute-force cosine for the vector signal (sub-5ms well past v1 scale).
+- `internal/llm`: the BYOAI chat boundary (a stdlib-only client shim over `claude -p` / the Anthropic Messages API / any OpenAI-compatible endpoint). It is open because it is a thin client with no defensible moat, and the flywheel features built on it are the open product.
+- `internal/ask`, `internal/extract`, `internal/guards`: the BYOAI flywheel - grounded Q&A over notes+code (`mesh ask`), auto-extraction of write-back candidates (`mesh extract` + the Review queue), and gotcha pre-commit guards. All use `internal/llm`.
 - `internal/mcp`: the agent retrieval + write-back surface (read tools, `mesh_append_note`/`mesh_write_entity`, `mesh_reindex`).
 - `internal/web`, `internal/tui`, `internal/sshserve`: the 2D/3D viewers, the terminal UI, and the SSH viewer (`mesh serve-ssh`: the TUI over SSH, key-auth, fail-closed).
 - `internal/merge`, `internal/syncproto`, `pkg/meshclient`: the sync **client** and wire protocol, so the open core can join a hub.
@@ -26,18 +32,25 @@ The whole single-user + hub-client experience:
 The collaboration server and the AI layer, the monetized value:
 
 - `internal/hub`, `cmd/mesh-hub`: the team-sync hub server (the durable moat: a managed/licensed service, not code value).
-- `internal/curator`, `cmd/mesh-curator`, `internal/llm`: the BYOAI sync-curator (AI conflict merge).
+- `internal/curator`, `cmd/mesh-curator`: the BYOAI sync-curator (AI conflict merge). It imports the open `internal/llm` - pro importing open is fine.
 - `internal/hnsw` + `internal/retrieve/retrieve_ann_pro.go`: the HNSW ANN index, the "1000+ vectors" scale gate. The core has a build-tag seam (`annSearcher`/`buildANN`, nil in the open build) so it compiles brute-force-only; the pro build wires HNSW with `-tags pro`. This is gated by ABSENCE (the impl is stripped from the mirror), not a removable flag.
+- `cmd/mesh/ui_hubteam_pro.go`: the team-mode wiring for `mesh ui --hub-db`, which reads the pro hub store. Same build-tag seam as HNSW: the open core ships `cmd/mesh/ui_hubteam_stub.go` (an `openHubTeam` that refuses team mode with a "needs the pro build" error), and this pro file - the only `cmd/mesh` file importing `internal/hub` - is stripped from the mirror. Plain `mesh ui` (solo vault) stays fully open.
+- `cmd/mesh/conflicts_test.go` and the `pkg/meshclient` hub-harness tests (`e2e_test.go`, `events_test.go`, `tombstone_test.go`): integration tests that stand up a real hub to exercise the open sync client and conflicts command, so they need the pro hub and are stripped with it. The meshclient set strips together because `e2e_test.go` defines the `setupHub` helper the other two reuse. The production code they cover ships open; the private monorepo runs the full suite. (`pkg/meshclient/vault_test.go` is hub-free and stays in the mirror.)
 - Future: cross-vault federation, team-scale collaboration analytics, pro graph functions. These belong here, behind the service/license, not as a flag in the open binary.
 
-Authoritative exclude set for the public mirror:
+Authoritative exclude set for the public mirror (keep in sync with `split-public-repo.sh` `PRO_PATHS` and `check-open-core-boundary.sh`):
 
 ```
-internal/hub  cmd/mesh-hub  internal/curator  cmd/mesh-curator  internal/llm
+internal/hub  cmd/mesh-hub  internal/curator  cmd/mesh-curator
 internal/hnsw  internal/retrieve/retrieve_ann_pro.go  internal/retrieve/retrieve_ann_pro_test.go
+cmd/mesh/ui_hubteam_pro.go
+cmd/mesh/conflicts_test.go
+pkg/meshclient/e2e_test.go  pkg/meshclient/events_test.go  pkg/meshclient/tombstone_test.go
 ```
 
-The pro binaries build with `-tags pro` (wires HNSW); the open mirror builds with the default tags (brute-force only).
+`internal/llm` is NOT excluded - it is open core (see the open-core list above).
+
+The pro binaries build with `-tags pro` (wires HNSW + the hub team-mode impl); the open mirror builds with the default tags (brute-force only, team mode stubbed out).
 
 ## How the public mirror is produced
 
