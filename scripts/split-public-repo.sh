@@ -132,8 +132,8 @@ echo "Stripping pro paths from all history: ${PRO_PATHS[*]}"
 # a blunt replace would corrupt unrelated tests.
 REDACT="$WORK/redactions.txt"
 printf 'host==>host\n' > "$REDACT"
-echo "Redacting internal hostname from all history ..."
-( cd "$CLONE" && git filter-repo --force --replace-text "$REDACT" )
+echo "Redacting internal hostname from all history (file contents + commit messages) ..."
+( cd "$CLONE" && git filter-repo --force --replace-text "$REDACT" --replace-message "$REDACT" )
 
 # Defense in depth: fail if any pro path survived the filter.
 for p in "${PRO_PATHS[@]}"; do
