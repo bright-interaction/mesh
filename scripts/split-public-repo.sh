@@ -52,6 +52,14 @@ PRO_PATHS=(
   pkg/meshclient/e2e_test.go
   pkg/meshclient/events_test.go
   pkg/meshclient/tombstone_test.go
+  # Internal-only docs (NOT pro code): milestone working-plans + the Bright-Interaction-
+  # specific deploy runbook. They name internal infra (host, Dockyard, Hephaestus) and
+  # machines, add nothing for external users, and are kept private. The architecture lives
+  # in the public docs/SPEC.md (infra names sanitised there). Decided 2026-06-30 with Tom.
+  docs/S1-PLAN.md
+  docs/S2-PLAN.md
+  docs/M3-PLAN.md
+  deploy/DEPLOY.md
 )
 
 for arg in "$@"; do
