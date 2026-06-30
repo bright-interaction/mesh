@@ -85,7 +85,7 @@
   function computeDomains() {
     for (const n of G.nodes) n.domain = domainIndexFor(n);
     // pass 2: a note that matched nothing inherits its community's dominant domain
-    // (communities are topical, so an untagged note in the Dockyard cluster is Infra).
+    // (communities are topical, so an untagged note in an infra cluster is Infra).
     const byComm = new Map();
     for (const n of G.nodes) {
       if (n.domain === GENERAL_DOMAIN) continue;
