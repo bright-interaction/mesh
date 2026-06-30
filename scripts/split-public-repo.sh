@@ -53,9 +53,9 @@ PRO_PATHS=(
   pkg/meshclient/events_test.go
   pkg/meshclient/tombstone_test.go
   # Internal-only docs (NOT pro code): milestone working-plans + the Bright-Interaction-
-  # specific deploy runbook. They name internal infra (host, Dockyard, Hephaestus) and
-  # machines, add nothing for external users, and are kept private. The architecture lives
-  # in the public docs/SPEC.md (infra names sanitised there). Decided 2026-06-30 with Tom.
+  # specific deploy runbook. They name internal hostnames and tooling, add nothing for
+  # external users, and are kept private. The architecture lives in the public
+  # docs/SPEC.md (infra names sanitised there). Decided 2026-06-30 with Tom.
   docs/S1-PLAN.md
   docs/S2-PLAN.md
   docs/M3-PLAN.md
@@ -123,6 +123,17 @@ FR_ARGS=()
 for p in "${PRO_PATHS[@]}"; do FR_ARGS+=(--path "$p"); done
 echo "Stripping pro paths from all history: ${PRO_PATHS[*]}"
 ( cd "$CLONE" && git filter-repo --force --invert-paths "${FR_ARGS[@]}" )
+
+# Redact the internal deploy-host nickname from ALL mirror history (not just the
+# current tree, which is already sanitised). "host" is a distinctive hostname token
+# that appears in no source/test fixture, so a literal global replace is safe. We do NOT
+# redact "Dockyard"/"Hephaestus": those are Bright Interaction product names, low
+# sensitivity, and are used as arbitrary example entity names in parser test fixtures, so
+# a blunt replace would corrupt unrelated tests.
+REDACT="$WORK/redactions.txt"
+printf 'host==>host\n' > "$REDACT"
+echo "Redacting internal hostname from all history ..."
+( cd "$CLONE" && git filter-repo --force --replace-text "$REDACT" )
 
 # Defense in depth: fail if any pro path survived the filter.
 for p in "${PRO_PATHS[@]}"; do
