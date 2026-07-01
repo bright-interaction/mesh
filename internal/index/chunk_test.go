@@ -8,6 +8,47 @@ import (
 	"testing"
 )
 
+// Editing a field the embedder puts into the vector chunk (title/do/dont/why/tags) must
+// change retrievalHash, so the stale pre-edit vector is excluded until a re-embed. This
+// is the fix for the "corrected a gotcha's do:, but the old vector kept being served"
+// bug: the hash is stamped onto each vector as note_hash and the staleness check keys on
+// it, so if the hash ignored these fields the correction would never invalidate.
+func TestRetrievalHashCoversEmbeddingFields(t *testing.T) {
+	base := `---
+id: h
+type: gotcha
+title: Original title
+do: use sqlite
+dont: use cgo
+why: static binary
+tags: [a, b]
+---
+# body
+same body text
+`
+	parse := func(src string) *ParsedNote {
+		pn, err := Parse("vault/h.md", []byte(src))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return pn
+	}
+	h0 := retrievalHash(parse(base))
+
+	edits := map[string]string{
+		"title": strings.Replace(base, "Original title", "New title", 1),
+		"do":    strings.Replace(base, "do: use sqlite", "do: NEVER use sqlite", 1),
+		"dont":  strings.Replace(base, "dont: use cgo", "dont: use raw C", 1),
+		"why":   strings.Replace(base, "why: static binary", "why: reproducible builds", 1),
+		"tags":  strings.Replace(base, "tags: [a, b]", "tags: [a, c]", 1),
+	}
+	for field, src := range edits {
+		if retrievalHash(parse(src)) == h0 {
+			t.Errorf("editing %q did not change retrievalHash; its vector would stay stale", field)
+		}
+	}
+}
+
 func TestChunkText(t *testing.T) {
 	src := []byte(`---
 id: chunk-demo

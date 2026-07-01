@@ -12,7 +12,6 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/rerank"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 const (
@@ -647,22 +647,11 @@ func (r *Retriever) card(id string) Card {
 }
 
 // scopeAllowed reports whether a card may be returned given an allowed-scope set.
-// allowed==nil means unrestricted (the solo / no-ACL fast path). A card with no
-// scope attr is treated as the fail-safe default (dev-only).
+// allowed==nil means unrestricted (the solo / no-ACL fast path). A card with no scope
+// attr is treated as the fail-safe default (dev-only). Delegates to the one shared
+// predicate so this surface cannot drift from the MCP/web scope checks.
 func scopeAllowed(cardScope string, allowed map[string]bool) bool {
-	if allowed == nil {
-		return true
-	}
-	cs := cardScope
-	if strings.TrimSpace(cs) == "" {
-		cs = "dev"
-	}
-	for _, s := range strings.Split(cs, ",") {
-		if allowed[strings.TrimSpace(s)] {
-			return true
-		}
-	}
-	return false
+	return vault.ScopeAllowsCSV(cardScope, allowed)
 }
 
 // freshnessTypes are NON-institutional notes that decay with age. Decisions,

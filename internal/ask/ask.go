@@ -33,7 +33,16 @@ type Result struct {
 	Citations []Citation `json:"citations"`
 }
 
-const system = `You answer a developer's question using ONLY the provided context, which is the team's own notes and source code. Cite every claim with its source number like [2]. If the context does not contain the answer, say so plainly ("the vault has nothing on that") instead of guessing. Be concise and concrete; prefer the team's specific decisions/gotchas over generic advice.`
+const system = `You answer a developer's question using ONLY the provided context, which is the team's own notes and source code. Do not use any outside or general knowledge. If the provided context does not contain the answer, reply exactly with "The vault has nothing on that." and nothing else, rather than guessing or answering from what you already know. Cite every claim with its source number like [2]. Be concise and concrete, and ground every statement in a cited source.`
+
+// codeReadable reports whether the caller may see the source-code index. Code symbols
+// carry no per-note scope, so the whole index is treated as dev-scoped (the same rule
+// the MCP code tools enforce via codeScopeDenied): only an unrestricted caller or one
+// who can read the dev scope gets code in their answer. Without this a scope-confined
+// member's answer would leak dev source symbols (name, signature, file:line).
+func codeReadable(allowedScopes map[string]bool) bool {
+	return allowedScopes == nil || allowedScopes["dev"]
+}
 
 // Answer retrieves notes + code for the question, asks the LLM grounded on them, and
 // returns the answer with the cited sources. allowedScopes (nil = unrestricted) keeps
@@ -57,7 +66,7 @@ func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, cl
 			cites = append(cites, Citation{N: n, Kind: "note", ID: c.NoteID, Title: c.Title, Loc: c.Path})
 		}
 	}
-	if store != nil {
+	if store != nil && codeReadable(allowedScopes) {
 		if hits, err := store.SearchCode(question, 5, nil); err == nil {
 			for _, h := range hits {
 				n++

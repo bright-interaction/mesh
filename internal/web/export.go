@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 const (
@@ -71,15 +72,7 @@ func scopeVisible(n *graph.Node, allowed map[string]bool) bool {
 		return true
 	}
 	sc, _ := n.Attrs["scope"].(string)
-	if strings.TrimSpace(sc) == "" {
-		return allowed["dev"]
-	}
-	for _, s := range strings.Split(sc, ",") {
-		if allowed[strings.TrimSpace(s)] {
-			return true
-		}
-	}
-	return false
+	return vault.ScopeAllowsCSV(sc, allowed)
 }
 
 // BuildExport projects the in-memory graph into the SPA payload. allowed (nil =

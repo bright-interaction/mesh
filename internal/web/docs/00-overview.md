@@ -36,7 +36,7 @@ it is used.
 
 - **Finds the right knowledge cheaply.** Instead of an agent reading whole files to be
   safe, Mesh returns small ranked cards (title, snippet, why it matched) and the agent
-  opens only the one note it needs. About a third of the tokens of classic RAG, with
+  opens only the one note it needs. About half the tokens of classic RAG, with
   no embedding model or vector database required. See "Efficiency vs classic RAG".
 - **Connects notes to code.** A separate source-code index lets you find a function by
   name and, crucially, see the team's notes ABOUT that function next to it (the

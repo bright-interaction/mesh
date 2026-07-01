@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // ScopeFilter is the per-request access-control context the hub injects so the MCP
@@ -36,20 +37,13 @@ func scopeFromCtx(ctx context.Context) *ScopeFilter {
 }
 
 // allowsRead reports whether a note carrying these scopes is readable. A nil filter
-// or nil AllowedRead = unrestricted. No scopes = the fail-safe dev default.
+// or nil AllowedRead = unrestricted. No scopes = the fail-safe dev default. The intersect
+// logic lives in one place (vault.ScopeAllows) so it cannot drift per surface.
 func (sf *ScopeFilter) allowsRead(scopes []string) bool {
-	if sf == nil || sf.AllowedRead == nil {
+	if sf == nil {
 		return true
 	}
-	if len(scopes) == 0 {
-		return sf.AllowedRead["dev"]
-	}
-	for _, s := range scopes {
-		if sf.AllowedRead[strings.TrimSpace(s)] {
-			return true
-		}
-	}
-	return false
+	return vault.ScopeAllows(scopes, sf.AllowedRead)
 }
 
 // allowsNode reports whether a graph note node is readable under the filter, reading
