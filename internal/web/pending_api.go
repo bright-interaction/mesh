@@ -18,6 +18,9 @@ import (
 // unreviewed. GET lists; promote writes a real note + clears the item; discard clears.
 
 func (s *Server) handlePendingList(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) { // extraction candidates are dev-scoped review content
+		return
+	}
 	items, err := s.store.ListPending()
 	if err != nil {
 		http.Error(w, "list failed", http.StatusInternalServerError)
@@ -30,6 +33,9 @@ func (s *Server) handlePendingList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	var req struct {
 		ID string `json:"id"`
 	}
@@ -70,6 +76,9 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePendingDiscard(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	var req struct {
 		ID string `json:"id"`
 	}

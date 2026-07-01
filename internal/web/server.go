@@ -280,7 +280,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // mode (each request authenticates as a hub client and is scoped to them); member auth
 // is then the fail-closed gate, so the single-token requirement is skipped. Otherwise
 // it is the standalone single-token viewer (loopback needs no token).
-func Serve(vaultRoot, addr, token, basePath string, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool) error {
+func Serve(vaultRoot, addr, token, basePath string, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, bool)) error {
 	memberMode := verify != nil
 	var auth authConfig
 	if !memberMode {
@@ -298,7 +298,7 @@ func Serve(vaultRoot, addr, token, basePath string, verify func(string) (int64, 
 	s.auth = auth
 	s.basePath = normalizeBasePath(basePath)
 	if memberMode {
-		s.SetMemberAuth(verify, scopesFor)
+		s.SetMemberAuth(verify, scopesFor, roleFor)
 	}
 	exp := BuildExport(s.graph, vaultRoot, nil)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))

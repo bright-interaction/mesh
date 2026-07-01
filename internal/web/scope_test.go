@@ -48,6 +48,15 @@ func TestWebMemberScoping(t *testing.T) {
 			}
 			return nil // dev: unrestricted
 		},
+		func(id int64) (string, bool) {
+			switch id {
+			case 1:
+				return "admin", true
+			case 2:
+				return "member", true
+			}
+			return "", false // unknown/revoked
+		},
 	)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()

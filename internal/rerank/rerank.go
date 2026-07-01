@@ -22,6 +22,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/safehttp"
 )
 
 // maxRerankResponseBytes bounds a rerank endpoint's response (a small score list);
@@ -66,7 +68,7 @@ func NewHTTP(endpoint, model, key string) *HTTP {
 		Endpoint: strings.TrimRight(endpoint, "/"),
 		ModelID:  model,
 		Key:      key,
-		Client:   &http.Client{Timeout: 60 * time.Second},
+		Client:   safehttp.LLMClient(60 * time.Second),
 	}
 }
 

@@ -51,10 +51,11 @@ pkg/meshclient/e2e_test.go  pkg/meshclient/events_test.go  pkg/meshclient/tombst
 `internal/llm` is NOT excluded - it is open core (see the open-core list above).
 
 The split script also strips a few **internal-only docs** (not code): the milestone
-working-plans (`docs/S1-PLAN.md`, `docs/S2-PLAN.md`, `docs/M3-PLAN.md`) and the
-deployment runbook (`deploy/DEPLOY.md`). They describe Bright Interaction's own
-infrastructure rather than the project, so they stay private; the architecture lives in
-the public `docs/SPEC.md`.
+working-plans (`docs/S1-PLAN.md`, `docs/S2-PLAN.md`, `docs/M3-PLAN.md`), the deployment
+runbook (`deploy/DEPLOY.md`), and the full internal spec (`docs/SPEC.md`, which cross-
+references other Bright Interaction projects). They describe Bright Interaction's own
+infrastructure and monorepo rather than the project, so they stay private; the public
+architecture story lives in `README.md` and the in-app docs (`internal/web/docs`).
 
 The pro binaries build with `-tags pro` (wires HNSW + the hub team-mode impl); the open mirror builds with the default tags (brute-force only, team mode stubbed out).
 

@@ -11,10 +11,10 @@ func TestMemberCookieSurvivesRestart(t *testing.T) {
 	t.Setenv("MESH_UI_COOKIE_SECRET", "")
 	t.Setenv("MESH_UI_TOKEN", "stable-shared-secret")
 
-	before := newMemberAuth(nil, nil)
+	before := newMemberAuth(nil, nil, nil)
 	cookie := before.sign(7) // issued to the member
 
-	after := newMemberAuth(nil, nil) // simulates a server restart / redeploy
+	after := newMemberAuth(nil, nil, nil) // simulates a server restart / redeploy
 	if id, ok := after.clientFromCookie(cookie); !ok || id != 7 {
 		t.Fatalf("cookie issued before restart did not validate after (ok=%v id=%d)", ok, id)
 	}
@@ -27,9 +27,9 @@ func TestMemberCookieSurvivesRestart(t *testing.T) {
 func TestCookieSecretPriority(t *testing.T) {
 	t.Setenv("MESH_UI_COOKIE_SECRET", "explicit-secret")
 	t.Setenv("MESH_UI_TOKEN", "other")
-	a := newMemberAuth(nil, nil)
+	a := newMemberAuth(nil, nil, nil)
 	t.Setenv("MESH_UI_TOKEN", "changed") // token rotates, but the explicit secret pins the key
-	b := newMemberAuth(nil, nil)
+	b := newMemberAuth(nil, nil, nil)
 	if a.sign(1) != b.sign(1) {
 		t.Fatal("MESH_UI_COOKIE_SECRET should pin the key regardless of MESH_UI_TOKEN")
 	}

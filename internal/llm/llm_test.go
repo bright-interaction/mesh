@@ -15,6 +15,37 @@ import (
 	"time"
 )
 
+// sanitizedEnv must strip mesh's own secrets + credential-shaped vars before they reach
+// a third-party BYOAI subprocess, while keeping the child's own auth (ANTHROPIC_*) and
+// the basics it needs to run (PATH/HOME).
+func TestSanitizedEnvStripsSecrets(t *testing.T) {
+	t.Setenv("MESH_UI_TOKEN", "hubsecret")
+	t.Setenv("MESH_INGEST_GITHUB_TOKEN", "ghtok")
+	t.Setenv("MESH_UI_COOKIE_SECRET", "cookiesecret")
+	t.Setenv("GITHUB_TOKEN", "othertok")
+	t.Setenv("STRIPE_SECRET_KEY", "sk_live")
+	t.Setenv("ANTHROPIC_API_KEY", "childkey") // the child legitimately needs this
+	t.Setenv("PATH", "/usr/bin")
+
+	got := map[string]string{}
+	for _, kv := range sanitizedEnv() {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			got[kv[:i]] = kv[i+1:]
+		}
+	}
+	for _, dropped := range []string{"MESH_UI_TOKEN", "MESH_INGEST_GITHUB_TOKEN", "MESH_UI_COOKIE_SECRET", "GITHUB_TOKEN", "STRIPE_SECRET_KEY"} {
+		if _, ok := got[dropped]; ok {
+			t.Errorf("sanitizedEnv leaked %s to the subprocess", dropped)
+		}
+	}
+	if got["ANTHROPIC_API_KEY"] != "childkey" {
+		t.Error("sanitizedEnv dropped ANTHROPIC_API_KEY; the child agent can no longer authenticate")
+	}
+	if got["PATH"] != "/usr/bin" {
+		t.Error("sanitizedEnv dropped PATH; the child cannot run")
+	}
+}
+
 func TestTruncationDetected(t *testing.T) {
 	// Anthropic stop_reason=max_tokens -> ErrTruncated.
 	ats := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
