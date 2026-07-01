@@ -62,6 +62,55 @@ func TestLinkNotesToCode(t *testing.T) {
 	}
 }
 
+// A bare PascalCase word that names a method on many types (Server here) must NOT link:
+// an unqualified token only links when it resolves to exactly one symbol. A genuinely
+// unique bare name (StartTailnetProxy) still links.
+func TestLinkBareTokenRequiresUniqueSymbol(t *testing.T) {
+	dir := t.TempDir()
+	note := "---\nid: ambi\ntype: note\n---\n# notes\nWe touch the `Server` and also `StartTailnetProxy`.\n"
+	if err := os.WriteFile(filepath.Join(dir, "n.md"), []byte(note), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := Reindex(store, dir); err != nil {
+		t.Fatal(err)
+	}
+	// Two packages each define a Server type (ambiguous), one unique StartTailnetProxy.
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n\ntype Server struct{}\nfunc StartTailnetProxy() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package b\n\ntype Server struct{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReindexCode(store, []string{root}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LinkNotesToCode(dir); err != nil {
+		t.Fatal(err)
+	}
+	syms, _ := store.SymbolsForNote("ambi")
+	for _, s := range syms {
+		if s.Symbol == "Server" {
+			t.Errorf("ambiguous bare token 'Server' linked to a symbol; it names Server in two packages and must not link")
+		}
+	}
+	// The unique name must still link.
+	found := false
+	for _, s := range syms {
+		if s.Symbol == "StartTailnetProxy" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("unique bare token 'StartTailnetProxy' did not link; got %+v", syms)
+	}
+}
+
 // A note that names a symbol only in its TITLE (no backticks in the body) still links.
 func TestLinkFromTitle(t *testing.T) {
 	dir := t.TempDir()

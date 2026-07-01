@@ -13,6 +13,14 @@ import (
 // type, the most-reused notes, a contributor leaderboard (from provenance), and
 // the lifecycle health counts. All local, read from the index.
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	// The dashboard aggregates span every scope (most-fetched note ids/titles, the
+	// contributor leaderboard, health counts), so in per-member mode it would leak
+	// cross-scope metadata to a scope-confined member. Restrict it to admins, matching
+	// the config/reindex/review-queue gate. Standalone mode has no roles, so requireAdmin
+	// is a no-op there.
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	queries, _ := s.store.Metric("queries")
 	fetches, _ := s.store.Metric("fetches")
 	writes, _ := s.store.Metric("writes")
