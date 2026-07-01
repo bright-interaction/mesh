@@ -95,19 +95,34 @@ func LoadConfig(vaultRoot string) (Config, error) {
 // per-type env var (never from config). Returns an error for an unknown type or a
 // missing required field.
 func (cc ConnectorConfig) Build() (Connector, error) {
+	return cc.BuildWithToken("")
+}
+
+// BuildWithToken is Build but uses the supplied token when non-empty, falling back to
+// the per-type env var otherwise. The hub passes a token an admin set through the
+// Integrations UI (stored encrypted, never in config), so a non-vendor admin can make a
+// connector work without editing the container env; a self-hosted deploy that prefers
+// env tokens leaves it empty and gets the env value.
+func (cc ConnectorConfig) BuildWithToken(token string) (Connector, error) {
+	tok := func(env string) string {
+		if token != "" {
+			return token
+		}
+		return os.Getenv(env)
+	}
 	switch cc.Type {
 	case "github":
 		if cc.Owner == "" || cc.Repo == "" {
 			return nil, fmt.Errorf("github connector needs owner + repo")
 		}
-		return &GitHub{Owner: cc.Owner, Repo: cc.Repo, Token: os.Getenv("MESH_INGEST_GITHUB_TOKEN")}, nil
+		return &GitHub{Owner: cc.Owner, Repo: cc.Repo, Token: tok("MESH_INGEST_GITHUB_TOKEN")}, nil
 	case "slack":
 		if cc.Channel == "" {
 			return nil, fmt.Errorf("slack connector needs channel")
 		}
-		return &Slack{Channel: cc.Channel, Token: os.Getenv("MESH_INGEST_SLACK_TOKEN")}, nil
+		return &Slack{Channel: cc.Channel, Token: tok("MESH_INGEST_SLACK_TOKEN")}, nil
 	case "linear":
-		return &Linear{Token: os.Getenv("MESH_INGEST_LINEAR_TOKEN")}, nil
+		return &Linear{Token: tok("MESH_INGEST_LINEAR_TOKEN")}, nil
 	case "jira":
 		if cc.Site == "" {
 			return nil, fmt.Errorf("jira connector needs site")
@@ -117,9 +132,9 @@ func (cc ConnectorConfig) Build() (Connector, error) {
 		if u, err := url.Parse(cc.Site); err != nil || u.Scheme != "https" || u.Host == "" {
 			return nil, fmt.Errorf("jira site must be an https URL, e.g. https://acme.atlassian.net")
 		}
-		return &Jira{Site: cc.Site, Email: cc.Email, Token: os.Getenv("MESH_INGEST_JIRA_TOKEN"), JQL: cc.JQL}, nil
+		return &Jira{Site: cc.Site, Email: cc.Email, Token: tok("MESH_INGEST_JIRA_TOKEN"), JQL: cc.JQL}, nil
 	case "notion":
-		return &Notion{Token: os.Getenv("MESH_INGEST_NOTION_TOKEN")}, nil
+		return &Notion{Token: tok("MESH_INGEST_NOTION_TOKEN")}, nil
 	default:
 		return nil, fmt.Errorf("unknown connector type %q", cc.Type)
 	}
