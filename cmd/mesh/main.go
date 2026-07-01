@@ -1003,17 +1003,6 @@ func sortedCounts(m map[string]int) []kvCount {
 	return out
 }
 
-func stub(use, short, milestone string) *cobra.Command {
-	return &cobra.Command{
-		Use:   use,
-		Short: short,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("%s is planned for %s and is not implemented yet.\n", use, milestone)
-			return nil
-		},
-	}
-}
-
 func migrateCmd() *cobra.Command {
 	var dryRun bool
 	c := &cobra.Command{

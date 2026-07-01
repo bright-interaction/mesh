@@ -33,8 +33,16 @@ func PendingID(noteType, title string) string {
 	return "pending-" + hex.EncodeToString(sum[:8])
 }
 
+// pendingQueueCap bounds the review queue. Extraction is non-deterministic and the
+// BYOAI can reword the same learning across runs, so despite the dedup the queue could
+// grow without limit and bury the reviewer. When the cap is exceeded the OLDEST items
+// are dropped (a reviewer works newest-first; a genuinely important old learning gets
+// re-extracted the next time a session touches it).
+const pendingQueueCap = 200
+
 // AddPending stores a candidate for review. Idempotent on (type,title): a duplicate
-// extraction updates the existing row rather than piling up review items.
+// extraction updates the existing row rather than piling up review items. The queue is
+// capped at pendingQueueCap; older items beyond the cap are pruned in the same tx.
 func (s *Store) AddPending(p PendingNote) error {
 	if strings.TrimSpace(p.Title) == "" || strings.TrimSpace(p.Type) == "" {
 		return nil
@@ -46,13 +54,20 @@ func (s *Store) AddPending(p PendingNote) error {
 		p.CreatedAt = time.Now().Unix()
 	}
 	return s.Write(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
+		if _, err := tx.Exec(
 			`INSERT INTO pending_notes(id,type,title,do_text,dont_text,why,confidence,source,created_at)
 			 VALUES(?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET
 			   do_text=excluded.do_text, dont_text=excluded.dont_text, why=excluded.why,
 			   confidence=excluded.confidence, source=excluded.source`,
-			p.ID, p.Type, p.Title, p.Do, p.Dont, p.Why, p.Confidence, p.Source, p.CreatedAt)
+			p.ID, p.Type, p.Title, p.Do, p.Dont, p.Why, p.Confidence, p.Source, p.CreatedAt); err != nil {
+			return err
+		}
+		// Cap the queue: keep only the newest pendingQueueCap rows.
+		_, err := tx.Exec(
+			`DELETE FROM pending_notes WHERE id NOT IN (
+			   SELECT id FROM pending_notes ORDER BY created_at DESC, id DESC LIMIT ?)`,
+			pendingQueueCap)
 		return err
 	})
 }

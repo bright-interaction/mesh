@@ -4,10 +4,13 @@
 package index
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,6 +45,50 @@ func TestSchemaDropListCoversSchema(t *testing.T) {
 			t.Errorf("table %q is in the drop/keep list but not in schema.sql (stale entry)", name)
 		}
 	}
+}
+
+// A kept table's column shape cannot change silently: schema.sql runs with CREATE TABLE
+// IF NOT EXISTS, so a column added to a schemaKeep table would never apply on a live hub
+// DB. This fingerprints each kept table's DDL; a change fails the test until keepShapeVersion
+// is bumped (drop+rebuild that release) or the rows are migrated and the fingerprint updated.
+func TestKeptTableShapeGuard(t *testing.T) {
+	// Baked-in fingerprints for keepShapeVersion. If this test fails after a schema edit,
+	// see keepShapeVersion in store.go before updating these.
+	want := map[string]string{
+		"metrics":       "976162c7f6",
+		"vectors":       "f7efe75545",
+		"note_reuse":    "09ecef0eb3",
+		"pending_notes": "f73b61b7ed",
+	}
+	for name := range schemaKeep {
+		got := keptTableFingerprint(t, name)
+		if want[name] != got {
+			t.Errorf("kept table %q shape fingerprint = %q, baked-in = %q; if you changed its columns, bump keepShapeVersion (=%d) or migrate live rows, then set this fingerprint",
+				name, got, want[name], keepShapeVersion)
+		}
+	}
+}
+
+// keptTableFingerprint extracts a table's CREATE block from schema.sql, strips comments
+// and collapses whitespace, and returns a short hash of the normalized column list.
+func keptTableFingerprint(t *testing.T, table string) string {
+	t.Helper()
+	idx := regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?` + regexp.QuoteMeta(table) + `\s*\(`).FindStringIndex(SchemaSQL)
+	if idx == nil {
+		t.Fatalf("kept table %q not found in schema.sql", table)
+	}
+	rest := SchemaSQL[idx[0]:]
+	end := strings.Index(rest, ");")
+	if end < 0 {
+		t.Fatalf("could not find end of CREATE TABLE %q", table)
+	}
+	block := rest[:end]
+	// Strip -- line comments and collapse whitespace so a comment/format-only edit does
+	// not trip the guard; only a real column change does.
+	block = regexp.MustCompile(`--[^\n]*`).ReplaceAllString(block, "")
+	block = regexp.MustCompile(`\s+`).ReplaceAllString(block, " ")
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(block))))
+	return hex.EncodeToString(sum[:])[:10]
 }
 
 // H1: two files sharing a basename with no frontmatter id resolve to the same
