@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/safehttp"
 )
 
 // maxEmbedResponseBytes bounds an embedding endpoint's response. A batch of vectors
@@ -56,7 +58,7 @@ func NewHTTP(baseURL, model, key string) *HTTP {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		ModelID: model,
 		Key:     key,
-		Client:  &http.Client{Timeout: 60 * time.Second},
+		Client:  safehttp.LLMClient(60 * time.Second),
 	}
 }
 

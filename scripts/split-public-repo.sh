@@ -54,12 +54,17 @@ PRO_PATHS=(
   pkg/meshclient/tombstone_test.go
   # Internal-only docs (NOT pro code): milestone working-plans + the Bright-Interaction-
   # specific deploy runbook. They name internal hostnames and tooling, add nothing for
-  # external users, and are kept private. The architecture lives in the public
-  # docs/SPEC.md (infra names sanitised there). Decided 2026-06-30 with Tom.
+  # external users, and are kept private. Decided 2026-06-30 with Tom.
   docs/S1-PLAN.md
   docs/S2-PLAN.md
   docs/M3-PLAN.md
   deploy/DEPLOY.md
+  # SPEC.md was assumed "sanitised" but still names cross-project internal source paths
+  # (dockyard/internal/sentinel/sync.go), a private security-audit reference, arachne/
+  # dockyard/hephaestus internals, and the monorepo layout. gitleaks can't catch prose,
+  # so strip it from the mirror rather than ship it. The public architecture story lives
+  # in README.md + the in-app docs (internal/web/docs). (2026-07-01 audit fix)
+  docs/SPEC.md
 )
 
 for arg in "$@"; do

@@ -29,6 +29,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/safehttp"
 )
 
 // maxLLMResponseBytes bounds an LLM endpoint's response so a hostile/misconfigured
@@ -80,6 +82,13 @@ func (c *cliClient) Complete(ctx context.Context, system, user string) (string, 
 	defer cancel()
 	cmd := exec.CommandContext(ctx, c.argv[0], c.argv[1:]...)
 	cmd.Stdin = strings.NewReader(system + "\n\n" + user)
+	// The child (default `claude -p`) is a third party that phones home, and note/
+	// connector content flows into its prompt (a prompt-injection reach). Never hand it
+	// the parent's full environment: strip mesh's own secrets (MESH_*) and any other
+	// credential-shaped var so ingest tokens, the cookie/OIDC secrets, and the embed/
+	// rerank keys can't be exfiltrated. The child's OWN auth (ANTHROPIC_*/CLAUDE_*) and
+	// PATH/HOME/locale are preserved so `claude -p` still authenticates.
+	cmd.Env = sanitizedEnv()
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -98,6 +107,59 @@ func (c *cliClient) Complete(ctx context.Context, system, user string) (string, 
 		return "", fmt.Errorf("curator cli %q returned no output: %w", c.argv[0], ErrAuth)
 	}
 	return s, nil
+}
+
+// sanitizedEnv returns the parent environment with mesh's own secrets and other
+// credential-shaped variables removed, so a BYOAI subprocess never receives
+// MESH_UI_TOKEN, MESH_*_KEY, the ingest tokens, or the cookie/OIDC secrets. The child
+// agent's own credentials pass through: ANTHROPIC_*/CLAUDE_* (how `claude -p`
+// authenticates), plus PATH/HOME/locale so it still runs. An operator can force extra
+// names through with MESH_CURATOR_ENV_PASSTHROUGH (comma-separated).
+func sanitizedEnv() []string {
+	var passthrough map[string]bool
+	if v := strings.TrimSpace(os.Getenv("MESH_CURATOR_ENV_PASSTHROUGH")); v != "" {
+		passthrough = map[string]bool{}
+		for _, n := range strings.Split(v, ",") {
+			passthrough[strings.ToUpper(strings.TrimSpace(n))] = true
+		}
+	}
+	src := os.Environ()
+	out := make([]string, 0, len(src))
+	for _, kv := range src {
+		name := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			name = kv[:i]
+		}
+		up := strings.ToUpper(name)
+		if passthrough[up] || strings.HasPrefix(up, "ANTHROPIC_") || strings.HasPrefix(up, "CLAUDE_") {
+			out = append(out, kv) // the child's own auth / an explicit operator opt-in
+			continue
+		}
+		if secretEnvName(up) {
+			continue // drop mesh + credential-shaped vars
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// secretEnvName reports whether an env var name looks like a secret we must not hand to
+// a third-party subprocess: anything mesh owns (MESH_*) or any credential-shaped name.
+func secretEnvName(up string) bool {
+	if strings.HasPrefix(up, "MESH_") {
+		return true
+	}
+	for _, suf := range []string{"_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_PASSWD"} {
+		if strings.HasSuffix(up, suf) {
+			return true
+		}
+	}
+	for _, sub := range []string{"SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "CREDENTIAL"} {
+		if strings.Contains(up, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // cliErrDetail prefers the subprocess's stderr (truncated, no secrets assumed) and
@@ -140,7 +202,9 @@ func NewFromEnv() (Client, error) {
 		maxTok = v
 	}
 	model := strings.TrimSpace(os.Getenv("MESH_CURATOR_MODEL"))
-	hc := &http.Client{Timeout: 120 * time.Second}
+	// SSRF-guarded by default; an operator can allow a sovereign localhost endpoint
+	// (Ollama, a self-hosted model server) with MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1.
+	hc := safehttp.LLMClient(120 * time.Second)
 
 	switch agent {
 	case "cli":

@@ -33,6 +33,7 @@ func TestStubScoresByOverlap(t *testing.T) {
 }
 
 func TestHTTPContractAndOrdering(t *testing.T) {
+	t.Setenv("MESH_ALLOW_PRIVATE_LLM_ENDPOINT", "1") // the test server is on loopback
 	var gotQuery string
 	var gotDocs []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +85,7 @@ func TestHTTPContractAndOrdering(t *testing.T) {
 }
 
 func TestHTTPRejectsMalformedResultSets(t *testing.T) {
+	t.Setenv("MESH_ALLOW_PRIVATE_LLM_ENDPOINT", "1") // the test servers are on loopback
 	cases := []struct {
 		name    string
 		results []map[string]any

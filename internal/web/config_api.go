@@ -106,6 +106,9 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	var req struct {
 		Updates map[string]string `json:"updates"`
 	}
@@ -236,6 +239,9 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 // handleReindex runs an authoritative reconcile and swaps in the fresh graph, the
 // browser equivalent of `mesh index`. Returns what changed.
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	g, err := index.Reindex(s.store, s.vaultRoot)
 	if err != nil {
 		http.Error(w, "reindex failed", http.StatusInternalServerError)

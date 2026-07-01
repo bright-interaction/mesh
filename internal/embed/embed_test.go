@@ -62,6 +62,7 @@ func TestStubDim(t *testing.T) {
 }
 
 func TestHTTPDimProbeCache(t *testing.T) {
+	t.Setenv("MESH_ALLOW_PRIVATE_LLM_ENDPOINT", "1") // the test server is on loopback
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
@@ -106,6 +107,7 @@ func TestHTTPDimProbeCache(t *testing.T) {
 // COUNT of vectors but duplicate indices must error, not silently mis-pair vectors
 // to the wrong input (which the content-hash cache would then lock in).
 func TestHTTPRejectsDuplicateIndex(t *testing.T) {
+	t.Setenv("MESH_ALLOW_PRIVATE_LLM_ENDPOINT", "1") // the test server is on loopback
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Input []string `json:"input"`
