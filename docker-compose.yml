@@ -32,6 +32,9 @@ services:
       # it. Unset until the repo is published (offer shows the license, no broken link).
       - MESH_SOURCE_URL=${MESH_SOURCE_URL:-}
       - MESH_VERSION=${MESH_VERSION:-}
+      # Flare error reporting (no-op when unset; the DSN is injected at deploy time).
+      - FLARE_DSN=${FLARE_DSN:-}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     volumes:
       # Persistent: the git repo (history) + hub.db (tokens, versions). Back this
       # up: hub.db holds non-rebuildable client tokens. The host dir must be
