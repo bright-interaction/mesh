@@ -116,6 +116,43 @@ func (f *Frontmatter) EffectiveScopes() []string {
 	return out
 }
 
+// ScopeAllows reports whether a note carrying noteScopes is readable given the caller's
+// allowed-read set. nil allowed = unrestricted (no scoping configured). Absent/empty
+// noteScopes falls back to DefaultScope, the fail-safe every read check must honor.
+//
+// This is the ONE scope-intersect predicate. It used to be hand-copied in the MCP,
+// retrieve, and web layers (with subtly different shapes), which is exactly how the
+// changed_since / health / code_* leaks happened: a surface reimplemented the check and
+// got it wrong. All read surfaces now call this (or ScopeAllowsCSV) so the logic cannot
+// drift per surface.
+func ScopeAllows(noteScopes []string, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true // unrestricted: scoping not configured
+	}
+	labeled := false
+	for _, s := range noteScopes {
+		if t := strings.TrimSpace(s); t != "" {
+			labeled = true
+			if allowed[t] {
+				return true
+			}
+		}
+	}
+	if !labeled {
+		return allowed[DefaultScope] // unlabeled note = dev-only fail-safe
+	}
+	return false
+}
+
+// ScopeAllowsCSV is ScopeAllows for a comma-joined scope string, the shape the index
+// stores (notes.scope, graph node Attrs["scope"]).
+func ScopeAllowsCSV(csv string, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true
+	}
+	return ScopeAllows(strings.Split(csv, ","), allowed)
+}
+
 // ParseFrontmatter decodes a YAML frontmatter block into the whitelisted struct
 // and a raw map. Empty input yields a zero Frontmatter, not an error.
 func ParseFrontmatter(b []byte) (*Frontmatter, map[string]any, error) {

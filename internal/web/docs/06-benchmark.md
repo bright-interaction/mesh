@@ -1,22 +1,23 @@
 # Efficiency vs classic RAG
 
 How Mesh compares to the standard RAG pattern an agent would otherwise use:
-retrieve the top-k passages and stuff them into the prompt. Measured on a real
-330-note vault with Mesh's built-in harness (`mesh eval`).
+retrieve the top-k passages and stuff them into the prompt. Last measured on the
+real 539-note Hive vault on 2026-07-02 with Mesh's built-in harness
+(`mesh eval`); the ratio moves as the corpus grows, so re-run to refresh.
 
 ## The headline
 
-Mesh answers the same question for **about a third of the tokens**, with
+Mesh answers the same question for **about half the tokens**, with
 **equal-or-better recall**, and with **none of the embedding-model /
 vector-database / re-embedding machinery**.
 
 | Query type | Classic top-k RAG | Mesh | Saving |
 |------------|------------------:|-----:|-------:|
-| keyword (25 queries)    | 9,100 tokens  | 2,939 | **~3.1x** |
-| paraphrase (20 queries) | 15,110 tokens | 4,619 | **~3.3x** |
+| keyword (25 queries)    | 6,849 tokens | 3,683 | **~1.9x** (~2.5x budgeted) |
+| paraphrase (20 queries) | 9,778 tokens | 5,242 | **~1.9x** (~2.2x budgeted) |
 
-Recall: Mesh ties keyword search (23/25) and **beats it on paraphrase**
-(15/20 vs 13/20), the case where keyword RAG breaks.
+Recall: Mesh edges keyword search (24/25 vs 23/25) and **beats it on paraphrase**
+(13/20 vs 11/20), the case where keyword RAG breaks.
 
 ## Why it is cheaper
 

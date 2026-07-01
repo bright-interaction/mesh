@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // handleSearch runs the same fused retrieval the agent gets over MCP and returns
@@ -66,17 +67,10 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 }
 
 // scopeIntersect reports whether a note's scopes intersect the allowed set. Empty
-// scopes = the dev fail-safe default.
+// scopes = the dev fail-safe default. Delegates to the one shared predicate so this
+// surface cannot drift from the MCP/retrieve scope checks.
 func scopeIntersect(scopes []string, allowed map[string]bool) bool {
-	if len(scopes) == 0 {
-		return allowed["dev"]
-	}
-	for _, s := range scopes {
-		if allowed[s] {
-			return true
-		}
-	}
-	return false
+	return vault.ScopeAllows(scopes, allowed)
 }
 
 func atoiOr(s string, def int) int {

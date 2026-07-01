@@ -242,12 +242,16 @@ func titleOf(pn *ParsedNote) string {
 // excluded from retrieval.
 func RetrievalHash(pn *ParsedNote) string { return retrievalHash(pn) }
 
-// retrievalHash is SHA256 over the node identity (effectiveID) plus the body and
-// the retrieval-critical frontmatter (type, status, supersedes, related), so a
-// status change (accepted -> superseded) or an id change forces a reindex while a
-// cosmetic frontmatter edit (title, unrelated fields) does not (spec section 3.2).
-// The id is included because it is the node identity: an id-only edit must retire
-// the old node and create the new one, so the drift check has to see it.
+// retrievalHash is SHA256 over the node identity (effectiveID) plus the body and every
+// field that affects retrieval: the retrieval-critical frontmatter (type, status,
+// supersedes, related) AND the fields the embedder puts into a note's vector chunk
+// (title, do, dont, why, tags; see ChunkText). It is stamped onto each vector as
+// note_hash, so if it omitted the chunk fields, editing a gotcha's do/dont/why/title/
+// tags would change the embedding input WITHOUT changing the staleness key, and the
+// pre-correction vector would keep being served until a manual re-embed. Including them
+// means such an edit invalidates the stale vector (and forces a cheap note reindex).
+// The id is included because it is the node identity: an id-only edit must retire the
+// old node and create the new one, so the drift check has to see it.
 func retrievalHash(pn *ParsedNote) string {
 	h := sha256.New()
 	h.Write([]byte(effectiveID(pn)))
@@ -257,6 +261,17 @@ func retrievalHash(pn *ParsedNote) string {
 	h.Write([]byte(string(pn.FM.Type)))
 	h.Write([]byte{0})
 	h.Write([]byte(pn.FM.Status))
+	// Embedding-chunk fields (ChunkText): a change here must invalidate the vector.
+	h.Write([]byte{0})
+	h.Write([]byte(titleOf(pn)))
+	for _, s := range []string{pn.FM.Do, pn.FM.Dont, pn.FM.Why} {
+		h.Write([]byte{0})
+		h.Write([]byte(s))
+	}
+	for _, s := range pn.FM.Tags {
+		h.Write([]byte{0})
+		h.Write([]byte(s))
+	}
 	for _, s := range pn.FM.Supersedes {
 		h.Write([]byte{0})
 		h.Write([]byte(s))

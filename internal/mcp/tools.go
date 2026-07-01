@@ -154,6 +154,49 @@ func ToolSpecs() []map[string]any {
 // by the MCP initialize instructions and the web app's API reference.
 func Contract() string { return contractText }
 
+// toolClass is how a tool relates to scope-RBAC. It is the choke point that stops the
+// recurring "a new read tool leaks across scopes by default" bug (changed_since /
+// health / code_* each shipped that way and were patched one at a time). EVERY tool
+// must be classified here: TestEveryToolIsScopeClassified fails at build time if a tool
+// in ToolSpecs()/the dispatch has no class, and handleToolsCall refuses an unclassified
+// tool at runtime (fail closed). The per-handler filtering still does the fine-grained
+// work; this map forces a conscious scope decision for every tool that ships.
+type toolClass int
+
+const (
+	// classFiltered: a read tool that returns only the caller's readable SUBSET (it
+	// consults scopeFromCtx and filters per note / opaque-404s an out-of-scope id).
+	classFiltered toolClass = iota
+	// classCodeDev: reads the code index, which carries no per-note scope and is treated
+	// as dev-scoped in whole. The handler denies the ENTIRE call when the caller cannot
+	// read the dev scope (codeScopeDenied).
+	classCodeDev
+	// classWrite: creates a note; the handler write-gates and stamps the caller's scope.
+	classWrite
+	// classOpen: no vault content crosses a scope boundary (a local operator action).
+	classOpen
+)
+
+// toolScopeClass MUST contain every tool name in ToolSpecs(). Add a new tool here at
+// the same time you add it to ToolSpecs() and the dispatch, having decided how it
+// relates to scope. The test + the runtime check below both fail closed otherwise.
+var toolScopeClass = map[string]toolClass{
+	"mesh_search":         classFiltered,
+	"mesh_fetch":          classFiltered,
+	"mesh_god_nodes":      classFiltered,
+	"mesh_changed_since":  classFiltered,
+	"mesh_neighbors":      classFiltered,
+	"mesh_community":      classFiltered,
+	"mesh_reindex":        classFiltered,
+	"mesh_health":         classFiltered,
+	"mesh_append_note":    classWrite,
+	"mesh_write_entity":   classWrite,
+	"mesh_code_search":    classCodeDev,
+	"mesh_code_neighbors": classCodeDev,
+	"mesh_code_context":   classCodeDev,
+	"mesh_setup_hooks":    classOpen,
+}
+
 func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		Name      string          `json:"name"`
@@ -161,6 +204,11 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	}
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "bad params"}
+	}
+	// Fail closed on any tool that was never scope-classified: a dispatched tool missing
+	// from toolScopeClass must not run, so a new tool cannot silently bypass the gate.
+	if _, classified := toolScopeClass[p.Name]; !classified {
+		return nil, &rpcError{Code: codeMethodNotFound, Message: "unknown tool", Data: p.Name}
 	}
 	switch p.Name {
 	case "mesh_search":

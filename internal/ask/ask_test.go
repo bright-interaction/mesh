@@ -53,6 +53,20 @@ func TestAnswerGroundsAndCites(t *testing.T) {
 	}
 }
 
+// The code lane is dev-scoped: only an unrestricted caller or one who can read dev gets
+// source symbols in their answer. A scope-confined member must not.
+func TestCodeReadableGate(t *testing.T) {
+	if !codeReadable(nil) {
+		t.Error("unrestricted caller (nil scopes) should see code")
+	}
+	if !codeReadable(map[string]bool{"dev": true}) {
+		t.Error("dev-scoped caller should see code")
+	}
+	if codeReadable(map[string]bool{"sales": true}) {
+		t.Error("sales-scoped caller must NOT see the dev-scoped code index")
+	}
+}
+
 func TestEmptyQuestion(t *testing.T) {
 	if _, err := Answer(context.Background(), nil, nil, llm.Func(func(context.Context, string, string) (string, error) { return "", nil }), "  ", 0, nil); err == nil {
 		t.Error("empty question must error")

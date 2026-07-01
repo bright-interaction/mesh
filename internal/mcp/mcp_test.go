@@ -81,6 +81,30 @@ func TestInitializeAndToolsList(t *testing.T) {
 	}
 }
 
+// TestEveryToolIsScopeClassified is the durable guard against the recurring
+// "a new read tool leaks across scopes by default" bug: every tool in ToolSpecs() must
+// have a scope class in toolScopeClass, and every class entry must be a real tool. A new
+// tool added without a class fails this test (and is refused at runtime), forcing a
+// conscious scope decision before it can ship.
+func TestEveryToolIsScopeClassified(t *testing.T) {
+	specNames := map[string]bool{}
+	for _, sp := range ToolSpecs() {
+		name, _ := sp["name"].(string)
+		if name == "" {
+			t.Fatalf("a tool spec has no name: %v", sp)
+		}
+		specNames[name] = true
+		if _, ok := toolScopeClass[name]; !ok {
+			t.Errorf("tool %q is in ToolSpecs() but has no scope class in toolScopeClass; classify it (classFiltered/classCodeDev/classWrite/classOpen)", name)
+		}
+	}
+	for name := range toolScopeClass {
+		if !specNames[name] {
+			t.Errorf("toolScopeClass has %q but ToolSpecs() does not; drop the stale classification", name)
+		}
+	}
+}
+
 func TestToolSearchFused(t *testing.T) {
 	s := newTestServer(t)
 	res, rerr := s.dispatch(context.Background(), request{

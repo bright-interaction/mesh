@@ -1,7 +1,9 @@
 # Mesh vs classic RAG: efficiency benchmark
 
-Measured on the real Hive vault (330 notes, ~2,400 links) on 2026-06-18, with
-Mesh's built-in Gate-1 harness (`mesh eval`). Reproduce any row yourself:
+Last measured on the real Hive vault (539 notes, ~10,900 links) on 2026-07-02,
+with Mesh's built-in Gate-1 harness (`mesh eval`). The ratio is vault-dependent
+(it moves as the corpus grows), so treat the numbers below as the current
+measurement, not a fixed constant, and re-run to refresh:
 
 ```
 mesh eval eval/hive-heldout.json --vault ~/Desktop/Hive            # keyword queries
@@ -13,12 +15,15 @@ mesh eval eval/hive-heldout.json --vault ~/Desktop/Hive --budget 1200
 
 Against the standard RAG pattern an agent would otherwise use, retrieve the
 top-k passages and stuff them into the prompt, **Mesh answers the same question
-for about a third of the tokens, with equal-or-better recall, and with none of
-the embedding-model / vector-DB / re-embedding machinery.**
+for about half the tokens, with equal-or-better recall, and with none of the
+embedding-model / vector-DB / re-embedding machinery.**
 
-- **~3.1x fewer tokens** on keyword queries (2,939 vs 9,100 median).
-- **~3.3x fewer tokens** on paraphrase queries (4,619 vs 15,110 median).
-- **Better recall where keyword RAG breaks**: 15/20 vs 13/20 on paraphrase.
+- **~1.9x fewer tokens** on keyword queries (3,683 vs 6,849 median), and
+  **~2.5x** under a 1,200-token budget (2,719 vs 6,849).
+- **~1.9x fewer tokens** on paraphrase queries (5,242 vs 9,778 median), and
+  **~2.2x** budgeted (4,512 vs 9,778).
+- **Better recall where keyword RAG breaks**: 13/20 vs 11/20 on paraphrase, and
+  24/25 vs 23/25 on keyword.
 - **Zero models, zero vector DB**: the core is pure-Go full-text + graph. No
   embedding endpoint, no GPU, no Pinecone/pgvector, runs fully offline.
 - **Instant freshness**: a note edit re-indexes in ~0.4 ms; a classic RAG must
@@ -38,20 +43,19 @@ All three arms count tokens with the *same* tokenizer, so the ratios are sound.
 "Classic embedding RAG" maps onto the naive top-k arm on token cost (it also
 stuffs k passages per query) and adds an embedding model + vector store on top.
 
-## Results (median tokens per query, real Hive)
+## Results (median tokens per query, real Hive, 2026-07-02)
 
 | Query set | naive top-k RAG | Mesh (unbudgeted) | Mesh (budget 1200) | Mesh saving vs top-k |
 |-----------|----------------:|------------------:|-------------------:|---------------------:|
-| keyword (25)    | 9,100  | 2,984 | 2,939 | **~3.1x** |
-| keyword (10)    | 9,952  | 3,104 | -     | **~3.2x** |
-| paraphrase (20) | 15,110 | 4,708 | 4,619 | **~3.3x** |
+| keyword (25)    | 6,849  | 3,683 | 2,719 | **~1.9x** (~2.5x budgeted) |
+| paraphrase (20) | 9,778  | 5,242 | 4,512 | **~1.9x** (~2.2x budgeted) |
 
 Recall and answer quality (does the right note surface / get read):
 
 | Query set | surfacing recall @20 | answer@1 (single body) |
 |-----------|----------------------|------------------------|
-| keyword (25)    | Mesh 23/25 = FTS 23/25 | Mesh 13/25, single-read 14/25 |
-| paraphrase (20) | **Mesh 15/20 > FTS 13/20** | Mesh 2/20 = single-read 2/20 |
+| keyword (25)    | **Mesh 24/25 > FTS 23/25** | **Mesh 14/25 > single-read 13/25** |
+| paraphrase (20) | **Mesh 13/20 > FTS 11/20** | Mesh 2/20 = single-read 2/20 |
 
 ## Reading the numbers honestly
 
@@ -61,12 +65,13 @@ Recall and answer quality (does the right note surface / get read):
   whole point: the agent *sees the candidate set and the reasons*, so it opens
   the one correct body instead of guessing or reading three. Classic RAG pays
   the 3-body cost on every query; Mesh pays it once, in cheap cards.
-- **answer@1 on keyword is a tie** (13 vs 14). That metric measures a consumer
-  that blindly trusts position 1 without reading the cards, which is exactly the
-  cheap/blind RAG pipeline, not a capable agent. A real agent reads the cards
-  (free) and picks; the cards are why Mesh needs to read only one body.
-- **Mesh wins clearly on paraphrase** (15 vs 13 surfacing), the case where
-  keyword RAG breaks, because of graph proximity (and optional BYOAI vectors).
+- **answer@1 on keyword is close** (Mesh 14 vs single-read 13). That metric
+  measures a consumer that blindly trusts position 1 without reading the cards,
+  which is exactly the cheap/blind RAG pipeline, not a capable agent. A real
+  agent reads the cards (free) and picks; the cards are why Mesh needs to read
+  only one body.
+- **Mesh wins on paraphrase** (13 vs 11 surfacing), the case where keyword RAG
+  breaks, because of graph proximity (and optional BYOAI vectors).
 - The harness reported `tokenizer: estimate` (the BPE codec fell back to the
   char heuristic on this run); since every arm uses the same counter, the
   ~3x ratio holds regardless. Absolute counts are approximate.
@@ -89,12 +94,13 @@ machinery Mesh does not:
 ## Verdict
 
 For the job Mesh is built for, a capable coding agent retrieving from a
-markdown knowledge base, Mesh is roughly **3x more token-efficient per query
-than the standard top-k RAG**, with **equal-or-better recall**, **no embedding
-model or vector database**, **sub-millisecond offline retrieval**, and
-**instant freshness**. The per-query token win compounds with the eliminated
-infra: there is no embedding bill, no vector store to run, and no re-embedding
-lag every time a note changes.
+markdown knowledge base, Mesh is roughly **2x more token-efficient per query
+than the standard top-k RAG** (about 1.9x unbudgeted, up to ~2.5x under a tight
+budget), with **equal-or-better recall**, **no embedding model or vector
+database**, **sub-millisecond offline retrieval**, and **instant freshness**.
+The per-query token win compounds with the eliminated infra: there is no
+embedding bill, no vector store to run, and no re-embedding lag every time a
+note changes.
 
 If your prior setup was a specific stack (a named vector DB, a chunk size, a
 particular embedding model), point it out and this comparison can be tightened

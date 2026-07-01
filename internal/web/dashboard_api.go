@@ -19,8 +19,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	notes, _ := s.store.Count("notes")
 
 	// Estimated tokens saved vs a naive whole-file RAG dump. Mesh returns budgeted
-	// cards (~3.1x fewer tokens per the benchmark); we credit a conservative ~1800
-	// tokens saved per served query. Labeled an estimate in the UI.
+	// cards (~1.9x fewer tokens per the 2026-07-02 benchmark, a median saving of
+	// ~3,100-4,500 tokens/query); we credit a deliberately conservative 1800 tokens
+	// per served query, well under the measured saving. Labeled an estimate in the UI.
 	const tokensSavedPerQuery = 1800
 	estTokensSaved := queries * tokensSavedPerQuery
 
