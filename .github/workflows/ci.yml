@@ -1,0 +1,52 @@
+# CI for the public AGPL open core (github.com/bright-interaction/mesh). This lives at
+# mesh/.github/workflows in the private monorepo; split-public-repo.sh places it at the
+# repo root of the public mirror, where GitHub Actions runs it. It does NOT run in the
+# monorepo (Actions only reads .github/workflows at a repo's root, and there mesh/ is a
+# subdir). Build + vet + test + the open-core boundary guard + a secret scan, so an
+# external contribution cannot merge if it breaks the build, references the pro layer,
+# or adds a credential.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks scans the full history, not just the tip
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+      - name: Open-core boundary (no open package may import a pro package)
+        run: bash scripts/check-open-core-boundary.sh
+
+      - name: Secret scan (gitleaks)
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@latest
+          "$(go env GOPATH)/bin/gitleaks" detect --source . --no-banner --redact
+
+      - name: Vulnerability scan (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
