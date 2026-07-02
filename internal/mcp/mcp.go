@@ -48,8 +48,9 @@ type Server struct {
 	reloadMu sync.Mutex       // serializes rebuilds across dispatch + watcher
 	cache    *index.NoteCache // parsed-note cache for incremental reconcile; guarded by reloadMu
 
-	ready    chan struct{} // closed when the initial background load finishes
+	ready    chan struct{} // closed when retrieval is servable (initial reload done)
 	readyErr error         // written once before ready closes
+	bg       chan struct{} // closed when ALL background startup work is done (enrichment included)
 
 	agent string // calling client's name from initialize (provenance default), guarded by mu
 }
@@ -75,20 +76,23 @@ func NewServerAt(vaultRoot, indexDir string) (*Server, error) {
 }
 
 func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
-	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache(), ready: make(chan struct{})}
+	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache(), ready: make(chan struct{}), bg: make(chan struct{})}
 	// The initial load runs in the background so the MCP handshake answers
 	// immediately: a full reload of a grown vault plus the note<->code bridge
 	// exceeds a client's connect timeout (Claude Code kills the server at 30s
 	// and never retries, orphaning the whole session), and a concurrent
-	// `mesh code reindex` holding the db write lock makes it worse. Tool calls
-	// and resource reads gate on awaitReady instead.
+	// `mesh code reindex` holding the db write lock makes it worse. ready
+	// closes as soon as retrieval is servable (reload done) so a tool call
+	// gating on awaitReady waits ~1s, not for the enrichment passes below it.
 	go func() {
-		defer close(s.ready)
+		defer close(s.bg)
 		if err := s.reload(); err != nil {
 			s.readyErr = fmt.Errorf("initial index load: %w", err)
 			fmt.Fprintf(os.Stderr, "mesh mcp: %v\n", s.readyErr)
+			close(s.ready)
 			return
 		}
+		close(s.ready)
 		// Seed the flywheel measurement from the existing agent-authored corpus once, so
 		// the reuse number reflects accumulated knowledge from day one (idempotent).
 		_, _ = store.BackfillWritebacks()
@@ -97,10 +101,11 @@ func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
 	return s, nil
 }
 
-// WaitReady blocks until the initial background index load has finished and
-// reports its error, for callers that need deterministic startup (tests, hub boot).
+// WaitReady blocks until ALL background startup work (initial reload plus the
+// writeback backfill and note<->code bridge) has finished and reports the load
+// error, for callers that need fully deterministic startup (tests, hub boot).
 func (s *Server) WaitReady() error {
-	<-s.ready
+	<-s.bg
 	return s.readyErr
 }
 
@@ -130,7 +135,7 @@ func (s *Server) Reconcile() error {
 func (s *Server) NotePath(id string) (string, error) { return s.store.NotePath(id) }
 
 func (s *Server) Close() error {
-	<-s.ready // never close the store under the initial background load
+	<-s.bg // never close the store under the initial background load/enrichment
 	return s.store.Close()
 }
 

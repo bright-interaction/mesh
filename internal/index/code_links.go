@@ -75,6 +75,11 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 	}
 	rows.Close()
 
+	resolve, err := s.symbolResolver()
+	if err != nil {
+		return 0, err
+	}
+
 	type link struct{ noteID, symID, name string }
 	var links []link
 	for _, n := range notes {
@@ -85,7 +90,16 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 				return
 			}
 			seen[tok] = true
-			for _, sym := range s.symbolsByName(tok, 5) {
+			syms := resolve(tok, 5)
+			// Precision gate: an unqualified (bare) token must resolve to EXACTLY ONE
+			// symbol to link. Common PascalCase words (Close, Server, Store, Config,
+			// Handler) name a method or type on many packages, so linking a note that
+			// merely says `Store` to every service's Store is noise. A qualified token
+			// (Type.Method) is already specific, so its capped matches link as before.
+			if !strings.Contains(tok, ".") && len(syms) != 1 {
+				return
+			}
+			for _, sym := range syms {
 				links = append(links, link{n.id, sym.id, sym.name})
 			}
 		}
@@ -125,28 +139,44 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 
 type symRow struct{ id, name string }
 
-// symbolsByName resolves a token to symbols by exact name or last-segment match,
-// capped (an ambiguous common method name returning many is skipped by the caller's
-// cap so it does not link to everything).
-func (s *Store) symbolsByName(tok string, limit int) []symRow {
-	rows, err := s.readDB.Query(
-		`SELECT id, name FROM code_symbols WHERE name = ? OR name LIKE ? LIMIT ?`,
-		tok, "%."+tok, limit+1)
+// symbolResolver loads the symbol table once and resolves tokens in memory: exact
+// name match plus dotted-suffix match (a bare `RecordReuse` matches
+// `Store.RecordReuse`). Suffix keys are lowercased to keep the semantics of the
+// SQL LIKE this replaces (LIKE is case-insensitive, `=` is not). The per-token
+// query it replaces used a leading-wildcard LIKE, a full code_symbols scan for
+// every distinctive token in every note: ~57s per rebuild against a
+// monorepo-sized index, versus ~1s for this map build.
+func (s *Store) symbolResolver() (func(tok string, limit int) []symRow, error) {
+	rows, err := s.readDB.Query(`SELECT id, name FROM code_symbols`)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
-	var out []symRow
+	byExact := map[string][]symRow{}
+	bySuffix := map[string][]symRow{}
 	for rows.Next() {
 		var r symRow
-		if rows.Scan(&r.id, &r.name) == nil {
-			out = append(out, r)
+		if err := rows.Scan(&r.id, &r.name); err != nil {
+			return nil, err
+		}
+		byExact[r.name] = append(byExact[r.name], r)
+		low := strings.ToLower(r.name)
+		for i := strings.IndexByte(low, '.'); i >= 0; i = strings.IndexByte(low, '.') {
+			low = low[i+1:]
+			bySuffix[low] = append(bySuffix[low], r)
 		}
 	}
-	if len(out) > limit { // too ambiguous to link confidently
-		return nil
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	return out
+	return func(tok string, limit int) []symRow {
+		out := append([]symRow(nil), byExact[tok]...)
+		out = append(out, bySuffix[strings.ToLower(tok)]...)
+		if len(out) > limit { // too ambiguous to link confidently
+			return nil
+		}
+		return out
+	}, nil
 }
 
 // NoteCodeRef is a note linked to a symbol (either direction).
