@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,9 +32,11 @@ const codeEdgeFanoutCap = 25
 
 // CodeStats reports what a code reindex wrote, for the CLI and orient output.
 type CodeStats struct {
-	Files   int
-	Symbols int
-	Edges   int
+	Files     int // files parsed and (re)written this run
+	Symbols   int
+	Edges     int
+	Removed   int // indexed files no longer on disk, dropped this run
+	Unchanged int // files skipped because their mtime matches the stored row
 }
 
 // CodeHit is one FTS5 result over the symbol corpus: enough to render a card and a
@@ -411,11 +414,26 @@ func unqualify(name string) string {
 	return name
 }
 
-// ReindexCode walks the configured code roots, parses every source file in
-// parallel, and writes a full code index. Returned symbol paths are prefixed with
-// the root's basename (e.g. "automations/dockyard/...") so several repos coexist
-// and the path reads like graphify's src= locator.
+// ReindexCode walks the configured code roots and refreshes the code index
+// INCREMENTALLY: it parses only files whose mtime differs from the stored
+// code_files row (a monorepo walk re-parsing everything cost ~58s per git
+// commit via the post-commit hook; a typical push touches a handful of files).
+// Deleted files are dropped, and the call graph is rebuilt from the stored
+// symbol rows so edges stay globally consistent without re-parsing. An empty
+// index falls back to the full path. Returned symbol paths are prefixed with
+// the root's basename (e.g. "automations/dockyard/...") so several repos
+// coexist and the path reads like graphify's src= locator.
 func ReindexCode(s *Store, roots []string, langs map[string]bool) (CodeStats, error) {
+	return reindexCode(s, roots, langs, false)
+}
+
+// ReindexCodeFull wipes and rebuilds the whole code index regardless of stored
+// mtimes (the pre-incremental behavior; `mesh code reindex --full`).
+func ReindexCodeFull(s *Store, roots []string, langs map[string]bool) (CodeStats, error) {
+	return reindexCode(s, roots, langs, true)
+}
+
+func reindexCode(s *Store, roots []string, langs map[string]bool, full bool) (CodeStats, error) {
 	abs, err := code.WalkCode(roots, langs)
 	if err != nil {
 		return CodeStats{}, err
@@ -426,8 +444,122 @@ func ReindexCode(s *Store, roots []string, langs map[string]bool) (CodeStats, er
 			refs = append(refs, code.FileRef{Abs: p, Rel: rel})
 		}
 	}
-	files, _ := code.ParseCodeFiles(refs, 0)
-	return s.IndexCodeFull(files)
+
+	var known map[string]int64
+	if !full {
+		known, _ = s.CodeFileMtimes()
+	}
+	if full || len(known) == 0 {
+		files, _ := code.ParseCodeFiles(refs, 0)
+		return s.IndexCodeFull(files)
+	}
+
+	// mtime-only drift check: hashing would read every file, which is most of
+	// the cost being avoided. A same-second rewrite is missed until the next
+	// touch; `--full` is the escape hatch.
+	seen := make(map[string]bool, len(refs))
+	changed := refs[:0]
+	unchanged := 0
+	for _, r := range refs {
+		fi, err := os.Stat(r.Abs)
+		if err != nil {
+			continue // vanished mid-walk; handled as removed below
+		}
+		seen[r.Rel] = true
+		if m, ok := known[r.Rel]; ok && m == fi.ModTime().Unix() {
+			unchanged++
+			continue
+		}
+		changed = append(changed, r)
+	}
+	var removed []string
+	for p := range known {
+		if !seen[p] {
+			removed = append(removed, p)
+		}
+	}
+	if len(changed) == 0 && len(removed) == 0 {
+		st := CodeStats{Unchanged: unchanged}
+		st.Edges, _ = s.Count("code_edges")
+		return st, nil
+	}
+	files, _ := code.ParseCodeFiles(changed, 0)
+	st, err := s.indexCodeIncremental(files, removed)
+	st.Unchanged = unchanged
+	return st, err
+}
+
+// indexCodeIncremental replaces the rows of the changed files, drops the removed
+// ones, and rebuilds the call graph, all in one transaction. Explicit per-path
+// deletes come first because a changed file may have lost symbols (INSERT OR
+// REPLACE alone would leave them behind) and code_search has no upsert.
+func (s *Store) indexCodeIncremental(files []*code.CodeFile, removed []string) (CodeStats, error) {
+	var stats CodeStats
+	err := s.Write(func(tx *sql.Tx) error {
+		delFile, err := tx.Prepare(`DELETE FROM code_files WHERE path = ?`)
+		if err != nil {
+			return err
+		}
+		defer delFile.Close()
+		delSym, err := tx.Prepare(`DELETE FROM code_symbols WHERE path = ?`)
+		if err != nil {
+			return err
+		}
+		defer delSym.Close()
+		delFTS, err := tx.Prepare(`DELETE FROM code_search WHERE path = ?`)
+		if err != nil {
+			return err
+		}
+		defer delFTS.Close()
+		drop := func(path string) error {
+			for _, st := range []*sql.Stmt{delFile, delSym, delFTS} {
+				if _, err := st.Exec(path); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, p := range removed {
+			if err := drop(p); err != nil {
+				return err
+			}
+		}
+		for _, cf := range files {
+			if err := drop(cf.Path); err != nil {
+				return err
+			}
+		}
+		if err := insertCodeFiles(tx, files, &stats); err != nil {
+			return err
+		}
+		return rebuildCodeEdges(tx)
+	})
+	if err != nil {
+		return CodeStats{}, err
+	}
+	stats.Removed = len(removed)
+	stats.Edges, _ = s.Count("code_edges")
+	return stats, nil
+}
+
+// CodeFileMtimes returns path -> stored mtime for every indexed source file, the
+// drift baseline for the incremental reindex.
+func (s *Store) CodeFileMtimes() (map[string]int64, error) {
+	rows, err := s.readDB.Query(`SELECT path, mtime FROM code_files`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var p string
+		var m int64
+		if err := rows.Scan(&p, &m); err != nil {
+			return nil, err
+		}
+		out[p] = m
+	}
+	return out, rows.Err()
 }
 
 func relToRoots(roots []string, p string) (string, bool) {

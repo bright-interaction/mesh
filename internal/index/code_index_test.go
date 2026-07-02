@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/index/code"
 )
@@ -98,8 +99,93 @@ func TestSplitIdent(t *testing.T) {
 	}
 }
 
+// TestReindexCodeIncremental drives the mtime-drift path end to end: a second
+// run with no changes parses nothing, and a change/add/delete run rewrites only
+// the drifted files while the call graph stays globally consistent.
+func TestReindexCodeIncremental(t *testing.T) {
+	s := tmpStore(t)
+	root := t.TempDir()
+	write := func(rel, body string, at time.Time) {
+		t.Helper()
+		p := filepath.Join(root, rel)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	symCount := func(name string) int {
+		t.Helper()
+		var n int
+		if err := s.readDB.QueryRow(`SELECT count(*) FROM code_symbols WHERE name = ?`, name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	t0 := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	write("a.go", "package demo\n\nfunc Alpha() { beta() }\n", t0)
+	write("b.go", "package demo\n\nfunc beta() {}\n", t0)
+	langs := map[string]bool{"go": true}
+
+	st, err := ReindexCode(s, []string{root}, langs) // empty index falls back to full
+	if err != nil {
+		t.Fatalf("initial ReindexCode: %v", err)
+	}
+	if st.Files != 2 || st.Unchanged != 0 {
+		t.Fatalf("initial run: files=%d unchanged=%d, want 2/0", st.Files, st.Unchanged)
+	}
+
+	st, err = ReindexCode(s, []string{root}, langs) // no drift: nothing parsed
+	if err != nil {
+		t.Fatalf("no-op ReindexCode: %v", err)
+	}
+	if st.Files != 0 || st.Unchanged != 2 || st.Removed != 0 {
+		t.Fatalf("no-op run: files=%d unchanged=%d removed=%d, want 0/2/0", st.Files, st.Unchanged, st.Removed)
+	}
+
+	t1 := t0.Add(time.Hour)
+	write("a.go", "package demo\n\nfunc Alpha() { Gamma() }\n\nfunc AlphaTwo() {}\n", t1)
+	write("c.go", "package demo\n\nfunc Gamma() {}\n", t1)
+	if err := os.Remove(filepath.Join(root, "b.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = ReindexCode(s, []string{root}, langs)
+	if err != nil {
+		t.Fatalf("incremental ReindexCode: %v", err)
+	}
+	if st.Files != 2 || st.Removed != 1 || st.Unchanged != 0 {
+		t.Fatalf("incremental run: files=%d removed=%d unchanged=%d, want 2/1/0", st.Files, st.Removed, st.Unchanged)
+	}
+	if n := symCount("beta"); n != 0 {
+		t.Errorf("beta should be gone with b.go, still has %d rows", n)
+	}
+	if n := symCount("AlphaTwo"); n != 1 {
+		t.Errorf("AlphaTwo rows = %d, want 1", n)
+	}
+	if n := symCount("Gamma"); n != 1 {
+		t.Errorf("Gamma rows = %d, want 1", n)
+	}
+	base := filepath.Base(root)
+	_, callees, err := s.CodeNeighbors("code:" + base + "/a.go#Alpha")
+	if err != nil {
+		t.Fatalf("CodeNeighbors: %v", err)
+	}
+	found := false
+	for _, c := range callees {
+		if c.Name == "Gamma" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("edge Alpha -> Gamma missing after incremental rebuild (callees: %+v)", callees)
+	}
+}
+
 // BenchmarkReindexCode indexes the whole mesh module (real Go corpus) into a temp
-// store, so the headline number reflects parse + write on actual code.
+// store, so the headline number reflects parse + write on actual code. Uses the
+// full path: the incremental default would no-op every iteration after the first.
 func BenchmarkReindexCode(b *testing.B) {
 	wd, _ := os.Getwd()                   // .../mesh/internal/index
 	root := filepath.Join(wd, "..", "..") // the mesh module root
@@ -107,7 +193,7 @@ func BenchmarkReindexCode(b *testing.B) {
 	langs := map[string]bool{"go": true}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		st, err := ReindexCode(s, []string{root}, langs)
+		st, err := ReindexCodeFull(s, []string{root}, langs)
 		if err != nil {
 			b.Fatalf("ReindexCode: %v", err)
 		}
