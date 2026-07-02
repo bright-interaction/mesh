@@ -33,6 +33,9 @@ func scopedServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := srv.WaitReady(); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { srv.Close() })
 	return srv
 }

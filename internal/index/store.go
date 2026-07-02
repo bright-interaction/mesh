@@ -47,7 +47,7 @@ type job struct {
 }
 
 func dsn(path string) string {
-	return "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)"
+	return "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(on)"
 }
 
 // Open creates (or opens) <vaultRoot>/.mesh/mesh.db, applies the schema, and
@@ -114,6 +114,15 @@ var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "c
 //   - pending_notes: auto-extracted write-back candidates awaiting review, not yet in
 //     the vault, so they would be lost on a rebuild if dropped.
 var schemaKeep = map[string]bool{"metrics": true, "vectors": true, "note_reuse": true, "pending_notes": true}
+
+// keepShapeVersion tracks the COLUMN SHAPE of the schemaKeep tables. ensureSchema runs
+// schema.sql with CREATE TABLE IF NOT EXISTS, which is a no-op on an existing table, so
+// adding a column to a kept table in schema.sql would NOT apply on a live hub DB and the
+// change would silently do nothing. TestKeptTableShapeGuard fingerprints each kept
+// table's DDL against a baked-in value; if you change a kept table's columns you must
+// bump this version (which makes that release drop+rebuild the kept tables, accepting
+// the one-time data loss) or otherwise migrate the live rows, and update the guard.
+const keepShapeVersion = 1
 
 // ensureSchema applies the schema, dropping and rebuilding if the stored version
 // differs. No data is lost that matters: everything is re-derivable from the
