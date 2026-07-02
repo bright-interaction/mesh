@@ -9,12 +9,17 @@
 FROM golang:1.26.4-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
+# Build tags select the edition: empty = AGPL core (public mirror builds work
+# as-is), "pro" = team-sync hub + team web UI + ANN retrieval. The production
+# hub compose sets MESH_BUILD_TAGS=pro via build args; forgetting it makes
+# mesh-ui crash-loop at boot ("team mode requires the pro build").
+ARG MESH_BUILD_TAGS=""
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -o /mesh-hub ./cmd/mesh-hub
+    CGO_ENABLED=0 GOOS=linux go build -tags "$MESH_BUILD_TAGS" -o /mesh-hub ./cmd/mesh-hub
 
 # Cross-compile the mesh CLIENT for every common platform, so the hub can serve
 # ready-to-run binaries (closing the onboarding loop: invite link -> install ->
@@ -23,7 +28,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     mkdir -p /dist && for t in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64; do \
       os="${t%/*}"; arch="${t#*/}"; ext=""; [ "$os" = "windows" ] && ext=".exe"; \
-      CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -o "/dist/mesh-$os-$arch$ext" ./cmd/mesh; \
+      CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -tags "$MESH_BUILD_TAGS" -o "/dist/mesh-$os-$arch$ext" ./cmd/mesh; \
     done && cd /dist && sha256sum mesh-* > SHA256SUMS
 
 # ---------- runtime stage ----------
