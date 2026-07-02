@@ -819,9 +819,10 @@ func codeCmd() *cobra.Command {
 func codeReindexCmd() *cobra.Command {
 	var rootsFlag []string
 	var langsFlag string
+	var full bool
 	c := &cobra.Command{
 		Use:   "reindex [vault]",
-		Short: "Walk the configured code roots and (re)build the source-code index",
+		Short: "Walk the configured code roots and refresh the source-code index (incremental; --full rebuilds)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := "."
@@ -849,18 +850,23 @@ func codeReindexCmd() *cobra.Command {
 				langs = strings.Split(langsFlag, ",")
 			}
 			start := time.Now()
-			st, err := index.ReindexCode(store, roots, codeLangSet(langs))
+			reindex := index.ReindexCode
+			if full {
+				reindex = index.ReindexCodeFull
+			}
+			st, err := reindex(store, roots, codeLangSet(langs))
 			if err != nil {
 				return err
 			}
 			links, _ := store.LinkNotesToCode(root) // refresh the note<->code bridge
-			fmt.Printf("code index: %d files, %d symbols, %d edges, %d note links in %s\n  roots: %s\n  db:    %s\n",
-				st.Files, st.Symbols, st.Edges, links, time.Since(start).Round(time.Millisecond), strings.Join(roots, ", "), store.Path())
+			fmt.Printf("code index: %d files parsed (%d unchanged, %d removed), %d symbols, %d edges, %d note links in %s\n  roots: %s\n  db:    %s\n",
+				st.Files, st.Unchanged, st.Removed, st.Symbols, st.Edges, links, time.Since(start).Round(time.Millisecond), strings.Join(roots, ", "), store.Path())
 			return nil
 		},
 	}
 	c.Flags().StringSliceVar(&rootsFlag, "root", nil, "code root to index (repeatable); overrides config")
 	c.Flags().StringVar(&langsFlag, "languages", "", "comma list of language tags (default: config or all)")
+	c.Flags().BoolVar(&full, "full", false, "wipe and rebuild the whole index instead of the incremental mtime-drift refresh")
 	return c
 }
 
