@@ -10,6 +10,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -47,6 +48,9 @@ type Server struct {
 	reloadMu sync.Mutex       // serializes rebuilds across dispatch + watcher
 	cache    *index.NoteCache // parsed-note cache for incremental reconcile; guarded by reloadMu
 
+	ready    chan struct{} // closed when the initial background load finishes
+	readyErr error         // written once before ready closes
+
 	agent string // calling client's name from initialize (provenance default), guarded by mu
 }
 
@@ -71,16 +75,48 @@ func NewServerAt(vaultRoot, indexDir string) (*Server, error) {
 }
 
 func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
-	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache()}
-	if err := s.reload(); err != nil {
-		store.Close()
-		return nil, err
-	}
-	// Seed the flywheel measurement from the existing agent-authored corpus once, so
-	// the reuse number reflects accumulated knowledge from day one (idempotent).
-	_, _ = store.BackfillWritebacks()
-	_, _ = store.LinkNotesToCode(vaultRoot) // build the note<->code bridge if a code index exists
+	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache(), ready: make(chan struct{})}
+	// The initial load runs in the background so the MCP handshake answers
+	// immediately: a full reload of a grown vault plus the note<->code bridge
+	// exceeds a client's connect timeout (Claude Code kills the server at 30s
+	// and never retries, orphaning the whole session), and a concurrent
+	// `mesh code reindex` holding the db write lock makes it worse. Tool calls
+	// and resource reads gate on awaitReady instead.
+	go func() {
+		defer close(s.ready)
+		if err := s.reload(); err != nil {
+			s.readyErr = fmt.Errorf("initial index load: %w", err)
+			fmt.Fprintf(os.Stderr, "mesh mcp: %v\n", s.readyErr)
+			return
+		}
+		// Seed the flywheel measurement from the existing agent-authored corpus once, so
+		// the reuse number reflects accumulated knowledge from day one (idempotent).
+		_, _ = store.BackfillWritebacks()
+		_, _ = store.LinkNotesToCode(vaultRoot) // build the note<->code bridge if a code index exists
+	}()
 	return s, nil
+}
+
+// WaitReady blocks until the initial background index load has finished and
+// reports its error, for callers that need deterministic startup (tests, hub boot).
+func (s *Server) WaitReady() error {
+	<-s.ready
+	return s.readyErr
+}
+
+// awaitReady blocks until the initial background load finishes. Early tool
+// calls (a client may fire one right after the handshake) wait for the index
+// rather than racing a nil graph.
+func (s *Server) awaitReady(ctx context.Context) *rpcError {
+	select {
+	case <-s.ready:
+		if s.readyErr != nil {
+			return &rpcError{Code: codeInternalError, Message: s.readyErr.Error()}
+		}
+		return nil
+	case <-ctx.Done():
+		return &rpcError{Code: codeInternalError, Message: "index still loading: " + ctx.Err().Error()}
+	}
 }
 
 // Reconcile re-reads the vault and rebuilds the in-memory index (authoritative).
@@ -93,7 +129,10 @@ func (s *Server) Reconcile() error {
 // NotePath resolves a note id to its vault-relative path (for the hub's ACL gate).
 func (s *Server) NotePath(id string) (string, error) { return s.store.NotePath(id) }
 
-func (s *Server) Close() error { return s.store.Close() }
+func (s *Server) Close() error {
+	<-s.ready // never close the store under the initial background load
+	return s.store.Close()
+}
 
 // snapshot returns the current graph + retriever under a read lock, so a
 // concurrent rebuild swapping them in never tears a reader's view.
@@ -242,10 +281,16 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	case "tools/list":
 		return s.handleToolsList(), nil
 	case "tools/call":
+		if rerr := s.awaitReady(ctx); rerr != nil {
+			return nil, rerr
+		}
 		return s.handleToolsCall(ctx, req.Params)
 	case "resources/list":
 		return s.handleResourcesList(), nil
 	case "resources/read":
+		if rerr := s.awaitReady(ctx); rerr != nil {
+			return nil, rerr
+		}
 		return s.handleResourcesRead(ctx, req.Params)
 	default:
 		return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found", Data: req.Method}
