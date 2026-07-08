@@ -6,7 +6,7 @@
 # laptops; it never runs here and never needs git.
 
 # ---------- build stage ----------
-FROM golang:1.26.4-alpine AS builder
+FROM golang:1.26.5-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
 # Build tags select the edition: empty = AGPL core (public mirror builds work
