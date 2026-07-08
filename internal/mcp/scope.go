@@ -36,6 +36,32 @@ func scopeFromCtx(ctx context.Context) *ScopeFilter {
 	return sf
 }
 
+type writeCapKey struct{}
+
+// WithWriteCapability marks the context with whether the caller may create or
+// modify notes AT ALL (role-based, independent of scope). The hosted hub sets
+// it on every request so a read-only (viewer) client is blocked from writing
+// even when scope enforcement is off - the scope gate alone leaves sf nil in
+// that mode and would otherwise skip the only write check. The trusted local /
+// solo binary never sets it (the caller owns the vault), so writes stay open
+// there.
+func WithWriteCapability(ctx context.Context, canWrite bool) context.Context {
+	return context.WithValue(ctx, writeCapKey{}, canWrite)
+}
+
+// writeAllowed returns (canWrite, explicitlySet). When no policy was set (local
+// solo run), writes are allowed; a hosted request always sets an explicit value.
+func writeAllowed(ctx context.Context) (canWrite, set bool) {
+	if ctx == nil {
+		return true, false
+	}
+	v, ok := ctx.Value(writeCapKey{}).(bool)
+	if !ok {
+		return true, false
+	}
+	return v, true
+}
+
 // allowsRead reports whether a note carrying these scopes is readable. A nil filter
 // or nil AllowedRead = unrestricted. No scopes = the fail-safe dev default. The intersect
 // logic lives in one place (vault.ScopeAllows) so it cannot drift per surface.
