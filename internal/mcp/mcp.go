@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -356,8 +357,14 @@ const (
 	codeMethodNotFound = -32601
 )
 
+// internalErr wraps an internal failure (index reload, vault I/O, driver error)
+// as a JSON-RPC error WITHOUT leaking the raw message: sqlite driver text and
+// absolute filesystem paths would otherwise reach the agent verbatim. The real
+// error is logged server-side; the agent gets a generic message. Validation
+// errors use codeInvalidParams with explicit operator-authored messages instead.
 func internalErr(err error) *rpcError {
-	return &rpcError{Code: codeInternalError, Message: err.Error()}
+	slog.Error("mesh mcp internal error", "err", err)
+	return &rpcError{Code: codeInternalError, Message: "internal error"}
 }
 
 // textResult wraps a value as an MCP text content block, JSON-encoding it so the
