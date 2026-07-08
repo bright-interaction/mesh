@@ -180,7 +180,9 @@ func TestToolWriteRecordsProvenance(t *testing.T) {
 		t.Fatalf("write rpc error: %v", rerr)
 	}
 	w := toolText(t, res.(map[string]any))
-	b, err := os.ReadFile(w["path"].(string))
+	// path is now vault-relative (absolute paths must not leak to the agent),
+	// so join it back onto the vault root to read the file.
+	b, err := os.ReadFile(filepath.Join(s.vaultRoot, w["path"].(string)))
 	if err != nil {
 		t.Fatalf("read written note: %v", err)
 	}

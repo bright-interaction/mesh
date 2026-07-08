@@ -538,6 +538,14 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 		Scope      string   `json:"scope"`
 	}
 	json.Unmarshal(raw, &a)
+	// Role write gate (independent of scope): a read-only hosted client must not
+	// create notes. This is enforced FIRST because the scope gate below leaves
+	// sf nil when the team has not configured scoping, which would otherwise skip
+	// the only write check and let a viewer-role token write. Unset (local solo
+	// binary) means the caller owns the vault, so writes are allowed there.
+	if can, set := writeAllowed(ctx); set && !can {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
+	}
 	// Scope write gate: a scoped caller may only create notes in a scope they can
 	// write, and the new note is stamped with that scope. A nil filter (solo / no-scope
 	// hub) leaves noteScope empty so the note carries no scope frontmatter (= dev).
@@ -585,7 +593,15 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	}
 	_ = s.store.IncrMetric("writes", 1)         // ROI telemetry (best-effort)
 	_ = s.store.RecordWriteback(res.ID, source) // flywheel: stamp authoring time for reuse measurement
-	return textResult(map[string]any{"id": res.ID, "path": res.Path, "when": res.When, "todo": res.TODOs}), nil
+	// Return a vault-relative path, never the server's absolute filesystem path:
+	// on the hosted hub the absolute path would leak /opt/mesh-hub/... to the agent.
+	notePath := res.Path
+	if rel, err := filepath.Rel(s.vaultRoot, res.Path); err == nil && !strings.HasPrefix(rel, "..") {
+		notePath = rel
+	} else {
+		notePath = filepath.Base(res.Path)
+	}
+	return textResult(map[string]any{"id": res.ID, "path": notePath, "when": res.When, "todo": res.TODOs}), nil
 }
 
 // flywheelReuseGap is how long after a write-back a fetch must land to count as reuse
