@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -46,8 +47,26 @@ type job struct {
 	reply chan error
 }
 
+const (
+	// walSizeLimit caps mesh.db-wal on disk. SQLite's WAL autocheckpoint is PASSIVE:
+	// it resets the write pointer but NEVER shrinks the file, and nothing here ever
+	// issued a TRUNCATE, so the WAL only grew to its high-water mark and stayed there
+	// (observed 223MB, which starved writers into SQLITE_BUSY). journal_size_limit
+	// makes every checkpoint truncate the WAL back to at most this size. 16MB holds
+	// the largest single reindex transaction's frames without thrashing.
+	walSizeLimit = 16 * 1024 * 1024
+	// walCheckpointInterval is how often the single writer goroutine runs a PASSIVE
+	// checkpoint, so a WAL left behind by an idle stretch still gets checkpointed and
+	// capped by journal_size_limit (autocheckpoint only fires on writes). PASSIVE never
+	// blocks the writer on a reader; TRUNCATE-to-zero is the out-of-process mesh-doctor's job.
+	walCheckpointInterval = 2 * time.Minute
+)
+
 func dsn(path string) string {
-	return "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(on)"
+	return fmt.Sprintf(
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(on)&_pragma=journal_size_limit(%d)",
+		path, walSizeLimit,
+	)
 }
 
 // Open creates (or opens) <vaultRoot>/.mesh/mesh.db, applies the schema, and
@@ -180,12 +199,24 @@ func (s *Store) NoteDates() (map[string]NoteDate, error) {
 
 func (s *Store) writer() {
 	defer s.wg.Done()
+	// Periodically checkpoint the WAL from inside the single writer so mesh.db-wal
+	// cannot grow without bound even across idle stretches (autocheckpoint only fires
+	// on writes). PASSIVE, not TRUNCATE: PASSIVE returns immediately and never blocks
+	// the writer on a live reader, while journal_size_limit (DSN) still truncates the
+	// file to <=16MB after the checkpoint. Running it on this goroutine means it never
+	// races a write: the select serves one job OR one checkpoint per iteration.
+	ticker := time.NewTicker(walCheckpointInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-s.done:
 			return
 		case j := <-s.jobs:
 			j.reply <- s.runTx(j.fn)
+		case <-ticker.C:
+			// Best-effort and non-blocking; journal_size_limit caps the file. Full
+			// zeroing (TRUNCATE) + reaping stale readers is the hourly mesh-doctor's job.
+			_, _ = s.writeDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
 		}
 	}
 }
