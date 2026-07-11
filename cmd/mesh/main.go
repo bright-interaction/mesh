@@ -60,6 +60,7 @@ func rootCmd() *cobra.Command {
 		tuneCmd(),
 		statusCmd(),
 		healthCmd(),
+		flywheelCmd(),
 		ingestCmd(),
 		migrateCmd(),
 		scopeCmd(),
@@ -689,6 +690,57 @@ func healthCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func flywheelCmd() *cobra.Command {
+	var asJSON bool
+	var top int
+	c := &cobra.Command{
+		Use:   "flywheel [vault]",
+		Short: "Show write-back reuse metrics: does the knowledge get reused by later sessions?",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := "."
+			if len(args) == 1 {
+				root = args[0]
+			}
+			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
+				return fmt.Errorf("no index (run: mesh index %s)", root)
+			}
+			store, err := index.Open(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			st, err := store.FlywheelStats()
+			if err != nil {
+				return err
+			}
+			reused := store.TopReused(top)
+			if asJSON {
+				b, _ := json.MarshalIndent(map[string]any{"stats": st, "top_reused": reused}, "", "  ")
+				fmt.Println(string(b))
+				return nil
+			}
+			fmt.Printf("Mesh write-back flywheel (does knowledge get reused by later sessions?)\n\n")
+			fmt.Printf("  reuse rate:            %.0f%%   (%d of %d write-backs reused in a later session)\n", st.ReuseRatePct, st.Reused, st.Authored)
+			fmt.Printf("  total reuses:          %d\n", st.TotalReuses)
+			fmt.Printf("  median time to reuse:  %.1f h\n", st.MedianHoursToReuse)
+			fmt.Printf("  input health:          %.0f writes per 100 reads\n", st.WritesPer100Reads)
+			if len(reused) > 0 {
+				fmt.Printf("\n  most-reused notes:\n")
+				for _, r := range reused {
+					fmt.Printf("    %3dx  %s\n", r.ReuseCount, r.NoteID)
+				}
+			}
+			fmt.Printf("\n  Reuse = a mesh_fetch of a note >=10min after it was written (a LATER session\n")
+			fmt.Printf("  inheriting it). Search-surfaced reuse is not counted, so this is a floor.\n")
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
+	c.Flags().IntVar(&top, "top", 8, "show the N most-reused notes")
+	return c
 }
 
 func newCmd() *cobra.Command {
