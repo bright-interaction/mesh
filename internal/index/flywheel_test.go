@@ -136,6 +136,38 @@ func TestBackfillWritebacks(t *testing.T) {
 	}
 }
 
+// TopReused returns the most-reused notes, reuse_count desc, excluding never-reused.
+func TestTopReused(t *testing.T) {
+	s := openTestStore(t)
+	for _, id := range []string{"a", "b", "c"} {
+		if err := s.RecordWriteback(id, "agent"); err != nil {
+			t.Fatal(err)
+		}
+		backdate(t, s, id, 7200) // 2h so the reuse gap is satisfied
+	}
+	for i := 0; i < 3; i++ {
+		if err := s.RecordReuse("a", 600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.RecordReuse("b", 600); err != nil {
+		t.Fatal(err)
+	}
+	top := s.TopReused(8)
+	if len(top) != 2 {
+		t.Fatalf("want 2 reused notes (c never reused), got %d: %+v", len(top), top)
+	}
+	if top[0].NoteID != "a" || top[0].ReuseCount != 3 {
+		t.Errorf("top should be a x3, got %+v", top[0])
+	}
+	if top[1].NoteID != "b" || top[1].ReuseCount != 1 {
+		t.Errorf("second should be b x1, got %+v", top[1])
+	}
+	if one := s.TopReused(1); len(one) != 1 || one[0].NoteID != "a" {
+		t.Errorf("limit not respected: %+v", one)
+	}
+}
+
 // FlywheelStats reports reuse rate and median time-to-reuse over reused notes.
 func TestFlywheelStats(t *testing.T) {
 	s := openTestStore(t)
