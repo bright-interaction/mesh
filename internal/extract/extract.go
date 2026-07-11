@@ -17,6 +17,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/bright-interaction/mesh/internal/llm"
@@ -374,12 +375,50 @@ const judgeSystem = `You are a senior engineer reviewing one candidate note for 
 
 Output STRICT JSON only: {"keep": true|false, "reason": "one short line"}. No prose, no fences.`
 
-// Judge rates whether a candidate is worth keeping, for measuring extraction precision
-// in the benchmark. Strict by design (it is the precision gate, not a rubber stamp).
-func Judge(ctx context.Context, client llm.Client, c Candidate) (keep bool, reason string, err error) {
+// The panel lenses each stress ONE of the three qualifying criteria the extractor prompt
+// names. A single generalist judge is lenient (it rubber-stamps almost everything, so a
+// self-grade reports ~100%); three judges each focused on a different failure mode
+// disagree usefully, which is what makes the precision number honest and the gate strong.
+const (
+	judgeLensNonObvious = judgeSystem + "\nFor THIS decision weigh ONLY non-obviousness: keep only if it states something a competent engineer would NOT already assume; reject the obvious."
+	judgeLensReusable   = judgeSystem + "\nFor THIS decision weigh ONLY reusability: keep only if it transfers beyond this one task or session; reject one-offs and single-incident stories."
+	judgeLensDurable    = judgeSystem + "\nFor THIS decision weigh ONLY durability: keep only if it is still true next month; reject transient state and one-time fixes."
+)
+
+var judgeLenses = []struct{ Name, System string }{
+	{"non-obvious", judgeLensNonObvious},
+	{"reusable", judgeLensReusable},
+	{"durable", judgeLensDurable},
+}
+
+// PanelMajority keeps a candidate when at least 2 of the 3 lenses approve (robust to one
+// lens being wrong); PanelUnanimous requires all three (the strictest, honest bar).
+const (
+	PanelMajority  = 2
+	PanelUnanimous = 0
+)
+
+// Vote is one lens's verdict on a candidate.
+type Vote struct {
+	Lens   string `json:"lens"`
+	Keep   bool   `json:"keep"`
+	Reason string `json:"reason"`
+	Err    string `json:"err,omitempty"`
+}
+
+// PanelVerdict aggregates the lens votes for a candidate.
+type PanelVerdict struct {
+	Keep  bool   `json:"keep"`
+	KeepN int    `json:"keep_n"`
+	Total int    `json:"total"`
+	Votes []Vote `json:"votes"`
+}
+
+// judgeOnce runs one judge with a given system prompt over a candidate.
+func judgeOnce(ctx context.Context, client llm.Client, system string, c Candidate) (keep bool, reason string, err error) {
 	u := fmt.Sprintf("Candidate note:\ntype: %s\ntitle: %s\ndo: %s\ndont: %s\nwhy: %s\nconfidence: %s",
 		c.Type, c.Title, c.Do, c.Dont, c.Why, c.Confidence)
-	out, err := client.Complete(ctx, judgeSystem, u)
+	out, err := client.Complete(ctx, system, u)
 	if err != nil {
 		return false, "", err
 	}
@@ -396,4 +435,57 @@ func Judge(ctx context.Context, client llm.Client, c Candidate) (keep bool, reas
 		return false, "", err
 	}
 	return v.Keep, strings.TrimSpace(v.Reason), nil
+}
+
+// Judge rates a candidate with the single generalist rubric. Retained for callers/tests
+// that want one vote; JudgePanel is the stronger, default precision gate.
+func Judge(ctx context.Context, client llm.Client, c Candidate) (keep bool, reason string, err error) {
+	return judgeOnce(ctx, client, judgeSystem, c)
+}
+
+// JudgePanel runs each qualifying-criterion lens as an INDEPENDENT judge call and keeps
+// the candidate when at least keepThreshold lenses vote keep (keepThreshold<=0 means
+// unanimity, the strict default). judges are cycled across lenses: pass one client for a
+// cheap prompt-diverse panel, or N clients for true model diversity. A lens that ERRORS
+// counts as a keep vote (fail-open: never silently drop knowledge on an LLM hiccup, the
+// human still vetoes) with its error recorded; only when EVERY lens errors is it an error.
+// Lenses run concurrently, so the panel costs about one judge's latency, not three.
+func JudgePanel(ctx context.Context, judges []llm.Client, c Candidate, keepThreshold int) (PanelVerdict, error) {
+	if len(judges) == 0 {
+		return PanelVerdict{}, fmt.Errorf("no judges")
+	}
+	votes := make([]Vote, len(judgeLenses))
+	var wg sync.WaitGroup
+	for i, lens := range judgeLenses {
+		wg.Add(1)
+		go func(i int, name, system string) {
+			defer wg.Done()
+			keep, reason, err := judgeOnce(ctx, judges[i%len(judges)], system, c)
+			v := Vote{Lens: name, Keep: keep, Reason: reason}
+			if err != nil {
+				v.Keep = true // fail-open: a flaky judge must not drop a candidate
+				v.Err = err.Error()
+			}
+			votes[i] = v
+		}(i, lens.Name, lens.System)
+	}
+	wg.Wait()
+
+	keepN, errN := 0, 0
+	for _, v := range votes {
+		if v.Keep {
+			keepN++
+		}
+		if v.Err != "" {
+			errN++
+		}
+	}
+	if errN == len(votes) {
+		return PanelVerdict{Votes: votes, Total: len(votes)}, fmt.Errorf("all judge lenses failed: %s", votes[0].Err)
+	}
+	threshold := keepThreshold
+	if threshold <= 0 {
+		threshold = len(judgeLenses)
+	}
+	return PanelVerdict{Keep: keepN >= threshold, KeepN: keepN, Total: len(votes), Votes: votes}, nil
 }

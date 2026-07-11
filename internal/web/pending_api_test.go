@@ -61,6 +61,12 @@ func TestPendingPromoteAndDiscard(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "gotchas")); err != nil {
 		t.Fatalf("promoted note dir not created: %v", err)
 	}
+	// Promoting must stamp the note in the flywheel (authored count), like a direct
+	// mesh_append_note. Startup backfill saw only the non-agent seed note (authored 0),
+	// so an authored count here proves the promote-time RecordWriteback fired.
+	if fw, err := s.store.FlywheelStats(); err != nil || fw.Authored < 1 {
+		t.Errorf("promoted candidate should count as an authored write-back, authored=%d err=%v", fw.Authored, err)
+	}
 
 	if st, _ := postJSON(t, ts, "/api/pending/discard", `{"id":"`+tossID+`"}`); st != 200 {
 		t.Fatalf("discard = %d", st)
