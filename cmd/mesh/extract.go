@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,7 +28,7 @@ import (
 // many extracted notes a strict judge would keep). BYOAI via MESH_CURATOR_* (claude -p).
 func extractCmd() *cobra.Command {
 	var benchmark bool
-	var n, concurrency, maxChars int
+	var n, concurrency, maxChars, repeat int
 	var asJSON bool
 	var toPending, dedupVault, judgeEval string
 	var recurring bool
@@ -47,7 +48,7 @@ func extractCmd() *cobra.Command {
 				if len(args) < 1 {
 					return fmt.Errorf("--benchmark needs a directory of transcripts")
 				}
-				return runExtractBenchmark(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON, dedupVault)
+				return runExtractBenchmark(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON, dedupVault, repeat)
 			}
 			if recurring {
 				if len(args) < 1 {
@@ -83,6 +84,7 @@ func extractCmd() *cobra.Command {
 	c.Flags().StringVar(&toPending, "to-pending", "", "persist extracted candidates to this vault's review queue instead of printing")
 	c.Flags().StringVar(&dedupVault, "dedup-vault", "", "benchmark: dedup candidates against this vault and report fresh vs already-known")
 	c.Flags().StringVar(&judgeEval, "judge-eval", "", "grade the judge PANEL's discrimination over a labeled good/bad fixture (JSON): keeps good AND rejects bad")
+	c.Flags().IntVar(&repeat, "repeat", 1, "benchmark: run K times and report coverage/precision mean +/- stddev + per-session stability (variance-aware)")
 	c.Flags().BoolVar(&recurring, "recurring", false, "find problems that RECUR across sessions (systemic issues), not one-offs")
 	return c
 }
@@ -331,7 +333,7 @@ func sampleTranscripts(dir string, n int) ([]string, error) {
 	return out, nil
 }
 
-func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, concurrency, maxChars int, asJSON bool, dedupVault string) error {
+func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, concurrency, maxChars int, asJSON bool, dedupVault string, repeat int) error {
 	files, err := sampleTranscripts(dir, n)
 	if err != nil {
 		return err
@@ -367,57 +369,14 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	rows := make([]benchRow, len(files))
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
-	for i, f := range files {
-		wg.Add(1)
-		go func(i int, f string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			row := benchRow{File: filepath.Base(f)}
-			if st, e := os.Stat(f); e == nil {
-				row.SizeKB = st.Size() >> 10
-			}
-			digest, st, e := extract.Digest(f, maxChars)
-			if e != nil {
-				row.Err = "digest: " + e.Error()
-				rows[i] = row
-				return
-			}
-			row.HadWriteback = st.HadWriteback
-			cands, e := extract.Extract(ctx, client, digest)
-			if e != nil {
-				row.Err = "extract: " + e.Error()
-				rows[i] = row
-				return
-			}
-			row.Candidates = len(cands)
-			for _, cnd := range cands {
-				if known, _ := knownInVault(ctx, rtr, cnd); known {
-					row.Duplicates++ // restates a note already in the vault; not judged as fresh
-					continue
-				}
-				v, je := extract.JudgePanel(ctx, judges, cnd, extract.PanelMajority)
-				if je != nil {
-					row.Err = "judge: " + je.Error()
-					continue
-				}
-				if v.Keep {
-					row.Kept++
-					if v.KeepN == v.Total {
-						row.Unanimous++ // 3/3 lenses: the strictest bar, for the split
-					}
-				}
-			}
-			rows[i] = row
-			if !asJSON {
-				fmt.Fprintf(os.Stderr, "  %-40s writeback=%-5v cands=%d dup=%d kept=%d(u%d) %s\n", row.File, row.HadWriteback, row.Candidates, row.Duplicates, row.Kept, row.Unanimous, row.Err)
-			}
-		}(i, f)
+	// Variance mode: extraction is non-deterministic (the LLM samples at ~temp 1), so a
+	// single run's coverage is a noisy point. --repeat K runs the whole benchmark K times
+	// and reports mean +/- stddev plus per-session stability, so coverage is never quoted
+	// as one number again.
+	if repeat > 1 {
+		return runVarianceBenchmark(ctx, files, client, judges, independent, rtr, maxChars, concurrency, repeat, asJSON)
 	}
-	wg.Wait()
+	rows := benchmarkRows(ctx, files, client, judges, rtr, maxChars, concurrency, !asJSON)
 
 	// Tally. "Fresh" = candidates that are not duplicates of an existing vault note;
 	// precision is measured on the fresh set (what a reviewer actually sees).
@@ -501,6 +460,197 @@ func max1(n int) int {
 		return 1
 	}
 	return n
+}
+
+func pctOf(a, b int) float64 {
+	if b == 0 {
+		return 0
+	}
+	return float64(a) / float64(b) * 100
+}
+
+// benchStats is the per-run tally of a benchmark pass.
+type benchStats struct {
+	N, manual, extractCov, totalC, totalDup, totalK, totalU, errs int
+}
+
+func (s benchStats) coveragePct() float64  { return pctOf(s.extractCov, s.N) }
+func (s benchStats) precisionPct() float64 { return pctOf(s.totalK, s.totalC-s.totalDup) }
+
+func tallyRows(rows []benchRow) benchStats {
+	s := benchStats{N: len(rows)}
+	for _, r := range rows {
+		if r.Err != "" && r.Candidates == 0 {
+			s.errs++
+		}
+		if r.HadWriteback {
+			s.manual++
+		}
+		if r.Candidates-r.Duplicates > 0 {
+			s.extractCov++
+		}
+		s.totalC += r.Candidates
+		s.totalDup += r.Duplicates
+		s.totalK += r.Kept
+		s.totalU += r.Unanimous
+	}
+	return s
+}
+
+// benchmarkRows runs one benchmark pass over files: digest -> extract -> dedup -> judge
+// panel, concurrently. Verbose prints a per-file line to stderr. This is the single-run
+// unit that --repeat drives K times for a variance estimate.
+func benchmarkRows(ctx context.Context, files []string, client llm.Client, judges []llm.Client, rtr *retrieve.Retriever, maxChars, concurrency int, verbose bool) []benchRow {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	rows := make([]benchRow, len(files))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i, f := range files {
+		wg.Add(1)
+		go func(i int, f string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			row := benchRow{File: filepath.Base(f)}
+			if st, e := os.Stat(f); e == nil {
+				row.SizeKB = st.Size() >> 10
+			}
+			digest, st, e := extract.Digest(f, maxChars)
+			if e != nil {
+				row.Err = "digest: " + e.Error()
+				rows[i] = row
+				return
+			}
+			row.HadWriteback = st.HadWriteback
+			cands, e := extract.Extract(ctx, client, digest)
+			if e != nil {
+				row.Err = "extract: " + e.Error()
+				rows[i] = row
+				return
+			}
+			row.Candidates = len(cands)
+			for _, cnd := range cands {
+				if known, _ := knownInVault(ctx, rtr, cnd); known {
+					row.Duplicates++ // restates a note already in the vault; not judged as fresh
+					continue
+				}
+				v, je := extract.JudgePanel(ctx, judges, cnd, extract.PanelMajority)
+				if je != nil {
+					row.Err = "judge: " + je.Error()
+					continue
+				}
+				if v.Keep {
+					row.Kept++
+					if v.KeepN == v.Total {
+						row.Unanimous++ // 3/3 lenses: the strictest bar, for the split
+					}
+				}
+			}
+			rows[i] = row
+			if verbose {
+				fmt.Fprintf(os.Stderr, "  %-40s writeback=%-5v cands=%d dup=%d kept=%d(u%d) %s\n", row.File, row.HadWriteback, row.Candidates, row.Duplicates, row.Kept, row.Unanimous, row.Err)
+			}
+		}(i, f)
+	}
+	wg.Wait()
+	return rows
+}
+
+func meanStddev(xs []float64) (mean, sd float64) {
+	if len(xs) == 0 {
+		return 0, 0
+	}
+	for _, x := range xs {
+		mean += x
+	}
+	mean /= float64(len(xs))
+	for _, x := range xs {
+		d := x - mean
+		sd += d * d
+	}
+	return mean, math.Sqrt(sd / float64(len(xs)))
+}
+
+// runVarianceBenchmark runs the benchmark K times and reports coverage + precision as
+// mean +/- stddev, plus per-session stability (which transcripts ALWAYS, SOMETIMES, or
+// NEVER yield a note across the K runs). The stability split is the real characterization
+// of the non-determinism: a "sometimes" session is where the coverage variance lives.
+func runVarianceBenchmark(ctx context.Context, files []string, client llm.Client, judges []llm.Client, independent bool, rtr *retrieve.Retriever, maxChars, concurrency, repeat int, asJSON bool) error {
+	var covs, precs []float64
+	var candCounts []int
+	yields := map[string]int{} // file base -> # of runs it yielded a fresh note
+	for run := 0; run < repeat; run++ {
+		rows := benchmarkRows(ctx, files, client, judges, rtr, maxChars, concurrency, false)
+		s := tallyRows(rows)
+		covs = append(covs, s.coveragePct())
+		precs = append(precs, s.precisionPct())
+		candCounts = append(candCounts, s.totalC)
+		for _, r := range rows {
+			if r.Candidates-r.Duplicates > 0 {
+				yields[r.File]++
+			}
+		}
+		if !asJSON {
+			fmt.Fprintf(os.Stderr, "  run %d/%d: coverage %.0f%%  precision %.0f%%  candidates %d\n", run+1, repeat, s.coveragePct(), s.precisionPct(), s.totalC)
+		}
+	}
+	covMean, covSD := meanStddev(covs)
+	precMean, precSD := meanStddev(precs)
+	totCand := 0
+	for _, c := range candCounts {
+		totCand += c
+	}
+	candMean := float64(totCand) / float64(max1(repeat))
+
+	// Per-session stability across the K runs.
+	always, never := 0, 0
+	var unstableNames []string
+	for _, f := range files {
+		switch yields[filepath.Base(f)] {
+		case repeat:
+			always++
+		case 0:
+			never++
+		default:
+			unstableNames = append(unstableNames, fmt.Sprintf("%s (%d/%d runs)", filepath.Base(f), yields[filepath.Base(f)], repeat))
+		}
+	}
+	unstable := len(unstableNames)
+
+	if asJSON {
+		b, _ := json.MarshalIndent(map[string]any{
+			"repeats": repeat, "sampled": len(files), "independent_judge": independent,
+			"coverage_pct_mean": covMean, "coverage_pct_stddev": covSD, "coverage_pct_runs": covs,
+			"precision_pct_mean": precMean, "precision_pct_stddev": precSD, "precision_pct_runs": precs,
+			"candidates_per_run_mean": candMean,
+			"sessions_always_yield":   always, "sessions_never_yield": never,
+			"sessions_unstable": unstable, "unstable_sessions": unstableNames,
+		}, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+	fmt.Printf("\nMesh extraction VARIANCE benchmark (%d repeats, %d transcripts, panel independent=%v)\n", repeat, len(files), independent)
+	fmt.Printf("\n  coverage:   %.0f%% +/- %.0f%%   (per run: %s)\n", covMean, covSD, fmtPcts(covs))
+	fmt.Printf("  precision:  %.0f%% +/- %.0f%%   (per run: %s)\n", precMean, precSD, fmtPcts(precs))
+	fmt.Printf("  candidates: %.1f per run (mean)\n", candMean)
+	fmt.Printf("\nper-session stability (of %d transcripts, across %d runs):\n", len(files), repeat)
+	fmt.Printf("  ALWAYS yields a note:  %d\n", always)
+	fmt.Printf("  NEVER yields a note:   %d\n", never)
+	fmt.Printf("  UNSTABLE (flips):      %d   <- where the coverage variance lives\n", unstable)
+	for _, u := range unstableNames {
+		fmt.Printf("     - %s\n", u)
+	}
+	return nil
+}
+
+func fmtPcts(xs []float64) string {
+	parts := make([]string, len(xs))
+	for i, x := range xs {
+		parts[i] = fmt.Sprintf("%.0f", x)
+	}
+	return strings.Join(parts, " ")
 }
 
 // judgeEvalCase is one labeled candidate: label "keep" means the panel SHOULD keep it,
