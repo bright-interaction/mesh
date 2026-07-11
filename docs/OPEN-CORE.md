@@ -1,7 +1,7 @@
 # Open-core architecture
 
-Mesh is split into a public AGPL core and a private commercial pro layer. This doc
-is the source of truth for what lives where and how the public mirror is produced.
+Mesh is split into a public fair-code core and a private commercial pro layer. This
+doc is the source of truth for what lives where and how the public mirror is produced.
 
 ## The boundary
 
@@ -13,7 +13,7 @@ gate in `split-public-repo.sh` and in the repo pre-commit hook, so the boundary
 cannot silently rot (it did once, 2026-06-30: the flywheel features pulled in
 `internal/llm` and `mesh ui --hub-db` pulled in `internal/hub`; see the fix below).
 
-### Open core (public repo, AGPL-3.0)
+### Open core (public repo, Mesh Sustainable Use License)
 
 The whole single-user + hub-client experience:
 
@@ -62,12 +62,12 @@ The pro binaries build with `-tags pro` (wires HNSW + the hub team-mode impl); t
 ## How the public mirror is produced
 
 The private monorepo (`automations/mesh`, this tree) is the source of truth and the
-build source for the hosted SaaS + licensed binaries. The public AGPL repo is a
+build source for the hosted SaaS + licensed binaries. The public fair-code repo is a
 history-filtered mirror of the core:
 
 1. `scripts/split-public-repo.sh` runs `git subtree split --prefix=mesh`, then
    `git filter-repo --invert-paths` to strip the pro paths from **all** history (so
-   pro code never appears in the AGPL repo, not even in old commits).
+   pro code never appears in the fair-code repo, not even in old commits).
 2. It build-checks the filtered tree (`go build ./...`) to prove the core compiles
    without the pro layer.
 3. Dry-run by default; `--push` mirrors to `github.com/bright-interaction/mesh`.
@@ -76,11 +76,14 @@ See `docs/RELEASING.md` for the operator steps (repo creation, tag).
 
 ## Revenue model
 
-- **Free / clout:** the AGPL core. Individuals, OSS, top-of-funnel.
+- **Free / clout:** the fair-code core. Individuals, OSS, top-of-funnel.
 - **Hosted team hub** (primary, build first): subscription, low-friction funnel from
   the free core via `mesh join`.
 - **Sovereign self-host license:** the hub + curator on the customer's own infra
   with support + SLA, for EU / regulated buyers (Bright Interaction's lane).
 
-AGPL on the core deters a competitor from running a closed, rehosted Mesh; the dual
-commercial license is how customers who can't accept AGPL pay instead.
+The fair-code license keeps the core free to self-host, use internally or
+commercially, and run for your own clients, but bars reselling it as a hosted
+service; the dual commercial license is how a buyer who wants to offer Mesh as a
+hosted product (or otherwise needs terms the fair-code license does not grant) pays
+instead.

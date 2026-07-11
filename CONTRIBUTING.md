@@ -1,8 +1,8 @@
 # Contributing to Mesh
 
-Thanks for your interest in Mesh. This is the open core (AGPL-3.0); the team-sync
-hub and the BYOAI curator are a separate commercial product and live elsewhere (see
-[LICENSING.md](LICENSING.md)).
+Thanks for your interest in Mesh. This is the open core (Mesh Sustainable Use
+License, fair-code); the team-sync hub and the BYOAI curator are a separate
+commercial product and live elsewhere (see [LICENSING.md](LICENSING.md)).
 
 ## Getting set up
 
@@ -26,14 +26,15 @@ artifact and the markdown is the source of truth. There is nothing else to insta
 
 ## Contribution license (important)
 
-Mesh is dual-licensed: AGPL-3.0 for the open core, plus a commercial license for the
-hub/curator and for users the AGPL does not fit. For that model to work, every
-contribution has to be available under both licenses.
+Mesh is dual-licensed: the Mesh Sustainable Use License (fair-code) for the open
+core, plus a commercial license for the hub/curator and for users the Mesh
+Sustainable Use License does not fit. For that model to work, every contribution has
+to be available under both licenses.
 
 **By opening a pull request, you agree that:**
 
 - Your contribution is licensed to the project and to everyone under the
-  **AGPL-3.0-or-later** (inbound = outbound), and
+  **Mesh Sustainable Use License** (inbound = outbound), and
 - You grant **Bright Interaction AB** a perpetual, worldwide, non-exclusive,
   royalty-free, irrevocable right to also distribute your contribution under the
   project's separate **commercial license**, and
@@ -41,8 +42,8 @@ contribution has to be available under both licenses.
   contribute it, and it does not knowingly infringe anyone else's rights).
 
 You keep the copyright to your contribution. This grant only lets the project offer
-your work under both the AGPL and the commercial license, which is what keeps the open
-core sustainable. If you cannot agree to this, please do not open a pull request;
+your work under both the Mesh Sustainable Use License and the commercial license,
+which is what keeps the open core sustainable. If you cannot agree to this, please do not open a pull request;
 open an issue instead and we will find another way to incorporate the idea.
 
 ## Reporting a vulnerability

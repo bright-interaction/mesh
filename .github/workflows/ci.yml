@@ -1,4 +1,4 @@
-# CI for the public AGPL open core (github.com/bright-interaction/mesh). This lives at
+# CI for the public fair-code open core (github.com/bright-interaction/mesh). This lives at
 # mesh/.github/workflows in the private monorepo; split-public-repo.sh places it at the
 # repo root of the public mirror, where GitHub Actions runs it. It does NOT run in the
 # monorepo (Actions only reads .github/workflows at a repo's root, and there mesh/ is a

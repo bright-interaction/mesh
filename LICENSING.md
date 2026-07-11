@@ -5,14 +5,17 @@ Mesh is **open core**, dual-licensed.
 ## The open core (this repository)
 
 Everything in the public `github.com/bright-interaction/mesh` repository is
-licensed under the **GNU Affero General Public License v3.0** (see `LICENSE`).
+licensed under the **Mesh Sustainable Use License** (see `LICENSE`), a "fair-code"
+license (https://faircode.io).
 
 Copyright the Mesh authors and Bright Interaction AB.
 
-The AGPL means you may use, study, modify, and redistribute the core freely. The
-one obligation that matters in practice: **if you run a modified version as a
-network service, you must offer that service's users the modified source.** Using
-unmodified Mesh, or modifying it for your own internal use, triggers nothing.
+Fair-code means the source is open and free to read, run, and modify. You may run
+Mesh on your own hardware, use it internally and commercially, run it for your own
+clients' knowledge and context, and redistribute the source with this license. The
+one limit that matters in practice: **you may not resell Mesh itself or run it as a
+hosted service for third parties** (a competing "Mesh cloud"). That commercial case
+needs a separate license.
 
 The open core is a complete, sovereign, single-user (and hosted-hub client) tool:
 the markdown vault, the graph + community detection, the MCP retrieval surface, the
@@ -31,13 +34,14 @@ are not published here. They are available two ways:
 
 ## Commercial license for the core
 
-If the AGPL does not fit your use (for example you want to embed the core in a
-closed-source product, or run a modified hub as a service without publishing your
-changes), a commercial license to the core is available. Contact Bright Interaction.
+If the Mesh Sustainable Use License does not fit your use (for example you want to
+offer Mesh to third parties as a hosted or managed service, or embed it in a product
+you resell), a commercial license to the core is available. Contact Bright Interaction.
 
 ## Contributing
 
 Contributions to the open core are welcome under a Contributor License Agreement
-that lets Bright Interaction continue to offer the dual (AGPL + commercial) license.
+that lets Bright Interaction continue to offer the dual (Mesh Sustainable Use
+License + commercial) license.
 By opening a PR you agree your contribution may be distributed under both. The full
 terms are in [`CONTRIBUTING.md`](CONTRIBUTING.md).

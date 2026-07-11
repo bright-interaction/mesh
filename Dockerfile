@@ -9,7 +9,7 @@
 FROM golang:1.26.5-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
-# Build tags select the edition: empty = AGPL core (public mirror builds work
+# Build tags select the edition: empty = fair-code core (public mirror builds work
 # as-is), "pro" = team-sync hub + team web UI + ANN retrieval. The production
 # hub compose sets MESH_BUILD_TAGS=pro via build args; forgetting it makes
 # mesh-ui crash-loop at boot ("team mode requires the pro build").
