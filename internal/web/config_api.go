@@ -47,11 +47,14 @@ var envFor = map[string]string{
 	"rerank.key_env":         "",
 	"rerank.blend":           "MESH_RERANK_BLEND",
 	"ann.hnsw_threshold":     "MESH_HNSW_THRESHOLD",
+	"secret_bridge.base_url": "MESH_SECRET_BRIDGE_URL",
+	"secret_bridge.key_env":  "",
+	"secret_bridge.agent_id": "MESH_SECRET_BRIDGE_AGENT_ID",
 }
 
 func (s *Server) effectiveConfig() []cfgField {
 	c, _ := meshcfg.LoadConfig(s.store.MeshDir())
-	e, rv := c.Embedding, c.Retrieval
+	e, rv, sb := c.Embedding, c.Retrieval, c.SecretBridge
 	num := func(f float64) string {
 		if f == 0 {
 			return ""
@@ -81,6 +84,9 @@ func (s *Server) effectiveConfig() []cfgField {
 		{"rerank.key_env", "Key env var", "Reranker (optional)", "keyref", rv.RerankKeyEnv, "Name of the environment variable holding the reranker's API key."},
 		{"rerank.blend", "Blend", "Reranker (optional)", "number", num(rv.RerankBlend), "0 to 1. How strongly the reranker overrides the base ranking (1 = trust it fully). Blank = default."},
 		{"ann.hnsw_threshold", "Approx-index threshold", "Large-vault scale (pro)", "number", ival(rv.HNSWThreshold), "Pro builds only. Above this many chunks, switch to a faster approximate index. Blank or 0 = exact search, which is fine for most vaults."},
+		{"secret_bridge.base_url", "Dockyard URL", "Secret vault (optional)", "text", sb.BaseURL, "URL of a Dockyard instance running the capability-mode secrets vault. When set, agents can fetch short-lived, use-once tokens for your stored API keys (which stay encrypted and auto-rotate) without ever seeing the key. Leave blank to disable."},
+		{"secret_bridge.key_env", "Key env var", "Secret vault (optional)", "keyref", sb.KeyEnv, "Name of the environment variable holding the Dockyard API key. Mesh reads the key from there; it is never typed or stored here. Blank = MESH_SECRET_BRIDGE_KEY."},
+		{"secret_bridge.agent_id", "Agent id", "Secret vault (optional)", "text", sb.AgentID, "The identity Mesh presents to Dockyard (for the audit log + access grants). Blank = mesh-<hostname>."},
 	}
 	out := make([]cfgField, 0, len(defs))
 	for _, d := range defs {
@@ -230,6 +236,12 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 			return err
 		}
 		c.Retrieval.HNSWThreshold = i
+	case "secret_bridge.base_url":
+		c.SecretBridge.BaseURL = v
+	case "secret_bridge.key_env":
+		c.SecretBridge.KeyEnv = v
+	case "secret_bridge.agent_id":
+		c.SecretBridge.AgentID = v
 	default:
 		return fmt.Errorf("unknown field: %s", key)
 	}

@@ -6,6 +6,7 @@ package meshcfg
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -82,6 +83,65 @@ func TestSaveSanitizesInvalidKeyEnv(t *testing.T) {
 		if out.KeyEnv != "MESH_EMBED_KEY" {
 			t.Errorf("invalid KeyEnv %q should sanitize to MESH_EMBED_KEY, got %q", bad, out.KeyEnv)
 		}
+	}
+}
+
+// TestSecretBridgeRoundTrip: the [secret_bridge] section persists and reloads, and the
+// file holds only base_url + the env-var NAME (never the Dockyard API key itself).
+func TestSecretBridgeRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	in := Config{
+		Embedding:    Embedding{Endpoint: "http://x/v1", Model: "m", Dim: 4, KeyEnv: "MESH_EMBED_KEY"},
+		SecretBridge: SecretBridge{BaseURL: "https://dockyard.example.com", KeyEnv: "MESH_SECRET_BRIDGE_KEY", AgentID: "mesh-box1"},
+	}
+	if err := SaveConfig(dir, in); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	out, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if out.SecretBridge != in.SecretBridge {
+		t.Fatalf("secret_bridge round-trip:\n in  %+v\n out %+v", in.SecretBridge, out.SecretBridge)
+	}
+	// The file must never contain a secret VALUE, only the env-var name.
+	b, _ := os.ReadFile(filepath.Join(dir, "config.toml"))
+	if s := string(b); !strings.Contains(s, `key_env = "MESH_SECRET_BRIDGE_KEY"`) || !strings.Contains(s, `base_url = "https://dockyard.example.com"`) {
+		t.Fatalf("secret_bridge section not written as expected:\n%s", s)
+	}
+}
+
+// TestSecretBridgeSanitizesKeyEnv: a garbage key_env must reset to the default name.
+func TestSecretBridgeSanitizesKeyEnv(t *testing.T) {
+	dir := t.TempDir()
+	in := Config{
+		Embedding:    Embedding{Endpoint: "http://x/v1", Model: "m", Dim: 4, KeyEnv: "MESH_EMBED_KEY"},
+		SecretBridge: SecretBridge{BaseURL: "https://d.example.com", KeyEnv: `bad name`},
+	}
+	if err := SaveConfig(dir, in); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	out, _ := LoadConfig(dir)
+	if out.SecretBridge.KeyEnv != "MESH_SECRET_BRIDGE_KEY" {
+		t.Fatalf("invalid key_env should sanitize to MESH_SECRET_BRIDGE_KEY, got %q", out.SecretBridge.KeyEnv)
+	}
+}
+
+// TestFreshnessRoundTrip: freshness_half_life_days must survive SaveConfig->LoadConfig
+// (the template previously hardcoded it to 0, silently dropping an operator's value on
+// any save, e.g. when saving an unrelated field through the config UI).
+func TestFreshnessRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	in := Config{
+		Embedding: Embedding{Endpoint: "http://x/v1", Model: "m", Dim: 4, KeyEnv: "MESH_EMBED_KEY"},
+		Retrieval: Retrieval{FreshnessHalfLifeDays: 30},
+	}
+	if err := SaveConfig(dir, in); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	out, _ := LoadConfig(dir)
+	if out.Retrieval.FreshnessHalfLifeDays != 30 {
+		t.Fatalf("freshness round-trip = %d, want 30", out.Retrieval.FreshnessHalfLifeDays)
 	}
 }
 
