@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 # Copyright (C) 2026 Bright Interaction AB
 # Open-core boundary guard. Fails if any OPEN package imports a PRO package in the
-# default (open) build, which would make the published AGPL mirror fail to compile
+# default (open) build, which would make the published fair-code mirror fail to compile
 # once split-public-repo.sh strips the pro paths.
 #
 # Why this exists: on 2026-06-30 the boundary had silently rotted - the flywheel
@@ -33,7 +33,7 @@ leaks="$(go list -deps -f '{{.ImportPath}} {{join .Imports " "}}' ./... 2>/dev/n
 
 if [ -n "$leaks" ]; then
   echo "open-core boundary VIOLATED: an open package imports a pro package." >&2
-  echo "The AGPL mirror would not compile once split-public-repo.sh strips the pro paths." >&2
+  echo "The fair-code mirror would not compile once split-public-repo.sh strips the pro paths." >&2
   echo "$leaks" >&2
   echo "Fix: reclassify the dep as open, or put a //go:build pro seam between them" >&2
   echo "(see cmd/mesh/ui_hubteam_{pro,stub}.go and docs/OPEN-CORE.md)." >&2

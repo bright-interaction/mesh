@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 # Copyright (C) 2026 Bright Interaction AB
 # mesh-hub container entrypoint. `init` is idempotent (it reuses an existing
 # vault_id and leaves existing files), so it is safe to run on every boot: the

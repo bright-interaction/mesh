@@ -3,7 +3,7 @@
 
 // Package flarereport wires the pro entry points (mesh-hub) to the house Flare
 // instance. It is the ONLY package in this module allowed to import sentry-go:
-// the AGPL open core (the mesh CLI and pkg/) must never link error reporting,
+// the fair-code open core (the mesh CLI and pkg/) must never link error reporting,
 // so keep this import isolated here and never import flarereport from open-core
 // packages.
 package flarereport

@@ -6,8 +6,9 @@ lives in the `bright-interaction/automations` monorepo under `mesh/`. Go's
 module path, so a public release is: **mirror the open-core subset of the `mesh/`
 subtree to its own repo `github.com/bright-interaction/mesh`, then tag a version.**
 
-Mesh is open core (see [OPEN-CORE.md](OPEN-CORE.md)): the mirror carries the AGPL-3.0
-core only. The pro layer (team-sync hub + BYOAI curator) is stripped from the
+Mesh is open core (see [OPEN-CORE.md](OPEN-CORE.md)): the mirror carries the
+fair-code core only (the Mesh Sustainable Use License). The pro layer (team-sync hub
++ BYOAI curator) is stripped from the
 mirror's entire history by `scripts/split-public-repo.sh` (subtree split ->
 `git filter-repo --invert-paths` -> `go build` check), so it never appears in the
 public repo.
@@ -22,12 +23,13 @@ release is a re-run plus a new tag.
 build-check, push). It does NOT create the GitHub repo or push without `--push`, so
 a dry run is safe. It requires `git-filter-repo` on PATH.
 
-1. License: the repo ships `LICENSE` (**AGPL-3.0**) plus `LICENSING.md` (the dual
-   AGPL + commercial model). Confirm the copyright holder line before publishing.
+1. License: the repo ships `LICENSE` (**Mesh Sustainable Use License**) plus
+   `LICENSING.md` (the dual fair-code + commercial model). Confirm the copyright
+   holder line before publishing.
 2. Create the public repo (one command, outward):
    ```
    gh repo create bright-interaction/mesh --public \
-     --description "Sovereign single-binary knowledge mesh for coding agents (MCP), AGPL-3.0"
+     --description "Sovereign single-binary knowledge mesh for coding agents (MCP), fair-code (Mesh Sustainable Use License)"
    ```
 3. Mirror the subtree (preserves `mesh/`'s history) and push:
    ```

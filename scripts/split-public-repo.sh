@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 # Copyright (C) 2026 Bright Interaction AB
-# Produce the public AGPL-3.0 mirror of Mesh's open core at
-# github.com/bright-interaction/mesh, so `go install
+# Produce the public fair-code mirror of Mesh's open core (Mesh Sustainable Use
+# License) at github.com/bright-interaction/mesh, so `go install
 # github.com/bright-interaction/mesh/cmd/mesh@latest` resolves. See
 # docs/RELEASING.md and docs/OPEN-CORE.md.
 #
 # Open core only: the pro layer (team-sync hub + BYOAI curator) is a separate
 # commercial product and is stripped from ALL history here, so it never appears in
-# the AGPL repo. The script subtree-splits mesh/, filter-repos out the pro paths,
+# the fair-code repo. The script subtree-splits mesh/, filter-repos out the pro paths,
 # and build-checks that the core compiles standalone.
 #
 # Safe by default: with no --push it produces + build-checks the filtered tree and

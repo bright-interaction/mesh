@@ -183,7 +183,10 @@ No cgo. Storage is pure-Go `modernc.org/sqlite` in WAL mode; the `.mesh/` index 
 ## License & editions
 
 Open core, dual-licensed. This repository (the single-user vault, graph, retrieval,
-viewers, CLI, MCP surface, and the sync **client**) is **AGPL-3.0** (see `LICENSE`).
+viewers, CLI, MCP surface, and the sync **client**) is the **Mesh Sustainable Use
+License** (fair-code, see `LICENSE`): free to self-host, use internally or
+commercially, and run for your own clients; you just cannot resell it as a hosted
+service.
 
 The **team-sync hub** and **BYOAI sync-curator** are a commercial product:
 
@@ -191,5 +194,6 @@ The **team-sync hub** and **BYOAI sync-curator** are a commercial product:
 - **Sovereign self-host** under a commercial license + support, for EU / regulated
   orgs running the hub on their own infrastructure.
 
-A commercial license to the core is available for uses the AGPL does not fit. See
-[LICENSING.md](LICENSING.md) and [docs/OPEN-CORE.md](docs/OPEN-CORE.md).
+A commercial license to the core is available for uses the Mesh Sustainable Use
+License does not fit. See [LICENSING.md](LICENSING.md) and
+[docs/OPEN-CORE.md](docs/OPEN-CORE.md).

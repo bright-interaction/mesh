@@ -27,9 +27,9 @@ services:
       - MESH_HUB_MAX_SEATS=${MESH_HUB_MAX_SEATS:-0}
       # Public base URL, so `mesh-hub invite` emits a ready-to-send /invite link.
       - MESH_HUB_PUBLIC_URL=${MESH_HUB_PUBLIC_URL:-https://mesh.brightinteraction.com}
-      # AGPL section 13 source offer: point MESH_SOURCE_URL at the public open-core
+      # Source-availability link: point MESH_SOURCE_URL at the public open-core
       # repo for THIS version (e.g. .../tree/<tag>) and the served pages + /about link
-      # it. Unset until the repo is published (offer shows the license, no broken link).
+      # it. Unset until the repo is published (offer shows the version, no broken link).
       - MESH_SOURCE_URL=${MESH_SOURCE_URL:-}
       - MESH_VERSION=${MESH_VERSION:-}
       # Flare error reporting (no-op when unset; the DSN is injected at deploy time).
@@ -66,7 +66,7 @@ services:
       # match the hub's vault.hub.db sibling. Omitting this silently falls back to the
       # shared-token single login, so it stays pinned here to stop a deploy regressing it.
       - MESH_UI_HUB_DB=/var/lib/mesh-hub/vault.hub.db
-      # AGPL section 13: same source offer rendered in the web app footer badge.
+      # Source-availability link: same offer rendered in the web app footer badge.
       - MESH_SOURCE_URL=${MESH_SOURCE_URL:-}
       - MESH_VERSION=${MESH_VERSION:-}
     volumes:

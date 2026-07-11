@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 // Copyright (C) 2026 Bright Interaction AB
 
 package web
@@ -181,7 +181,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	html := strings.ReplaceAll(string(body), "__MESH_BASE__", s.baseHref())
-	html = strings.ReplaceAll(html, "__MESH_AGPL__", buildinfo.FooterInline())
+	html = strings.ReplaceAll(html, "__MESH_SOURCE__", buildinfo.FooterInline())
 	body = []byte(html)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
