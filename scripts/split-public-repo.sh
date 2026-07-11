@@ -97,9 +97,15 @@ fi
 echo "Checking open-core boundary (no open package may import a pro package) ..."
 ( cd "$PREFIX" && bash scripts/check-open-core-boundary.sh )
 
-# Guard: refuse to mirror if a secret ever landed under mesh/ (defense before an
-# outward, irreversible public push).
-if git log -p -- "$PREFIX/" | grep -iEq '(api[_-]?key|secret|password|bearer|private[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/_+.-]{16,}'; then
+# Guard: refuse to mirror if a secret ever landed under mesh/ (a fast, coarse pre-check
+# before the outward push; the gitleaks scan below is the authoritative, high-recall gate).
+# The value must be QUOTED: a real hardcoded secret in source is a string literal
+# ("sk_live_..."), whereas a bare identifier after a *Secret field (`WebhookPathSecret:
+# webhookPathSecret`, `Secret: s.webhookSecret`) is a Go reference, not a credential.
+# Requiring the quote excludes those identifier/selector false-positives (they false-tripped
+# Pare/Flare/Slab 3x in one day) without weakening real detection, since gitleaks still scans
+# unquoted content too.
+if git log -p -- "$PREFIX/" | grep -iEq '(api[_-]?key|secret|password|bearer|private[_-]?key)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9/_+.-]{16,}'; then
   echo "REFUSING: a possible secret appears in mesh/ history. Audit before any public push:" >&2
   echo "  git log -p -- $PREFIX/ | grep -iE 'key|secret|token|password'" >&2
   exit 1
