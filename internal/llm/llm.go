@@ -193,31 +193,68 @@ const (
 //	anthropic: MESH_ANTHROPIC_KEY (fallback ANTHROPIC_API_KEY), MESH_ANTHROPIC_BASE
 //	local:     MESH_CURATOR_ENDPOINT (e.g. http://localhost:11434/v1), MESH_CURATOR_KEY
 func NewFromEnv() (Client, error) {
-	agent := strings.ToLower(strings.TrimSpace(os.Getenv("MESH_CURATOR_AGENT")))
+	return newFromEnvPrefix("MESH_CURATOR")
+}
+
+// NewJudgeFromEnv builds a SEPARATE judge client from MESH_JUDGE_* (same schema as
+// MESH_CURATOR_*: MESH_JUDGE_AGENT / MESH_JUDGE_MODEL / MESH_JUDGE_CMD /
+// MESH_JUDGE_CMD_TIMEOUT / MESH_JUDGE_ENDPOINT / MESH_JUDGE_KEY; the anthropic key
+// stays the shared MESH_ANTHROPIC_KEY / ANTHROPIC_API_KEY). It exists so extraction
+// precision can be graded by a model that did NOT write the candidate: a self-grade
+// (the extractor judging itself) flatters its own output. When nothing under
+// MESH_JUDGE_* is set it returns (fallback, false) so the judge is the extractor
+// itself and the caller labels the measurement a self-grade, not independent.
+func NewJudgeFromEnv(fallback Client) (Client, bool) {
+	if !anyEnvWithPrefix("MESH_JUDGE_") {
+		return fallback, false
+	}
+	c, err := newFromEnvPrefix("MESH_JUDGE")
+	if err != nil || c == nil {
+		return fallback, false
+	}
+	return c, true
+}
+
+// anyEnvWithPrefix reports whether any environment variable starts with prefix.
+func anyEnvWithPrefix(prefix string) bool {
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// newFromEnvPrefix builds a client from <prefix>_AGENT/_MODEL/_MAXTOK/_CMD/_ENDPOINT/
+// _KEY (the anthropic key/base stay the shared MESH_ANTHROPIC_* names). NewFromEnv and
+// NewJudgeFromEnv are the two prefixes, so the curator and the judge configure the same
+// way without duplicating this switch.
+func newFromEnvPrefix(p string) (Client, error) {
+	agent := strings.ToLower(strings.TrimSpace(os.Getenv(p + "_AGENT")))
 	if agent == "" {
 		agent = "cli"
 	}
 	maxTok := defaultMaxTokens
-	if v, err := strconv.Atoi(os.Getenv("MESH_CURATOR_MAXTOK")); err == nil && v > 0 {
+	if v, err := strconv.Atoi(os.Getenv(p + "_MAXTOK")); err == nil && v > 0 {
 		maxTok = v
 	}
-	model := strings.TrimSpace(os.Getenv("MESH_CURATOR_MODEL"))
+	model := strings.TrimSpace(os.Getenv(p + "_MODEL"))
 	// SSRF-guarded by default; an operator can allow a sovereign localhost endpoint
 	// (Ollama, a self-hosted model server) with MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1.
 	hc := safehttp.LLMClient(120 * time.Second)
 
 	switch agent {
 	case "cli":
-		cmdStr := strings.TrimSpace(os.Getenv("MESH_CURATOR_CMD"))
+		cmdStr := strings.TrimSpace(os.Getenv(p + "_CMD"))
 		if cmdStr == "" {
 			cmdStr = defaultCuratorCmd
 		}
 		argv := strings.Fields(cmdStr)
 		if len(argv) == 0 {
-			return nil, fmt.Errorf("cli agent needs MESH_CURATOR_CMD (e.g. %q)", defaultCuratorCmd)
+			return nil, fmt.Errorf("cli agent needs %s_CMD (e.g. %q)", p, defaultCuratorCmd)
 		}
 		to := defaultCLITimeout
-		if v, err := strconv.Atoi(os.Getenv("MESH_CURATOR_CMD_TIMEOUT")); err == nil && v > 0 {
+		if v, err := strconv.Atoi(os.Getenv(p + "_CMD_TIMEOUT")); err == nil && v > 0 {
 			to = time.Duration(v) * time.Second
 		}
 		return &cliClient{argv: argv, timeout: to}, nil
@@ -232,16 +269,16 @@ func NewFromEnv() (Client, error) {
 		base := firstNonEmpty(os.Getenv("MESH_ANTHROPIC_BASE"), defaultAnthropicBase)
 		return &anthropic{base: strings.TrimRight(base, "/"), key: key, model: model, maxTok: maxTok, hc: hc}, nil
 	case "local":
-		ep := strings.TrimRight(strings.TrimSpace(os.Getenv("MESH_CURATOR_ENDPOINT")), "/")
+		ep := strings.TrimRight(strings.TrimSpace(os.Getenv(p+"_ENDPOINT")), "/")
 		if ep == "" {
-			return nil, fmt.Errorf("local agent needs MESH_CURATOR_ENDPOINT (e.g. http://localhost:11434/v1)")
+			return nil, fmt.Errorf("local agent needs %s_ENDPOINT (e.g. http://localhost:11434/v1)", p)
 		}
 		if model == "" {
-			return nil, fmt.Errorf("local agent needs MESH_CURATOR_MODEL")
+			return nil, fmt.Errorf("local agent needs %s_MODEL", p)
 		}
-		return &openaiCompat{endpoint: ep, key: os.Getenv("MESH_CURATOR_KEY"), model: model, maxTok: maxTok, hc: hc}, nil
+		return &openaiCompat{endpoint: ep, key: os.Getenv(p + "_KEY"), model: model, maxTok: maxTok, hc: hc}, nil
 	default:
-		return nil, fmt.Errorf("unknown MESH_CURATOR_AGENT %q (want cli|anthropic|local)", agent)
+		return nil, fmt.Errorf("unknown %s_AGENT %q (want cli|anthropic|local)", p, agent)
 	}
 }
 

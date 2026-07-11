@@ -30,6 +30,15 @@ type HealthFinding struct {
 // codePathRe matches a source-file path token (high precision: a real extension).
 var codePathRe = regexp.MustCompile(`[A-Za-z0-9_./-]+\.(?:go|ts|tsx|js|jsx|svelte|astro|py)\b`)
 
+// isChangelogNote reports whether a note is an append-only history log (the vault's
+// `*-log` entities and the root `log`). Such notes deliberately record file paths as
+// they were at the time, so their references going dead is expected history, not rot;
+// dead_ref detection skips them so the finding stays actionable.
+func isChangelogNote(id string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	return id == "log" || strings.HasSuffix(id, "-log")
+}
+
 // ComputeHealth runs the dead-ref + overdue passes over the vault and replaces the
 // note_health rows for those two issue types (it leaves contradiction rows, which
 // the curator owns). Returns the findings it wrote. vaultRoot is the notes vault.
@@ -55,7 +64,12 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 			continue
 		}
 		// Dead source-file references (only meaningful once the code index exists).
-		if len(codeFiles) > 0 {
+		// Changelogs are exempt: an append-only history log records file paths as they
+		// were at the time, so a reference that later points at a moved/deleted file is
+		// expected history, not rot. Flagging every changelog line buries the genuine
+		// cases (a live note claiming a current file that is gone), so skip them here,
+		// the same high-precision spirit as the "don't judge dirs we don't index" guard.
+		if len(codeFiles) > 0 && !isChangelogNote(n.id) {
 			seen := map[string]bool{}
 			for _, m := range codePathRe.FindAllString(string(body), -1) {
 				ref := strings.TrimLeft(m, "./")

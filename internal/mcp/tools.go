@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/hooks"
+	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
@@ -311,6 +312,24 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		return nil, internalErr(err)
 	}
 	counts, _ := s.store.HealthCounts()
+	if counts == nil {
+		counts = map[string]int{}
+	}
+	// Unparseable notes never made it into the DB, which is exactly the bug: a note
+	// with broken frontmatter vanishes from search and the graph with no signal.
+	// Surface the ones the last reindex dropped so an operator can find and fix the
+	// note that disappeared. They carry no note id or scope (they never parsed), so
+	// they are operational findings, always shown, never scope-filtered out.
+	if a.Issue == "" || a.Issue == "unparseable" {
+		for _, d := range s.store.DroppedNotes() {
+			detail := ""
+			if d.Err != nil {
+				detail = d.Err.Error()
+			}
+			findings = append(findings, index.HealthFinding{Issue: "unparseable", Path: d.Path, Detail: detail})
+			counts["unparseable"]++
+		}
+	}
 	// Scope read check: findings carry a note id + path, so an unfiltered health pass
 	// leaks the existence and paths of notes outside the caller's scope (and the global
 	// counts do the same in aggregate). Drop out-of-scope findings and recompute counts
@@ -319,6 +338,12 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		kept := findings[:0]
 		scoped := make(map[string]int, len(counts))
 		for _, f := range findings {
+			if f.Issue == "unparseable" {
+				// No parsed note, so no scope to check: an operational finding shown to all.
+				kept = append(kept, f)
+				scoped[f.Issue]++
+				continue
+			}
 			sc, serr := s.store.NoteScope(f.NoteID)
 			if serr != nil || !sf.allowsRead(sc) {
 				continue
