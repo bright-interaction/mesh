@@ -223,6 +223,67 @@ func Extract(ctx context.Context, client llm.Client, digest string) ([]Candidate
 	return cands, nil
 }
 
+// ExtractConsistent runs Extract `samples` times concurrently and returns the DEDUPED
+// UNION of candidates. Extraction is non-deterministic (the model samples at ~temp 1), so
+// a single pass misses candidates a MARGINAL session yields only sometimes; the variance
+// benchmark showed most sessions are "unstable" (they flip between yielding and not).
+// Unioning K passes lifts recall/coverage on exactly those sessions (a session that yields
+// with probability p per pass yields with 1-(1-p)^K), while title-similarity dedup
+// collapses the same learning surfaced in multiple passes. Precision is unaffected: the
+// downstream judge panel + human review still gate every candidate, so a more generous
+// union just gives the panel more to filter, it does not lower the precision of what
+// reaches review. samples<=1 is a plain Extract. Errors: returns the union of the passes
+// that succeeded; only when EVERY pass errors is the first error returned.
+func ExtractConsistent(ctx context.Context, client llm.Client, digest string, samples int) ([]Candidate, error) {
+	if samples < 2 {
+		return Extract(ctx, client, digest)
+	}
+	type res struct {
+		cands []Candidate
+		err   error
+	}
+	out := make([]res, samples)
+	var wg sync.WaitGroup
+	for i := 0; i < samples; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c, e := Extract(ctx, client, digest)
+			out[i] = res{c, e}
+		}(i)
+	}
+	wg.Wait()
+
+	var union []Candidate
+	var firstErr error
+	ok := false
+	for _, r := range out {
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
+		}
+		ok = true
+		for _, c := range r.cands {
+			dup := false
+			for _, u := range union {
+				if TitleSimilarity(c.Title, u.Title) >= DuplicateThreshold {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				union = append(union, c)
+			}
+		}
+	}
+	if !ok {
+		return nil, firstErr
+	}
+	return union, nil
+}
+
 // parseCandidates tolerates a model that wraps JSON in fences or stray prose by
 // extracting the outermost JSON array, then validates each candidate.
 func parseCandidates(out string) ([]Candidate, error) {

@@ -9,10 +9,45 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/llm"
 )
+
+// ExtractConsistent unions K passes and dedups the same learning surfaced differently, so
+// a marginal session that yields a candidate only sometimes is more likely to yield one.
+func TestExtractConsistentUnionsAndDedups(t *testing.T) {
+	var n int32
+	stub := llm.Func(func(ctx context.Context, system, user string) (string, error) {
+		if atomic.AddInt32(&n, 1) == 1 {
+			return `[{"type":"gotcha","title":"Alpha rule about pgx","do":"x","dont":"y","why":"z"}]`, nil
+		}
+		return `[{"type":"gotcha","title":"Alpha rule about pgx nulls","do":"x","dont":"y","why":"z"},{"type":"decision","title":"Beta decision on bun","do":"a","dont":"b","why":"c"}]`, nil
+	})
+	got, err := ExtractConsistent(context.Background(), stub, "digest", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The two Alpha variants dedup to one; Beta is distinct, so the union is 2.
+	if len(got) != 2 {
+		t.Fatalf("union should dedup Alpha variants and keep Beta = 2, got %d: %+v", len(got), got)
+	}
+	hasBeta := false
+	for _, c := range got {
+		if strings.Contains(strings.ToLower(c.Title), "beta") {
+			hasBeta = true
+		}
+	}
+	if !hasBeta {
+		t.Error("union missing the distinct Beta candidate")
+	}
+	// samples<=1 is a plain Extract (single pass).
+	one, _ := ExtractConsistent(context.Background(), stub, "digest", 1)
+	if len(one) == 0 {
+		t.Error("samples=1 should still extract")
+	}
+}
 
 // The 3-lens panel keeps a candidate by a configurable vote bar, fails OPEN when a lens
 // errors (never silently drops knowledge), and errors only when EVERY lens fails. Each

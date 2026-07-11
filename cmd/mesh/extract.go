@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +29,7 @@ import (
 // many extracted notes a strict judge would keep). BYOAI via MESH_CURATOR_* (claude -p).
 func extractCmd() *cobra.Command {
 	var benchmark bool
-	var n, concurrency, maxChars, repeat int
+	var n, concurrency, maxChars, repeat, samples int
 	var asJSON bool
 	var toPending, dedupVault, judgeEval string
 	var recurring bool
@@ -41,6 +42,13 @@ func extractCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Self-consistency sample count resolves from --samples or MESH_EXTRACT_SAMPLES
+			// (so the Stop hook can opt in via env without changing its command).
+			if samples <= 1 {
+				if v, e := strconv.Atoi(strings.TrimSpace(os.Getenv("MESH_EXTRACT_SAMPLES"))); e == nil && v > 1 {
+					samples = v
+				}
+			}
 			if judgeEval != "" {
 				return runJudgeEval(cmd.Context(), client, judgeEval, concurrency, asJSON)
 			}
@@ -48,7 +56,7 @@ func extractCmd() *cobra.Command {
 				if len(args) < 1 {
 					return fmt.Errorf("--benchmark needs a directory of transcripts")
 				}
-				return runExtractBenchmark(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON, dedupVault, repeat)
+				return runExtractBenchmark(cmd.Context(), client, args[0], n, concurrency, maxChars, asJSON, dedupVault, repeat, samples)
 			}
 			if recurring {
 				if len(args) < 1 {
@@ -63,7 +71,7 @@ func extractCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cands, err := extract.Extract(cmd.Context(), client, digest)
+			cands, err := extract.ExtractConsistent(cmd.Context(), client, digest, samples)
 			if err != nil {
 				return err
 			}
@@ -85,6 +93,7 @@ func extractCmd() *cobra.Command {
 	c.Flags().StringVar(&dedupVault, "dedup-vault", "", "benchmark: dedup candidates against this vault and report fresh vs already-known")
 	c.Flags().StringVar(&judgeEval, "judge-eval", "", "grade the judge PANEL's discrimination over a labeled good/bad fixture (JSON): keeps good AND rejects bad")
 	c.Flags().IntVar(&repeat, "repeat", 1, "benchmark: run K times and report coverage/precision mean +/- stddev + per-session stability (variance-aware)")
+	c.Flags().IntVar(&samples, "samples", 1, "extraction self-consistency: union K extraction passes per session to lift coverage on marginal sessions (also MESH_EXTRACT_SAMPLES)")
 	c.Flags().BoolVar(&recurring, "recurring", false, "find problems that RECUR across sessions (systemic issues), not one-offs")
 	return c
 }
@@ -333,7 +342,7 @@ func sampleTranscripts(dir string, n int) ([]string, error) {
 	return out, nil
 }
 
-func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, concurrency, maxChars int, asJSON bool, dedupVault string, repeat int) error {
+func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, concurrency, maxChars int, asJSON bool, dedupVault string, repeat, samples int) error {
 	files, err := sampleTranscripts(dir, n)
 	if err != nil {
 		return err
@@ -374,9 +383,9 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 	// and reports mean +/- stddev plus per-session stability, so coverage is never quoted
 	// as one number again.
 	if repeat > 1 {
-		return runVarianceBenchmark(ctx, files, client, judges, independent, rtr, maxChars, concurrency, repeat, asJSON)
+		return runVarianceBenchmark(ctx, files, client, judges, independent, rtr, maxChars, concurrency, repeat, samples, asJSON)
 	}
-	rows := benchmarkRows(ctx, files, client, judges, rtr, maxChars, concurrency, !asJSON)
+	rows := benchmarkRows(ctx, files, client, judges, rtr, maxChars, concurrency, samples, !asJSON)
 
 	// Tally. "Fresh" = candidates that are not duplicates of an existing vault note;
 	// precision is measured on the fresh set (what a reviewer actually sees).
@@ -500,7 +509,7 @@ func tallyRows(rows []benchRow) benchStats {
 // benchmarkRows runs one benchmark pass over files: digest -> extract -> dedup -> judge
 // panel, concurrently. Verbose prints a per-file line to stderr. This is the single-run
 // unit that --repeat drives K times for a variance estimate.
-func benchmarkRows(ctx context.Context, files []string, client llm.Client, judges []llm.Client, rtr *retrieve.Retriever, maxChars, concurrency int, verbose bool) []benchRow {
+func benchmarkRows(ctx context.Context, files []string, client llm.Client, judges []llm.Client, rtr *retrieve.Retriever, maxChars, concurrency, samples int, verbose bool) []benchRow {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -524,7 +533,7 @@ func benchmarkRows(ctx context.Context, files []string, client llm.Client, judge
 				return
 			}
 			row.HadWriteback = st.HadWriteback
-			cands, e := extract.Extract(ctx, client, digest)
+			cands, e := extract.ExtractConsistent(ctx, client, digest, samples)
 			if e != nil {
 				row.Err = "extract: " + e.Error()
 				rows[i] = row
@@ -577,12 +586,12 @@ func meanStddev(xs []float64) (mean, sd float64) {
 // mean +/- stddev, plus per-session stability (which transcripts ALWAYS, SOMETIMES, or
 // NEVER yield a note across the K runs). The stability split is the real characterization
 // of the non-determinism: a "sometimes" session is where the coverage variance lives.
-func runVarianceBenchmark(ctx context.Context, files []string, client llm.Client, judges []llm.Client, independent bool, rtr *retrieve.Retriever, maxChars, concurrency, repeat int, asJSON bool) error {
+func runVarianceBenchmark(ctx context.Context, files []string, client llm.Client, judges []llm.Client, independent bool, rtr *retrieve.Retriever, maxChars, concurrency, repeat, samples int, asJSON bool) error {
 	var covs, precs []float64
 	var candCounts []int
 	yields := map[string]int{} // file base -> # of runs it yielded a fresh note
 	for run := 0; run < repeat; run++ {
-		rows := benchmarkRows(ctx, files, client, judges, rtr, maxChars, concurrency, false)
+		rows := benchmarkRows(ctx, files, client, judges, rtr, maxChars, concurrency, samples, false)
 		s := tallyRows(rows)
 		covs = append(covs, s.coveragePct())
 		precs = append(precs, s.precisionPct())
