@@ -144,6 +144,14 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Guard: a note whose frontmatter does not re-parse would be silently dropped
+	// from the index (invalid YAML removes it from search and the graph with no
+	// warning). yaml.Marshal quotes values correctly today, so this should never
+	// fire, but it makes that a hard invariant: Mesh's own tools never write a note
+	// that would vanish.
+	if err := validateRoundTrip(content, id); err != nil {
+		return nil, err
+	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return nil, err
 	}
@@ -194,6 +202,25 @@ func normalizeTags(in []string) StringList {
 		}
 	}
 	return out
+}
+
+// validateRoundTrip re-parses a freshly rendered note to prove its frontmatter is
+// valid YAML and the id survives the round trip. Broken frontmatter would make the
+// note invisible to search and the graph with no warning, so a note that fails this
+// is never written to disk.
+func validateRoundTrip(content, wantID string) error {
+	fmStr, _, had := SplitFrontmatter(content)
+	if !had {
+		return fmt.Errorf("rendered note has no frontmatter block")
+	}
+	parsed, _, err := ParseFrontmatter([]byte(fmStr))
+	if err != nil {
+		return fmt.Errorf("rendered note has invalid frontmatter (would be dropped by the index): %w", err)
+	}
+	if parsed.ID != wantID {
+		return fmt.Errorf("rendered note id %q does not round-trip (want %q)", parsed.ID, wantID)
+	}
+	return nil
 }
 
 func renderNote(fm *Frontmatter, by string) (string, error) {

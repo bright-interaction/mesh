@@ -4,6 +4,7 @@
 package index
 
 import (
+	"log/slog"
 	"path/filepath"
 	"strings"
 
@@ -21,7 +22,8 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	notes, _ := ParseFiles(files, 0)
+	notes, ferrs := ParseFiles(files, 0)
+	s.recordDropped(root, ferrs)
 	for _, pn := range notes {
 		if rel, err := filepath.Rel(root, pn.Path); err == nil {
 			pn.Path = rel
@@ -33,6 +35,41 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 		return nil, nil, err
 	}
 	return g, notes, nil
+}
+
+// recordDropped remembers and logs the notes ParseFiles could not parse (invalid
+// YAML frontmatter is the usual cause) so a silently dropped note is visible in the
+// logs on EVERY reindex, not only when someone runs `mesh structure`. A broken
+// frontmatter block otherwise removes a note from search and the graph with zero
+// signal, which hid three real notes for weeks. Paths are made vault-relative.
+func (s *Store) recordDropped(root string, ferrs []FileError) {
+	rel := make([]FileError, 0, len(ferrs))
+	for _, fe := range ferrs {
+		p := fe.Path
+		if r, err := filepath.Rel(root, p); err == nil {
+			p = r
+		}
+		rel = append(rel, FileError{Path: p, Err: fe.Err})
+		slog.Warn("mesh: dropping unparseable note; it is invisible to search and the graph until the frontmatter is fixed",
+			"path", p, "err", fe.Err)
+	}
+	s.mu.Lock()
+	s.dropped = rel
+	s.mu.Unlock()
+	if len(ferrs) > 0 {
+		slog.Warn("mesh reindex dropped unparseable notes", "count", len(ferrs), "root", root)
+	}
+}
+
+// DroppedNotes returns the notes the last full reindex dropped as unparseable
+// (empty when the whole vault parsed cleanly). Feeds health/status surfaces so an
+// operator can find a note that vanished from the index.
+func (s *Store) DroppedNotes() []FileError {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]FileError, len(s.dropped))
+	copy(out, s.dropped)
+	return out
 }
 
 // Reindex walks the vault, parses it, builds the graph + communities, persists

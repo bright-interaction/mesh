@@ -135,6 +135,14 @@ func (s *Server) Reconcile() error {
 // NotePath resolves a note id to its vault-relative path (for the hub's ACL gate).
 func (s *Server) NotePath(id string) (string, error) { return s.store.NotePath(id) }
 
+// FlywheelStats exposes the write-back reuse metrics (authored notes, reuse rate,
+// median time-to-reuse, writes-per-100-reads) of this server's index. The hub reads
+// it for the team-level /team metrics, so the flywheel shows up team-wide and not only
+// on the per-vault web dashboard. Reuse events counted here are those served by THIS
+// index (the hosted MCP), so a team on `mesh mcp --http` over synced vaults contributes
+// authored counts but its reuse lands in each member's local index, not here.
+func (s *Server) FlywheelStats() (index.FlywheelStats, error) { return s.store.FlywheelStats() }
+
 func (s *Server) Close() error {
 	<-s.bg // never close the store under the initial background load/enrichment
 	return s.store.Close()

@@ -13,9 +13,12 @@ import (
 )
 
 // The review queue: auto-extracted write-back candidates (the input side of the
-// flywheel) that a human promotes into the vault with one click, or discards. This is
-// what makes auto-extraction safe at its measured ~64% precision: nothing lands
-// unreviewed. GET lists; promote writes a real note + clears the item; discard clears.
+// flywheel) that a human promotes into the vault with one click, or discards. Two
+// gates keep it high-signal: on the way in, writeToPending drops the extractor's
+// low-confidence self-ratings and lets a judge veto weak notes (so the queue is the
+// judged set, not every raw extraction), and on the way out a human promotes or
+// discards, so nothing lands unreviewed. GET lists; promote writes a real note +
+// clears the item; discard clears.
 
 func (s *Server) handlePendingList(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) { // extraction candidates are dev-scoped review content

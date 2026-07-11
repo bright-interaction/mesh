@@ -76,6 +76,54 @@ func TestHealthDeadRefAndOverdue(t *testing.T) {
 	}
 }
 
+// A changelog (*-log) that references a since-deleted file is recording history, not
+// rot, so it must NOT be flagged dead_ref, while a regular note referencing the same
+// gone file still is. This keeps the finding actionable instead of drowning in the
+// changelogs (which made up most of the vault's dead_ref count).
+func TestHealthChangelogDeadRefExempt(t *testing.T) {
+	dir := t.TempDir()
+	srcRoot := filepath.Join(dir, "src")
+	if err := os.MkdirAll(filepath.Join(srcRoot, "internal", "foo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcRoot, "internal", "foo", "bar.go"), []byte("package foo\nfunc Bar(){}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same dead reference (internal/foo/ghost.go is gone) in a changelog and a real note.
+	changelog := writeNote(t, dir, "entities/hephaestus-log.md", "---\nid: hephaestus-log\ntype: note\nwhen: 2026-01-01\n---\n# Changelog\n2026-05: retired internal/foo/ghost.go.\n")
+	realNote := writeNote(t, dir, "gotchas/live.md", "---\nid: live-note\ntype: gotcha\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: z\n---\n# Live\nThe handler is at internal/foo/ghost.go.\n")
+	notes := []*ParsedNote{changelog, realNote}
+	g, _ := BuildGraph(notes)
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.IndexVault(notes, g); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReindexCode(s, []string{srcRoot}, map[string]bool{"go": true}); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := s.ComputeHealth(dir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, f := range findings {
+		got[f.NoteID] = f.Issue
+	}
+	if got["hephaestus-log"] == "dead_ref" {
+		t.Error("a changelog's historical file reference must not be flagged as dead_ref")
+	}
+	if got["live-note"] != "dead_ref" {
+		t.Errorf("a live note referencing a gone file should still flag dead_ref, got %q", got["live-note"])
+	}
+}
+
 func TestHealthContradiction(t *testing.T) {
 	dir := t.TempDir()
 	// Two gotchas sharing a tag where A.do overlaps B.dont.

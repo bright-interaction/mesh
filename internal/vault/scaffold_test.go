@@ -82,6 +82,64 @@ func TestCreateNoteCompleteDecisionLintsClean(t *testing.T) {
 	}
 }
 
+// A note whose judgment fields contain colon-space (the exact shape that produced
+// invalid YAML and silently dropped real notes) must still round-trip cleanly,
+// because yaml.Marshal quotes such values. CreateNote proves this before writing.
+func TestCreateNoteRoundTripsColonValues(t *testing.T) {
+	fixedNow(t)
+	dir := t.TempDir()
+	res, err := CreateNote(dir, NewNoteSpec{
+		Type:  TypeGotcha,
+		Title: "Mollie: no HMAC on webhooks, so re-fetch by id",
+		Do:    "re-fetch GET /v2/payments/{id}: the webhook body is not signed",
+		Dont:  "trust the webhook payload: it can be forged (self-upgrade hole)",
+		Why:   "reason: the callback carries no signature to verify",
+	})
+	if err != nil {
+		t.Fatalf("CreateNote rejected a note it should have round-tripped: %v", err)
+	}
+	data, err := os.ReadFile(res.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmStr, _, had := SplitFrontmatter(string(data))
+	if !had {
+		t.Fatal("written note has no frontmatter block")
+	}
+	parsed, _, err := ParseFrontmatter([]byte(fmStr))
+	if err != nil {
+		t.Fatalf("written note does not re-parse (it would be dropped by the index): %v\n%s", err, data)
+	}
+	if parsed.ID != res.ID {
+		t.Errorf("id did not round-trip: parsed %q, created %q", parsed.ID, res.ID)
+	}
+	if parsed.Type != TypeGotcha {
+		t.Errorf("type did not round-trip: %q", parsed.Type)
+	}
+}
+
+func TestValidateRoundTrip(t *testing.T) {
+	valid := "---\nid: ok-note\ntype: gotcha\ntitle: \"a: b\"\n---\n# body\n"
+	if err := validateRoundTrip(valid, "ok-note"); err != nil {
+		t.Errorf("valid note rejected: %v", err)
+	}
+	// A colon-space in an unquoted value is invalid YAML: the guard must reject it so
+	// such a note is never written (it would vanish from search and the graph).
+	broken := "---\nid: bad-note\ntitle: foo: bar\n---\n# body\n"
+	if err := validateRoundTrip(broken, "bad-note"); err == nil {
+		t.Error("invalid frontmatter should be rejected, would be silently dropped by the index")
+	}
+	// Valid YAML but the id changed under us: still a round-trip failure.
+	mismatch := "---\nid: other\ntype: gotcha\n---\n# body\n"
+	if err := validateRoundTrip(mismatch, "expected"); err == nil {
+		t.Error("id mismatch should be rejected")
+	}
+	// No frontmatter at all is a failure too.
+	if err := validateRoundTrip("# just a body\n", "x"); err == nil {
+		t.Error("missing frontmatter should be rejected")
+	}
+}
+
 func TestCreateNoteCollisionSuffixes(t *testing.T) {
 	fixedNow(t)
 	dir := t.TempDir()

@@ -45,6 +45,14 @@ type DigestStats struct {
 
 var validType = map[string]bool{"decision": true, "gotcha": true, "post-mortem": true}
 
+// LowConfidence reports whether the model self-rated this candidate as low confidence.
+// The extractor's own "this is probably weak" signal is a cheap precision pre-filter
+// before the (costlier) judge pass: a low-confidence candidate is dropped outright.
+// Empty/med/high all pass (absence is not a low rating).
+func LowConfidence(c Candidate) bool {
+	return strings.EqualFold(strings.TrimSpace(c.Confidence), "low")
+}
+
 // transcript line + message shapes (Claude Code .jsonl). Only the fields we read.
 type tLine struct {
 	Type    string `json:"type"`
@@ -180,6 +188,16 @@ A note QUALIFIES only if it is ALL of:
 DO NOT emit a note for: routine task completion, restating the obvious, project trivia, generic best practices everyone knows, or speculation. Prefer returning [] over a weak note. Quality over quantity; 0 is a valid and common answer.
 
 The most common mistake is recording a SINGLE INCIDENT as if it were a rule ("found a stale prod container once"). Only emit a note that states a recurring, transferable rule with a concrete mechanism (e.g. "Mollie does not HMAC webhooks, so re-fetch the payment by id"), not a story about this one session. A duplicate-detector and a human reviewer sit after you, so lean toward surfacing a genuinely useful pattern rather than withholding it.
+
+Calibrate against these examples.
+KEEP (durable rule with a mechanism, reusable next month):
+  {"type":"gotcha","title":"pgx NULL vs empty string breaks $1='' filters","do":"filter with IS NULL or a sentinel, not $1=''","dont":"assume an unset text column equals ''","why":"pgtype.Text{} is NULL, so $1='' never matches it","confidence":"high"}
+  {"type":"decision","title":"Mollie webhooks are unsigned, re-fetch the payment by id","do":"on webhook, GET /v2/payments/{id} and trust that, not the body","dont":"act on the webhook payload directly","why":"the callback has no HMAC, so a forged body could self-upgrade an account","confidence":"high"}
+REJECT (return [] for these, do NOT emit them):
+  - "Fixed the login redirect bug" (a one-off task outcome, no reusable rule)
+  - "Use environment variables for secrets" (generic best practice everyone already knows)
+  - "The prod container was stale, so I restarted it" (a single incident, not a rule with a mechanism)
+  - "Refactored the handler into smaller functions" (routine work, nothing transferable)
 
 Each field is ONE line:
 - title: specific, under 12 words (e.g. "pgx NULL vs empty string breaks $1='' filters", not "Database note").
