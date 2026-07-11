@@ -176,6 +176,20 @@ func ToolSpecs() []map[string]any {
 // by the MCP initialize instructions and the web app's API reference.
 func Contract() string { return contractText }
 
+// ToolNames returns just the tool names in ToolSpecs() order. The mesh://capabilities
+// resource uses it so its advertised tool list can never drift from the real surface
+// (it used to hardcode a slice that silently went stale on every new tool).
+func ToolNames() []string {
+	specs := ToolSpecs()
+	names := make([]string, 0, len(specs))
+	for _, t := range specs {
+		if n, ok := t["name"].(string); ok {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
 // toolClass is how a tool relates to scope-RBAC. It is the choke point that stops the
 // recurring "a new read tool leaks across scopes by default" bug (changed_since /
 // health / code_* each shipped that way and were patched one at a time). EVERY tool

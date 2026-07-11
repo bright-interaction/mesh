@@ -55,6 +55,13 @@ Write-back:
 - `mesh_write_entity` create a system / tool / concept page.
 - `mesh_reindex` re-read the vault now (after editing files directly).
 
+Secrets (only when a Dockyard vault is attached, see "Secret vault"):
+
+- `mesh_secret_status` is a vault attached, and how to use it.
+- `mesh_secret_list` the stored credentials (names + rotation status only, never values).
+- `mesh_secret_use` get a short-lived, single-use capability token for a destination and
+  call it through the vault's proxy. The real key is injected server-side; you never see it.
+
 Onboarding:
 
 - `mesh_setup_hooks` wire the session hooks (read at start, nudge write-back at end).
