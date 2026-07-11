@@ -63,7 +63,8 @@ func extractCmd() *cobra.Command {
 				return err
 			}
 			if toPending != "" {
-				return writeToPending(toPending, args[0], cands)
+				judge, _ := llm.NewJudgeFromEnv(client)
+				return writeToPending(toPending, args[0], cands, judge)
 			}
 			b, _ := json.MarshalIndent(map[string]any{"stats": st, "candidates": cands}, "", "  ")
 			fmt.Println(string(b))
@@ -163,7 +164,14 @@ func runRecurring(ctx context.Context, client llm.Client, dir string, n, concurr
 // writeToPending opens the vault index and stores extracted candidates in the review
 // queue (pending_notes), skipping any that restate a note already in the vault (so the
 // queue surfaces only NEW knowledge). Idempotent. Used by the Stop hook's extraction.
-func writeToPending(vaultRoot, transcript string, cands []extract.Candidate) error {
+//
+// judge is the quality gate (nil = no gate, for tests / when no LLM is configured):
+// each fresh candidate is scored by the judge and low-confidence self-ratings are
+// dropped, so the queue a human sees is the JUDGED set, not every raw extraction.
+// Without this the queue held every non-duplicate candidate (the ~64% measured
+// precision), i.e. the benchmark judged but production did not. The judge fails OPEN
+// (an LLM hiccup queues the candidate for the human, never silently drops knowledge).
+func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, judge llm.Client) error {
 	store, err := index.Open(vaultRoot)
 	if err != nil {
 		return err
@@ -182,7 +190,7 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate) err
 	queuedTitles, _ := store.ListPending()
 
 	src := filepath.Base(transcript)
-	queued, dupes := 0, 0
+	queued, dupes, filtered := 0, 0, 0
 	for _, cnd := range cands {
 		if known, of := knownInVault(ctx, rtr, cnd); known {
 			dupes++
@@ -194,6 +202,26 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate) err
 			fmt.Printf("skip (already queued): %q ~ %q\n", cnd.Title, of)
 			continue
 		}
+		// Quality gate: drop the extractor's own low-confidence ratings, then let the
+		// judge veto weak notes, so the review queue is the judged set (not every raw
+		// extraction). Fails open on a judge error (queue for the human, never drop).
+		if extract.LowConfidence(cnd) {
+			filtered++
+			fmt.Printf("skip (low confidence): %q\n", cnd.Title)
+			continue
+		}
+		if judge != nil {
+			jctx, jcancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			keep, reason, jerr := extract.Judge(jctx, judge, cnd)
+			jcancel()
+			if jerr != nil {
+				fmt.Fprintf(os.Stderr, "judge unavailable, queueing for human review anyway: %v\n", jerr)
+			} else if !keep {
+				filtered++
+				fmt.Printf("skip (judge rejected: %s): %q\n", reason, cnd.Title)
+				continue
+			}
+		}
 		if err := store.AddPending(index.PendingNote{
 			Type: cnd.Type, Title: cnd.Title, Do: cnd.Do, Dont: cnd.Dont,
 			Why: cnd.Why, Confidence: cnd.Confidence, Source: src,
@@ -204,7 +232,7 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate) err
 		queuedTitles = append(queuedTitles, index.PendingNote{Type: cnd.Type, Title: cnd.Title})
 		queued++
 	}
-	fmt.Printf("queued %d candidate(s) for review in %s (%d skipped as duplicate)\n", queued, vaultRoot, dupes)
+	fmt.Printf("queued %d candidate(s) for review in %s (%d duplicate, %d below quality bar)\n", queued, vaultRoot, dupes, filtered)
 	return nil
 }
 
@@ -314,8 +342,16 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 			rtr, _ = buildVaultRetriever(vs, dedupVault)
 		}
 	}
+	// Grade with a SEPARATE judge model when MESH_JUDGE_* is configured. A self-grade
+	// (extractor judging its own output) is not a precision measurement: it rubber-stamps
+	// what it just wrote (observed 100% keep). Independent judging is the honest number.
+	judge, independent := llm.NewJudgeFromEnv(client)
 	if !asJSON {
-		fmt.Fprintf(os.Stderr, "grading %d transcripts via %s (this calls the LLM per transcript)...\n", len(files), client.Describe())
+		fmt.Fprintf(os.Stderr, "grading %d transcripts: extractor %s, judge %s (independent=%v)\n",
+			len(files), client.Describe(), judge.Describe(), independent)
+		if !independent {
+			fmt.Fprintf(os.Stderr, "WARNING: judge == extractor (self-grade, precision inflated). Set MESH_JUDGE_AGENT/MESH_JUDGE_MODEL for an honest number.\n")
+		}
 	}
 	if concurrency < 1 {
 		concurrency = 1
@@ -352,7 +388,7 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 					row.Duplicates++ // restates a note already in the vault; not judged as fresh
 					continue
 				}
-				keep, _, je := extract.Judge(ctx, client, cnd)
+				keep, _, je := extract.Judge(ctx, judge, cnd)
 				if je != nil {
 					row.Err = "judge: " + je.Error()
 					continue
@@ -405,7 +441,7 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 			"sampled": N, "errors": errs,
 			"manual_writeback_sessions": manual, "extraction_coverage_sessions": extractCov,
 			"candidates": totalC, "duplicates": totalDup, "fresh": fresh, "kept": totalK,
-			"precision_pct": precision, "verdict": verdict, "rows": rows,
+			"precision_pct": precision, "independent_judge": independent, "verdict": verdict, "rows": rows,
 		}, "", "  ")
 		fmt.Println(string(b))
 		return nil
@@ -428,7 +464,11 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 		fmt.Printf("  already-known (deduped out):     %d   (%.0f%% of candidates)\n", totalDup, pct(totalDup, max1(totalC)))
 		fmt.Printf("  fresh (reach review):            %d\n", fresh)
 	}
-	fmt.Printf("  judged keep-worthy (of fresh):   %d / %d   (PRECISION %.0f%%)\n", totalK, fresh, precision)
+	judgeKind := "self-grade, inflated"
+	if independent {
+		judgeKind = "independent"
+	}
+	fmt.Printf("  judged keep-worthy (of fresh):   %d / %d   (PRECISION %.0f%%, %s judge)\n", totalK, fresh, precision, judgeKind)
 	lift := "n/a"
 	if manual > 0 {
 		lift = fmt.Sprintf("%.1fx", pct(extractCov, N)/pct(manual, N))

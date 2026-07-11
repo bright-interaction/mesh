@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -28,6 +29,9 @@ type Store struct {
 	jobs    chan job
 	done    chan struct{}
 	wg      sync.WaitGroup // tracks the writer goroutine so Close can join it
+
+	mu      sync.Mutex  // guards dropped
+	dropped []FileError // notes dropped as unparseable by the last full reindex
 }
 
 // SchemaVersion bumps whenever schema.sql changes shape. The index is a derived,
@@ -272,10 +276,35 @@ func (s *Store) Count(table string) (int, error) {
 func (s *Store) Close() error {
 	close(s.done)
 	s.wg.Wait()
+	// The writer has drained, so a clean shutdown is the safe moment to TRUNCATE the WAL
+	// back to zero: journal_size_limit only caps mesh.db-wal to 16MB, so without this a
+	// cleanly-restarted process inherits (and re-grows from) a 16MB high-water mark. This
+	// is the in-process, restart-time complement to the hourly mesh-doctor's out-of-process
+	// TRUNCATE (which reaps stale readers of processes that never Close). Bounded to a few
+	// seconds so a reader in another `mesh mcp --watch` process can never stall shutdown.
+	s.checkpointTruncateBestEffort()
 	errW := s.writeDB.Close()
 	errR := s.readDB.Close()
 	if errW != nil {
 		return errW
 	}
 	return errR
+}
+
+// checkpointTruncateBestEffort runs a single TRUNCATE checkpoint on shutdown to reclaim
+// the WAL file. Best-effort and tightly bounded: a short busy_timeout plus a context
+// deadline mean that if another process holds a read lock it gives up quickly rather than
+// blocking Close for the DSN's 30s busy_timeout. Full durability across never-closing
+// multi-writer processes remains the deferred read-only-MCP refactor (see the mesh WAL
+// decision note); this only covers the clean-restart path.
+func (s *Store) checkpointTruncateBestEffort() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := s.writeDB.Conn(ctx)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_, _ = conn.ExecContext(ctx, "PRAGMA busy_timeout=2000")
+	_, _ = conn.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 }
