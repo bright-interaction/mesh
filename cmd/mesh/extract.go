@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,7 +29,7 @@ func extractCmd() *cobra.Command {
 	var benchmark bool
 	var n, concurrency, maxChars int
 	var asJSON bool
-	var toPending, dedupVault string
+	var toPending, dedupVault, judgeEval string
 	var recurring bool
 	c := &cobra.Command{
 		Use:   "extract [transcript.jsonl]",
@@ -38,6 +39,9 @@ func extractCmd() *cobra.Command {
 			client, err := llm.NewFromEnv()
 			if err != nil {
 				return err
+			}
+			if judgeEval != "" {
+				return runJudgeEval(cmd.Context(), client, judgeEval, concurrency, asJSON)
 			}
 			if benchmark {
 				if len(args) < 1 {
@@ -63,8 +67,8 @@ func extractCmd() *cobra.Command {
 				return err
 			}
 			if toPending != "" {
-				judge, _ := llm.NewJudgeFromEnv(client)
-				return writeToPending(toPending, args[0], cands, judge)
+				judges, _ := llm.NewJudgePanelFromEnv(client)
+				return writeToPending(toPending, args[0], cands, judges)
 			}
 			b, _ := json.MarshalIndent(map[string]any{"stats": st, "candidates": cands}, "", "  ")
 			fmt.Println(string(b))
@@ -78,6 +82,7 @@ func extractCmd() *cobra.Command {
 	c.Flags().BoolVar(&asJSON, "json", false, "benchmark: emit JSON instead of a report")
 	c.Flags().StringVar(&toPending, "to-pending", "", "persist extracted candidates to this vault's review queue instead of printing")
 	c.Flags().StringVar(&dedupVault, "dedup-vault", "", "benchmark: dedup candidates against this vault and report fresh vs already-known")
+	c.Flags().StringVar(&judgeEval, "judge-eval", "", "grade the judge PANEL's discrimination over a labeled good/bad fixture (JSON): keeps good AND rejects bad")
 	c.Flags().BoolVar(&recurring, "recurring", false, "find problems that RECUR across sessions (systemic issues), not one-offs")
 	return c
 }
@@ -165,13 +170,13 @@ func runRecurring(ctx context.Context, client llm.Client, dir string, n, concurr
 // queue (pending_notes), skipping any that restate a note already in the vault (so the
 // queue surfaces only NEW knowledge). Idempotent. Used by the Stop hook's extraction.
 //
-// judge is the quality gate (nil = no gate, for tests / when no LLM is configured):
-// each fresh candidate is scored by the judge and low-confidence self-ratings are
-// dropped, so the queue a human sees is the JUDGED set, not every raw extraction.
+// judges is the quality gate (nil/empty = no gate, for tests / when no LLM is configured):
+// each fresh candidate is scored by a 3-lens judge panel and low-confidence self-ratings
+// are dropped, so the queue a human sees is the JUDGED set, not every raw extraction.
 // Without this the queue held every non-duplicate candidate (the ~64% measured
-// precision), i.e. the benchmark judged but production did not. The judge fails OPEN
+// precision), i.e. the benchmark judged but production did not. The panel fails OPEN
 // (an LLM hiccup queues the candidate for the human, never silently drops knowledge).
-func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, judge llm.Client) error {
+func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, judges []llm.Client) error {
 	store, err := index.Open(vaultRoot)
 	if err != nil {
 		return err
@@ -210,15 +215,15 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, jud
 			fmt.Printf("skip (low confidence): %q\n", cnd.Title)
 			continue
 		}
-		if judge != nil {
+		if len(judges) > 0 {
 			jctx, jcancel := context.WithTimeout(context.Background(), 4*time.Minute)
-			keep, reason, jerr := extract.Judge(jctx, judge, cnd)
+			v, jerr := extract.JudgePanel(jctx, judges, cnd, extract.PanelMajority)
 			jcancel()
 			if jerr != nil {
-				fmt.Fprintf(os.Stderr, "judge unavailable, queueing for human review anyway: %v\n", jerr)
-			} else if !keep {
+				fmt.Fprintf(os.Stderr, "judge panel unavailable, queueing for human review anyway: %v\n", jerr)
+			} else if !v.Keep {
 				filtered++
-				fmt.Printf("skip (judge rejected: %s): %q\n", reason, cnd.Title)
+				fmt.Printf("skip (panel %d/%d keep): %q\n", v.KeepN, v.Total, cnd.Title)
 				continue
 			}
 		}
@@ -287,7 +292,8 @@ type benchRow struct {
 	HadWriteback bool   `json:"had_writeback"`
 	Candidates   int    `json:"candidates"`
 	Duplicates   int    `json:"duplicates"` // candidates that restate an existing vault note (dedup)
-	Kept         int    `json:"kept"`       // fresh candidates a strict judge would keep
+	Kept         int    `json:"kept"`       // fresh candidates the panel keeps (majority)
+	Unanimous    int    `json:"unanimous"`  // of Kept, how many passed all 3 lenses (strictest)
 	Err          string `json:"err,omitempty"`
 }
 
@@ -342,15 +348,20 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 			rtr, _ = buildVaultRetriever(vs, dedupVault)
 		}
 	}
-	// Grade with a SEPARATE judge model when MESH_JUDGE_* is configured. A self-grade
-	// (extractor judging its own output) is not a precision measurement: it rubber-stamps
-	// what it just wrote (observed 100% keep). Independent judging is the honest number.
-	judge, independent := llm.NewJudgeFromEnv(client)
+	// Grade with a 3-lens judge PANEL, using SEPARATE judge models when MESH_JUDGE*_* is
+	// configured. A single generalist judge (worse, a self-grade) rubber-stamps almost
+	// everything (observed 100% keep); three lenses each stressing one qualifying criterion
+	// (non-obvious / reusable / durable) with a majority-keep bar is the honest number.
+	judges, independent := llm.NewJudgePanelFromEnv(client)
 	if !asJSON {
-		fmt.Fprintf(os.Stderr, "grading %d transcripts: extractor %s, judge %s (independent=%v)\n",
-			len(files), client.Describe(), judge.Describe(), independent)
+		descs := make([]string, len(judges))
+		for i, j := range judges {
+			descs[i] = j.Describe()
+		}
+		fmt.Fprintf(os.Stderr, "grading %d transcripts: extractor %s, judge panel [%s] (independent=%v, majority keep)\n",
+			len(files), client.Describe(), strings.Join(descs, ", "), independent)
 		if !independent {
-			fmt.Fprintf(os.Stderr, "WARNING: judge == extractor (self-grade, precision inflated). Set MESH_JUDGE_AGENT/MESH_JUDGE_MODEL for an honest number.\n")
+			fmt.Fprintf(os.Stderr, "WARNING: judge panel == extractor (self-grade). Set MESH_JUDGE_AGENT/MESH_JUDGE_MODEL (and MESH_JUDGE2_*/MESH_JUDGE3_*) for an honest, model-diverse number.\n")
 		}
 	}
 	if concurrency < 1 {
@@ -388,18 +399,21 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 					row.Duplicates++ // restates a note already in the vault; not judged as fresh
 					continue
 				}
-				keep, _, je := extract.Judge(ctx, judge, cnd)
+				v, je := extract.JudgePanel(ctx, judges, cnd, extract.PanelMajority)
 				if je != nil {
 					row.Err = "judge: " + je.Error()
 					continue
 				}
-				if keep {
+				if v.Keep {
 					row.Kept++
+					if v.KeepN == v.Total {
+						row.Unanimous++ // 3/3 lenses: the strictest bar, for the split
+					}
 				}
 			}
 			rows[i] = row
 			if !asJSON {
-				fmt.Fprintf(os.Stderr, "  %-40s writeback=%-5v cands=%d dup=%d kept=%d %s\n", row.File, row.HadWriteback, row.Candidates, row.Duplicates, row.Kept, row.Err)
+				fmt.Fprintf(os.Stderr, "  %-40s writeback=%-5v cands=%d dup=%d kept=%d(u%d) %s\n", row.File, row.HadWriteback, row.Candidates, row.Duplicates, row.Kept, row.Unanimous, row.Err)
 			}
 		}(i, f)
 	}
@@ -407,7 +421,7 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 
 	// Tally. "Fresh" = candidates that are not duplicates of an existing vault note;
 	// precision is measured on the fresh set (what a reviewer actually sees).
-	var manual, extractCov, totalC, totalDup, totalK, errs int
+	var manual, extractCov, totalC, totalDup, totalK, totalU, errs int
 	for _, r := range rows {
 		if r.Err != "" && r.Candidates == 0 {
 			errs++
@@ -421,6 +435,7 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 		totalC += r.Candidates
 		totalDup += r.Duplicates
 		totalK += r.Kept
+		totalU += r.Unanimous
 	}
 	N := len(rows)
 	fresh := totalC - totalDup
@@ -440,7 +455,7 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 		b, _ := json.MarshalIndent(map[string]any{
 			"sampled": N, "errors": errs,
 			"manual_writeback_sessions": manual, "extraction_coverage_sessions": extractCov,
-			"candidates": totalC, "duplicates": totalDup, "fresh": fresh, "kept": totalK,
+			"candidates": totalC, "duplicates": totalDup, "fresh": fresh, "kept": totalK, "unanimous": totalU,
 			"precision_pct": precision, "independent_judge": independent, "verdict": verdict, "rows": rows,
 		}, "", "  ")
 		fmt.Println(string(b))
@@ -468,7 +483,8 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 	if independent {
 		judgeKind = "independent"
 	}
-	fmt.Printf("  judged keep-worthy (of fresh):   %d / %d   (PRECISION %.0f%%, %s judge)\n", totalK, fresh, precision, judgeKind)
+	fmt.Printf("  panel keep-worthy (of fresh):    %d / %d   (PRECISION %.0f%%, %s 3-lens panel, majority)\n", totalK, fresh, precision, judgeKind)
+	fmt.Printf("  of those, unanimous (3/3 lenses): %d   (the strictest bar)\n", totalU)
 	lift := "n/a"
 	if manual > 0 {
 		lift = fmt.Sprintf("%.1fx", pct(extractCov, N)/pct(manual, N))
@@ -485,4 +501,153 @@ func max1(n int) int {
 		return 1
 	}
 	return n
+}
+
+// judgeEvalCase is one labeled candidate: label "keep" means the panel SHOULD keep it,
+// "reject" means it SHOULD reject it.
+type judgeEvalCase struct {
+	Label      string `json:"label"`
+	Type       string `json:"type"`
+	Title      string `json:"title"`
+	Do         string `json:"do"`
+	Dont       string `json:"dont"`
+	Why        string `json:"why"`
+	Confidence string `json:"confidence"`
+}
+
+// evalResult is the confusion matrix of a judge-eval run (label "keep" = positive class).
+type evalResult struct {
+	TP, FN, TN, FP, Errs  int
+	Slipped, OverRejected []string
+}
+
+// evalCases runs the panel over labeled cases and tallies the confusion matrix. Pure over
+// its judges, so a stub client makes it deterministic in tests.
+func evalCases(ctx context.Context, judges []llm.Client, cases []judgeEvalCase, concurrency int) evalResult {
+	if concurrency < 1 {
+		concurrency = 4
+	}
+	kept := make([]struct {
+		keep bool
+		err  string
+	}, len(cases))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i, c := range cases {
+		wg.Add(1)
+		go func(i int, c judgeEvalCase) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			cand := extract.Candidate{Type: c.Type, Title: c.Title, Do: c.Do, Dont: c.Dont, Why: c.Why, Confidence: c.Confidence}
+			v, e := extract.JudgePanel(ctx, judges, cand, extract.PanelMajority)
+			if e != nil {
+				kept[i].err = e.Error()
+				return
+			}
+			kept[i].keep = v.Keep
+		}(i, c)
+	}
+	wg.Wait()
+
+	var er evalResult
+	for i, c := range cases {
+		if kept[i].err != "" {
+			er.Errs++
+			continue
+		}
+		switch strings.ToLower(c.Label) {
+		case "keep":
+			if kept[i].keep {
+				er.TP++
+			} else {
+				er.FN++
+				er.OverRejected = append(er.OverRejected, c.Title)
+			}
+		case "reject":
+			if kept[i].keep {
+				er.FP++
+				er.Slipped = append(er.Slipped, c.Title)
+			} else {
+				er.TN++
+			}
+		}
+	}
+	return er
+}
+
+// runJudgeEval measures the judge PANEL's DISCRIMINATION over a labeled fixture: does it
+// keep the good notes (recall) AND reject the bad ones (specificity)? A raw keep-rate on
+// live extractions cannot answer this (it has no negatives), so a pinned ~100% precision
+// there could mean "everything's good" OR "the judge accepts anything". This benchmark
+// adds the missing negative control: bad candidates the panel MUST reject.
+func runJudgeEval(ctx context.Context, client llm.Client, path string, concurrency int, asJSON bool) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var fx struct {
+		Cases []judgeEvalCase `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		return fmt.Errorf("parse fixture: %w", err)
+	}
+	if len(fx.Cases) == 0 {
+		return fmt.Errorf("no cases in %s", path)
+	}
+	judges, independent := llm.NewJudgePanelFromEnv(client)
+	if concurrency < 1 {
+		concurrency = 4
+	}
+	if !asJSON {
+		descs := make([]string, len(judges))
+		for i, j := range judges {
+			descs[i] = j.Describe()
+		}
+		fmt.Fprintf(os.Stderr, "judge-eval: %d cases via panel [%s] (independent=%v)\n", len(fx.Cases), strings.Join(descs, ", "), independent)
+	}
+
+	er := evalCases(ctx, judges, fx.Cases, concurrency)
+	tp, fn, tn, fp, errs := er.TP, er.FN, er.TN, er.FP, er.Errs
+	slipped, overRejected := er.Slipped, er.OverRejected
+	good, bad := tp+fn, tn+fp
+	pct := func(a, b int) float64 {
+		if b == 0 {
+			return 0
+		}
+		return float64(a) / float64(b) * 100
+	}
+	recall := pct(tp, good)     // keeps the good (true-positive rate)
+	specificity := pct(tn, bad) // rejects the bad (true-negative rate) <- the discrimination signal
+	accuracy := pct(tp+tn, good+bad)
+
+	if asJSON {
+		b, _ := json.MarshalIndent(map[string]any{
+			"cases": len(fx.Cases), "errors": errs, "independent_judge": independent,
+			"good_total": good, "bad_total": bad,
+			"kept_good": tp, "rejected_good": fn, "rejected_bad": tn, "kept_bad": fp,
+			"recall_pct": recall, "specificity_pct": specificity, "accuracy_pct": accuracy,
+			"bad_that_slipped_through": slipped, "good_over_rejected": overRejected,
+		}, "", "  ")
+		fmt.Println(string(b))
+		return nil
+	}
+	fmt.Printf("\nJudge-panel discrimination benchmark (majority keep, independent=%v)\n", independent)
+	fmt.Printf("cases: %d   (LLM errors: %d)\n", len(fx.Cases), errs)
+	fmt.Printf("\nKEEPS THE GOOD (recall):       %d / %d   (%.0f%%)\n", tp, good, recall)
+	fmt.Printf("REJECTS THE BAD (specificity): %d / %d   (%.0f%%)   <- the discrimination signal\n", tn, bad, specificity)
+	fmt.Printf("accuracy:                      %d / %d   (%.0f%%)\n", tp+tn, good+bad, accuracy)
+	if len(slipped) > 0 {
+		fmt.Printf("\nBAD notes the panel WRONGLY KEPT (%d):\n", len(slipped))
+		for _, s := range slipped {
+			fmt.Printf("  - %s\n", s)
+		}
+	}
+	if len(overRejected) > 0 {
+		fmt.Printf("\nGOOD notes the panel WRONGLY REJECTED (%d):\n", len(overRejected))
+		for _, s := range overRejected {
+			fmt.Printf("  - %s\n", s)
+		}
+	}
+	return nil
 }

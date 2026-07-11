@@ -215,6 +215,26 @@ func NewJudgeFromEnv(fallback Client) (Client, bool) {
 	return c, true
 }
 
+// NewJudgePanelFromEnv builds up to 3 independent judge clients from MESH_JUDGE_*,
+// MESH_JUDGE2_*, MESH_JUDGE3_* (each the same schema as MESH_CURATOR_*), for a
+// model-diverse panel. Prefixes with no env set are skipped. When none are set it returns
+// ([]Client{fallback}, false): the panel runs on the extractor itself (a self-grade) and
+// the caller labels it honestly. independent is true when any configured judge exists.
+func NewJudgePanelFromEnv(fallback Client) (judges []Client, independent bool) {
+	for _, p := range []string{"MESH_JUDGE", "MESH_JUDGE2", "MESH_JUDGE3"} {
+		if !anyEnvWithPrefix(p + "_") {
+			continue
+		}
+		if c, err := newFromEnvPrefix(p); err == nil && c != nil {
+			judges = append(judges, c)
+		}
+	}
+	if len(judges) == 0 {
+		return []Client{fallback}, false
+	}
+	return judges, true
+}
+
 // anyEnvWithPrefix reports whether any environment variable starts with prefix.
 func anyEnvWithPrefix(prefix string) bool {
 	for _, kv := range os.Environ() {

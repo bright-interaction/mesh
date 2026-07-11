@@ -73,7 +73,7 @@ func TestWriteToPendingQualityGate(t *testing.T) {
 		{Type: "gotcha", Title: "REJECT a weak one-off with no mechanism", Do: "do y", Confidence: "high"},
 		{Type: "decision", Title: "a low-confidence guess dropped before judging", Do: "do z", Confidence: "low"},
 	}
-	if err := writeToPending(dir, "session.jsonl", cands, judge); err != nil {
+	if err := writeToPending(dir, "session.jsonl", cands, []llm.Client{judge}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -88,6 +88,37 @@ func TestWriteToPendingQualityGate(t *testing.T) {
 	}
 	if !strings.Contains(items[0].Title, "KEEP") {
 		t.Errorf("wrong candidate queued: %q", items[0].Title)
+	}
+}
+
+// The discrimination harness must classify each labeled case correctly: a kept "keep" is
+// a true positive, a kept "reject" is a bad note that SLIPPED THROUGH (false positive),
+// and a rejected "keep" is a good note over-rejected. Deterministic via a stub panel that
+// keeps everything except titles containing BAD.
+func TestEvalCasesConfusionMatrix(t *testing.T) {
+	stub := llm.Func(func(ctx context.Context, system, user string) (string, error) {
+		if strings.Contains(user, "BAD") {
+			return `{"keep": false, "reason": "bad"}`, nil
+		}
+		return `{"keep": true, "reason": "good"}`, nil
+	})
+	cases := []judgeEvalCase{
+		{Label: "keep", Title: "GOOD one"},        // kept -> TP
+		{Label: "keep", Title: "GOOD two"},        // kept -> TP
+		{Label: "reject", Title: "BAD one"},       // rejected -> TN
+		{Label: "reject", Title: "BAD two"},       // rejected -> TN
+		{Label: "reject", Title: "sneaky filler"}, // KEPT (no BAD) -> FP, slipped through
+		{Label: "keep", Title: "BAD-tagged good"}, // rejected -> FN, over-rejected
+	}
+	er := evalCases(context.Background(), []llm.Client{stub}, cases, 2)
+	if er.TP != 2 || er.FN != 1 || er.TN != 2 || er.FP != 1 || er.Errs != 0 {
+		t.Fatalf("confusion matrix wrong: TP=%d FN=%d TN=%d FP=%d errs=%d", er.TP, er.FN, er.TN, er.FP, er.Errs)
+	}
+	if len(er.Slipped) != 1 || er.Slipped[0] != "sneaky filler" {
+		t.Errorf("slipped-through list wrong: %v", er.Slipped)
+	}
+	if len(er.OverRejected) != 1 || er.OverRejected[0] != "BAD-tagged good" {
+		t.Errorf("over-rejected list wrong: %v", er.OverRejected)
 	}
 }
 

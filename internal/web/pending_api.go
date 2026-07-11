@@ -66,6 +66,11 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "create note failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Promoting a candidate IS a write-back, so stamp it in the flywheel now (source
+	// "agent"), exactly like a direct mesh_append_note via the MCP does. Without this the
+	// authored count only caught promoted notes at the next backfill, undercounting the
+	// flywheel's input and diverging from the MCP write path.
+	_ = s.store.RecordWriteback(res.ID, "agent")
 	// The candidate is now a real note; clear it from the queue and refresh the graph
 	// so it is immediately searchable.
 	_ = s.store.DeletePending(req.ID)
