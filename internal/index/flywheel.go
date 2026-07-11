@@ -75,6 +75,36 @@ func (s *Store) RecordReuse(noteID string, gapSec int64) error {
 	})
 }
 
+// ReusedNote is one note and how many later-session fetches it has drawn, for the
+// most-reused list (the concrete evidence behind the reuse rate).
+type ReusedNote struct {
+	NoteID     string `json:"note_id"`
+	ReuseCount int64  `json:"reuse_count"`
+}
+
+// TopReused returns the n most-reused notes (reuse_count desc). n<=0 uses a small default.
+func (s *Store) TopReused(n int) []ReusedNote {
+	if n <= 0 {
+		n = 8
+	}
+	rows, err := s.readDB.Query(
+		`SELECT note_id, reuse_count FROM note_reuse WHERE reuse_count > 0
+		  ORDER BY reuse_count DESC, note_id LIMIT ?`, n)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []ReusedNote
+	for rows.Next() {
+		var r ReusedNote
+		if err := rows.Scan(&r.NoteID, &r.ReuseCount); err != nil {
+			return out
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 // FlywheelStats is the headline answer to "does the flywheel compound?".
 type FlywheelStats struct {
 	Authored           int64   `json:"authored"`              // write-backs being tracked
