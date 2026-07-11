@@ -135,6 +135,27 @@ func ToolSpecs() []map[string]any {
 			}),
 		},
 		{
+			"name":        "mesh_secret_status",
+			"description": "Is a secret vault attached? Reports whether Mesh is wired to a Dockyard capability-mode vault (encrypted secret storage + autorotation) and how to use it. No network call, never echoes a key. Call this to discover the broker before mesh_secret_list / mesh_secret_use.",
+			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
+		},
+		{
+			"name":        "mesh_secret_list",
+			"description": "List the secrets in the attached vault (NAMES + provider + rotation status only, NEVER a value). Use it to see what credentials you can broker before calling mesh_secret_use. Returns an empty note if no vault is attached.",
+			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
+		},
+		{
+			"name":        "mesh_secret_use",
+			"description": "Get a credential you can use WITHOUT ever seeing it. Give the destination you will call (host+path, e.g. 'api.openai.com/v1/chat/completions'); Mesh mints a short-lived, single-use capability TOKEN bound to that destination. Send your request to the returned proxy_url with header `Authorization: Capability <token>` and the Dockyard vault injects the real, auto-rotated secret server-side. The plaintext secret never reaches you. Optionally pass secret_name to pin a specific vault entry and method to bind the HTTP method. Mint a fresh token per request; never store or log it.",
+			"inputSchema": obj(map[string]any{
+				"type":     "object",
+				"required": []string{"destination"},
+				"properties": map[string]any{
+					"destination": str, "secret_name": str, "method": str, "ttl_seconds": intp,
+				},
+			}),
+		},
+		{
 			"name":        "mesh_setup_hooks",
 			"description": "ONBOARDING. Set up Claude Code SESSION hooks so you (the agent) automatically READ the mesh at the start of every session and get nudged to WRITE BACK what you learned before finishing - the flywheel that makes Mesh compound. Call with no args (action=status) to get the current install state plus the pitch and the exact questions to ask the user; then call action=install (read_only to skip the write-back nudge; dry_run to preview the settings.json first) to wire it into the project's .claude/settings.json. Offer this the FIRST time a user connects to Mesh. These are session hooks, NOT git pre/post-push.",
 			"inputSchema": obj(map[string]any{
@@ -196,6 +217,13 @@ var toolScopeClass = map[string]toolClass{
 	"mesh_code_neighbors": classCodeDev,
 	"mesh_code_context":   classCodeDev,
 	"mesh_setup_hooks":    classOpen,
+	// Secret-broker tools broker an ATTACHED Dockyard vault, not vault-note content, so
+	// no per-note scope crosses a boundary (classOpen). mesh_secret_use additionally
+	// applies the write-role gate inside its handler (a read-only hosted viewer must not
+	// mint capability tokens); list/status are metadata-only reads.
+	"mesh_secret_status": classOpen,
+	"mesh_secret_list":   classOpen,
+	"mesh_secret_use":    classOpen,
 }
 
 func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (any, *rpcError) {
@@ -238,6 +266,12 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return s.toolCodeContext(ctx, p.Arguments)
 	case "mesh_code_neighbors":
 		return s.toolCodeNeighbors(ctx, p.Arguments)
+	case "mesh_secret_status":
+		return s.toolSecretStatus(ctx)
+	case "mesh_secret_list":
+		return s.toolSecretList(ctx, p.Arguments)
+	case "mesh_secret_use":
+		return s.toolSecretUse(ctx, p.Arguments)
 	case "mesh_setup_hooks":
 		return s.toolSetupHooks(p.Arguments)
 	default:

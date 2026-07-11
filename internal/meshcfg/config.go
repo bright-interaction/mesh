@@ -58,11 +58,27 @@ type Code struct {
 	Languages []string
 }
 
-// Config is the full solo config.toml (embedding + retrieval + code).
+// SecretBridge is the [secret_bridge] section: an optional attached Dockyard vault
+// (capability mode) that Mesh brokers secrets from. When BaseURL is set, the MCP
+// server exposes mesh_secret_list / mesh_secret_use so an agent can fetch a short-
+// lived capability token for a secret it can never read; the real value stays
+// encrypted in Dockyard and is injected server-side by its proxy. Mesh stores NO
+// secret: KeyEnv NAMES the env var that holds the Dockyard API key, exactly like the
+// embedding key_env indirection. AgentID is the identity Mesh presents to Dockyard
+// (empty = mesh-<hostname>). Env MESH_SECRET_BRIDGE_URL / MESH_SECRET_BRIDGE_KEY /
+// MESH_SECRET_BRIDGE_AGENT_ID override these.
+type SecretBridge struct {
+	BaseURL string
+	KeyEnv  string // env var NAME holding the Dockyard API key (never the key itself)
+	AgentID string
+}
+
+// Config is the full solo config.toml (embedding + retrieval + code + secret bridge).
 type Config struct {
-	Embedding Embedding
-	Retrieval Retrieval
-	Code      Code
+	Embedding    Embedding
+	Retrieval    Retrieval
+	Code         Code
+	SecretBridge SecretBridge
 }
 
 // configName is the file under <vault>/.mesh.
@@ -124,6 +140,11 @@ func LoadConfig(meshDir string) (Config, error) {
 		Roots:     sectionList(body, "code", "roots"),
 		Languages: sectionList(body, "code", "languages"),
 	}
+	c.SecretBridge = SecretBridge{
+		BaseURL: sectionString(body, "secret_bridge", "base_url"),
+		KeyEnv:  sectionString(body, "secret_bridge", "key_env"),
+		AgentID: sectionString(body, "secret_bridge", "agent_id"),
+	}
 	return c, nil
 }
 
@@ -149,7 +170,7 @@ weight_graph = %g
 weight_vec = %g
 # Age-decay non-institutional notes in ranking (0 = off). Tier-0 + entities/concepts
 # never decay. Env MESH_FRESHNESS_HALFLIFE_DAYS wins.
-freshness_half_life_days = 0
+freshness_half_life_days = %d
 
 [rerank]
 # Cross-encoder rerank (BYOAI). Empty endpoint/model = off. Env MESH_RERANK_* wins.
@@ -172,6 +193,18 @@ hnsw_threshold = %d
 index = %v
 roots = %q
 languages = %q
+
+[secret_bridge]
+# Optional attached Dockyard vault (capability mode). When base_url is set, Mesh
+# exposes mesh_secret_list / mesh_secret_use so an agent can fetch a SHORT-LIVED
+# capability token for a secret it can never read: the real value stays encrypted in
+# the Dockyard vault and is injected server-side by Dockyard's /proxy at forward time.
+# Mesh stores NO secret here - key_env only NAMES the env var holding the Dockyard API
+# key. Leave base_url empty to disable. Env MESH_SECRET_BRIDGE_URL /
+# MESH_SECRET_BRIDGE_KEY / MESH_SECRET_BRIDGE_AGENT_ID override these.
+base_url = %q
+key_env = %q
+agent_id = %q
 `
 
 // Save writes the [embedding] section, preserving any other sections already in the
@@ -192,13 +225,19 @@ func SaveConfig(meshDir string, c Config) error {
 	if c.Retrieval.RerankKeyEnv != "" && !validEnvName(c.Retrieval.RerankKeyEnv) {
 		c.Retrieval.RerankKeyEnv = "MESH_RERANK_KEY"
 	}
+	// key_env is a NAME, never a secret. A non-empty garbage value would break the
+	// round-trip, so reset it to the default name (matching the embedding guard above).
+	if c.SecretBridge.KeyEnv != "" && !validEnvName(c.SecretBridge.KeyEnv) {
+		c.SecretBridge.KeyEnv = "MESH_SECRET_BRIDGE_KEY"
+	}
 	e, rv := c.Embedding, c.Retrieval
 	body := fmt.Sprintf(configTemplate,
 		e.Endpoint, e.Model, e.Dim, e.KeyEnv, e.QueryPrefix, e.DocPrefix,
-		rv.WeightFTS, rv.WeightGraph, rv.WeightVec,
+		rv.WeightFTS, rv.WeightGraph, rv.WeightVec, rv.FreshnessHalfLifeDays,
 		rv.RerankEndpoint, rv.RerankModel, rv.RerankKeyEnv, rv.RerankBlend,
 		rv.HNSWThreshold,
 		c.Code.Index, strings.Join(c.Code.Roots, ","), strings.Join(c.Code.Languages, ","),
+		c.SecretBridge.BaseURL, c.SecretBridge.KeyEnv, c.SecretBridge.AgentID,
 	)
 	tmp, err := os.CreateTemp(meshDir, ".config-*.toml")
 	if err != nil {
