@@ -5,6 +5,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -91,6 +92,38 @@ func TestAnthropicComplete(t *testing.T) {
 	}
 	if c.Describe() != "anthropic/claude-sonnet-4-6" {
 		t.Fatalf("describe = %q", c.Describe())
+	}
+}
+
+// Temperature is sent only when configured (nil = provider default), so a reproducible
+// run can pin it to 0 without changing the default behavior.
+func TestAnthropicTemperature(t *testing.T) {
+	var seen map[string]any
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&seen)
+		w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
+	}
+	// With temp set, the body carries "temperature".
+	ts := httptest.NewServer(http.HandlerFunc(handler))
+	defer ts.Close()
+	zero := 0.0
+	c := &anthropic{key: "k", model: "m", maxTok: 10, temp: &zero, hc: &http.Client{Timeout: 5 * time.Second}, baseOverride: ts.URL}
+	if _, err := c.Complete(context.Background(), "s", "u"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := seen["temperature"]; !ok || v.(float64) != 0.0 {
+		t.Errorf("temperature not sent when set: %v", seen["temperature"])
+	}
+	// With temp nil, the body omits it (provider default).
+	seen = nil
+	ts2 := httptest.NewServer(http.HandlerFunc(handler))
+	defer ts2.Close()
+	c2 := &anthropic{key: "k", model: "m", maxTok: 10, hc: &http.Client{Timeout: 5 * time.Second}, baseOverride: ts2.URL}
+	if _, err := c2.Complete(context.Background(), "s", "u"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := seen["temperature"]; ok {
+		t.Error("temperature must be omitted when unset")
 	}
 }
 

@@ -122,6 +122,39 @@ func TestEvalCasesConfusionMatrix(t *testing.T) {
 	}
 }
 
+// The variance benchmark's stats must be correct: tallyRows derives coverage/precision
+// from rows, and meanStddev summarizes the per-run spread. Deterministic, no LLM.
+func TestVarianceStats(t *testing.T) {
+	rows := []benchRow{
+		{Candidates: 3, Duplicates: 1, Kept: 2}, // fresh 2, kept 2, yields
+		{Candidates: 0},                         // no candidates, no yield
+		{Candidates: 2, Duplicates: 2, Kept: 0}, // all dup, no fresh -> no yield
+		{Candidates: 1, Duplicates: 0, Kept: 1}, // fresh 1, kept 1, yields
+	}
+	s := tallyRows(rows)
+	if s.N != 4 || s.extractCov != 2 {
+		t.Fatalf("coverage sessions: N=%d extractCov=%d, want 4 and 2", s.N, s.extractCov)
+	}
+	if got := s.coveragePct(); got != 50 {
+		t.Errorf("coverage%% = %.0f, want 50", got)
+	}
+	// fresh = totalC - totalDup = 6 - 3 = 3; kept = 3; precision = 100.
+	if got := s.precisionPct(); got != 100 {
+		t.Errorf("precision%% = %.0f, want 100 (kept 3 / fresh 3)", got)
+	}
+
+	mean, sd := meanStddev([]float64{90, 100, 100})
+	if mean < 96.6 || mean > 96.7 {
+		t.Errorf("mean = %.2f, want ~96.67", mean)
+	}
+	if sd < 4.6 || sd > 4.8 {
+		t.Errorf("stddev = %.2f, want ~4.71", sd)
+	}
+	if m, s := meanStddev(nil); m != 0 || s != 0 {
+		t.Errorf("empty meanStddev = %v,%v want 0,0", m, s)
+	}
+}
+
 func TestNearDuplicatePending(t *testing.T) {
 	existing := []index.PendingNote{
 		{Type: "gotcha", Title: "Verify new credential works BEFORE invalidating the old one"},

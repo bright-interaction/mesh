@@ -259,6 +259,15 @@ func newFromEnvPrefix(p string) (Client, error) {
 		maxTok = v
 	}
 	model := strings.TrimSpace(os.Getenv(p + "_MODEL"))
+	// Optional sampling temperature (api backends only; the cli passes none). Set
+	// <prefix>_TEMP=0 for reproducible runs, e.g. a deterministic benchmark or a judge whose
+	// verdicts should not flip run to run. Unset leaves the provider default (~1.0).
+	var temp *float64
+	if v := strings.TrimSpace(os.Getenv(p + "_TEMP")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			temp = &f
+		}
+	}
 	// SSRF-guarded by default; an operator can allow a sovereign localhost endpoint
 	// (Ollama, a self-hosted model server) with MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1.
 	hc := safehttp.LLMClient(120 * time.Second)
@@ -287,7 +296,7 @@ func newFromEnvPrefix(p string) (Client, error) {
 			model = defaultAnthropicModel
 		}
 		base := firstNonEmpty(os.Getenv("MESH_ANTHROPIC_BASE"), defaultAnthropicBase)
-		return &anthropic{base: strings.TrimRight(base, "/"), key: key, model: model, maxTok: maxTok, hc: hc}, nil
+		return &anthropic{base: strings.TrimRight(base, "/"), key: key, model: model, maxTok: maxTok, temp: temp, hc: hc}, nil
 	case "local":
 		ep := strings.TrimRight(strings.TrimSpace(os.Getenv(p+"_ENDPOINT")), "/")
 		if ep == "" {
@@ -296,7 +305,7 @@ func newFromEnvPrefix(p string) (Client, error) {
 		if model == "" {
 			return nil, fmt.Errorf("local agent needs %s_MODEL", p)
 		}
-		return &openaiCompat{endpoint: ep, key: os.Getenv(p + "_KEY"), model: model, maxTok: maxTok, hc: hc}, nil
+		return &openaiCompat{endpoint: ep, key: os.Getenv(p + "_KEY"), model: model, maxTok: maxTok, temp: temp, hc: hc}, nil
 	default:
 		return nil, fmt.Errorf("unknown %s_AGENT %q (want cli|anthropic|local)", p, agent)
 	}
@@ -316,6 +325,7 @@ func firstNonEmpty(vals ...string) string {
 type anthropic struct {
 	base, key, model string
 	maxTok           int
+	temp             *float64 // nil = provider default
 	hc               *http.Client
 	baseOverride     string // tests
 }
@@ -323,12 +333,16 @@ type anthropic struct {
 func (a *anthropic) Describe() string { return "anthropic/" + a.model }
 
 func (a *anthropic) Complete(ctx context.Context, system, user string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model":      a.model,
 		"max_tokens": a.maxTok,
 		"system":     system,
 		"messages":   []map[string]any{{"role": "user", "content": user}},
-	})
+	}
+	if a.temp != nil {
+		payload["temperature"] = *a.temp
+	}
+	body, _ := json.Marshal(payload)
 	base := a.base
 	if a.baseOverride != "" {
 		base = a.baseOverride
@@ -378,20 +392,25 @@ func (a *anthropic) Complete(ctx context.Context, system, user string) (string, 
 type openaiCompat struct {
 	endpoint, key, model string
 	maxTok               int
+	temp                 *float64 // nil = provider default
 	hc                   *http.Client
 }
 
 func (o *openaiCompat) Describe() string { return "local/" + o.model }
 
 func (o *openaiCompat) Complete(ctx context.Context, system, user string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model":      o.model,
 		"max_tokens": o.maxTok,
 		"messages": []map[string]string{
 			{"role": "system", "content": system},
 			{"role": "user", "content": user},
 		},
-	})
+	}
+	if o.temp != nil {
+		payload["temperature"] = *o.temp
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.endpoint+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return "", err
