@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 // Copyright (C) 2026 Bright Interaction AB
 
 package buildinfo
@@ -16,17 +16,17 @@ func TestVerEnvOverride(t *testing.T) {
 }
 
 func TestSourceOfferGatedOnEnv(t *testing.T) {
-	// Unset: license is offered, but no (broken) source link.
+	// Unset: the version notice renders, but no (broken) source link.
 	t.Setenv("MESH_SOURCE_URL", "")
 	in := FooterInline()
-	if !contains(in, License) {
-		t.Fatalf("footer missing license: %q", in)
+	if !contains(in, "Mesh ") {
+		t.Fatalf("footer missing version notice: %q", in)
 	}
 	if contains(in, "Source code") {
 		t.Fatalf("footer offered a source link with no MESH_SOURCE_URL set: %q", in)
 	}
 
-	// Set: the Corresponding Source link appears, pointing at the configured URL.
+	// Set: the source link appears, pointing at the configured URL.
 	t.Setenv("MESH_SOURCE_URL", "https://example.com/mesh/tree/abc123")
 	in = FooterInline()
 	if !contains(in, "Source code") || !contains(in, "https://example.com/mesh/tree/abc123") {

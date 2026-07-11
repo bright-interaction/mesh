@@ -38,8 +38,9 @@ capability with no shell.
 Mesh is open core, dual-licensed:
 
 - The **open core** (this single-user app: vault, graph, retrieval, viewers, CLI,
-  the MCP surface, and the sync client) is AGPL-3.0.
+  the MCP surface, and the sync client) is the Mesh Sustainable Use License (fair-code).
 - The **team-sync hub** and the BYOAI conflict **curator** are a commercial product,
   available hosted or as a sovereign self-host license with support.
 
-A commercial license to the core is available for uses the AGPL does not fit.
+A commercial license to the core is available for uses the Mesh Sustainable Use
+License does not fit.
