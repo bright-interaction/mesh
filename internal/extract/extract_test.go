@@ -5,6 +5,7 @@ package extract
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,66 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/llm"
 )
+
+// The 3-lens panel keeps a candidate by a configurable vote bar, fails OPEN when a lens
+// errors (never silently drops knowledge), and errors only when EVERY lens fails. Each
+// lens is identified by a keyword in its system prompt, so a stub can vote per lens.
+func TestJudgePanel(t *testing.T) {
+	c := Candidate{Type: "gotcha", Title: "x", Do: "y"}
+	ctx := context.Background()
+
+	keepAll := llm.Func(func(ctx context.Context, system, user string) (string, error) {
+		return `{"keep": true, "reason": "ok"}`, nil
+	})
+	if v, err := JudgePanel(ctx, []llm.Client{keepAll}, c, PanelMajority); err != nil || !v.Keep || v.KeepN != 3 {
+		t.Fatalf("all-keep: keep=%v keepN=%d err=%v", v.Keep, v.KeepN, err)
+	}
+
+	// Reject only the durable lens -> 2/3: majority keeps, not unanimous.
+	durReject := llm.Func(func(ctx context.Context, system, user string) (string, error) {
+		if strings.Contains(system, "durability") {
+			return `{"keep": false, "reason": "transient"}`, nil
+		}
+		return `{"keep": true, "reason": "ok"}`, nil
+	})
+	v, _ := JudgePanel(ctx, []llm.Client{durReject}, c, PanelMajority)
+	if !v.Keep || v.KeepN != 2 || v.KeepN == v.Total {
+		t.Errorf("2/3 should keep at majority and not be unanimous: keep=%v keepN=%d total=%d", v.Keep, v.KeepN, v.Total)
+	}
+	if v2, _ := JudgePanel(ctx, []llm.Client{durReject}, c, PanelUnanimous); v2.Keep {
+		t.Error("2/3 must be rejected at unanimity")
+	}
+
+	// Reject two lenses -> 1/3: majority rejects.
+	twoReject := llm.Func(func(ctx context.Context, system, user string) (string, error) {
+		if strings.Contains(system, "durability") || strings.Contains(system, "reusability") {
+			return `{"keep": false, "reason": "no"}`, nil
+		}
+		return `{"keep": true, "reason": "ok"}`, nil
+	})
+	if v, _ := JudgePanel(ctx, []llm.Client{twoReject}, c, PanelMajority); v.Keep || v.KeepN != 1 {
+		t.Errorf("1/3 should reject at majority: keep=%v keepN=%d", v.Keep, v.KeepN)
+	}
+
+	// One lens errors -> fail open (counts as keep), panel still returns no error.
+	oneErr := llm.Func(func(ctx context.Context, system, user string) (string, error) {
+		if strings.Contains(system, "durability") {
+			return "", fmt.Errorf("llm down")
+		}
+		return `{"keep": true, "reason": "ok"}`, nil
+	})
+	if v, err := JudgePanel(ctx, []llm.Client{oneErr}, c, PanelUnanimous); err != nil || !v.Keep {
+		t.Errorf("one lens error must fail open and keep at unanimity: keep=%v err=%v", v.Keep, err)
+	}
+
+	// Every lens errors -> the panel errors (the caller then queues for human review).
+	allErr := llm.Func(func(ctx context.Context, system, user string) (string, error) {
+		return "", fmt.Errorf("llm down")
+	})
+	if _, err := JudgePanel(ctx, []llm.Client{allErr}, c, PanelMajority); err == nil {
+		t.Error("all lenses erroring should return an error")
+	}
+}
 
 func writeTranscript(t *testing.T, lines ...string) string {
 	t.Helper()
