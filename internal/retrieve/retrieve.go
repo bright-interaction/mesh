@@ -659,9 +659,25 @@ func scopeAllowed(cardScope string, allowed map[string]bool) bool {
 // and never decay; only loose notes + status pages do.
 var freshnessTypes = map[string]bool{"note": true, "status": true, "": true}
 
-// freshnessMult returns a [floor,1] multiplier from a note's age. Institutional
+// freshnessMult returns a (floor,1] multiplier from a note's age. Institutional
 // types return 1 (no decay). An overdue review_by applies a small extra penalty.
-// 0.5^(age/halfLife), floored at 0.6 so an old note is demoted, never buried.
+//
+// The curve is floor + (1-floor)*0.5^(age/halfLife): it DECAYS ASYMPTOTICALLY
+// TOWARD the floor instead of being clipped at it.
+//
+// That distinction is the whole point. The old form was
+// `mult = 0.5^(age/halfLife); if mult < 0.6 { mult = 0.6 }`, a hard clamp, and
+// 0.5^(age/30) crosses 0.6 at just 22 days. So EVERY note older than ~22 days
+// received the identical 0.6 multiplier and freshness stopped discriminating
+// entirely: a 24-day-old note and an 11-year-old note ranked the same, ties
+// never broke, and the alphabetical NodeID fallback decided the order. The
+// signal was dead for essentially the whole corpus, which is exactly the corpus
+// it exists to rank.
+//
+// Asymptotic decay keeps the same guarantee (an old note is demoted at most
+// 40%, never buried) while staying strictly monotonic in age forever, so
+// freshness always breaks a tie in favour of the fresher note.
+const freshnessFloor = 0.6
 func (r *Retriever) freshnessMult(c Card) float64 {
 	r.freshOnce.Do(func() {
 		if d, err := r.store.NoteDates(); err == nil {
@@ -678,10 +694,11 @@ func (r *Retriever) freshnessMult(c Card) float64 {
 		if t, err := time.Parse("2006-01-02", d.Updated); err == nil {
 			ageDays := now.Sub(t).Hours() / 24
 			if ageDays > 0 {
-				mult = math.Pow(0.5, ageDays/float64(r.freshHalfLife))
-				if mult < 0.6 {
-					mult = 0.6
-				}
+				// Asymptotic toward freshnessFloor, never clipped at it: stays
+				// strictly monotonic in age, so a fresher note always outranks a
+				// staler one on a tie, at any age.
+				decay := math.Pow(0.5, ageDays/float64(r.freshHalfLife))
+				mult = freshnessFloor + (1-freshnessFloor)*decay
 			}
 		}
 	}
