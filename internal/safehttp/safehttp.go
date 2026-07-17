@@ -66,6 +66,16 @@ func newClient(timeout time.Duration, allowPrivate bool) *http.Client {
 			if len(via) >= 3 {
 				return fmt.Errorf("stopped after 3 redirects")
 			}
+			// Go strips Authorization/Cookie on a cross-host redirect but NOT custom auth
+			// headers. Backends here send credentials in custom headers (x-api-key for
+			// Anthropic, X-Flare-Key for ingest), so on a redirect to a different host those
+			// would be replayed to the target and leak the key. Strip them when the host
+			// changes; a same-host redirect keeps them so a normal 30x still authenticates.
+			if len(via) > 0 && req.URL.Host != via[len(via)-1].URL.Host {
+				for _, h := range []string{"X-Api-Key", "Anthropic-Version", "X-Flare-Key", "X-Api-Token"} {
+					req.Header.Del(h)
+				}
+			}
 			return nil // the redirect target is re-dialed through the guard, so it is re-checked
 		},
 	}

@@ -98,6 +98,12 @@ func (s *Server) toolSecretStatus(_ context.Context) (any, *rpcError) {
 // toolSecretList returns the NAMES + rotation metadata of the attached vault's secrets
 // (never a value). Read-only metadata, so it is not write-gated.
 func (s *Server) toolSecretList(ctx context.Context, _ json.RawMessage) (any, *rpcError) {
+	// Enumerating the vault inventory (names/providers of brokerable secrets) is a
+	// privileged action: a read-only hosted viewer must not see it. Gate it the same way
+	// as mesh_secret_use. Unset capability (local solo binary) owns the vault.
+	if can, set := writeAllowed(ctx); set && !can {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
+	}
 	c, ok := s.secretBridge()
 	if !ok {
 		return notConfigured(), nil

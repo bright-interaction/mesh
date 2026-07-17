@@ -287,7 +287,7 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	case "mesh_secret_use":
 		return s.toolSecretUse(ctx, p.Arguments)
 	case "mesh_setup_hooks":
-		return s.toolSetupHooks(p.Arguments)
+		return s.toolSetupHooks(ctx, p.Arguments)
 	default:
 		return nil, &rpcError{Code: codeMethodNotFound, Message: "unknown tool", Data: p.Name}
 	}
@@ -408,7 +408,15 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 // toolSetupHooks drives the session-hook onboarding: status returns the pitch +
 // questions for the agent to run the conversation; install/uninstall apply it. The
 // hooks make the agent read the mesh at session start and write back at the end.
-func (s *Server) toolSetupHooks(raw json.RawMessage) (any, *rpcError) {
+func (s *Server) toolSetupHooks(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
+	// This tool writes .claude/settings.json under a caller-supplied project_dir on the
+	// SERVER host. It only makes sense for the local solo binary configuring its own
+	// agent; over a hosted hub it would let any authenticated member (a read-only viewer
+	// included) drive a server-side filesystem write at an arbitrary path. A set write
+	// capability means we are on the hosted hub, so refuse it there entirely.
+	if _, set := writeAllowed(ctx); set {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "mesh_setup_hooks is only available on a local mesh install, not the hosted hub"}
+	}
 	var a struct {
 		Action     string `json:"action"`
 		ProjectDir string `json:"project_dir"`

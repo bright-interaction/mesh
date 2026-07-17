@@ -60,8 +60,14 @@ func installLogShipperOnce(service string) {
 		endpoint: base,
 		key:      key,
 		service:  service,
-		ch:       make(chan nativeLogLine, logShipBuffer),
-		client:   &http.Client{Timeout: 5 * time.Second},
+		ch: make(chan nativeLogLine, logShipBuffer),
+		// Refuse redirects: this client sends the ingest key in the X-Flare-Key header, and
+		// Go would replay that custom header to a 3xx target on a different host. A redirect
+		// surfaces as a non-2xx (the batch is dropped) instead of leaking the key.
+		client: &http.Client{
+			Timeout:       5 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 	}
 	go sh.run()
 	// slog.SetDefault re-routes the standard log package through the new default

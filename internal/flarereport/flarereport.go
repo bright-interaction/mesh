@@ -10,6 +10,7 @@ package flarereport
 
 import (
 	"log/slog"
+	"strings"
 	"net/http"
 	"os"
 	"time"
@@ -21,6 +22,24 @@ import (
 // protocol) when FLARE_DSN is set in the environment. The DSN is injected by
 // the Hephaestus flare-provision deploy step; without it this is a no-op so
 // dev runs and self-hosts boot unchanged.
+// scrubEvent strips request context that must not reach the shared Flare store: the query
+// string (invite/join tokens), cookies (session), and auth headers (bearer/x-api-key).
+func scrubEvent(event *sentry.Event) *sentry.Event {
+	if event != nil && event.Request != nil {
+		event.Request.QueryString = ""
+		event.Request.Cookies = ""
+		if event.Request.Headers != nil {
+			for _, h := range []string{"Authorization", "Cookie", "X-Api-Key", "X-Api-Token", "X-Flare-Key"} {
+				delete(event.Request.Headers, h)
+			}
+		}
+		if i := strings.IndexByte(event.Request.URL, '?'); i >= 0 {
+			event.Request.URL = event.Request.URL[:i]
+		}
+	}
+	return event
+}
+
 func InitFlare(service, release string) bool {
 	dsn := os.Getenv("FLARE_DSN")
 	if dsn == "" {
@@ -30,6 +49,13 @@ func InitFlare(service, release string) bool {
 		Dsn:        dsn,
 		Release:    release,
 		ServerName: service,
+		// Scrub request context before it egresses to the shared Flare store: query
+		// strings can carry tokens (e.g. an invite/join token), cookies carry the session,
+		// and headers carry bearer/x-api-key creds. BeforeSend covers error/message events;
+		// BeforeSendTransaction covers trace envelopes (registered too so a future
+		// EnableTracing cannot silently bypass the scrub).
+		BeforeSend:            func(e *sentry.Event, _ *sentry.EventHint) *sentry.Event { return scrubEvent(e) },
+		BeforeSendTransaction: func(e *sentry.Event, _ *sentry.EventHint) *sentry.Event { return scrubEvent(e) },
 	})
 	if err != nil {
 		slog.Warn("flare: error reporting disabled (sentry init failed)", "error", err)
