@@ -55,12 +55,19 @@ Write-back:
 - `mesh_write_entity` create a system / tool / concept page.
 - `mesh_reindex` re-read the vault now (after editing files directly).
 
-Secrets (only when a Dockyard vault is attached, see "Secret vault"):
+Secrets. These three need an attached **secret bridge**: an external secret manager
+that speaks Mesh's small capability-mode HTTP contract. (Dockyard, the authors'
+self-hosted server platform, is one such implementation; anything that implements the
+contract works.) Mesh stores no credentials of its own. You point it at the bridge with
+`MESH_SECRET_BRIDGE_URL` (plus `MESH_SECRET_BRIDGE_KEY`) and it brokers access, so an
+agent can *use* a credential without ever being handed the value. With no bridge
+configured the tools are still listed, and each one answers `configured: false` instead
+of failing.
 
-- `mesh_secret_status` is a vault attached, and how to use it.
+- `mesh_secret_status` is a bridge attached, and how to use it.
 - `mesh_secret_list` the stored credentials (names + rotation status only, never values).
 - `mesh_secret_use` get a short-lived, single-use capability token for a destination and
-  call it through the vault's proxy. The real key is injected server-side; you never see it.
+  call it through the bridge's proxy. The real key is injected server-side; you never see it.
 
 Onboarding:
 

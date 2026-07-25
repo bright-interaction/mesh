@@ -1,9 +1,11 @@
 # Efficiency vs classic RAG
 
 How Mesh compares to the standard RAG pattern an agent would otherwise use:
-retrieve the top-k passages and stuff them into the prompt. Last measured on the
-real 539-note Corpus vault on 2026-07-02 with Mesh's built-in harness
-(`mesh eval`); the ratio moves as the corpus grows, so re-run to refresh.
+retrieve the top-k passages and stuff them into the prompt. Measured on 2026-07-02
+with Mesh's built-in harness (`mesh eval`), against a **private production vault**
+that does not ship with Mesh, so these exact figures are not reproducible as-is.
+The ratio is corpus-dependent and grows with vault size, so re-run `mesh eval` on
+your own labelled queries for a number that means something to you.
 
 ## The headline
 
@@ -42,6 +44,10 @@ bolt-on cross-encoder and costs nothing extra.
 The win is against the realistic top-k RAG, not against a blind "open one
 file" read (that is cheaper, but it guesses, and misses paraphrase). On keyword
 queries the blind-top-1 metric is a tie; that metric models a pipeline that
-trusts position 1 without reading the cards, which is not a capable agent. The
-full methodology, raw numbers, and how to reproduce every row live in
-`docs/BENCHMARK.md` in the repo.
+trusts position 1 without reading the cards, which is not a capable agent. And on
+a very small vault the ratio inverts: the ranked cards cost more than reading the
+two or three notes that matched, so the win only shows up once the corpus is big
+enough for the card overhead to be amortized.
+
+The full methodology, the raw numbers, and how to run the harness on your own
+vault live in `docs/BENCHMARK.md` in the repository.

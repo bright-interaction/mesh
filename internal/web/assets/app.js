@@ -52,11 +52,11 @@
   // colors and clean labels. This is a VIEW only: retrieval + the community graph are
   // untouched. A note's domain = the domain its tags vote for most (ties: first listed).
   const DOMAIN_DEFS = [
-    { label: "Engineering", color: "#6ea8ff", tags: ["mesh","crm","sitebuilder","consent","flow","ledger","site-inspector","svar","frontend","backend","sqlc","mcp","webgl","workflow"] },
-    { label: "Infra / DevOps", color: "#54c489", tags: ["dockyard","ci","deploy","self-hosted","docker","tailscale","infra","dns","proxy","monitoring","paas","zitadel"] },
-    { label: "Marketing / SEO", color: "#f0a93b", tags: ["marketing","seo","cro","content","social","geo","aeo","growth","newsletter","copywriting","hormozi"] },
-    { label: "Sales / Outreach", color: "#e8629a", tags: ["sales","outreach","leads","prospecting","law","advokat","crm"] },
-    { label: "Security / Compliance", color: "#e0524e", tags: ["security","gdpr","audit","compliance","owasp","pii","encryption","secrets","vault","keyvault"] },
+    { label: "Engineering", color: "#6ea8ff", tags: ["mesh","frontend","backend","api","database","sql","sqlc","mcp","webgl","workflow","testing","refactor","go","typescript"] },
+    { label: "Infra / DevOps", color: "#54c489", tags: ["deploy","self-hosted","docker","kubernetes","tailscale","infra","dns","proxy","monitoring","ci","backup","networking"] },
+    { label: "Marketing / SEO", color: "#f0a93b", tags: ["marketing","seo","cro","content","social","geo","aeo","growth","newsletter","copywriting"] },
+    { label: "Sales / Outreach", color: "#e8629a", tags: ["sales","outreach","leads","prospecting","legal","crm"] },
+    { label: "Security / Compliance", color: "#e0524e", tags: ["security","gdpr","audit","compliance","owasp","pii","encryption","secrets","vault"] },
     { label: "Design", color: "#38c5d0", tags: ["design","branding","typography","visual","taste","css","font"] },
     { label: "Knowledge / Learning", color: "#b08cf0", tags: ["claude-skill","learning","networking","fundamentals","reference","concept","skill","basics","guide","patterns"] },
     { label: "General", color: "#8a8f9a", tags: [] },
@@ -68,8 +68,8 @@
   let grouping = "community"; // "community" (emergent link clusters) | "domain" (topic)
 
   function domainIndexFor(n) {
-    // vote from tags + tokens of the id/title (so untagged notes that name their
-    // project, e.g. "ci-log", still classify).
+    // vote from tags + tokens of the id/title (so an untagged note whose id names its
+    // topic, e.g. "deploy-log", still classifies).
     const idt = ((n.id || "") + " " + (n.label || "")).toLowerCase().split(/[^a-z0-9]+/);
     const toks = (n.tags || []).map((t) => String(t).toLowerCase()).concat(idt);
     const score = {};

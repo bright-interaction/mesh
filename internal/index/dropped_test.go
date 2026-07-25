@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 // Copyright (C) 2026 Bright Interaction AB
 
 package index
@@ -20,7 +20,7 @@ func TestReindexRecordsDroppedUnparseableNotes(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A colon-space in an unquoted value is invalid YAML: the documented cause that
-	// silently dropped real notes for weeks (flow, dockyard-secrets-bridge, ...).
+	// silently dropped real notes for weeks before this guard existed.
 	broken := "---\nid: broken-note\ntype: gotcha\nupdated: 2026-06-18 (post-mortem: root cause)\n---\n# A broken note\nbody\n"
 	if err := os.WriteFile(filepath.Join(dir, "broken.md"), []byte(broken), 0o644); err != nil {
 		t.Fatal(err)

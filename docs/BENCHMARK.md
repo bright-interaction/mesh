@@ -1,15 +1,55 @@
 # Mesh vs classic RAG: efficiency benchmark
 
-Last measured on the real Corpus vault (539 notes, ~10,900 links) on 2026-07-02,
-with Mesh's built-in Gate-1 harness (`mesh eval`). The ratio is vault-dependent
-(it moves as the corpus grows), so treat the numbers below as the current
-measurement, not a fixed constant, and re-run to refresh:
+## About these numbers, read this first
+
+The headline numbers below were measured on 2026-07-02 against a **private
+production vault** and a labelled query set built for it. Neither the vault nor
+the query set ships with this repository, so **you cannot reproduce these exact
+figures**, and you should not treat them as a benchmark you can audit. They are
+the authors reporting what they measured on their own corpus, with the method
+described in full below so you can judge whether it is a fair test and repeat it
+on yours.
+
+The ratio is also vault-dependent: it grows with the corpus, because the fixed
+card overhead is amortized over more candidates. On a tiny vault it goes the
+other way and Mesh costs *more* than a naive read (see "Run it yourself").
+
+## Run it yourself
+
+`mesh eval` is the harness that produced every number here, and it is in the
+binary you already have. It takes a labelled query set, a JSON array of
+`{"query": ..., "relevant": [note-id, ...]}`, and reports Mesh against the two
+full-text baselines on the same tokenizer.
+
+From a clone of this repository, against the sample vault in `vault/`:
 
 ```
-mesh eval eval/corpus-heldout.json --vault ~/Desktop/Corpus            # keyword queries
-mesh eval eval/corpus-semantic.json --vault ~/Desktop/Corpus           # paraphrase queries
-mesh eval eval/corpus-heldout.json --vault ~/Desktop/Corpus --budget 1200
+mesh index ./vault
+mesh eval eval/tier0.json --vault ./vault
 ```
+
+```
+Gate 1: Mesh vs FTS baselines  (vault: ./vault, 6 cases, budget 0, tokenizer: estimate)
+  surfacing recall @K=20:   mesh 6/6   fts 6/6
+  answer@1 (one body read): mesh 6/6   fts-top1 6/6
+  tokens median:  mesh 1224   fts-top1 202 (matched)   fts-top3 822 (naive)
+  tokens mean:    mesh 1147   fts-top1 200             fts-top3 752
+  sub-claims: surfacing>=fts PASS | answer@1>=fts-top1 PASS | cheaper-than-naive-top3 FAIL
+  VERDICT: PARTIAL (see sub-claims; matched fts-top1 cost shows the card overhead honestly)
+Error: gate 1 not fully met
+```
+
+That is the honest small-vault result, and it is worth understanding before you
+read the table further down. `vault/` holds 14 notes. Every query has a trivially
+small candidate set, so the ranked cards cost more than simply reading the three
+matching notes, and the token sub-claim fails (the command exits non-zero for
+that reason). The card overhead is close to fixed, while the cost of the naive
+"read the top 3 bodies" arm grows with note size and corpus size, which is why
+the ratio flips and then widens on a real vault.
+
+To measure your own corpus, write 20 or so queries you actually ask, label the
+note ids that answer them, and run `mesh eval your-cases.json --vault /your/vault`
+with and without `--budget`.
 
 ## TL;DR
 
@@ -17,6 +57,8 @@ Against the standard RAG pattern an agent would otherwise use, retrieve the
 top-k passages and stuff them into the prompt, **Mesh answers the same question
 for about half the tokens, with equal-or-better recall, and with none of the
 embedding-model / vector-DB / re-embedding machinery.**
+
+On the private corpus described above:
 
 - **~1.9x fewer tokens** on keyword queries (3,683 vs 6,849 median), and
   **~2.5x** under a 1,200-token budget (2,719 vs 6,849).
@@ -43,7 +85,7 @@ All three arms count tokens with the *same* tokenizer, so the ratios are sound.
 "Classic embedding RAG" maps onto the naive top-k arm on token cost (it also
 stuffs k passages per query) and adds an embedding model + vector store on top.
 
-## Results (median tokens per query, real Corpus, 2026-07-02)
+## Results (median tokens per query, private corpus, 2026-07-02)
 
 | Query set | naive top-k RAG | Mesh (unbudgeted) | Mesh (budget 1200) | Mesh saving vs top-k |
 |-----------|----------------:|------------------:|-------------------:|---------------------:|

@@ -15,7 +15,7 @@ open it.
 On the command line:
 
 ```
-mesh ask "how do we deploy the hub?"
+mesh ask "why did we pick SQLite over Postgres?"
 ```
 
 ## Grounded, not guessing
