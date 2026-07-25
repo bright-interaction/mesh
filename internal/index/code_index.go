@@ -19,7 +19,7 @@ import (
 )
 
 // This file is the source-code index: the persistence + retrieval half of the
-// codeindex replacement. It is deliberately separate from the note index (own
+// It is deliberately separate from the note index (own
 // tables, own FTS, own search) so locating a function never disturbs note
 // retrieval, its ranking, or the tier-0 budget. The note graph and the code graph
 // share only the SQLite file and the FTS5 tokenizer.
@@ -27,7 +27,7 @@ import (
 // codeEdgeFanoutCap drops a callee name that resolves to more than this many
 // symbols: a call to a name like "Error", "String", or "New" matches dozens of
 // unrelated definitions and would bury the real call graph in noise. This is the
-// same heuristic codeindex uses to keep its extracted edges meaningful.
+// same heuristic that keeps extracted edges meaningful.
 const codeEdgeFanoutCap = 25
 
 // CodeStats reports what a code reindex wrote, for the CLI and orient output.
@@ -146,7 +146,7 @@ func insertCodeFiles(tx *sql.Tx, files []*code.CodeFile, stats *CodeStats) error
 // rebuildCodeEdges recomputes the entire call graph from code_symbols. It is pure
 // SQL + in-memory resolution (no file I/O), so it is cheap to run on every reindex
 // and keeps edges globally consistent: a callee name resolves to every same-named
-// symbol (codeindex-style fuzziness), capped by codeEdgeFanoutCap. Storing each
+// symbol (deliberate fuzziness), capped by codeEdgeFanoutCap. Storing each
 // symbol's call list in the symbols table is what lets this run without re-parsing.
 func rebuildCodeEdges(tx *sql.Tx) error {
 	if _, err := tx.Exec(`DELETE FROM code_edges`); err != nil {
@@ -353,7 +353,7 @@ func retrievalHashCode(cf *code.CodeFile) string {
 // "DeployHandler" -> "deployhandler deploy handler" and "Server.HTTPGet" ->
 // "server.httpget server http get". This is what lets a natural-language
 // "deploy handler" query match the real symbol instead of only underscore-split
-// test names, matching codeindex's identifier splitting.
+// test names, matching the index identifier splitting.
 func splitIdent(name string) string {
 	words := []string{name}
 	for _, seg := range strings.FieldsFunc(name, func(r rune) bool {
@@ -422,7 +422,7 @@ func unqualify(name string) string {
 // symbol rows so edges stay globally consistent without re-parsing. An empty
 // index falls back to the full path. Returned symbol paths are prefixed with
 // the root's basename (e.g. "automations/dockyard/...") so several repos
-// coexist and the path reads like codeindex's src= locator.
+// coexist and the path reads like a src= locator.
 func ReindexCode(s *Store, roots []string, langs map[string]bool) (CodeStats, error) {
 	return reindexCode(s, roots, langs, false)
 }

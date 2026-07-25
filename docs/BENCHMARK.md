@@ -116,7 +116,7 @@ Recall and answer quality (does the right note surface / get read):
   breaks, because of graph proximity (and optional BYOAI vectors).
 - The harness reported `tokenizer: estimate` (the BPE codec fell back to the
   char heuristic on this run); since every arm uses the same counter, the
-  ~3x ratio holds regardless. Absolute counts are approximate.
+  ~1.9x ratio holds regardless. Absolute counts are approximate.
 
 ## The efficiency that does not show up per query
 

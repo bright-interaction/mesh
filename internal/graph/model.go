@@ -9,7 +9,7 @@ package graph
 
 import "sync"
 
-// Edge confidence levels (from the dockyard/codeindex extraction model).
+// Edge confidence levels (from a graph extraction model).
 const (
 	ConfExtracted = "EXTRACTED"
 	ConfInferred  = "INFERRED"

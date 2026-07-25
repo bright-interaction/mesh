@@ -6,7 +6,7 @@ when: "2026-06-16"
 created: "2026-06-16"
 related:
     - cross-encoder-rerank-is-the-answer-1-lever-that-chunking-was-not
-    - per-section-embeddings-do-not-beat-whole-note-on-the-corpus-corpus
+    - per-section-embeddings-do-not-beat-whole-note
 tags:
     - mesh
     - retrieval
@@ -34,4 +34,3 @@ status: accepted
 ## Related
 <!-- linked notes from the related: field render in the graph -->
 
-<!-- authored by claude+tom -->

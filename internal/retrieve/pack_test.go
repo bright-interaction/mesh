@@ -52,7 +52,7 @@ func TestCardTokensCountsTheSerializedCard(t *testing.T) {
 		name string
 		card Card
 	}{
-		{name: "full corpus-shaped card", card: productionShapedCards(1)[0]},
+		{name: "full production-shaped card", card: productionShapedCards(1)[0]},
 		{name: "compact card with no snippet", card: func() Card {
 			c := productionShapedCards(1)[0]
 			c.Snippet = ""

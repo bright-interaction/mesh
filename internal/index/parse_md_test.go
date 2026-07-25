@@ -15,10 +15,10 @@ const sample = "---\n" +
 	"title: Mesh\n" +
 	"when: 2026-06-15\n" +
 	"tags: [knowledge, go]\n" +
-	"related: [codeindex, dockyard]\n" +
+	"related: [codeindex, platform]\n" +
 	"---\n" +
 	"# Mesh\n" +
-	"Mesh links to [[codeindex]] and [[dockyard|the platform]].\n" +
+	"Mesh links to [[codeindex]] and [[platform|the platform]].\n" +
 	"It is tagged #sovereign here.\n" +
 	"## Sync\n" +
 	"```\n" +
@@ -46,7 +46,7 @@ func TestParseExtractsStructure(t *testing.T) {
 		t.Fatalf("headings: %+v", pn.Headings)
 	}
 
-	wantLinks := map[string]bool{"codeindex": true, "dockyard": true, "missing-note": true}
+	wantLinks := map[string]bool{"codeindex": true, "platform": true, "missing-note": true}
 	for _, l := range pn.Links {
 		if !wantLinks[l.Target] {
 			t.Errorf("unexpected link target %q (code/inline should be skipped)", l.Target)
@@ -76,9 +76,9 @@ func TestParseExtractsStructure(t *testing.T) {
 func TestBuildGraphResolvesAndFlags(t *testing.T) {
 	mesh := parse(t, "mesh.md", sample)
 	codeindex := parse(t, "codeindex.md", "---\nid: codeindex\ntype: entity\nwhen: 2026-01-01\n---\n# Codeindex\n")
-	dockyard := parse(t, "dockyard.md", "---\nid: dockyard\ntype: entity\nwhen: 2026-01-01\n---\n# Dockyard\n")
+	platform := parse(t, "platform.md", "---\nid: platform\ntype: entity\nwhen: 2026-01-01\n---\n# Platform\n")
 
-	g, issues := BuildGraph([]*ParsedNote{mesh, codeindex, dockyard})
+	g, issues := BuildGraph([]*ParsedNote{mesh, codeindex, platform})
 
 	if _, ok := g.Node("note:mesh"); !ok {
 		t.Fatal("expected note:mesh node")
@@ -86,8 +86,8 @@ func TestBuildGraphResolvesAndFlags(t *testing.T) {
 	if !hasEdge(g.Neighbors("note:mesh"), "note:codeindex", "references") {
 		t.Error("expected mesh -> codeindex reference edge")
 	}
-	if !hasEdge(g.Neighbors("note:mesh"), "note:dockyard", "references") {
-		t.Error("expected mesh -> dockyard reference edge (from related + body)")
+	if !hasEdge(g.Neighbors("note:mesh"), "note:platform", "references") {
+		t.Error("expected mesh -> platform reference edge (from related + body)")
 	}
 	if !hasEdge(g.Neighbors("note:mesh"), "tag:sovereign", "tagged") {
 		t.Error("expected mesh -> sovereign tagged edge")

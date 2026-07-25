@@ -45,7 +45,7 @@ func Lang(ext string) string {
 // note vault never contains but a code root always does.
 var codeSkipDirs = map[string]bool{
 	".git": true, ".mesh": true, "node_modules": true, "vendor": true,
-	"codeindex-out": true, "_archive": true, "dist": true, "build": true,
+	"_archive": true, "dist": true, "build": true,
 	"out": true, ".next": true, ".svelte-kit": true, ".turbo": true,
 	".cache": true, "__pycache__": true, ".venv": true, "venv": true,
 	"target": true, "coverage": true, ".astro": true,
