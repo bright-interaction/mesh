@@ -8,10 +8,11 @@ doc is the source of truth for what lives where and how the public mirror is pro
 The split is a pure package boundary: **nothing in the open core imports the pro
 packages**, so the core builds and ships on its own. This is enforced, not assumed:
 `scripts/check-open-core-boundary.sh` walks the open build's import graph (`go list
--deps`) and fails if any open package imports a pro package. It runs as a pre-flight
-gate in `split-public-repo.sh` and in the repo pre-commit hook, so the boundary
-cannot silently rot (it did once, 2026-06-30: the flywheel features pulled in
-`internal/llm` and `mesh ui --hub-db` pulled in `internal/hub`; see the fix below).
+-deps`) and fails if any open package imports a pro package. Run it yourself, and CI
+runs it on every push and pull request, as does the release pipeline before it mirrors
+anything, so the boundary cannot silently rot (it did once, 2026-06-30: the flywheel
+features pulled in `internal/llm` and `mesh ui --hub-db` pulled in `internal/hub`; see
+the fix below).
 
 ### Open core (public repo, Mesh Sustainable Use License)
 
@@ -26,6 +27,11 @@ The whole single-user + hub-client experience:
 - `internal/secretbridge`: a thin stdlib HTTP client for an ATTACHED Dockyard capability-mode vault (open because it holds no crypto/vault/rotation of its own - all of that stays in Dockyard). It lets Mesh broker secrets for an agent (names + capability tokens only, never a plaintext value). Kept open so OSS users who run their own Dockyard get the feature.
 - `internal/web`, `internal/tui`, `internal/sshserve`: the 2D/3D viewers, the terminal UI, and the SSH viewer (`mesh serve-ssh`: the TUI over SSH, key-auth, fail-closed).
 - `internal/merge`, `internal/syncproto`, `pkg/meshclient`: the sync **client** and wire protocol, so the open core can join a hub.
+- `internal/watch`: the live index (`mesh watch`), so an edit in your editor is searchable at once, with no commit and no manual `mesh index`.
+- `internal/ingest`: the sovereign importers (`mesh ingest`, GitHub/Slack/Linear/Jira/Notion) that turn what a team already wrote into notes in **their** vault.
+- `internal/hooks`: installs the Claude Code session hooks (`mesh hooks install`) that make an agent read the mesh at session start and write back before it finishes.
+- `internal/safehttp`: the SSRF-guarded HTTP clients every outbound path shares (the ingest connectors and the BYOAI embedding / rerank / chat endpoints).
+- `internal/buildinfo`: the running version and the source-availability link rendered by every network-served surface.
 - `internal/meshcfg`, `internal/eval`, `internal/textdiff`: config, eval harness, diff.
 
 ### Pro layer (private, commercial, NOT published)
@@ -39,50 +45,76 @@ The collaboration server and the AI layer, the monetized value:
 - `cmd/mesh/conflicts_test.go` and the `pkg/meshclient` hub-harness tests (`e2e_test.go`, `events_test.go`, `tombstone_test.go`): integration tests that stand up a real hub to exercise the open sync client and conflicts command, so they need the pro hub and are stripped with it. The meshclient set strips together because `e2e_test.go` defines the `setupHub` helper the other two reuse. The production code they cover ships open; the private monorepo runs the full suite. (`pkg/meshclient/vault_test.go` is hub-free and stays in the mirror.)
 - Future: cross-vault federation, team-scale collaboration analytics, pro graph functions. These belong here, behind the service/license, not as a flag in the open binary.
 
-Authoritative exclude set for the public mirror (keep in sync with `split-public-repo.sh` `PRO_PATHS` and `check-open-core-boundary.sh`):
+Authoritative exclude set: every path below is removed from the public mirror's entire
+history. It is kept in sync with the release script's strip list and with
+`check-open-core-boundary.sh`.
 
 ```
+# pro code
 internal/hub  cmd/mesh-hub  internal/curator  cmd/mesh-curator
 internal/hnsw  internal/retrieve/retrieve_ann_pro.go  internal/retrieve/retrieve_ann_pro_test.go
 cmd/mesh/ui_hubteam_pro.go
+internal/flarereport
+
+# tests that need a running pro hub
 cmd/mesh/conflicts_test.go
 pkg/meshclient/e2e_test.go  pkg/meshclient/events_test.go  pkg/meshclient/tombstone_test.go
+
+# files that build or run the pro hub
 docker-compose.yml  deploy/Dockerfile.hub  deploy/entrypoint.sh  deploy/hub-image.sh
+
+# internal-only docs
+docs/S1-PLAN.md  docs/S2-PLAN.md  docs/M3-PLAN.md  docs/SPEC.md  deploy/DEPLOY.md
+
+# the release tooling and its runbook (they only run from the private monorepo)
+scripts/split-public-repo.sh  scripts/lib/mirror-redaction.sh  scripts/test-release-gates.sh
+docs/RELEASING.md
+
+# retrieval-eval fixtures built from a private vault
+eval/corpus.json  eval/corpus-heldout.json  eval/corpus-semantic.json
 ```
 
-The four **deployment** files at the end are new (2026-07-25 audit). They build and run
-`./cmd/mesh-hub`, which the mirror strips, so publishing them meant `docker build .` on
-the public repo failed at the first RUN, and they disclosed the private deployment shape
-(the `web-proxy` network, `/opt/mesh/.env`, the invite runbook) that
-`deploy/DEPLOY.md` was already stripped to keep private. The root `Dockerfile` is the
-PUBLIC open-core image and stays in the mirror: it builds only `./cmd/mesh` and must
-never name a stripped path, which `split-public-repo.sh` gates on.
+The **deployment** files build and run `./cmd/mesh-hub`, which the mirror does not
+contain, and they describe a private deployment, so they stay out. The root `Dockerfile`
+is the PUBLIC open-core image and stays in the mirror: it builds only `./cmd/mesh` and
+must never name a stripped path, which a publish gate enforces.
 
-`internal/llm` is NOT excluded - it is open core (see the open-core list above).
+`internal/flarereport` is the pro binaries' error-reporting shim. Nothing in the open
+core imports it, and it is licensed commercially, so it goes with the pro layer.
 
-The split script also strips a few **internal-only docs** (not code): the milestone
-working-plans (`docs/S1-PLAN.md`, `docs/S2-PLAN.md`, `docs/M3-PLAN.md`), the deployment
-runbook (`deploy/DEPLOY.md`), and the full internal spec (`docs/SPEC.md`, which cross-
-references other Bright Interaction projects). They describe Bright Interaction's own
-infrastructure and monorepo rather than the project, so they stay private; the public
-architecture story lives in `README.md` and the in-app docs (`internal/web/docs`).
+The **internal-only docs** (milestone working-plans, the deployment runbook, the full
+internal spec) describe Bright Interaction's own infrastructure and the monorepo the
+code is developed in, rather than the project itself. The public architecture story is
+`README.md` and the in-app docs (`internal/web/docs`).
+
+The **eval fixtures** are query/answer sets written against a private vault, so each
+case names an internal system. `eval/tier0.json` and `eval/extract_judge_cases.json` are
+generic and ship.
+
+`internal/llm` is NOT excluded, it is open core (see the open-core list above).
 
 The pro binaries build with `-tags pro` (wires HNSW + the hub team-mode impl); the open mirror builds with the default tags (brute-force only, team mode stubbed out).
 
 ## How the public mirror is produced
 
-The private monorepo (`automations/mesh`, this tree) is the source of truth and the
-build source for the hosted SaaS + licensed binaries. The public fair-code repo is a
-history-filtered mirror of the core:
+The monorepo is the source of truth and the build source for the hosted service and the
+licensed binaries. The public fair-code repo is a history-filtered mirror of the core,
+produced by a release script that lives in the monorepo and is not part of this
+repository:
 
-1. `scripts/split-public-repo.sh` runs `git subtree split --prefix=mesh`, then
-   `git filter-repo --invert-paths` to strip the pro paths from **all** history (so
-   pro code never appears in the fair-code repo, not even in old commits).
-2. It build-checks the filtered tree (`go build ./...`) to prove the core compiles
-   without the pro layer.
-3. Dry-run by default; `--push` mirrors to `github.com/bright-interaction/mesh`.
+1. `git subtree split --prefix=mesh` lifts the `mesh/` subtree with its history, then
+   `git filter-repo --invert-paths` strips every excluded path from **all** of it, so
+   pro code never appears in the fair-code repo, not even in old commits.
+2. Publish gates then refuse the push if anything slipped: a surviving excluded path, a
+   build file pointing at one, internal vocabulary in a commit message or in the content
+   of any tracked file, a secret anywhere in the history, or a core that does not build
+   and test-compile on its own.
+3. Dry-run by default; publishing is an explicit, deliberate operator action.
 
-See `docs/RELEASING.md` for the operator steps (repo creation, tag).
+One consequence for contributors: commits from before 2026-06-30 (when the boundary was
+fixed) were written against packages that are now stripped, so an old commit checked out
+from this mirror can fail to build. `git bisect` over recent history is fine; going back
+past that point is not.
 
 ## Revenue model
 

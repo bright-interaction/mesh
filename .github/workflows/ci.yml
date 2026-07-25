@@ -1,10 +1,7 @@
-# CI for the public fair-code open core (github.com/bright-interaction/mesh). This lives at
-# mesh/.github/workflows in the private monorepo; split-public-repo.sh places it at the
-# repo root of the public mirror, where GitHub Actions runs it. It does NOT run in the
-# monorepo (Actions only reads .github/workflows at a repo's root, and there mesh/ is a
-# subdir). Build + vet + test + the open-core boundary guard + a secret scan, so an
-# external contribution cannot merge if it breaks the build, references the pro layer,
-# or adds a credential.
+# CI for the public fair-code open core (github.com/bright-interaction/mesh). Build + vet
+# + test + the open-core boundary guard + license headers + a secret scan + govulncheck,
+# so a contribution cannot merge if it breaks the build, reaches into the commercial pro
+# layer, ships an unlicensed file, or adds a credential.
 name: ci
 
 on:
@@ -41,11 +38,23 @@ jobs:
       - name: Open-core boundary (no open package may import a pro package)
         run: bash scripts/check-open-core-boundary.sh
 
-      # The publish gates only fire during a rare manual mirror push, so they are the
-      # code most likely to rot unnoticed. This self-test is offline and side-effect free,
-      # and skips the cases whose files this mirror strips.
-      - name: Release gates self-test
-        run: bash scripts/test-release-gates.sh
+      # Every Go file in this repository is under the Mesh Sustainable Use License, and
+      # the header is how a reader (and a downstream packager) knows it. A file without
+      # it is either an unlicensed contribution or a file that belongs in the commercial
+      # repo instead, and both have happened. One awk pass per file, no network.
+      - name: License headers (SPDX on every Go file)
+        run: |
+          missing=$(git ls-files '*.go' | while read -r f; do
+            awk 'NR<=5 && /SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License/ { found=1; exit } END { exit !found }' "$f" \
+              || printf '%s\n' "$f"
+          done)
+          if [ -n "$missing" ]; then
+            echo "These Go files lack the SPDX header 'LicenseRef-Mesh-Sustainable-Use-License' in their first 5 lines:"
+            echo "$missing"
+            echo "Add it (see any file in internal/ for the exact two-line form), or the file does not belong here."
+            exit 1
+          fi
+          echo "every tracked Go file carries the open SPDX header"
 
       - name: Secret scan (gitleaks)
         run: |

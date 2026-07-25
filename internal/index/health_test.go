@@ -91,7 +91,7 @@ func TestHealthChangelogDeadRefExempt(t *testing.T) {
 	}
 
 	// Same dead reference (internal/foo/ghost.go is gone) in a changelog and a real note.
-	changelog := writeNote(t, dir, "entities/ci-log.md", "---\nid: ci-log\ntype: note\nwhen: 2026-01-01\n---\n# Changelog\n2026-05: retired internal/foo/ghost.go.\n")
+	changelog := writeNote(t, dir, "entities/service-log.md", "---\nid: service-log\ntype: note\nwhen: 2026-01-01\n---\n# Changelog\n2026-05: retired internal/foo/ghost.go.\n")
 	realNote := writeNote(t, dir, "gotchas/live.md", "---\nid: live-note\ntype: gotcha\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: z\n---\n# Live\nThe handler is at internal/foo/ghost.go.\n")
 	notes := []*ParsedNote{changelog, realNote}
 	g, _ := BuildGraph(notes)
@@ -116,7 +116,7 @@ func TestHealthChangelogDeadRefExempt(t *testing.T) {
 	for _, f := range findings {
 		got[f.NoteID] = f.Issue
 	}
-	if got["ci-log"] == "dead_ref" {
+	if got["service-log"] == "dead_ref" {
 		t.Error("a changelog's historical file reference must not be flagged as dead_ref")
 	}
 	if got["live-note"] != "dead_ref" {

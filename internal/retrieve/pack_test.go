@@ -29,13 +29,13 @@ func productionShapedCards(n int) []Card {
 	for i := range cards {
 		s := strconv.Itoa(i)
 		cards[i] = Card{
-			NodeID:  "note:project-deploy-ci-" + s,
-			NoteID:  "project-deploy-ci-" + s,
-			Title:   "Deploy system is CI, Forgejo retired " + s,
-			Path:    "projects/project_deploy_ci_" + s + ".md",
+			NodeID:  "note:project-deploy-pipeline-" + s,
+			NoteID:  "project-deploy-pipeline-" + s,
+			Title:   "Deploy system is the build pipeline, the old runner retired " + s,
+			Path:    "projects/project_deploy_pipeline_" + s + ".md",
 			Type:    "decision",
 			Scope:   "dev",
-			Snippet: strings.Repeat("post-receive on host is [CI] enqueueing builds ... ", 3),
+			Snippet: strings.Repeat("the post-receive hook enqueues a [build] on the server ... ", 3),
 			Score:   1.2345678901234567 / float64(i+1),
 			Tier0:   i%3 == 0,
 			Reason:  "fts +reranked",

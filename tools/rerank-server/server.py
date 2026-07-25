@@ -19,11 +19,12 @@ Contract:
        results sorted by relevance_score descending; index is the document's
        position in the request. GET /health -> {"status":"ok","model":...}.
 
-Setup (this machine's Homebrew Python has a broken libexpat, so use uv):
-    brew install uv
-    uv venv /tmp/mesh-rerank-venv --python 3.11
-    uv pip install --python /tmp/mesh-rerank-venv/bin/python fastembed
-    /tmp/mesh-rerank-venv/bin/python mesh/tools/rerank-server/server.py
+Setup (Python 3.11+, run from the repository root):
+    python3 -m venv .venv
+    .venv/bin/pip install fastembed
+    .venv/bin/python tools/rerank-server/server.py
+
+See tools/rerank-server/README.md for model options and the data-boundary notes.
 """
 import json
 import os

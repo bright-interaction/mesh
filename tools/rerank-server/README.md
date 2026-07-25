@@ -14,32 +14,38 @@ The fused retrieval (FTS + graph + vector cosine) is good at *surfacing* the
 right note in the candidate set (recall). It is weaker at putting it at rank 1
 on paraphrase queries, because a bi-encoder vector compares the query and a note
 independently. A cross-encoder reads the query and each candidate **together**,
-so it scores relevance directly. Measured on the Corpus vault, turning this on
-lifted paraphrase `answer@1` from 3/20 to 10/20 with no recall change.
+so it scores relevance directly. On the private corpus behind `docs/BENCHMARK.md`,
+turning this on lifted paraphrase `answer@1` from 3/20 to 10/20 with no recall
+change. Your corpus will differ, so measure with `mesh eval` before committing.
 
 It is a mechanical scoring transform, the same category as embeddings. Mesh
 still has no reasoning AI inside it.
 
 ## Setup
 
-This repo's machine has a broken Homebrew Python (libexpat symbol skew, the same
-one that forces `DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib` on codeindex), so
-use `uv`, which brings its own standalone CPython:
+Python 3.11 or newer (`onnxruntime` only publishes prebuilt arm64 wheels from
+3.11 up). A plain virtualenv is enough:
 
 ```bash
-brew install uv
-uv venv /tmp/mesh-rerank-venv --python 3.11
-uv pip install --python /tmp/mesh-rerank-venv/bin/python fastembed
+python3 -m venv .venv
+.venv/bin/pip install fastembed
 ```
 
-(On a machine with a healthy Python, a plain `python3 -m venv` + `pip install
-fastembed` works too. `onnxruntime` needs Python >= 3.11 for a prebuilt arm64
-wheel.)
+If your system Python is patched up in a way that breaks native extensions (a
+mismatched `libexpat` is the classic one on macOS Homebrew), `uv` sidesteps it by
+bringing its own standalone CPython:
+
+```bash
+uv venv .venv --python 3.11
+uv pip install --python .venv/bin/python fastembed
+```
 
 ## Run
 
+From the repository root:
+
 ```bash
-/tmp/mesh-rerank-venv/bin/python mesh/tools/rerank-server/server.py
+.venv/bin/python tools/rerank-server/server.py
 # [rerank] listening on http://127.0.0.1:8787  (POST /rerank)
 ```
 
@@ -51,8 +57,8 @@ Env knobs: `RERANK_MODEL` (default `Xenova/ms-marco-MiniLM-L-6-v2`),
 ```bash
 export MESH_RERANK_ENDPOINT=http://127.0.0.1:8787/rerank
 export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
-mesh status .          # confirms: rerank  active (cross-encoder ...)
-mesh search "..." .    # now rerank-refined
+mesh status ./vault              # confirms: rerank  active (cross-encoder ...)
+mesh search "rerank" --vault ./vault   # now rerank-refined
 ```
 
 `mesh search`, `mesh eval`, and `mesh mcp` all pick it up automatically. Unset
@@ -64,11 +70,11 @@ if on) candidates, so it works with or without `mesh embed`. It pairs best with
 vectors on, since that is where the paraphrase top-1 gain was measured.
 
 `MESH_RERANK_BLEND` (default `1.0`) sets how much the cross-encoder owns the head
-vs the fused score: `score = a*cross-encoder + (1-a)*fused`. On the Corpus vault an
-alpha sweep showed pure rerank (`1.0`) is best; lowering it traded the paraphrase
-gain away faster than it recovered keyword cases. Lower it only on a keyword-heavy
-corpus where the lexical signal deserves a vote, and re-measure with
-`eval/ab-rerank.sh` before trusting a non-default value.
+vs the fused score: `score = a*cross-encoder + (1-a)*fused`. On the corpus behind
+`docs/BENCHMARK.md` an alpha sweep showed pure rerank (`1.0`) is best; lowering it
+traded the paraphrase gain away faster than it recovered keyword cases. Lower it
+only on a keyword-heavy corpus where the lexical signal deserves a vote, and
+re-measure with `mesh eval <your-cases.json>` before trusting a non-default value.
 
 ## Sovereignty / data boundary
 

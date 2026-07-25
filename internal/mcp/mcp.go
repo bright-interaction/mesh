@@ -4,7 +4,7 @@
 // Package mcp serves Mesh's retrieval + write-back surface to a coding agent
 // over JSON-RPC 2.0 on stdio. A local agent (Claude Code / Codex) spawns
 // `mesh mcp` and talks to it directly; no port or auth surface. The JSON-RPC
-// envelope matches the ci MCP house pattern.
+// envelope follows the standard MCP shape.
 package mcp
 
 import (
@@ -371,7 +371,7 @@ func (s *Server) handleInitialize(params json.RawMessage) any {
 	}
 }
 
-// ---- JSON-RPC envelope (matches the ci house shape) ----
+// ---- JSON-RPC envelope ----
 
 type request struct {
 	JSONRPC string          `json:"jsonrpc"`

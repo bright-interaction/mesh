@@ -12,7 +12,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
-// BM25 parameters (ported from flow knowledge/search.go). labelWeight repeats
+// BM25 parameters. labelWeight repeats
 // a node's label tokens so a title match outranks a body match.
 const (
 	bm25K1      = 1.5
@@ -27,8 +27,7 @@ type ScoredNode struct {
 }
 
 // Ranker precomputes corpus statistics over the scorable (note) nodes once, so
-// per-query scoring is O(queryTerms x candidates) instead of flow's
-// O(corpus)-per-call. Rebuild it whenever the graph changes.
+// per-query scoring is O(queryTerms x candidates) instead of O(corpus) per call. Rebuild it whenever the graph changes.
 type Ranker struct {
 	node   map[string]*Node
 	tf     map[string]map[string]int
@@ -192,7 +191,7 @@ func termFreq(tokens []string) map[string]int {
 	return m
 }
 
-// stopwords: English (from flow) plus common Swedish function words, since
+// stopwords: English plus common Swedish function words, since
 // the vault is bilingual.
 var stopwords = map[string]bool{
 	"the": true, "and": true, "for": true, "with": true, "that": true,
