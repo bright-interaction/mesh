@@ -57,22 +57,17 @@ func (s *Store) BackfillWritebacks() (int, error) {
 
 // RecordReuse records a fetch of a tracked note as reuse, but only when it happens at
 // least gapSec after the note was authored. A no-op for untracked notes (those not
-// written back through Mesh) and for fetches inside the authoring burst. Best-effort.
+// written back through Mesh) and for fetches inside the authoring burst. Best-effort and
+// NON-BLOCKING: mesh_fetch calls it purely for telemetry after the note is already
+// returned, so it is queued in memory with the fetch's own timestamp and applied by the
+// writer's batched flush (see Store.drainTelemetry). Recording the time here, not at
+// flush time, keeps the gap check honest. Always returns nil.
 func (s *Store) RecordReuse(noteID string, gapSec int64) error {
 	if noteID == "" {
 		return nil
 	}
-	now := time.Now().Unix()
-	return s.Write(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
-			`UPDATE note_reuse
-			    SET reuse_count = reuse_count + 1,
-			        first_reuse = COALESCE(first_reuse, ?),
-			        last_reuse  = ?
-			  WHERE note_id = ? AND (? - authored_at) >= ?`,
-			now, now, noteID, now, gapSec)
-		return err
-	})
+	s.recordTelemetry("", 0, &reuseEvent{noteID: noteID, gapSec: gapSec, at: time.Now().Unix()})
+	return nil
 }
 
 // ReusedNote is one note and how many later-session fetches it has drawn, for the
@@ -87,6 +82,7 @@ func (s *Store) TopReused(n int) []ReusedNote {
 	if n <= 0 {
 		n = 8
 	}
+	s.flushTelemetry() // reporting surface: include reuse events not yet flushed
 	rows, err := s.readDB.Query(
 		`SELECT note_id, reuse_count FROM note_reuse WHERE reuse_count > 0
 		  ORDER BY reuse_count DESC, note_id LIMIT ?`, n)
@@ -118,6 +114,7 @@ type FlywheelStats struct {
 // FlywheelStats computes the reuse picture from note_reuse plus the usage counters.
 func (s *Store) FlywheelStats() (FlywheelStats, error) {
 	var st FlywheelStats
+	s.flushTelemetry() // reporting surface: include reuse events not yet flushed
 	if err := s.readDB.QueryRow(
 		`SELECT count(*),
 		        count(first_reuse),

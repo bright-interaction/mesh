@@ -223,21 +223,43 @@ func TestCLIComplete(t *testing.T) {
 	}
 }
 
-func TestCLINonZeroExitIsAuth(t *testing.T) {
-	// A misconfigured/unauthenticated CLI exits non-zero. That is an operator
-	// problem, not a poison merge, so it must be ErrAuth (no attempt charged).
-	c := &cliClient{argv: []string{writeScript(t, "echo 'not logged in' >&2; exit 1")}, timeout: 5 * time.Second}
-	_, err := c.Complete(context.Background(), "s", "u")
-	if !errors.Is(err, ErrAuth) {
-		t.Fatalf("want ErrAuth, got %v", err)
+// The CLI error taxonomy decides whether the curator halts the whole pass (ErrAuth,
+// no attempt charged) or charges THIS job an attempt. Only a CLI that could not start
+// or that reports a login problem is global; anything that depends on the job's own
+// input must be job-specific, else one poison job at the head of the pending queue
+// starves every other conflict forever.
+func TestCLIErrorTaxonomy(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "definitely-not-installed")
+	cases := []struct {
+		name    string
+		argv    []string
+		script  string
+		wantErr bool // ErrAuth expected
+	}{
+		{name: "stderr names a login problem", script: "echo 'Not logged in. Run /login' >&2; exit 1", wantErr: true},
+		{name: "stderr is a 401", script: "echo 'request failed: 401 Unauthorized' >&2; exit 1", wantErr: true},
+		{name: "binary is missing", argv: []string{missing}, wantErr: true},
+		{name: "oversize prompt rejected", script: "echo 'prompt is too long: 2100000 chars exceeds the limit' >&2; exit 1"},
+		{name: "digits that merely look like a status", script: "echo 'prompt is 403000 tokens, over the limit at line 401' >&2; exit 1"},
+		{name: "plain non-zero exit", script: "exit 2"},
+		{name: "refusal with empty stdout", script: "exit 0"},
+		{name: "stderr only, exit 0, no stdout", script: "echo 'warning: cache miss' >&2; exit 0"},
 	}
-}
-
-func TestCLIEmptyOutputIsAuth(t *testing.T) {
-	c := &cliClient{argv: []string{writeScript(t, "exit 0")}, timeout: 5 * time.Second}
-	_, err := c.Complete(context.Background(), "s", "u")
-	if !errors.Is(err, ErrAuth) {
-		t.Fatalf("empty output should be ErrAuth, got %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			argv := tc.argv
+			if argv == nil {
+				argv = []string{writeScript(t, tc.script)}
+			}
+			c := &cliClient{argv: argv, timeout: 5 * time.Second}
+			_, err := c.Complete(context.Background(), "s", "u")
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			if got := errors.Is(err, ErrAuth); got != tc.wantErr {
+				t.Fatalf("errors.Is(err, ErrAuth) = %v, want %v (err: %v)", got, tc.wantErr, err)
+			}
+		})
 	}
 }
 

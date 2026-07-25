@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -46,8 +48,12 @@ var ErrRateLimited = errors.New("llm: rate limited")
 // a complete merged note.
 var ErrTruncated = errors.New("llm: output truncated at max_tokens")
 
-// ErrAuth (401/403) is an operator config problem (bad/expired key), not a poison
-// job: the caller should wait for the key to be fixed, NOT burn the attempt cap.
+// ErrAuth (401/403, a CLI that cannot start or reports a login problem) is an operator
+// config problem, not a poison job: the caller should wait for the key to be fixed, NOT
+// burn the attempt cap. It is GLOBAL by contract, so a failure that depends on the job's
+// own input (an oversize prompt, a refusal, a non-zero exit with unrelated stderr) must
+// never be reported as ErrAuth: the curator halts the whole pass on it, and one such job
+// sitting at the head of the queue would starve every other conflict.
 var ErrAuth = errors.New("llm: authentication failed (check the API key)")
 
 // Client turns a (system, user) prompt into completion text.
@@ -97,16 +103,65 @@ func (c *cliClient) Complete(ctx context.Context, system, user string) (string, 
 		return "", ctx.Err() // timeout / cancellation: transient, retry next pass
 	}
 	if err != nil {
-		// The CLI is missing, not logged in, or otherwise misconfigured: an
-		// operator/environment problem, not a bad merge. Surface as ErrAuth so the
-		// curator waits for it to be fixed instead of burning a job's attempt cap.
-		return "", fmt.Errorf("curator cli %q: %w: %s", c.argv[0], ErrAuth, cliErrDetail(errb.String(), err))
+		// ErrAuth means "the operator must fix something, every job is affected", and
+		// the curator honours that by ending the whole pass WITHOUT charging the job an
+		// attempt. So only failures that really are global earn it: the CLI could not
+		// start at all (missing binary, not executable) or its stderr names a login /
+		// credential problem. Any other non-zero exit is job-specific (an oversize
+		// prompt from two 1 MB note versions, a refusal, a parse error on this input),
+		// and classifying those as ErrAuth let one poison job at the head of the
+		// created_at-ordered pending list starve the whole queue forever.
+		if startupFailure(err) || authFailureStderr(errb.String()) {
+			return "", fmt.Errorf("curator cli %q: %w: %s", c.argv[0], ErrAuth, cliErrDetail(errb.String(), err))
+		}
+		return "", fmt.Errorf("curator cli %q failed: %s", c.argv[0], cliErrDetail(errb.String(), err))
 	}
 	s := strings.TrimSpace(out.String())
 	if s == "" {
-		return "", fmt.Errorf("curator cli %q returned no output: %w", c.argv[0], ErrAuth)
+		// The process ran and exited 0 with nothing on stdout: this input produced no
+		// completion (a refusal, a silent truncation). That is deterministic for THIS
+		// job, so it must be charged an attempt and retired at the cap, not treated as
+		// an operator outage that halts every other job.
+		return "", fmt.Errorf("curator cli %q returned no output", c.argv[0])
 	}
 	return s, nil
+}
+
+// startupFailure reports whether the subprocess never ran: the binary is missing, is
+// not on PATH, or is not executable. That is an operator/environment problem affecting
+// every job, so it is the one exec failure that maps to ErrAuth.
+func startupFailure(err error) bool {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return false // the process ran and exited non-zero: job-specific
+	}
+	return errors.Is(err, exec.ErrNotFound) ||
+		errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, fs.ErrPermission) ||
+		errors.Is(err, exec.ErrDot)
+}
+
+// authFailureStderr reports whether the CLI's stderr names a login/credential problem,
+// the other case where waiting for the operator (rather than charging the job) is
+// right. The list is deliberately narrow: a phrase that could describe a bad INPUT
+// (too long, invalid request, rate limit) must not land here, or one poison job would
+// again be able to halt the pass indefinitely.
+func authFailureStderr(stderr string) bool {
+	s := strings.ToLower(stderr)
+	for _, pat := range []string{
+		"not logged in", "please log in", "please login", "run /login", "login required",
+		"unauthorized", "authentication failed", "authentication required", "not authenticated",
+		"invalid api key", "missing api key", "no api key", "api key not", "invalid credentials",
+		"expired token", "token expired", "forbidden",
+		// A bare "401"/"403" would also match a token count or a line number, which is
+		// exactly the oversize-prompt case this taxonomy must keep job-specific.
+		"401 unauthorized", "403 forbidden", "status 401", "status 403", "status code 401", "status code 403",
+	} {
+		if strings.Contains(s, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 // sanitizedEnv returns the parent environment with mesh's own secrets and other
@@ -368,10 +423,28 @@ func (a *anthropic) Complete(ctx context.Context, system, user string) (string, 
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		// Token spend was previously dropped on the floor, which made an agent-driven
+		// curation/ask pass completely unobservable: no way to see what a run cost, and
+		// no way to notice a prompt-size regression until the bill arrived.
+		Usage struct {
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxLLMResponseBytes)).Decode(&out); err != nil {
 		return "", fmt.Errorf("anthropic decode: %w", err)
 	}
+	// Debug, not Info: a curator pass makes one of these per job and this is
+	// per-request accounting, not an operational event.
+	slog.Debug("llm: anthropic usage",
+		"model", a.model,
+		"input_tokens", out.Usage.InputTokens,
+		"output_tokens", out.Usage.OutputTokens,
+		"cache_creation_input_tokens", out.Usage.CacheCreationInputTokens,
+		"cache_read_input_tokens", out.Usage.CacheReadInputTokens,
+		"stop_reason", out.StopReason)
 	if out.StopReason == "max_tokens" {
 		return "", fmt.Errorf("anthropic: %w", ErrTruncated)
 	}

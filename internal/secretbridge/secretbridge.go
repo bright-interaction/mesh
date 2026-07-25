@@ -13,12 +13,18 @@
 // a tool result, a prompt, Mesh's process env, or a note. See the estate note
 // "Dockyard Secrets Bridge (Capability Mode)".
 //
-// It is a pure stdlib leaf (open core, so OSS users get the feature). The bridge
-// base URL is operator-configured, not attacker-controlled, and a self-hosted
-// Dockyard commonly runs on localhost / LAN / Tailscale, so it deliberately does
-// NOT use internal/safehttp's public-only SSRF guard (that would wrongly block the
-// self-host case). Mesh only ever dials the configured base URL; the agent-supplied
-// destination is a string forwarded to Dockyard for the token, never dialed here.
+// The base URL is NOT a trusted operator-only value: internal/web/config_api.go makes
+// secret_bridge.base_url writable over PUT /api/config and the MCP tools re-read it per
+// call, so a config-writing caller can aim this authenticated request (it carries the
+// Dockyard API key in X-API-Key) at loopback, RFC1918, 169.254.169.254 or the tailnet.
+// Every request therefore goes through internal/safehttp's SSRF guard. A self-hosted
+// Dockyard on localhost / LAN / Tailscale is a supported deployment, so a private
+// destination is still allowed on OPERATOR authority only: either the base URL is the
+// one named in the MESH_SECRET_BRIDGE_URL env var (which outranks the config file and
+// no HTTP surface can write), or MESH_ALLOW_PRIVATE_SECRET_BRIDGE=1 is set, the same
+// shape as MESH_ALLOW_PRIVATE_LLM_ENDPOINT.
+// Mesh only ever dials the configured base URL; the agent-supplied destination is a
+// string forwarded to Dockyard for the token, never dialed here.
 package secretbridge
 
 import (
@@ -29,8 +35,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/safehttp"
 )
 
 // Client talks to one Dockyard bridge as one agent identity. apiKey is the Dockyard
@@ -43,25 +52,52 @@ type Client struct {
 	hc      *http.Client
 }
 
+// AllowPrivateBridge reports whether the operator opted into a private bridge
+// destination (a self-hosted Dockyard on localhost, the LAN, or the tailnet) via
+// MESH_ALLOW_PRIVATE_SECRET_BRIDGE. The config API never writes environment variables,
+// so a member who can PUT /api/config cannot flip this guard off.
+func AllowPrivateBridge() bool {
+	v := strings.TrimSpace(os.Getenv("MESH_ALLOW_PRIVATE_SECRET_BRIDGE"))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
+// operatorConfiguredBase reports whether baseURL is exactly the one the OPERATOR named
+// in MESH_SECRET_BRIDGE_URL. That variable outranks the config file and no HTTP surface
+// can write the environment, so a matching value provably did not come from a
+// PUT /api/config caller: a self-hosted Dockyard named there stays reachable, while the
+// same private URL arriving through the writable config field does not.
+func operatorConfiguredBase(baseURL string) bool {
+	env := normalizeBase(os.Getenv("MESH_SECRET_BRIDGE_URL"))
+	return env != "" && env == normalizeBase(baseURL)
+}
+
+func normalizeBase(s string) string { return strings.TrimRight(strings.TrimSpace(s), "/") }
+
 // New builds a client for baseURL authenticating as agentID with apiKey. baseURL is
 // normalized (trailing slash trimmed). A 20s timeout bounds a hung Dockyard.
 func New(baseURL, apiKey, agentID string) *Client {
+	// SSRF-guarded by default (base_url is config-writable, see the package doc): the
+	// guard resolves the host and refuses loopback/private/link-local/CGNAT before
+	// dialing, so a redirected base URL cannot probe internal services with the team's
+	// Dockyard key attached. The operator opt-in restores the self-hosted case.
+	hc := safehttp.Client(20 * time.Second)
+	if AllowPrivateBridge() || operatorConfiguredBase(baseURL) {
+		hc = safehttp.LoopbackAllowed(20 * time.Second)
+	}
+	// NEVER follow redirects. The only host Mesh should ever dial is the configured
+	// base URL. Go copies non-Authorization custom headers (our X-API-Key) across a
+	// redirect, so a single 3xx from a compromised, MITM'd (plaintext http on
+	// LAN/Tailscale is a supported case), or open-redirecting Dockyard would otherwise
+	// re-send the team API key to an attacker or internal host (an SSRF + key-egress
+	// primitive). This is stricter than safehttp's own 3-redirect policy on purpose: a
+	// real bridge endpoint never 3xx-redirects, so refusing them only closes the abuse
+	// path. doJSON then sees the 3xx as a non-2xx status and returns an error.
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		apiKey:  strings.TrimSpace(apiKey),
 		agentID: strings.TrimSpace(agentID),
-		hc: &http.Client{
-			Timeout: 20 * time.Second,
-			// NEVER follow redirects. The only host Mesh should ever dial is the
-			// operator-configured base URL. Go copies non-Authorization custom headers
-			// (our X-API-Key) across a redirect, so a single 3xx from a compromised,
-			// MITM'd (plaintext http on LAN/Tailscale is a supported case), or open-
-			// redirecting Dockyard would otherwise re-send the team API key to an
-			// attacker or internal host (an SSRF + key-egress primitive). A real bridge
-			// endpoint never 3xx-redirects, so refusing redirects only closes the abuse
-			// path: doJSON then sees the 3xx as a non-2xx status and returns an error.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
+		hc:      hc,
 	}
 }
 

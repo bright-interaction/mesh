@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,8 +51,11 @@ func (c *Client) Vault() (syncproto.VaultInfo, error) {
 	return vi, err
 }
 
-// Sync runs one reconcile round (authed).
+// Sync runs one reconcile round (authed). It always declares the protocol this
+// build speaks, so the hub can refuse a client that predates a response field
+// instead of sending one it would silently mishandle (see syncproto.ProtoVersion).
 func (c *Client) Sync(req syncproto.SyncRequest) (syncproto.SyncResponse, error) {
+	req.Proto = syncproto.ProtoVersion
 	var sr syncproto.SyncResponse
 	err := c.rpc("POST", "/v1/sync", req, true, &sr)
 	return sr, err
@@ -73,6 +77,9 @@ func (c *Client) rpc(method, path string, body any, authed bool, out any) error 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// Every request carries the protocol version, including the ones with no body,
+	// so the hub's audit log can spot a stale client before it corrupts anything.
+	req.Header.Set(syncproto.ProtoHeader, strconv.Itoa(syncproto.ProtoVersion))
 	if authed {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}

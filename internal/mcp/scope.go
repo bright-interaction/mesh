@@ -62,6 +62,36 @@ func writeAllowed(ctx context.Context) (canWrite, set bool) {
 	return v, true
 }
 
+type localOperatorKey struct{}
+
+// WithLocalOperator marks a request as coming from the TRUSTED LOCAL TRANSPORT:
+// the stdio pipe of a `mesh mcp` process the operator spawned themselves. It is
+// set by ServeStdio and by nothing else, so it is the only positive signal that
+// the caller already owns this filesystem.
+//
+// It exists because the previous "are we hosted?" test was the WriteCapability
+// marker, which only the hub sets. `mesh mcp --http` sets neither, so a tool
+// meant to be local-only (mesh_setup_hooks, which writes .claude/settings.json
+// under a caller-supplied directory on the SERVER host) failed OPEN on that
+// transport: a bearer-token holder could drive server-side directory creation
+// and edit a real project's hook config. Gating on the presence of the local
+// marker instead of the absence of a hosted one fails closed for every transport
+// that is not stdio.
+func WithLocalOperator(ctx context.Context) context.Context {
+	return context.WithValue(ctx, localOperatorKey{}, true)
+}
+
+// localOperator reports whether this request arrived on the trusted local stdio
+// transport. Anything else (mesh mcp --http, the hosted hub, a bare context)
+// is treated as remote.
+func localOperator(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(localOperatorKey{}).(bool)
+	return v
+}
+
 // allowsRead reports whether a note carrying these scopes is readable. A nil filter
 // or nil AllowedRead = unrestricted. No scopes = the fail-safe dev default. The intersect
 // logic lives in one place (vault.ScopeAllows) so it cannot drift per surface.

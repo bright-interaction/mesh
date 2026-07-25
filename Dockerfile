@@ -1,54 +1,45 @@
-# Build + run the Mesh team-sync hub (mesh-hub).
+# Build + run the Mesh open core: the `mesh` CLI (index, retrieve, MCP server, web app).
 #
-# Only the HUB is containerized. It authors the team's git history via os/exec,
-# so git ships in the runtime image (the locked S1 decision). The CLIENT binary
-# (mesh) stays a separate single static binary teammates install on their
-# laptops; it never runs here and never needs git.
+# This is the PUBLIC image, and it is the one the fair-code mirror ships, so it must build
+# standalone from that mirror alone. It may therefore never name anything the mirror
+# strips (the pro hub command, its package, its entrypoint or its compose file):
+# scripts/split-public-repo.sh has a gate that refuses to publish a build file which does,
+# and that gate matches on the literal path, comments included. The pro hub image lives
+# beside the private hub deployment files, not here.
+#
+# The usual install path is still `go install github.com/bright-interaction/mesh/cmd/mesh@latest`
+# or `make install`; this exists for people who would rather run Mesh in a container.
 
 # ---------- build stage ----------
 FROM golang:1.26.5-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
-# Build tags select the edition: empty = fair-code core (public mirror builds work
-# as-is), "pro" = team-sync hub + team web UI + ANN retrieval. The production
-# hub compose sets MESH_BUILD_TAGS=pro via build args; forgetting it makes
-# mesh-ui crash-loop at boot ("team mode requires the pro build").
-ARG MESH_BUILD_TAGS=""
+# The commit being built, stamped into buildinfo.Version below so `mesh version` and the
+# web app footer report the code that is actually running instead of the "dev" default.
+ARG MESH_GIT_SHA="dev"
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -tags "$MESH_BUILD_TAGS" -o /mesh-hub ./cmd/mesh-hub
-
-# Cross-compile the mesh CLIENT for every common platform, so the hub can serve
-# ready-to-run binaries (closing the onboarding loop: invite link -> install ->
-# join). Plus a SHA256SUMS for verification.
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    mkdir -p /dist && for t in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64; do \
-      os="${t%/*}"; arch="${t#*/}"; ext=""; [ "$os" = "windows" ] && ext=".exe"; \
-      CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -tags "$MESH_BUILD_TAGS" -o "/dist/mesh-$os-$arch$ext" ./cmd/mesh; \
-    done && cd /dist && sha256sum mesh-* > SHA256SUMS
+    CGO_ENABLED=0 GOOS=linux go build \
+      -ldflags "-X github.com/bright-interaction/mesh/internal/buildinfo.Version=$MESH_GIT_SHA" \
+      -o /mesh ./cmd/mesh
 
 # ---------- runtime stage ----------
 FROM alpine:3.21
-# git: the hub commits via os/exec. ca-certificates + wget for the healthcheck.
+# git: `mesh` reads git metadata when a vault is a repo. wget: healthchecks for `mesh ui`.
 RUN apk add --no-cache ca-certificates git wget && \
     adduser -D -u 1000 mesh && \
-    mkdir -p /var/lib/mesh-hub && chown -R mesh:mesh /var/lib/mesh-hub
+    mkdir -p /vault && chown -R mesh:mesh /vault
 
-COPY --from=builder /mesh-hub /usr/local/bin/mesh-hub
-COPY --from=builder /dist /usr/local/share/mesh-dist
-COPY deploy/entrypoint.sh /usr/local/bin/mesh-hub-entrypoint
-RUN chmod +x /usr/local/bin/mesh-hub-entrypoint
+COPY --from=builder /mesh /usr/local/bin/mesh
 
 USER mesh
-ENV MESH_HUB_REPO=/var/lib/mesh-hub/vault \
-    MESH_HUB_ADDR=:8848 \
-    MESH_HUB_GC_HORIZON=90 \
-    MESH_HUB_DOWNLOAD_DIR=/usr/local/share/mesh-dist
-EXPOSE 8848
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost:8848/healthz || exit 1
-ENTRYPOINT ["mesh-hub-entrypoint"]
+WORKDIR /vault
+# Mount your vault at /vault. Default command serves the web app on all interfaces, which
+# is fail-closed: binding beyond loopback REQUIRES a token, so set MESH_UI_TOKEN.
+#   docker run --rm -p 7474:7474 -e MESH_UI_TOKEN=... -v "$PWD:/vault" mesh
+EXPOSE 7474
+ENTRYPOINT ["mesh"]
+CMD ["ui", "/vault", "--addr", "0.0.0.0:7474"]

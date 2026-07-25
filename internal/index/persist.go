@@ -98,12 +98,11 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 }
 
 // IndexVaultIncremental applies a drift delta: targeted INSERT OR REPLACE / DELETE
-// for the changed notes + their FTS rows, a full rewrite of the (globally rebuilt)
-// nodes/edges tables from the in-memory graph, and the orphan-vector prune, all in
-// one writer-goroutine transaction so a concurrent reader sees an all-or-nothing
-// WAL snapshot. upserts are Added+Changed notes (vault-relative Path); removedIDs
-// are ids whose files are gone (and old ids retired on an id change). Returns the
-// number of upserted notes.
+// for the changed notes + their FTS rows and a full rewrite of the (globally rebuilt)
+// nodes/edges tables from the in-memory graph, all in one writer-goroutine transaction
+// so a concurrent reader sees an all-or-nothing WAL snapshot. upserts are Added+Changed
+// notes (vault-relative Path); removedIDs are ids whose files are gone (and old ids
+// retired on an id change). Returns the number of upserted notes.
 func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string, g *graph.Graph) (int, error) {
 	err := s.Write(func(tx *sql.Tx) error {
 		// Deletes first: a rename frees a path another note now claims, and an id
@@ -224,6 +223,17 @@ func writeGraphTables(tx *sql.Tx, g *graph.Graph) error {
 // notes are kept on disk and excluded from retrieval by LoadVectors' note_hash
 // JOIN; they are refreshed in place on the next `mesh embed`. Orphans have no note
 // to refresh them, so they are removed here to bound table growth across deletes.
+//
+// A note whose file is still on disk but temporarily fails to parse also loses its note
+// row, so this prunes its vectors too, and embeddings are paid BYOAI work no reindex
+// regenerates. That was raised in the 2026-07-25 audit and deliberately NOT special-cased
+// here. Exempting those ids costs the "incremental produces a byte-identical DB to a full
+// reindex" invariant (TestIncrementalMatchesFullReindex), and the protection cannot even
+// hold: once the note row is gone the next full reindex has no path-to-id mapping left,
+// so it prunes anyway. The real window is closed at its source instead, by writeFileAtomic
+// on both the hub (internal/hub/repo.go) and the client (pkg/meshclient/vault.go), so a
+// reader never observes a half-written note. If you are here because you lost embeddings,
+// look for a NON-atomic writer, do not weaken this prune.
 func pruneOrphanVectors(tx *sql.Tx) error {
 	_, err := tx.Exec(`DELETE FROM vectors WHERE node_id NOT IN (SELECT 'note:' || id FROM notes)`)
 	return err
@@ -252,6 +262,17 @@ func RetrievalHash(pn *ParsedNote) string { return retrievalHash(pn) }
 // means such an edit invalidates the stale vector (and forces a cheap note reindex).
 // The id is included because it is the node identity: an id-only edit must retire the
 // old node and create the new one, so the drift check has to see it.
+//
+// The invariant, and why it is load-bearing: this hash is the ONLY drift signal. Both
+// DriftReport and DriftDeltaReport compare hashes and Reconcile returns early when
+// nothing differs, so any frontmatter field that reaches a persisted notes column or a
+// graph node attr MUST be hashed here or an edit to it never reindexes. Scope is the
+// sharp edge: it is the live access-control input (retrieve.go scopeAllowed reads the
+// node's scope attr, Store.NoteScope reads notes.scope for direct fetch/neighbors), so
+// while it was unhashed, tightening a note's scope on a running hub did not revoke read
+// access until some unrelated event forced a reindex. updated/when/review_by feed
+// freshness decay and lifecycle health, and source feeds provenance, with the same
+// staleness. If you add a column to noteRowValues or an attr in BuildGraph, add it here.
 func retrievalHash(pn *ParsedNote) string {
 	h := sha256.New()
 	h.Write([]byte(effectiveID(pn)))
@@ -277,6 +298,19 @@ func retrievalHash(pn *ParsedNote) string {
 		h.Write([]byte(s))
 	}
 	for _, s := range pn.FM.Related {
+		h.Write([]byte{0})
+		h.Write([]byte(s))
+	}
+	// Persisted-column / graph-attr fields: scope (notes.scope + the node's scope attr,
+	// the access-control input), updated + when (notes.updated, freshness decay),
+	// review_by (notes.review_by, lifecycle health) and source (notes.source,
+	// provenance). EffectiveScopes is hashed rather than FM.Scope so the fail-safe
+	// default is what the hash describes, matching exactly what gets persisted.
+	for _, s := range pn.FM.EffectiveScopes() {
+		h.Write([]byte{0})
+		h.Write([]byte(s))
+	}
+	for _, s := range []string{pn.FM.Updated, pn.FM.When, pn.FM.ReviewBy, pn.FM.Source} {
 		h.Write([]byte{0})
 		h.Write([]byte(s))
 	}

@@ -177,10 +177,28 @@ func BasePath(sibling string) (string, bool) {
 
 // appendMerge unions two additive edits to a shared file. It succeeds only when
 // both hub and incoming preserve every base block (i.e. each side only ADDED
-// blocks). Incoming's novel blocks are inserted into the hub sequence anchored by
-// the block that precedes them in incoming (or at the top if none), so a
-// top-prepend lands at the top and a bottom-append at the bottom. Identical
-// blocks added by both sides collapse to one (content-hash dedup).
+// blocks). Incoming's blocks are walked in order against the hub sequence with a
+// cursor, so a novel block lands immediately after whatever preceded it in
+// incoming (or at the top if nothing did): a top-prepend lands at the top and a
+// bottom-append at the bottom. Identical blocks added by both sides collapse to
+// one.
+//
+// Matching is by COUNT, not set membership, and the cursor is a list INDEX, not a
+// content hash. Both matter, and the set/hash version silently corrupted merges:
+//   - a client block byte-identical to one already at HEAD (a repeated log line in
+//     its own paragraph) was treated as "already placed" and dropped, and the merge
+//     still reported success, so the client's edit vanished with no conflict and no
+//     sibling. Each incoming block now consumes ONE unconsumed hub copy; only the
+//     copies beyond what the hub has are inserted, which mirrors preservesAll.
+//   - a duplicated anchor block (a "---" thematic break is the common case)
+//     resolved to its FIRST occurrence, so a whole appended section was hoisted
+//     above pre-existing content. The cursor is the index of the copy this merge
+//     actually matched, so a duplicated block anchors at the right occurrence.
+//
+// An incoming block whose only unconsumed copies sit BEFORE the cursor is a
+// reorder, not an addition: it consumes that copy and keeps the hub's ordering
+// rather than inserting a second copy (appendMerge is additive-only; a reorder is
+// not data to preserve twice).
 func appendMerge(base Version, hub, incoming []byte) ([]byte, bool) {
 	if !base.Exists {
 		return nil, false // no common ancestor; cannot be a clean additive merge
@@ -194,20 +212,25 @@ func appendMerge(base Version, hub, incoming []byte) ([]byte, bool) {
 	}
 
 	result := append([]block(nil), hubBlocks...)
-	placed := hashSet(hubBlocks)
-	for i, b := range inBlocks {
-		if placed[b.hash] {
+	consumed := make([]bool, len(result))
+	cursor := -1 // index in result of the last incoming block placed or matched
+	for _, b := range inBlocks {
+		if k := findUnconsumed(result, consumed, b.hash, cursor+1); k >= 0 {
+			consumed[k] = true
+			cursor = k
 			continue
 		}
-		anchor := "" // empty => insert at the front
-		for j := i - 1; j >= 0; j-- {
-			if placed[inBlocks[j].hash] {
-				anchor = inBlocks[j].hash
-				break
-			}
+		if k := findUnconsumed(result, consumed, b.hash, 0); k >= 0 {
+			// Only copies behind the cursor are left: a reorder. Consume one and
+			// leave the cursor where it is, so we neither duplicate the block nor
+			// drag the cursor backwards.
+			consumed[k] = true
+			continue
 		}
-		result = insertAfter(result, anchor, b)
-		placed[b.hash] = true
+		at := cursor + 1
+		result = insertBlockAt(result, at, b)
+		consumed = insertBoolAt(consumed, at, true)
+		cursor = at
 	}
 	return render(result), true
 }
@@ -275,14 +298,6 @@ func render(bl []block) []byte {
 	return []byte(strings.Join(parts, "\n\n") + "\n")
 }
 
-func hashSet(bl []block) map[string]bool {
-	s := make(map[string]bool, len(bl))
-	for _, b := range bl {
-		s[b.hash] = true
-	}
-	return s
-}
-
 func hashCounts(bl []block) map[string]int {
 	m := make(map[string]int, len(bl))
 	for _, b := range bl {
@@ -305,20 +320,33 @@ func preservesAll(side []block, baseCounts map[string]int) bool {
 	return true
 }
 
-func insertAfter(list []block, anchorHash string, b block) []block {
-	if anchorHash == "" {
-		return append([]block{b}, list...)
-	}
-	for i, x := range list {
-		if x.hash == anchorHash {
-			out := make([]block, 0, len(list)+1)
-			out = append(out, list[:i+1]...)
-			out = append(out, b)
-			out = append(out, list[i+1:]...)
-			return out
+// findUnconsumed returns the first index >= from whose block hashes to h and has
+// not already been matched by an earlier incoming block, or -1. Tracking consumed
+// copies is what makes the placement walk count-based: N incoming copies of a
+// block can only match N hub copies, and the surplus is a genuine addition.
+func findUnconsumed(list []block, consumed []bool, h string, from int) int {
+	for i := from; i < len(list); i++ {
+		if !consumed[i] && list[i].hash == h {
+			return i
 		}
 	}
-	return append(list, b) // anchor not found (shouldn't happen); append at end
+	return -1
+}
+
+func insertBlockAt(list []block, i int, b block) []block {
+	out := make([]block, 0, len(list)+1)
+	out = append(out, list[:i]...)
+	out = append(out, b)
+	out = append(out, list[i:]...)
+	return out
+}
+
+func insertBoolAt(list []bool, i int, v bool) []bool {
+	out := make([]bool, 0, len(list)+1)
+	out = append(out, list[:i]...)
+	out = append(out, v)
+	out = append(out, list[i:]...)
+	return out
 }
 
 // ---- helpers ----

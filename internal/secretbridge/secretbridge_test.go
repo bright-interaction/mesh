@@ -13,6 +13,14 @@ import (
 	"testing"
 )
 
+// allowLocalBridge opts this test into private bridge destinations, the way an operator
+// running a self-hosted Dockyard on localhost does. Without it the SSRF guard refuses to
+// dial an httptest server (127.0.0.1), which is exactly the point of the guard.
+func allowLocalBridge(t *testing.T) {
+	t.Helper()
+	t.Setenv("MESH_ALLOW_PRIVATE_SECRET_BRIDGE", "1")
+}
+
 // fakeDockyard stands up the two endpoints Mesh calls, asserting the auth header and
 // echoing back a plausible list + issue response. It deliberately never returns a
 // secret VALUE (Dockyard does not either), so the leak assertions are meaningful.
@@ -62,6 +70,7 @@ func fakeDockyard(t *testing.T, wantKey string) *httptest.Server {
 }
 
 func TestListSecretsProjectsMetadataOnly(t *testing.T) {
+	allowLocalBridge(t)
 	srv := fakeDockyard(t, "dk_testkey")
 	defer srv.Close()
 	c := New(srv.URL, "dk_testkey", "mesh-test")
@@ -84,6 +93,7 @@ func TestListSecretsProjectsMetadataOnly(t *testing.T) {
 }
 
 func TestIssueReturnsTokenNotSecret(t *testing.T) {
+	allowLocalBridge(t)
 	srv := fakeDockyard(t, "dk_testkey")
 	defer srv.Close()
 	c := New(srv.URL, "dk_testkey", "mesh-test")
@@ -138,6 +148,7 @@ func TestSplitHostPath(t *testing.T) {
 // TestErrorSurfacesDockyardCode: a non-2xx surfaces Dockyard's error code (so the
 // agent can adjust) without leaking the key, and no partial struct is returned.
 func TestErrorSurfacesDockyardCode(t *testing.T) {
+	allowLocalBridge(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": "ambiguous_destination"})
@@ -162,6 +173,7 @@ func TestErrorSurfacesDockyardCode(t *testing.T) {
 // give an SSRF primitive). The client must surface the 3xx as an error and never touch
 // the redirect location.
 func TestClientRefusesRedirects(t *testing.T) {
+	allowLocalBridge(t)
 	var hitTarget bool
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hitTarget = true
@@ -184,6 +196,64 @@ func TestClientRefusesRedirects(t *testing.T) {
 	}
 	if hitTarget {
 		t.Fatal("client followed the redirect to another host (key-egress / SSRF path)")
+	}
+}
+
+// TestPrivateBaseURLRefusedWithoutOptIn: secret_bridge.base_url is writable over
+// PUT /api/config, so a config-writing caller can point the bridge at an internal host.
+// The request carries the Dockyard API key in X-API-Key and its error body is echoed
+// back to the caller, so an unguarded dial is both a key-egress and an SSRF oracle.
+// A private destination must be refused unless the OPERATOR opted in via env.
+func TestPrivateBaseURLRefusedWithoutOptIn(t *testing.T) {
+	cases := []struct {
+		name string
+		// optIn is MESH_ALLOW_PRIVATE_SECRET_BRIDGE; envBase is MESH_SECRET_BRIDGE_URL,
+		// "self" meaning the operator named this exact server in the environment.
+		optIn, envBase string
+		wantDial       bool
+	}{
+		{name: "config-written base is guarded", wantDial: false},
+		{name: "operator opt-in restores self-hosting", optIn: "1", wantDial: true},
+		{name: "operator env names this base", envBase: "self", wantDial: true},
+		{name: "operator env names a different base", envBase: "https://dockyard.example.com", wantDial: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MESH_ALLOW_PRIVATE_SECRET_BRIDGE", tc.optIn)
+			var dialed bool
+			// Stands in for an internal-only service the bridge must never reach: it
+			// echoes a body, which briefError would surface to the caller.
+			internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				dialed = true
+				if !tc.wantDial {
+					t.Errorf("guarded client reached the internal host, X-API-Key=%q", r.Header.Get("X-API-Key"))
+				}
+				w.WriteHeader(http.StatusTeapot)
+				_, _ = w.Write([]byte("INTERNAL-ONLY-BODY"))
+			}))
+			defer internal.Close()
+
+			envBase := tc.envBase
+			if envBase == "self" {
+				envBase = internal.URL
+			}
+			t.Setenv("MESH_SECRET_BRIDGE_URL", envBase)
+
+			c := New(internal.URL, "dk_key_must_not_leak", "mesh-test")
+			_, err := c.ListSecrets(context.Background())
+			if dialed != tc.wantDial {
+				t.Fatalf("dialed the private destination = %v, want %v", dialed, tc.wantDial)
+			}
+			if err == nil {
+				t.Fatal("want an error (guard refusal or the 418 status)")
+			}
+			if strings.Contains(err.Error(), "dk_key_must_not_leak") {
+				t.Fatalf("error leaked the API key: %v", err)
+			}
+			if !tc.wantDial && strings.Contains(err.Error(), "INTERNAL-ONLY-BODY") {
+				t.Fatalf("guarded client still echoed an internal response body: %v", err)
+			}
+		})
 	}
 }
 

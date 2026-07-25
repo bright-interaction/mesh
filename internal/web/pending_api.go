@@ -75,9 +75,11 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 	// so it is immediately searchable.
 	_ = s.store.DeletePending(req.ID)
 	if g, e := index.Reindex(s.store, s.vaultRoot); e == nil {
+		// One exclusive critical section for the swap + invalidation, so an in-flight
+		// retriever build cannot publish over the old graph (see Server.retriever).
 		s.mu.Lock()
 		s.graph = g
-		s.cachedRetriever = nil
+		s.cachedRetriever.Store(nil)
 		s.mu.Unlock()
 	}
 	writeJSON(w, map[string]any{"promoted": true, "id": res.ID, "path": res.Path})

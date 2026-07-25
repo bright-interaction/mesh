@@ -197,8 +197,9 @@ func TestReindexCodeCountsScopeGate(t *testing.T) {
 		t.Fatalf("scoped reindex leaked code counts: %v", res)
 	}
 
-	// An unrestricted caller still gets the counts.
-	out, _ = s.toolReindex(context.Background())
+	// An unrestricted LOCAL caller still gets the counts (local operator: no cooldown,
+	// so this second back-to-back pass really re-indexes the code roots).
+	out, _ = s.toolReindex(WithLocalOperator(context.Background()))
 	res = toolJSON(t, out)
 	if _, ok := res["code_symbols"]; !ok {
 		t.Fatalf("unrestricted reindex missing code counts: %v", res)

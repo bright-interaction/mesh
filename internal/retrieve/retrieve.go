@@ -63,16 +63,24 @@ type Card struct {
 
 // Options tunes a retrieval. Zero values get sensible defaults.
 type Options struct {
-	Limit       int     // candidates pulled per signal (default 20)
-	Budget      int     // token budget for packing; 0 = return all ranked
+	// Limit is both the number of candidates pulled per signal AND the hard cap on
+	// the cards returned (default 20). It has to be both: the vector arm and the
+	// 1-hop expansion add candidates the per-signal fetch never saw, so a fetch-only
+	// limit let a caller asking for 5 receive one card per vector-bearing note.
+	Limit       int
+	Budget      int     // token budget for packing; 0 = return all ranked (up to Limit)
 	WeightFTS   float64 // fusion weight; 0 across all three => resolved defaults
 	WeightGraph float64
 	WeightVec   float64
 	NoRerank    bool // skip the cross-encoder stage even when configured (for tuning the fusion itself)
 	// AllowedScopes, when non-nil, restricts results to notes whose scope intersects
 	// the set (access control). nil = unrestricted (solo / no-ACL fast path). This is
-	// THE read boundary: it is applied at the card loop below so it covers FTS, graph,
-	// vector, and 1-hop expansion in one place, and before the reranker reads any doc.
+	// THE read boundary and it is enforced in three places, because one was not enough:
+	// in candidate generation (SearchScoped / ScoreScoped, so the per-signal limit
+	// counts only readable rows), at the expansion seeds (so an unreadable note cannot
+	// stamp its title into a neighbour's Reason or donate score to it), and at the card
+	// loop (the catch-all for the vector arm and expanded neighbours), which is still
+	// before the reranker reads any doc.
 	AllowedScopes map[string]bool
 }
 
@@ -173,10 +181,11 @@ func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
 		return
 	}
 	r.queryPrefix = envOr("MESH_EMBED_QUERY_PREFIX", emb.QueryPrefix)
-	keyEnv := emb.KeyEnv
-	if keyEnv == "" {
-		keyEnv = "MESH_EMBED_KEY"
-	}
+	// key_env is a POINTER to a process secret, so it is resolved through the closed
+	// allow-list rather than read verbatim: a hand-edited config.toml that never passed
+	// through the web config API must not be able to aim this at MESH_UI_TOKEN and have
+	// the embedding endpoint receive it.
+	keyEnv := meshcfg.ResolveKeyEnv("embedding.key_env", emb.KeyEnv, "MESH_EMBED_KEY")
 	// Optional ANN: build an HNSW index past the threshold (0/unset = brute force,
 	// the default; sub-5ms well past v1 scale). Env wins, then the config file.
 	if v, err := strconv.Atoi(os.Getenv("MESH_HNSW_THRESHOLD")); err == nil && v > 0 {
@@ -210,10 +219,8 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 	} else if rv.RerankBlend > 0 {
 		r.rerankBlend = rv.RerankBlend
 	}
-	keyEnv := rv.RerankKeyEnv
-	if keyEnv == "" {
-		keyEnv = "MESH_RERANK_KEY"
-	}
+	// Same allow-list as the embedding key: see enableVectors.
+	keyEnv := meshcfg.ResolveKeyEnv("rerank.key_env", rv.RerankKeyEnv, "MESH_RERANK_KEY")
 	r.EnableRerank(rerank.NewHTTP(endpoint, model, os.Getenv(keyEnv)))
 }
 
@@ -381,17 +388,17 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	vectorsActive := r.emb != nil && len(r.vecs) > 0
 	wFTS, wGraph, wVec := r.resolveWeights(opt, vectorsActive)
 
-	// When a scope filter is active, over-fetch candidates so the allowed head still
-	// fills after forbidden notes are dropped at the card loop.
+	// Candidate generation is scope-aware: both keyword signals apply the read
+	// boundary BEFORE their own truncation, so the fetch limit counts only rows this
+	// caller may read. The old shape (fetch globally, over-fetch 4x, filter at the
+	// card loop) starved a scoped caller to zero results as soon as ~4*Limit
+	// higher-ranked unreadable notes matched the query.
 	fetchLimit := opt.Limit
-	if opt.AllowedScopes != nil {
-		fetchLimit *= 4
-	}
-	ftsHits, err := r.store.Search(query, fetchLimit)
+	ftsHits, err := r.store.SearchScoped(query, fetchLimit, opt.AllowedScopes)
 	if err != nil {
 		return nil, err
 	}
-	graphHits := r.ranker.Score(query, fetchLimit)
+	graphHits := r.ranker.ScoreScoped(query, fetchLimit, opt.AllowedScopes)
 
 	fused := map[string]float64{}
 	snippet := map[string]string{}
@@ -433,46 +440,17 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		// note equally. Skip the whole vector contribution rather than emit that garbage.
 		// vecDim is always > 0 once EnableVectors succeeds, so a mismatch is a real skip.
 		if qv := r.queryVec(ctx, query); qv != nil && r.vecDim > 0 && len(qv) == r.vecDim {
-			var ids []string
-			var sims []float64
-			if r.ann != nil {
-				// ANN path (large vaults): the index returns the top chunks; fold them to
-				// a per-note max, exactly the brute-force semantics, over a candidate set
-				// instead of every note. hnswK is generous so the fused/reranked head is
-				// stable even though the deep tail is approximate.
-				hnswK := opt.Limit * 4
-				if hnswK < 50 {
-					hnswK = 50
-				}
-				best := map[string]float64{}
-				for _, h := range r.ann.Search(qv, hnswK, 0) {
-					if cur, ok := best[h.NodeID]; !ok || h.Score > cur {
-						best[h.NodeID] = h.Score
-					}
-				}
-				ids = make([]string, 0, len(best))
-				sims = make([]float64, 0, len(best))
-				for id, s := range best {
-					ids = append(ids, id)
-					sims = append(sims, s)
-				}
-			} else {
-				ids = make([]string, 0, len(r.vecs))
-				sims = make([]float64, 0, len(r.vecs))
-				for id, chunks := range r.vecs {
-					bestc := -1.0
-					for _, v := range chunks {
-						if s := embed.Cosine(qv, v); s > bestc {
-							bestc = s
-						}
-					}
-					ids = append(ids, id)
-					sims = append(sims, bestc)
-				}
-			}
-			vNorm := minMax(sims)
+			// Both arms produce the same shape: the top-K chunk vectors folded to a
+			// per-note max. Keeping the ANN and brute-force candidate sets identical is
+			// what makes the two paths rank alike (see vectorCandidates).
+			ids, sims := r.vectorCandidates(qv, vecCandidateK(opt.Limit))
 			for i, id := range ids {
-				fused[id] += wVec * vNorm[i]
+				// Path-independent scaling: map the cosine onto [0,1] against its own
+				// fixed range instead of min-maxing the per-request candidate set. The
+				// old min-max rescaled every score to whatever happened to be fetched,
+				// so switching on the ANN index (a much smaller candidate set) silently
+				// reordered results instead of only making them faster.
+				fused[id] += wVec * cosineTo01(sims[i])
 				if reason[id] == "" {
 					reason[id] = "vector"
 				}
@@ -480,8 +458,22 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		}
 	}
 
-	// Capped 1-hop expansion from the strongest seeds.
-	for _, seed := range topN(fused, expandSeeds) {
+	// Capped 1-hop expansion from the strongest seeds the caller is allowed to read.
+	// The seed filter is load-bearing, not defence in depth: a seed the caller cannot
+	// read used to stamp its own frontmatter title into the neighbour's Reason
+	// ("linked from <secret title>") and donate seed.score to the neighbour's rank,
+	// so an unreadable note leaked its title and steered the scoped ranking. Scanning
+	// past forbidden seeds (rather than dropping them from the top-5 slate) keeps
+	// expansion recall intact for scoped callers.
+	seeded := 0
+	for _, seed := range topN(fused, 0) {
+		if seeded >= expandSeeds {
+			break
+		}
+		if !scopeAllowed(r.card(seed.id).Scope, opt.AllowedScopes) {
+			continue
+		}
+		seeded++
 		for _, nb := range r.strongNeighbors(seed.id, expandK) {
 			if _, seen := fused[nb.id]; seen {
 				continue
@@ -522,10 +514,113 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		r.rerankHead(ctx, query, cards)
 	}
 
+	// Limit bounds the RETURNED set, after the reranker has had its say (so it can
+	// still pull a card up from the tail) and before packing. Without this the vector
+	// arm and the 1-hop expansion pushed cards the per-signal fetch never counted
+	// straight to the caller: a Limit of 5 over a vector-enabled vault returned one
+	// card per note in the vault.
+	if opt.Limit > 0 && len(cards) > opt.Limit {
+		cards = cards[:opt.Limit]
+	}
+
 	if opt.Budget > 0 {
 		cards = packToBudget(cards, opt.Budget)
 	}
 	return cards, nil
+}
+
+// vecCandidateFloor is the smallest chunk-candidate pool the vector arm considers,
+// so a tiny Limit still leaves the fused head a stable semantic signal.
+const vecCandidateFloor = 50
+
+// vecCandidateK is the number of chunk vectors the semantic signal considers for a
+// given result limit. It is generous, so the fused and reranked head is stable even
+// though the deep tail is cut off (and, on the pro build, approximate).
+func vecCandidateK(limit int) int {
+	k := limit * 4
+	if k < vecCandidateFloor {
+		k = vecCandidateFloor
+	}
+	return k
+}
+
+// cosineTo01 maps a cosine similarity onto [0,1] against its own fixed range.
+//
+// This must NOT be a min-max over the request's candidates. The candidate set
+// differs per path (every chunk in the vault on the brute-force arm, the ANN
+// index's top-k on the pro arm), so a relative normalizer made a note's semantic
+// contribution depend on what else happened to be fetched: enabling the HNSW index
+// rescaled every surviving score and reordered the results rather than only
+// speeding them up. A fixed reference keeps a given cosine worth the same thing on
+// both arms. The clamp only absorbs float drift outside [-1,1].
+func cosineTo01(c float64) float64 {
+	v := (c + 1) / 2
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// vectorCandidates returns the top-k chunk vectors for the query, folded to one
+// entry per note carrying that note's best chunk score, in descending score order.
+// Both arms go through here so the ANN and brute-force candidate sets have the same
+// shape and size: the ANN index is then an accelerator for the same computation,
+// not a different ranking.
+func (r *Retriever) vectorCandidates(qv []float32, k int) (ids []string, sims []float64) {
+	if k <= 0 {
+		return nil, nil
+	}
+	var hits []annResult
+	if r.ann != nil {
+		hits = r.ann.Search(qv, k, 0)
+	} else {
+		hits = r.bruteForceTopChunks(qv, k)
+	}
+	best := map[string]float64{}
+	for _, h := range hits {
+		cur, seen := best[h.NodeID]
+		if !seen {
+			best[h.NodeID] = h.Score
+			ids = append(ids, h.NodeID)
+			continue
+		}
+		if h.Score > cur {
+			best[h.NodeID] = h.Score
+		}
+	}
+	sims = make([]float64, len(ids))
+	for i, id := range ids {
+		sims[i] = best[id]
+	}
+	return ids, sims
+}
+
+// bruteForceTopChunks scans every stored chunk vector and returns the k closest,
+// mirroring what the ANN index returns (chunks, not notes: the caller max-pools).
+// Ties break on node id then chunk index so the order is deterministic.
+func (r *Retriever) bruteForceTopChunks(qv []float32, k int) []annResult {
+	all := make([]annResult, 0, len(r.vecs))
+	for id, chunks := range r.vecs {
+		for ci, v := range chunks {
+			all = append(all, annResult{NodeID: id, ChunkIx: ci, Score: embed.Cosine(qv, v)})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Score != all[j].Score {
+			return all[i].Score > all[j].Score
+		}
+		if all[i].NodeID != all[j].NodeID {
+			return all[i].NodeID < all[j].NodeID
+		}
+		return all[i].ChunkIx < all[j].ChunkIx
+	})
+	if len(all) > k {
+		all = all[:k]
+	}
+	return all
 }
 
 func sortCards(cards []Card) {
@@ -678,6 +773,7 @@ var freshnessTypes = map[string]bool{"note": true, "status": true, "": true}
 // 40%, never buried) while staying strictly monotonic in age forever, so
 // freshness always breaks a tie in favour of the fresher note.
 const freshnessFloor = 0.6
+
 func (r *Retriever) freshnessMult(c Card) float64 {
 	r.freshOnce.Do(func() {
 		if d, err := r.store.NoteDates(); err == nil {

@@ -47,7 +47,16 @@ internal/hnsw  internal/retrieve/retrieve_ann_pro.go  internal/retrieve/retrieve
 cmd/mesh/ui_hubteam_pro.go
 cmd/mesh/conflicts_test.go
 pkg/meshclient/e2e_test.go  pkg/meshclient/events_test.go  pkg/meshclient/tombstone_test.go
+docker-compose.yml  deploy/Dockerfile.hub  deploy/entrypoint.sh  deploy/hub-image.sh
 ```
+
+The four **deployment** files at the end are new (2026-07-25 audit). They build and run
+`./cmd/mesh-hub`, which the mirror strips, so publishing them meant `docker build .` on
+the public repo failed at the first RUN, and they disclosed the private deployment shape
+(the `proxy` network, `/opt/mesh/.env`, the invite runbook) that
+`deploy/DEPLOY.md` was already stripped to keep private. The root `Dockerfile` is the
+PUBLIC open-core image and stays in the mirror: it builds only `./cmd/mesh` and must
+never name a stripped path, which `split-public-repo.sh` gates on.
 
 `internal/llm` is NOT excluded - it is open core (see the open-core list above).
 

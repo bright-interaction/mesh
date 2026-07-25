@@ -41,6 +41,12 @@ jobs:
       - name: Open-core boundary (no open package may import a pro package)
         run: bash scripts/check-open-core-boundary.sh
 
+      # The publish gates only fire during a rare manual mirror push, so they are the
+      # code most likely to rot unnoticed. This self-test is offline and side-effect free,
+      # and skips the cases whose files this mirror strips.
+      - name: Release gates self-test
+        run: bash scripts/test-release-gates.sh
+
       - name: Secret scan (gitleaks)
         run: |
           go install github.com/zricethezav/gitleaks/v8@latest

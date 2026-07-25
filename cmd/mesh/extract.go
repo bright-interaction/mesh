@@ -23,6 +23,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// minDigestChars is the smallest --max-chars that still yields a digest with both a
+// head (the task) and a tail (the conclusions). extract.Digest reserves up to ~1.5 KB
+// for the head, so anything under this leaves no tail budget at all.
+const minDigestChars = 2000
+
 // extractCmd pulls candidate write-back notes from a finished session transcript (the
 // input side of the flywheel), and --benchmark measures it against the current manual
 // algo (the Stop-hook nudge): coverage (sessions that yield a note) and precision (how
@@ -41,6 +46,13 @@ func extractCmd() *cobra.Command {
 			client, err := llm.NewFromEnv()
 			if err != nil {
 				return err
+			}
+			// Digest keeps the task head (up to ~1.5 KB) plus a tail. Below that floor the
+			// tail budget goes negative: it used to panic on the slice bounds, and after
+			// that guard landed it silently degrades to a head-only digest, which is
+			// useless model input. Refuse instead of quietly producing garbage.
+			if maxChars > 0 && maxChars < minDigestChars {
+				return fmt.Errorf("--max-chars %d is too small: use at least %d, or 0 for no limit", maxChars, minDigestChars)
 			}
 			// Self-consistency sample count resolves from --samples or MESH_EXTRACT_SAMPLES
 			// (so the Stop hook can opt in via env without changing its command).
