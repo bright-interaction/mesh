@@ -2,10 +2,9 @@
 #
 # This is the PUBLIC image, and it is the one the fair-code mirror ships, so it must build
 # standalone from that mirror alone. It may therefore never name anything the mirror
-# strips (the pro hub command, its package, its entrypoint or its compose file):
-# scripts/split-public-repo.sh has a gate that refuses to publish a build file which does,
-# and that gate matches on the literal path, comments included. The pro hub image lives
-# beside the private hub deployment files, not here.
+# strips (the pro hub command, its package, its entrypoint or its compose file): a release
+# gate refuses to publish a build file that does, matching on the literal path, comments
+# included. The pro hub image lives beside the private hub deployment files, not here.
 #
 # The usual install path is still `go install github.com/bright-interaction/mesh/cmd/mesh@latest`
 # or `make install`; this exists for people who would rather run Mesh in a container.

@@ -11,7 +11,7 @@ BIN ?= $(HOME)/.local/bin/mesh
 MESH_GIT_SHA ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 LDFLAGS = -X github.com/bright-interaction/mesh/internal/buildinfo.Version=$(MESH_GIT_SHA)
 
-.PHONY: install build test vet tidy fmt clean release-gates
+.PHONY: install build test vet tidy fmt clean
 
 install: ## build + install mesh to ~/.local/bin (on PATH)
 	go build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/mesh
@@ -19,9 +19,6 @@ install: ## build + install mesh to ~/.local/bin (on PATH)
 
 build: ## build to ./bin/mesh
 	go build -ldflags "$(LDFLAGS)" -o bin/mesh ./cmd/mesh
-
-release-gates: ## self-test the public-mirror redaction + build-artifact gates
-	bash scripts/test-release-gates.sh
 
 test: ## run the full test suite
 	go test ./...

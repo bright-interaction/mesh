@@ -44,9 +44,10 @@ func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage
 		notes, nodes, edges := s.counts(scopeFromCtx(ctx))
 		b, _ := json.Marshal(map[string]any{
 			"server": map[string]any{"name": serverName, "version": serverVersion},
-			// The vault NAME, never the server's absolute path: on the hosted hub the
-			// full path leaks /opt/mesh/... to every authenticated client, which is
-			// the same disclosure toolWrite and toolReindex already suppress.
+			// The vault NAME, never the server's absolute path: on a hosted hub the
+			// full value would leak the server's absolute vault path to every
+			// authenticated client, which is the same disclosure toolWrite and
+			// toolReindex already suppress.
 			"vault":    filepath.Base(s.vaultRoot),
 			"counts":   map[string]any{"notes": notes, "nodes": nodes, "edges": edges},
 			"tools":    ToolNames(), // derived from ToolSpecs() so it never drifts from the real surface

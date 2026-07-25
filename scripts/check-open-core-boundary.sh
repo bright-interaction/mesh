@@ -14,11 +14,12 @@
 # Run standalone (cd mesh && scripts/check-open-core-boundary.sh) or via the release
 # gate in split-public-repo.sh and the repo pre-commit hook.
 #
-# The pro PACKAGE import paths below must stay in sync with PRO_PATHS in
-# split-public-repo.sh and the exclude set in docs/OPEN-CORE.md. Note: internal/llm
-# is OPEN (the BYOAI client shim has no moat; the flywheel that uses it is the open
-# product). Pro .go files behind `//go:build pro` (e.g. retrieve_ann_pro.go,
-# ui_hubteam_pro.go) never appear in the default build, so they are not listed here.
+# The pro PACKAGE import paths below must stay in sync with the exclude set in
+# docs/OPEN-CORE.md (and, in the private monorepo, with the release script that strips
+# them). Note: internal/llm is OPEN (the BYOAI client shim has no moat; the flywheel
+# that uses it is the open product). Pro .go files behind `//go:build pro` (e.g.
+# retrieve_ann_pro.go, ui_hubteam_pro.go) never appear in the default build, so they
+# are not listed here.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)/mesh" 2>/dev/null || {
@@ -26,7 +27,10 @@ cd "$(git rev-parse --show-toplevel)/mesh" 2>/dev/null || {
   [ -f go.mod ] || { echo "error: run from the mesh module" >&2; exit 1; }
 }
 
-PRO_PKGS='internal/hub|cmd/mesh-hub|internal/curator|cmd/mesh-curator|internal/hnsw'
+# internal/flarereport is pro too: it is the pro binaries' error-reporting shim, it
+# carries the commercial license header, and it is not part of the published mirror. An
+# open package importing it would break the mirror's build exactly like internal/hub does.
+PRO_PKGS='internal/hub|cmd/mesh-hub|internal/curator|cmd/mesh-curator|internal/hnsw|internal/flarereport'
 
 leaks="$(go list -deps -f '{{.ImportPath}} {{join .Imports " "}}' ./... 2>/dev/null \
   | awk -v pro="$PRO_PKGS" '{p=$1; if(p ~ ("("pro")"))next; for(i=2;i<=NF;i++) if($i ~ ("("pro")")) print "  LEAK: "p" imports "$i}')"

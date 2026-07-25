@@ -10,26 +10,31 @@ You do not convert anything. Mesh reads the markdown you already have. Point it 
 your vault and index it:
 
 ```
-mesh index ~/Desktop/Obsidian/MyVault     # parse + build the index in place
-mesh ui ~/Desktop/Obsidian/MyVault        # open the web app over it
+mesh index /path/to/MyVault     # parse + build the index in place
+mesh ui /path/to/MyVault        # open this web app over it
 ```
 
 That is the whole import for local use. Obsidian `[[wikilinks]]` and tags become
 graph edges automatically. Re-run `mesh index` (or use `mesh watch`) after edits.
 
-## See it in the hosted app (push to a team hub)
+Nothing leaves your machine: the index is a `.mesh/` folder next to your notes, and
+`mesh ui` binds to `127.0.0.1`. No account, no upload, no service to sign up for.
 
-The hosted app at `mesh.brightinteraction.com/app` shows a shared **hub** vault. To
-get your notes in there, join the hub from your vault once, then sync:
+## No vault yet?
 
-```
-mesh join https://mesh.brightinteraction.com <invite-token> ~/Desktop/MyVault
-mesh sync ~/Desktop/MyVault               # pushes your notes up; pulls others' down
-```
+`mesh init my-vault` creates one with a starter index. The Mesh repository also
+ships a small sample vault in `vault/`, so `mesh index ./vault && mesh ui ./vault`
+from a clone shows you a populated graph in one step.
 
-An operator mints `<invite-token>` with `docker exec mesh-hub mesh-hub invite`. After
-a sync, click **Reindex now** in Settings (or reload) so the app shows the new notes.
-`mesh sync` is also the import: it is a two-way merge, never a destructive overwrite.
+## Sharing a vault with a team
+
+`mesh join` and `mesh sync` reconcile your vault with a **team-sync hub**, so a
+whole team edits one vault with no git on any client. The hub is a commercial
+product and is not part of this build. See LICENSING.md in the repository for the
+hosted and self-hosted options.
+
+Everything else in this app works without it. Team sync is the only feature that
+needs a hub.
 
 ## Point your AI agent at it (MCP)
 

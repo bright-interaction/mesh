@@ -10,46 +10,84 @@ It is one Go binary, no cgo, no external services. Retrieving from Mesh is cheap
 
 - **The core, zero models:** cheap card-based retrieval (FTS + graph-BM25 + tier-0, pure Go, no inference, near-zero CPU) plus the agent write-back flywheel, in a single no-glue binary. `mesh_search` hands the agent ranked cards (title + snippet + why); **the agent reads the cards and picks** the 1-2 notes worth fetching. A capable coding agent is already a stronger relevance judge than any bolt-on reranker, so for the agent consumer the agent *is* the reranker, free. This is the whole product for an agent.
 - **Optional BYOAI add-ons (off by default, for cost-sensitive or non-agent consumers):**
-  - **Vectors (`mesh embed`)** lift recall on paraphrase queries where keyword search breaks (13/20 -> 20/20 on the Corpus eval). Worth turning on when queries paraphrase the notes; can point at a cloud endpoint for zero local CPU, or be skipped (FTS keyword recall is already 23/25).
+  - **Vectors (`mesh embed`)** lift recall on paraphrase queries where keyword search breaks (13/20 -> 20/20 on the private corpus behind `docs/BENCHMARK.md`; read that file's caveats before quoting the number). Worth turning on when queries paraphrase the notes; can point at a cloud endpoint for zero local CPU, or be skipped (FTS keyword recall is already 23/25).
   - **Cross-encoder rerank** lifts top-1 precision for a consumer that *trusts the top result without reading the cards* (`answer@1` 3/20 -> 10/20 on paraphrase). That is not a capable agent (which reads the cards and judges); it is a cheap/small downstream model, a blind "fetch top-1" pipeline, or a multi-tenant cloud deployment where offloading ranking to a local judge saves the tenant's billed model from reading and ranking candidates. Off unless an endpoint is configured. See `docs/BENCHMARK.md` for the matched-arm measurements.
-- **Also shipped:** a keyboard TUI (`mesh tui`) and a browser graph viewer (`mesh ui`) over the same index, and sovereign team sync (a self-hosted `mesh-hub`, real-time SSE push, and a BYOAI conflict curator). All optional; the solo, local core stands alone.
+- **Also shipped:** a keyboard TUI (`mesh tui`) and a browser app (`mesh ui`) over the same index, plus the client side of sovereign team sync (`mesh join` / `mesh sync` / `mesh conflicts`). The team-sync **server** those talk to is the commercial product and is not in this repository, see [LICENSING.md](LICENSING.md). All optional; the solo, local core stands alone.
 
 ## Install
 
-Mesh is a self-contained Go module (`github.com/bright-interaction/mesh`, no cgo)
-living in the `bright-interaction/automations` monorepo. Since that repo is
-private, the sovereign install path is one command from a checkout, no published
-repo, no public exposure:
-
-```
-cd automations/mesh
-make install            # builds a static binary to ~/.local/bin/mesh
-```
-
-Once published as its own public repo, plain `go install` works:
+Mesh is a self-contained Go module (`github.com/bright-interaction/mesh`, no cgo,
+no external services). One command:
 
 ```
 go install github.com/bright-interaction/mesh/cmd/mesh@latest
 ```
 
-The module path is already `github.com/bright-interaction/mesh`, so a public
-release is a mirror of the `mesh/` subtree to its own repo plus a version tag, with
-no code changes. `docs/RELEASING.md` documents that process and
-`scripts/split-public-repo.sh` performs it. Until then, the checkout build above is
-the install path. (A private mirror also works with
-`GOPRIVATE=github.com/bright-interaction/* go install ...@latest`.)
+That puts the binary in `$(go env GOPATH)/bin`, so make sure that directory is on
+your `PATH`.
+
+From source instead (Go 1.26 or newer):
+
+```
+git clone https://github.com/bright-interaction/mesh
+cd mesh
+make install            # builds a static binary to ~/.local/bin/mesh
+```
+
+`make install` writes to `~/.local/bin/mesh`; override with `make install
+BIN=/usr/local/bin/mesh`. `make build` drops it in `./bin/mesh` instead if you
+would rather not install anything.
 
 ## Quickstart
+
+This repository ships a small sample vault in `vault/`: the real decisions and
+gotchas written while building Mesh. It is the fastest way to see what the tool
+returns before you have written any notes of your own. From a clone:
+
+```
+mesh index ./vault                                   # parse + build the index
+mesh search "rerank" --vault ./vault --budget 4000   # ranked cards, not whole files
+```
+
+Six ranked cards come back (abridged here, paths shortened):
+
+```
+1. Blending fused score into rerank does not beat pure rerank [tier-0]  (decisions/blending-fused-score-...md)
+   # Blending fused score into [rerank] does not beat pure [rerank] ## Context ## Decision ...
+   ~ fts
+2. Cross-encoder rerank is the answer@1 lever that chunking was not [tier-0]  (decisions/cross-encoder-rerank-...md)
+   # Cross-encoder [rerank] is the answer@1 lever that chunking was not ...
+   ~ fts
+3. Learned fusion weights help the no-reranker path but wash out under rerank [tier-0]  (decisions/learned-fusion-weights-...md)
+   ... It matters most for a vectors-on, [rerank]-off deployment, where vector ...
+   ~ fts
+4. Per-section embeddings do not beat whole-note ... [tier-0]  (decisions/per-section-embeddings-...md)
+   ~ linked from Blending fused score into rerank does not beat pure rerank
+5. ...
+6. ...
+packed 6 cards, ~854 tokens (budget 4000)
+```
+
+Cards 1 to 3 matched the text. Card 4 did not: it surfaced because the graph
+links it to card 1. That one-hop expansion is the part plain full-text search
+cannot do. The trailing `~ fts` / `~ linked from` line is the "why it surfaced"
+reason, which is what an agent reads before deciding which single note to open.
+Six cards for ~854 tokens, instead of six note bodies.
+
+Now your own vault:
 
 ```
 mesh init my-vault                 # bootstrap a vault (starter index + first build)
 mesh new decision "Use Postgres over Mongo" \
   --do "..." --dont "..." --why "..." --vault my-vault   # capture judgment; Mesh fills id/date/placement
 mesh index my-vault                # rebuild the index after edits
+mesh search "Postgres" --vault my-vault --budget 4000
 mesh watch my-vault                # live-reindex as you edit (no manual index; Ctrl-C to stop)
-mesh search "datastore choice" --vault my-vault --budget 4000
 mesh doctor my-vault               # is the index fresh? any drift or lint problems?
 ```
+
+Search matches the words in your notes, so query with terms the note actually
+uses. Semantic (paraphrase) matching is the optional BYOAI vector stage below.
 
 `mesh watch` is the local-first, Obsidian-like immediacy: edit a note in your
 editor and it is searchable at once, no commit, no manual `mesh index`. It
@@ -85,12 +123,9 @@ export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
 mesh status my-vault    # shows which retrieval signals are active
 ```
 
-For a very large vault, set `MESH_HNSW_THRESHOLD=<N>` to build an in-memory HNSW
-(approximate-nearest-neighbour) index once the vault has at least N chunk vectors,
-replacing the brute-force cosine scan. It is off by default (brute force is
-sub-5ms well past a few thousand notes) and falls back to brute force on any build
-error, so it can only ever speed up retrieval. `mesh status` shows `ANN/hnsw` when
-it is active.
+Vector search in this repository is a brute-force cosine scan, which stays under
+5 ms well past a few thousand notes. The commercial build adds an approximate
+(HNSW) index for vaults large enough to need one, see [LICENSING.md](LICENSING.md).
 
 Once set, `mesh search` / `eval` / `mcp` fuse the semantic signal and apply the
 rerank automatically. Both degrade safely: no embedder means lexical-only, a
@@ -147,29 +182,64 @@ path (the hub itself stays AI-free).
 
 ## Commands
 
+Set up and capture:
+
 | Command | Purpose |
 |---|---|
+| `mesh install` | One-shot setup: register the MCP server with your agent (plus the auto-onboard hook on Claude Code) |
 | `mesh init [path]` | Bootstrap a new vault |
 | `mesh new <type> "<title>"` | Scaffold a note (id, date, placement, skeleton auto-filled) |
-| `mesh migrate [vault]` | Bring a Corpus/Foam-style vault up to the Mesh schema |
+| `mesh migrate [vault]` | Bring a Foam / Obsidian-style vault up to the Mesh schema |
+| `mesh ingest <source>` | Pull external knowledge (GitHub, Slack, Linear, Jira, Notion) into the vault, incrementally |
+| `mesh extract <transcript>` | Turn an agent session transcript into candidate write-back notes to keep or discard |
+| `mesh hooks install` | Wire Claude Code session hooks: read Mesh at session start, nudge write-back at the end |
+
+Index and retrieve:
+
+| Command | Purpose |
+|---|---|
 | `mesh index [vault]` | Parse + persist the index (`.mesh/mesh.db`) |
 | `mesh watch [vault]` | Live-reindex on every change (debounced + periodic reconcile) |
 | `mesh embed [vault]` | Embed notes via a BYOAI endpoint (turns on semantic search) |
 | `mesh search "<query>"` | Fused, budget-packed retrieval (semantic + rerank when configured) |
+| `mesh ask "<question>"` | Answer a question from your notes + code with citations (needs a BYOAI model) |
+| `mesh code <search\|context\|reindex>` | Source-code index: find a symbol by name (file:line), or pair it with the notes about it |
+| `mesh orient [vault]` | Print a session orientation: entry points, recent changes, how to retrieve |
+| `mesh mcp [--vault] [--watch]` | Serve the agent retrieval + write-back surface (live-reindex with `--watch`) |
+
+Inspect and maintain:
+
+| Command | Purpose |
+|---|---|
 | `mesh status [vault]` | Index row counts + which retrieval signals are active |
 | `mesh lint [vault]` | Frontmatter / links / filenames (non-zero exit for CI) |
 | `mesh doctor [vault]` | Index freshness (drift), counts, health |
+| `mesh health [vault]` | Knowledge lifecycle: dead source refs, overdue reviews, contradictions |
+| `mesh structure [vault]` | Grade the vault's organization: types, connectivity, tier-0, maps |
+| `mesh flywheel [vault]` | Write-back reuse metrics: does written-back knowledge get used again? |
+| `mesh guards <list\|suggest>` | Turn gotchas into candidate pre-commit guards (knowledge to enforcement) |
+| `mesh scope backfill` | Stamp an explicit access scope on notes that have none (which notes a given member may see) |
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |
 | `mesh tune <cases.json>` | Learn fusion weights from labelled queries (validated on held-out) |
-| `mesh mcp [--vault] [--watch]` | Serve the agent retrieval + write-back surface (live-reindex with `--watch`) |
-| `mesh tui [vault]` | Keyboard three-pane terminal view (notes, ranked search, preview + neighbors) |
-| `mesh ui [vault]` | Browser graph viewer (force-graph + galaxy) over the same index, localhost |
-| `mesh serve-ssh [vault]` | Serve the TUI over SSH so a teammate browses the graph with `ssh`, no install (key-auth, fail-closed) |
-| `mesh join <hub> <invite> [vault]` | Join a team vault and clone it (no git) |
-| `mesh sync [vault]` | Reconcile with the hub (push local edits, pull teammates') |
 
-The team-sync **hub** server and the BYOAI **curator** are the commercial / pro
-layer and are not in this repository (see Editions below).
+View:
+
+| Command | Purpose |
+|---|---|
+| `mesh tui [vault]` | Keyboard three-pane terminal view (notes, ranked search, preview + neighbors) |
+| `mesh ui [vault]` | Browser app (graph, search, docs, API reference) over the same index, localhost |
+| `mesh serve-ssh [vault]` | Serve the TUI over SSH so a teammate browses the graph with `ssh`, no install (key-auth, fail-closed) |
+
+Team sync. These are the client side and ship here, but they all talk to a
+**team-sync hub**, which is the commercial product and is not in this repository
+(see [LICENSING.md](LICENSING.md)):
+
+| Command | Purpose |
+|---|---|
+| `mesh join <hub> <invite> [vault]` | Join a team vault and clone it (no git). Needs a hub. |
+| `mesh sync [vault]` | Reconcile with the hub (push local edits, pull teammates'). Needs a hub. |
+| `mesh conflicts <list\|diff\|resolve>` | Review and resolve local sync-conflict siblings. Needs a hub. |
+| `mesh curator <log\|show\|accept>` | Review what the BYOAI sync-curator merged, and failed on, across the team. Needs a hub plus the commercial curator. |
 
 ## Build
 

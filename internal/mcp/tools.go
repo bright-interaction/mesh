@@ -788,7 +788,8 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	_ = s.store.IncrMetric("writes", 1)         // ROI telemetry (best-effort)
 	_ = s.store.RecordWriteback(res.ID, source) // flywheel: stamp authoring time for reuse measurement
 	// Return a vault-relative path, never the server's absolute filesystem path:
-	// on the hosted hub the absolute path would leak /opt/mesh/... to the agent.
+	// on a hosted hub the absolute path would leak the server's absolute vault path
+	// to the agent.
 	notePath := res.Path
 	if rel, err := filepath.Rel(s.vaultRoot, res.Path); err == nil && !strings.HasPrefix(rel, "..") {
 		notePath = rel

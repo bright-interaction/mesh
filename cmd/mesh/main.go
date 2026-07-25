@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bright-interaction/mesh/internal/buildinfo"
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/eval"
 	"github.com/bright-interaction/mesh/internal/graph"
@@ -48,8 +49,14 @@ func rootCmd() *cobra.Command {
 		Short:         "Mesh: a sovereign knowledge mesh built for coding agents",
 		SilenceUsage:  true,
 		SilenceErrors: false,
+		Version:       buildinfo.Ver(),
 	}
+	// `mesh --version` and `mesh version` must print the SAME line. Cobra's built-in
+	// --version flag has its own template, so point it at versionLine() too instead of
+	// letting the two surfaces drift.
+	root.SetVersionTemplate(versionLine() + "\n")
 	root.AddCommand(
+		versionCmd(),
 		initCmd(),
 		newCmd(),
 		indexCmd(),
@@ -84,6 +91,27 @@ func rootCmd() *cobra.Command {
 		doctorCmd(),
 	)
 	return root
+}
+
+// versionLine is the single line every version surface prints: the build stamp that
+// the Makefile and Dockerfile bake into buildinfo.Version via -ldflags (or the
+// MESH_VERSION override), plus the Go toolchain the binary was built with. An
+// unstamped local build reports "dev". SECURITY.md asks reporters for the affected
+// version or commit, so this is the command that answers it.
+func versionLine() string {
+	return fmt.Sprintf("mesh %s (%s)", buildinfo.Ver(), runtime.Version())
+}
+
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the Mesh build version and Go runtime",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fmt.Fprintln(cmd.OutOrStdout(), versionLine())
+			return nil
+		},
+	}
 }
 
 func initCmd() *cobra.Command {
@@ -451,7 +479,7 @@ func embedCmd() *cobra.Command {
 			// Default: one vector per note (the structured title + flywheel + titled
 			// sections joined). --per-section instead stores one vector per heading
 			// section and scores a note by its best-matching section (max-pool). On
-			// the Corpus corpus per-section gave no recall or answer@1 lift at ~18x the
+			// a real production corpus per-section gave no recall or answer@1 lift at ~18x the
 			// embedding cost, so whole-note is the default; the flag keeps the lever
 			// available for long heterogeneous corpora where it may pay off.
 			type chunkRef struct {
@@ -559,7 +587,7 @@ func embedCmd() *cobra.Command {
 	c.Flags().StringVar(&model, "model", "", "embedding model id (or MESH_EMBED_MODEL)")
 	c.Flags().StringVar(&keyEnv, "key-env", "MESH_EMBED_KEY", "env var holding the bearer key (empty for local)")
 	c.Flags().IntVar(&batch, "batch", 32, "embeddings per request")
-	c.Flags().BoolVar(&perSection, "per-section", false, "store one vector per heading section instead of one per note (~18x more vectors; no measured lift on Corpus)")
+	c.Flags().BoolVar(&perSection, "per-section", false, "store one vector per heading section instead of one per note (~18x more vectors; no measured lift on a real production corpus)")
 	c.Flags().BoolVar(&noCache, "no-cache", false, "re-embed every chunk, ignoring the content-hash cache (use if a same-named model changed its output width)")
 	return c
 }
@@ -1023,7 +1051,7 @@ func printStats(root string, files, parseErrs int, parseDur time.Duration, worke
 		fmt.Printf("          %-8s %d\n", kv.k, kv.v)
 	}
 	fmt.Printf("edges:  %d\n", g.EdgeCount())
-	fmt.Printf("communs: %d\n", communities)
+	fmt.Printf("communities: %d\n", communities)
 	fmt.Printf("types:\n")
 	for _, kv := range sortedCounts(byType) {
 		fmt.Printf("          %-12s %d\n", kv.k, kv.v)
@@ -1059,7 +1087,7 @@ func migrateCmd() *cobra.Command {
 	var dryRun bool
 	c := &cobra.Command{
 		Use:   "migrate [vault]",
-		Short: "Bring a Corpus-style vault up to the Mesh schema (idempotent)",
+		Short: "Bring a legacy pre-Mesh markdown vault up to the Mesh schema (idempotent)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := vaultArg(args)
