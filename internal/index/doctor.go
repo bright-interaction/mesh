@@ -88,6 +88,11 @@ type DriftDelta struct {
 	Upserts    []*ParsedNote // Added + Changed, parsed, vault-relative Path
 	RemovedIDs []string      // ids whose files are gone, plus retired old ids
 	Drift      Drift         // the path lists, for logging/reporting
+	// Dropped are files this delta could not index: unparseable frontmatter, or an
+	// effective id already claimed by another file. They are reported, never fatal, so
+	// the rest of the delta still applies and the invisible note is visible to the
+	// operator (mesh_health, the reindex log) instead of vanishing without a trace.
+	Dropped []FileError
 }
 
 // DriftDeltaReport is DriftReport that retains the parse work it must do anyway:
@@ -134,17 +139,30 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 	removed := map[string]bool{}
 	seen := map[string]bool{}
 	// finalOwner maps each id to the single path that will own it after this
-	// reconcile. Two live files resolving to the same effectiveID is a data error
-	// the schema cannot represent (notes.id is the PK); the full reindex aborts on
-	// it, so we refuse here too with a clear message rather than let INSERT OR
-	// REPLACE clobber a live note and flip-flop forever (never converging).
+	// reconcile. Two live files resolving to the same effectiveID is a data error the
+	// schema cannot represent (notes.id is the PK), so exactly one of them can be
+	// indexed. This used to abort the WHOLE delta, which froze the entire vault's
+	// index: after one duplicate appeared, no edit to any other note was indexed until
+	// the process restarted, and a restart only postponed it (the full reindex tolerates
+	// the duplicate via INSERT OR REPLACE, so the next incremental failed again). The
+	// hosted worker discarded the error, so the hub served a frozen index with zero
+	// signal. Quarantine instead: the incumbent keeps the id (converging, never
+	// flip-flopping), the challenger is dropped with a recorded reason, and the rest of
+	// the delta applies normally.
 	finalOwner := map[string]string{}
-	claim := func(id, rel string) error {
+	claim := func(id, rel string) bool {
 		if other, dup := finalOwner[id]; dup {
-			return fmt.Errorf("duplicate note id %q at %q and %q; ids must be unique before either can be indexed", id, other, rel)
+			dd.Dropped = append(dd.Dropped, FileError{
+				Path: rel,
+				// Wrapped, not just formatted: consumers (mesh_health) need to tell a
+				// duplicate-id quarantine from unparseable frontmatter, because the two
+				// have different remedies. errors.Is beats matching on the message text.
+				Err: fmt.Errorf("%w %q: already claimed by %q; ids must be unique before this file can be indexed", ErrDuplicateNoteID, id, other),
+			})
+			return false
 		}
 		finalOwner[id] = rel
-		return nil
+		return true
 	}
 	for _, f := range files {
 		rel, err := filepath.Rel(root, f)
@@ -156,9 +174,7 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 		// not parsed. It still owns its id (from the DB) for the collision check.
 		if r, ok := dbByPath[rel]; mtimeFast && ok && r.mtime != 0 {
 			if fi, statErr := os.Stat(f); statErr == nil && fi.ModTime().Unix() == r.mtime {
-				if err := claim(r.id, rel); err != nil {
-					return DriftDelta{}, err
-				}
+				claim(r.id, rel)
 				continue
 			}
 		}
@@ -170,12 +186,19 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 				dd.Drift.Removed = append(dd.Drift.Removed, rel)
 				removed[r.id] = true
 			}
+			// Record it either way. A brand-new unparseable file is NOT in the index, so
+			// it used to fall straight through to `continue`: no drift entry, no log
+			// line, no dropped record, and mesh_health reported a clean vault while the
+			// note was missing from search and the graph. That is the exact failure
+			// recordDropped was added to prevent, and it was wired only into ReindexFull,
+			// so the watcher and the hosted hub (the incremental paths) never saw it.
+			dd.Dropped = append(dd.Dropped, FileError{Path: rel, Err: err})
 			continue
 		}
 		pn.Path = rel
 		id := effectiveID(pn)
-		if err := claim(id, rel); err != nil {
-			return DriftDelta{}, err
+		if !claim(id, rel) {
+			continue
 		}
 		r, ok := dbByPath[rel]
 		switch {
@@ -209,5 +232,8 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 	sort.Strings(dd.Drift.Changed)
 	sort.Strings(dd.Drift.Removed)
 	sort.Strings(dd.RemovedIDs)
+	// Stable order so the dropped set can be compared between reconciles (that
+	// comparison is what stops the watcher re-logging the same warning every tick).
+	sort.Slice(dd.Dropped, func(i, j int) bool { return dd.Dropped[i].Path < dd.Dropped[j].Path })
 	return dd, nil
 }

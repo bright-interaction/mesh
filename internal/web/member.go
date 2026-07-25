@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // memberAuth backs the web app with the hub's per-member client tokens, used when the
@@ -26,16 +27,18 @@ type memberAuth struct {
 	verify func(token string) (clientID int64, user string, ok bool)
 	// scopesFor returns the member's readable scopes; nil = unrestricted (no scoping configured).
 	scopesFor func(clientID int64) map[string]bool
-	// roleFor returns the member's role and whether the client still exists. ok=false
-	// means the client was removed/revoked, so a still-valid cookie must stop working
-	// immediately instead of at cookie expiry.
-	roleFor func(clientID int64) (role string, ok bool)
+	// roleFor returns the member's role, their immutable created_at, and whether the
+	// client still exists. ok=false means the client was removed/revoked, so a
+	// still-valid cookie must stop working immediately instead of at cookie expiry.
+	// createdAt is signed into the cookie so a REUSED client rowid cannot revive a
+	// revoked member's cookie as whoever now holds that id.
+	roleFor func(clientID int64) (role string, createdAt int64, ok bool)
 	key     []byte // per-process HMAC key for the client-bound cookie
 }
 
 const memberCookie = "mesh_member"
 
-func newMemberAuth(verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, bool)) *memberAuth {
+func newMemberAuth(verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, int64, bool)) *memberAuth {
 	return &memberAuth{verify: verify, scopesFor: scopesFor, roleFor: roleFor, key: stableMemberKey()}
 }
 
@@ -77,26 +80,72 @@ func stableMemberKey() []byte {
 	return key
 }
 
-// sign returns the client-bound cookie value "<id>.<hmac>", signed with the stable key
-// so it stays valid across restarts.
-func (m *memberAuth) sign(id int64) string {
-	ids := strconv.FormatInt(id, 10)
-	mac := hmac.New(sha256.New, m.key)
-	mac.Write([]byte("mesh-member-v1:" + ids))
-	return ids + "." + hex.EncodeToString(mac.Sum(nil))
+// memberCookieTTL is how long an issued member cookie stays valid SERVER side. It
+// matches the browser-side MaxAge, but unlike MaxAge it is signed into the value, so a
+// copied cookie value stops working on its own schedule instead of living forever.
+const memberCookieTTL = 30 * 24 * time.Hour
+
+// sign returns the client-bound cookie value "<id>.<exp>.<hmac>", signed with the
+// stable key so it stays valid across restarts.
+//
+// Two things beyond the rowid are INSIDE the signed payload:
+//
+//   - the expiry. The v1 format signed the client rowid alone, which made the cookie a
+//     permanent bearer credential: nothing but the browser's own MaxAge (which the
+//     holder controls) ever retired it.
+//   - the client's immutable created_at. sqlite hands the deleted maximum rowid back to
+//     the next INSERT on a table declared without AUTOINCREMENT, so a revoked member's
+//     id can be reissued to a brand-new member. Binding created_at means the old
+//     cookie's HMAC no longer verifies against the new occupant of that id.
+//
+// The version string is bumped to v3 so every cookie minted under v1/v2 stops verifying
+// at once.
+func (m *memberAuth) sign(id, createdAt int64) string {
+	return m.signAt(id, createdAt, time.Now().Add(memberCookieTTL).Unix())
 }
 
-// clientFromCookie validates a cookie value (constant-time) and returns its client id.
-func (m *memberAuth) clientFromCookie(v string) (int64, bool) {
-	dot := strings.LastIndexByte(v, '.')
-	if dot <= 0 {
-		return 0, false
+// signAt is sign with an explicit expiry, split out so the expiry check is testable
+// without waiting or faking the clock globally.
+func (m *memberAuth) signAt(id, createdAt, exp int64) string {
+	ids, exps := strconv.FormatInt(id, 10), strconv.FormatInt(exp, 10)
+	mac := hmac.New(sha256.New, m.key)
+	mac.Write([]byte("mesh-member-v3:" + ids + ":" + strconv.FormatInt(createdAt, 10) + ":" + exps))
+	return ids + "." + exps + "." + hex.EncodeToString(mac.Sum(nil))
+}
+
+// cookieClaims parses the UNVERIFIED id and expiry out of a cookie value. The caller
+// must still run clientFromCookie to authenticate it; this only exists so the caller can
+// look up the createdAt that the signature is bound to.
+func cookieClaims(v string) (id, exp int64, ok bool) {
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return 0, 0, false
 	}
-	id, err := strconv.ParseInt(v[:dot], 10, 64)
+	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
+		return 0, 0, false
+	}
+	exp, err = strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return id, exp, true
+}
+
+// clientFromCookie validates a cookie value (constant-time) against the client's current
+// createdAt and returns its client id. A well-signed but expired value is refused, and so
+// is a value signed for a DIFFERENT createdAt on the same rowid (the reuse case).
+func (m *memberAuth) clientFromCookie(v string, createdAt int64) (int64, bool) {
+	id, exp, ok := cookieClaims(v)
+	if !ok {
 		return 0, false
 	}
-	if subtle.ConstantTimeCompare([]byte(v), []byte(m.sign(id))) != 1 {
+	if subtle.ConstantTimeCompare([]byte(v), []byte(m.signAt(id, createdAt, exp))) != 1 {
+		return 0, false
+	}
+	// Signature checked first so an expired-vs-forged cookie is indistinguishable in
+	// timing; only then does the expiry decide.
+	if time.Now().Unix() >= exp {
 		return 0, false
 	}
 	return id, true
@@ -109,11 +158,19 @@ func (m *memberAuth) clientFromCookie(v string) (int64, bool) {
 // or when the client has been revoked.
 func (m *memberAuth) member(r *http.Request) (id int64, role string, ok bool) {
 	if c, err := r.Cookie(memberCookie); err == nil && c.Value != "" {
-		if cid, valid := m.clientFromCookie(c.Value); valid {
-			if role, exists := m.roleFor(cid); exists {
+		// The claimed id is read first (unverified) purely to look up the createdAt the
+		// signature is bound to. Nothing is trusted until clientFromCookie verifies the
+		// HMAC over id+createdAt+exp, so a forged id resolves either to a non-existent
+		// client (refused here) or to a createdAt the forger cannot sign against.
+		if cid, _, parsed := cookieClaims(c.Value); parsed {
+			role, createdAt, exists := m.roleFor(cid)
+			if !exists {
+				return 0, "", false // client was revoked; the cookie dies with it
+			}
+			if _, valid := m.clientFromCookie(c.Value, createdAt); valid {
 				return cid, role, true
 			}
-			return 0, "", false // cookie signature valid but the client was revoked
+			return 0, "", false // bad signature, expired, or a reused rowid
 		}
 	}
 	// Bearer header only; the ?token= query fallback was removed so a member's client
@@ -121,7 +178,7 @@ func (m *memberAuth) member(r *http.Request) (id int64, role string, ok bool) {
 	tok := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
 	if tok != "" {
 		if cid, _, valid := m.verify(tok); valid {
-			if role, exists := m.roleFor(cid); exists {
+			if role, _, exists := m.roleFor(cid); exists {
 				return cid, role, true
 			}
 		}
@@ -139,8 +196,10 @@ func (m *memberAuth) clientFromRequest(r *http.Request) (int64, bool) {
 // SetMemberAuth puts the web app in per-member mode: requests authenticate as a hub
 // client and the graph/search/note surfaces are scoped to that member. verify checks a
 // client token; scopesFor returns a member's readable scopes (nil = unrestricted);
-// roleFor returns the member's role and whether the client still exists.
-func (s *Server) SetMemberAuth(verify func(token string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, bool)) {
+// roleFor returns the member's role, their immutable created_at (bound into the session
+// cookie so a reused client rowid cannot revive a revoked member's cookie), and whether
+// the client still exists.
+func (s *Server) SetMemberAuth(verify func(token string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, int64, bool)) {
 	s.member = newMemberAuth(verify, scopesFor, roleFor)
 	s.scopeResolver = func(r *http.Request) map[string]bool {
 		id, ok := s.member.clientFromRequest(r)

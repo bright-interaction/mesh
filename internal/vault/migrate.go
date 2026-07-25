@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -94,7 +95,7 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 	if !had {
 		out = "---\n" + newFM + "\n---\n\n" + body
 	}
-	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+	if err := writeNoteChecked(path, out); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -134,10 +135,29 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 	if !had {
 		out = "---\n" + newFM + "\n---\n\n" + body
 	}
-	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+	if err := writeNoteChecked(path, out); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// writeNoteChecked is the single guarded write path for a note Mesh authors itself. It
+// re-parses the rendered content and refuses to write when the frontmatter would not
+// come back out, because an unparseable frontmatter block removes the note from search
+// and the graph with no warning at all. CreateNote has enforced this since the drop was
+// diagnosed; the migrate writers did not, so `mesh migrate` could still prepend a block
+// that broke the YAML (an unquoted value carrying a colon, an existing block it merges
+// with) and leave the note silently invisible. Both writers now go through it, so the
+// invariant is "Mesh never writes a note that would vanish", not "CreateNote does not".
+func writeNoteChecked(path, content string) error {
+	fmStr, _, had := SplitFrontmatter(content)
+	if !had {
+		return fmt.Errorf("%s: rendered note has no frontmatter block; refusing to write a note the index would drop", path)
+	}
+	if _, _, err := ParseFrontmatter([]byte(fmStr)); err != nil {
+		return fmt.Errorf("%s: rewritten frontmatter is invalid YAML (the index would drop this note, invisible to search and the graph): %w", path, err)
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 func fileMtimeDate(path string) string {

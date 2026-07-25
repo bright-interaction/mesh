@@ -217,17 +217,20 @@ func Save(meshDir string, e Embedding) error {
 
 // SaveConfig writes the full <meshDir>/config.toml atomically (temp + rename), 0644.
 func SaveConfig(meshDir string, c Config) error {
-	// key_env vars are NAMES of env vars, never secrets. Reject anything that is not
-	// a plain identifier so a bad value cannot break the simple TOML round-trip.
-	if !validEnvName(c.Embedding.KeyEnv) {
+	// key_env vars are NAMES of env vars, never secrets, and the set of names they may
+	// point at is closed (see keyenv.go). Anything outside the allow-list is reset to the
+	// field's default rather than persisted, so SaveConfig can never write a config.toml
+	// that aims a key_env at an unrelated process secret. This subsumes the old
+	// plain-identifier shape check: every allow-listed name is a valid identifier.
+	// Empty stays empty for the optional sections (it means "unset"), except for
+	// embedding, whose template has always written the concrete default name.
+	if c.Embedding.KeyEnv == "" || !KeyEnvAllowed(c.Embedding.KeyEnv) {
 		c.Embedding.KeyEnv = "MESH_EMBED_KEY"
 	}
-	if c.Retrieval.RerankKeyEnv != "" && !validEnvName(c.Retrieval.RerankKeyEnv) {
+	if !KeyEnvAllowed(c.Retrieval.RerankKeyEnv) {
 		c.Retrieval.RerankKeyEnv = "MESH_RERANK_KEY"
 	}
-	// key_env is a NAME, never a secret. A non-empty garbage value would break the
-	// round-trip, so reset it to the default name (matching the embedding guard above).
-	if c.SecretBridge.KeyEnv != "" && !validEnvName(c.SecretBridge.KeyEnv) {
+	if !KeyEnvAllowed(c.SecretBridge.KeyEnv) {
 		c.SecretBridge.KeyEnv = "MESH_SECRET_BRIDGE_KEY"
 	}
 	e, rv := c.Embedding, c.Retrieval

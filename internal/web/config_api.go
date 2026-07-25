@@ -6,6 +6,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -107,7 +108,44 @@ func (s *Server) effectiveConfig() []cfgField {
 	return out
 }
 
+// checkKeyEnv validates a *.key_env value against the closed allow-list in
+// meshcfg (see internal/meshcfg/keyenv.go, which is also what the retrieval and
+// secret-bridge READ sites resolve through, so the write gate and the read gate cannot
+// drift). key_env is a POINTER to a secret: the retrieval layer dereferences it with
+// os.Getenv and sends the result as an Authorization: Bearer header to a
+// caller-configured endpoint, so validating only the identifier's SHAPE would turn a
+// config write into an arbitrary read of the whole process environment. Empty is allowed:
+// it clears the field back to the per-stage built-in default.
+func checkKeyEnv(key, v string) error {
+	if meshcfg.KeyEnvAllowed(v) {
+		return nil
+	}
+	return fmt.Errorf("%s must be one of %s", key, meshcfg.AllowedKeyEnvList)
+}
+
+// scrubKeyEnv clears every *.key_env on a loaded config that is not allow-listed,
+// logging what it dropped. Used before rewriting config.toml so a value that got in
+// before the allow-list existed (or by hand-editing the file) is not re-persisted.
+func scrubKeyEnv(c *meshcfg.Config) {
+	drop := func(field string, v *string) {
+		if err := checkKeyEnv(field, *v); err != nil {
+			slog.Warn("mesh ui: dropping a disallowed key_env from config.toml", "field", field, "value", *v)
+			*v = ""
+		}
+	}
+	drop("embedding.key_env", &c.Embedding.KeyEnv)
+	drop("rerank.key_env", &c.Retrieval.RerankKeyEnv)
+	drop("secret_bridge.key_env", &c.SecretBridge.KeyEnv)
+}
+
+// handleGetConfig returns the effective settings. Admin-gated: the values include the
+// internal embedding/rerank endpoints and the Dockyard secret-bridge URL plus agent id,
+// which is reconnaissance a read-only viewer has no reason to hold. A no-op in
+// standalone loopback mode, where the single token is already the gate.
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
 	writeJSON(w, map[string]any{"fields": s.effectiveConfig()})
 }
 
@@ -134,6 +172,11 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		editable[f.Key] = f.Editable
 	}
 	cfg, _ := meshcfg.LoadConfig(s.store.MeshDir())
+	// Defence in depth on the READ side: the file on disk may predate the allow-list or
+	// have been hand-edited, and this handler is about to rewrite the whole struct back
+	// out. Drop any key_env that names something outside allowedKeyEnv rather than
+	// re-persisting it, so the allow-list is not just an input filter.
+	scrubKeyEnv(&cfg)
 	for k, v := range req.Updates {
 		if _, known := envFor[k]; !known {
 			http.Error(w, "unknown field: "+k, http.StatusBadRequest)
@@ -192,6 +235,9 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 		}
 		c.Embedding.Dim = i
 	case "embedding.key_env":
+		if err := checkKeyEnv(key, v); err != nil {
+			return err
+		}
 		c.Embedding.KeyEnv = v
 	case "embedding.query_prefix":
 		c.Embedding.QueryPrefix = v
@@ -220,6 +266,9 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 	case "rerank.model":
 		c.Retrieval.RerankModel = v
 	case "rerank.key_env":
+		if err := checkKeyEnv(key, v); err != nil {
+			return err
+		}
 		c.Retrieval.RerankKeyEnv = v
 	case "rerank.blend":
 		f, err := pf()
@@ -239,6 +288,9 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 	case "secret_bridge.base_url":
 		c.SecretBridge.BaseURL = v
 	case "secret_bridge.key_env":
+		if err := checkKeyEnv(key, v); err != nil {
+			return err
+		}
 		c.SecretBridge.KeyEnv = v
 	case "secret_bridge.agent_id":
 		c.SecretBridge.AgentID = v
@@ -259,9 +311,12 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "reindex failed", http.StatusInternalServerError)
 		return
 	}
+	// Swap the graph and drop the cached retriever in ONE exclusive critical section, so
+	// a retriever build that is in flight cannot publish a retriever over the old graph
+	// after we cleared the cache (see Server.retriever).
 	s.mu.Lock()
 	s.graph = g
-	s.cachedRetriever = nil // rebuild over the fresh graph on the next search
+	s.cachedRetriever.Store(nil) // rebuild over the fresh graph on the next search
 	s.mu.Unlock()
 	notes, _ := s.store.Count("notes")
 	nodes, _ := s.store.Count("nodes")

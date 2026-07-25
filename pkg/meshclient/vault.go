@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,10 +137,19 @@ type park struct {
 // keeps the path "dirty" so the local change re-pushes next sync (it is not
 // silently dropped). Each write is atomic (temp + rename); a partial-batch
 // failure self-heals because the base is not advanced. Returns the parked paths.
+//
+// Every delta path goes through safeNotePath first: the path is hub-controlled,
+// so an unvalidated Join is arbitrary file write outside the vault. An unsafe
+// path is skipped and logged, never fatal, so one bad entry cannot stop the rest
+// of a legitimate sync.
 func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[string]string) ([]park, error) {
 	var parked []park
 	for _, d := range deltas {
-		abs := filepath.Join(vaultDir, filepath.FromSlash(d.Path))
+		abs, perr := safeNotePath(vaultDir, d.Path)
+		if perr != nil {
+			slog.Warn("sync: refusing hub delta path", "path", d.Path, "err", perr)
+			continue
+		}
 		onDisk, readErr := os.ReadFile(abs)
 		sentHash, wasSent := sentHashes[d.Path]
 		// A local change during the window is either an edit (present but
@@ -164,8 +174,16 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 		if locallyChanged && contentHash(onDisk) != contentHash(b) {
 			// External-editor race: park the incoming version, keep the local
 			// change (a local delete keeps the path absent; a local edit keeps it).
+			// The sibling is derived from the already-validated delta path, so a
+			// validation failure here is a local invariant break (e.g. a symlink
+			// planted mid-sync), not hub input: fail the round rather than skip it,
+			// which leaves the base unadvanced and self-heals on retry.
 			sib := merge.SiblingPath(d.Path, time.Now(), "hub", b)
-			if err := writeFileAtomic(filepath.Join(vaultDir, filepath.FromSlash(sib)), b); err != nil {
+			sibAbs, perr := safeSiblingPath(vaultDir, sib)
+			if perr != nil {
+				return parked, perr
+			}
+			if err := writeFileAtomic(sibAbs, b); err != nil {
 				return parked, err
 			}
 			parked = append(parked, park{note: d.Path, sibling: sib})
@@ -188,6 +206,50 @@ func keepParkedDirty(current, base map[string]string, parked []park) {
 			current[p.note] = old
 		} else {
 			delete(current, p.note)
+		}
+	}
+}
+
+// keepWindowEditsDirty stops a local write made DURING the sync window from being
+// silently recorded as already synced. current is recomputed from disk after the
+// round trip, so any file the user (or the indexer, or another agent) touched
+// while the request was in flight would be baselined as if the hub had it: the
+// edit is never pushed, never retried, and a later inbound delta for that path
+// overwrites it with no conflict sibling, because sentHashes then matches disk.
+//
+// sentHashes is the on-disk state at send time, so a path whose hash differs from
+// it changed during the window. Two cases are NOT window edits and are skipped:
+// a path the hub sent a delta for (applyDeltas wrote it, and its own guard plus
+// keepParkedDirty already decided what happens), and a path we dropped because it
+// was deleted upstream. Everything else is reset to its send-time hash, which is
+// what the hub has, so the next computeOutbox re-detects the change: an edit
+// re-pushes as an upsert and a window delete re-pushes as a delete.
+func keepWindowEditsDirty(current, sentHashes map[string]string, deltas []syncproto.Delta, dropped []string) {
+	skip := make(map[string]bool, len(deltas)+len(dropped))
+	for _, d := range deltas {
+		skip[d.Path] = true
+	}
+	for _, rel := range dropped {
+		skip[rel] = true
+	}
+	restore := func(rel string) {
+		if skip[rel] {
+			return
+		}
+		if old, ok := sentHashes[rel]; ok {
+			current[rel] = old
+		} else {
+			delete(current, rel) // created during the window: no base, so it pushes as new
+		}
+	}
+	for rel, h := range current {
+		if sentHashes[rel] != h {
+			restore(rel)
+		}
+	}
+	for rel := range sentHashes {
+		if _, ok := current[rel]; !ok {
+			restore(rel) // deleted during the window: keep the base so the delete pushes
 		}
 	}
 }
@@ -275,7 +337,12 @@ func dropTombstoned(vaultDir string, tombstones []string, base map[string]string
 		if !ok {
 			continue // never synced here: nothing to prune
 		}
-		abs := filepath.Join(vaultDir, filepath.FromSlash(rel))
+		// The drop-list is hub-controlled, so validate before touching the disk.
+		abs, perr := safeNotePath(vaultDir, rel)
+		if perr != nil {
+			slog.Warn("sync: refusing hub tombstone path", "path", rel, "err", perr)
+			continue
+		}
 		onDisk, err := os.ReadFile(abs)
 		if err != nil {
 			continue // already gone or unreadable
@@ -294,13 +361,28 @@ func dropTombstoned(vaultDir string, tombstones []string, base map[string]string
 // writeConflictSiblings preserves the client's losing version of each conflicted
 // path in a local sibling BEFORE applyDeltas overwrites the path with the hub's
 // winning version. Siblings are local resolution artifacts, never pushed.
+//
+// Both fields are hub-controlled. Path must be a safe note path and SiblingPath
+// must be a safe path that actually carries the sync-conflict marker, so the hub
+// cannot use the sibling field to write a local copy over an arbitrary note (or
+// over a file outside the vault entirely).
 func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) error {
 	for _, cf := range conflicts {
-		local, err := os.ReadFile(filepath.Join(vaultDir, filepath.FromSlash(cf.Path)))
+		noteAbs, perr := safeNotePath(vaultDir, cf.Path)
+		if perr != nil {
+			slog.Warn("sync: refusing hub conflict path", "path", cf.Path, "err", perr)
+			continue
+		}
+		sibAbs, perr := safeSiblingPath(vaultDir, cf.SiblingPath)
+		if perr != nil {
+			slog.Warn("sync: refusing hub conflict sibling path", "path", cf.SiblingPath, "err", perr)
+			continue
+		}
+		local, err := os.ReadFile(noteAbs)
 		if err != nil {
 			continue // nothing local to preserve (e.g. we deleted it)
 		}
-		if err := writeFileAtomic(filepath.Join(vaultDir, filepath.FromSlash(cf.SiblingPath)), local); err != nil {
+		if err := writeFileAtomic(sibAbs, local); err != nil {
 			return err
 		}
 	}
@@ -387,6 +469,7 @@ func SyncVault(vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	keepParkedDirty(current, state.Hashes, parked)
+	keepWindowEditsDirty(current, sentHashes, resp.Deltas, dropped)
 	// Hub-rejected paths (viewer role, folder ACL, out-of-scope, or oversize/binary
 	// content) were NOT landed by the hub. Keep them dirty exactly like a parked path
 	// so the next sync re-attempts the push, and never record the local (un-landed)

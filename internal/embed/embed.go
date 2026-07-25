@@ -49,9 +49,17 @@ type HTTP struct {
 	Key     string // bearer token; empty for keyless local endpoints
 	Client  *http.Client
 
-	mu  sync.Mutex
-	dim int // cached vector width; 0 = unknown until first Embed or a probe
+	mu        sync.Mutex
+	dim       int  // cached vector width; 0 = unknown until first Embed or a probe
+	probeFail bool // a dim probe already failed; do not pay for it again
 }
+
+// dimProbeTimeout bounds the one-shot Dim() probe. The client itself allows 60s, which
+// is right for a real embedding batch but wrong for a liveness question asked on a
+// latency-sensitive path: a misconfigured or unreachable endpoint made the first search
+// after a config edit hang for a full minute. A dim probe is one sentinel string; any
+// endpoint that cannot answer it in 5s is not usable for retrieval anyway.
+const dimProbeTimeout = 5 * time.Second
 
 func NewHTTP(baseURL, model, key string) *HTTP {
 	return &HTTP{
@@ -65,18 +73,31 @@ func NewHTTP(baseURL, model, key string) *HTTP {
 func (h *HTTP) Model() string { return h.ModelID }
 
 // Dim returns the embedding width. It is cached from the first Embed; if Dim is
-// asked before any Embed it probes once with a sentinel string (no /embeddings
+// asked before any Embed it probes ONCE with a sentinel string (no /embeddings
 // endpoint exposes dim metadata, so a probe is the only honest option). Returns
 // 0 if the endpoint is unreachable.
+//
+// Both the timeout and the failure are bounded on purpose. The probe gets
+// dimProbeTimeout rather than the client's full 60s, and a failed probe is remembered,
+// so an unreachable endpoint costs one short timeout for the life of the client instead
+// of stalling every caller that asks. Callers wanting to retry build a new HTTP.
 func (h *HTTP) Dim() int {
 	h.mu.Lock()
-	d := h.dim
+	d, failed := h.dim, h.probeFail
 	h.mu.Unlock()
 	if d > 0 {
 		return d
 	}
-	vecs, err := h.Embed(context.Background(), []string{"dim probe"})
+	if failed {
+		return 0 // already probed and the endpoint did not answer; do not pay again
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dimProbeTimeout)
+	defer cancel()
+	vecs, err := h.Embed(ctx, []string{"dim probe"})
 	if err != nil || len(vecs) == 0 {
+		h.mu.Lock()
+		h.probeFail = true
+		h.mu.Unlock()
 		return 0
 	}
 	return len(vecs[0]) // Embed recorded h.dim

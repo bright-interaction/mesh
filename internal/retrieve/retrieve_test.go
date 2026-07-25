@@ -6,6 +6,7 @@ package retrieve
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -124,6 +125,349 @@ func buildVault(t *testing.T) *Retriever {
 		t.Fatal(err)
 	}
 	return New(s, lg)
+}
+
+// noteSrc is one (path, markdown) pair for buildVaultFrom.
+type noteSrc struct{ path, body string }
+
+// buildVaultFrom indexes an arbitrary set of notes and returns a Retriever over
+// them, so a test can shape the corpus (scopes, link structure, corpus size)
+// instead of reusing the fixed three-note vault.
+func buildVaultFrom(t *testing.T, srcs []noteSrc) *Retriever {
+	t.Helper()
+	dir := t.TempDir()
+	notes := make([]*index.ParsedNote, 0, len(srcs))
+	for _, s := range srcs {
+		pn, err := index.Parse(s.path, []byte(s.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		notes = append(notes, pn)
+	}
+	g, _ := index.BuildGraph(notes)
+	g.DetectCommunities(0)
+	s, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if _, err := s.IndexVault(notes, g); err != nil {
+		t.Fatal(err)
+	}
+	lg, err := s.LoadGraph()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(s, lg)
+}
+
+func cardIDs(cards []Card) []string {
+	out := make([]string, len(cards))
+	for i, c := range cards {
+		out[i] = c.NodeID
+	}
+	return out
+}
+
+// TestScopedCandidateGenerationDoesNotStarve is the regression for the scope ACL
+// being applied only after the per-signal limit. 60 unreadable notes match the
+// query far better than the 3 readable ones, so any post-truncation filter (the
+// old fixed 4x over-fetch) hands the caller an empty result while readable
+// matches exist. The scope predicate now runs inside candidate generation, so the
+// limit counts only readable rows.
+func TestScopedCandidateGenerationDoesNotStarve(t *testing.T) {
+	var srcs []noteSrc
+	for i := 0; i < 60; i++ {
+		n := strconv.Itoa(i)
+		srcs = append(srcs, noteSrc{"dev" + n + ".md",
+			"---\nid: dev" + n + "\ntype: note\nwhen: 2026-01-01\ntitle: Deploy pipeline hardening runbook " + n + "\nscope: [dev]\n---\n" +
+				"# Deploy pipeline hardening runbook " + n + "\ndeploy pipeline hardening rollout deploy pipeline hardening\n"})
+	}
+	for i := 0; i < 3; i++ {
+		n := strconv.Itoa(i)
+		srcs = append(srcs, noteSrc{"team" + n + ".md",
+			"---\nid: team" + n + "\ntype: note\nwhen: 2026-01-01\ntitle: Pipeline notes " + n + "\nscope: [team]\n---\n# Pipeline notes " + n + "\npipeline\n"})
+	}
+	// devops must never be readable by a caller allowed only dev: the scopes are
+	// stored comma-joined, so a substring test would wrongly match the prefix.
+	srcs = append(srcs, noteSrc{"devops.md",
+		"---\nid: devops\ntype: note\nwhen: 2026-01-01\ntitle: Deploy pipeline hardening ops\nscope: [devops]\n---\n# Deploy pipeline hardening ops\ndeploy pipeline hardening\n"})
+	r := buildVaultFrom(t, srcs)
+
+	tests := []struct {
+		name       string
+		allowed    map[string]bool
+		wantIDs    []string // every id that must be present
+		forbidden  []string // ids that must never appear
+		wantNoCard bool
+	}{
+		{
+			name:      "scoped caller still gets its readable minority",
+			allowed:   map[string]bool{"team": true},
+			wantIDs:   []string{"note:team0", "note:team1", "note:team2"},
+			forbidden: []string{"note:dev0", "note:devops"},
+		},
+		{
+			name:      "dev must not read the devops scope by prefix",
+			allowed:   map[string]bool{"dev": true},
+			wantIDs:   []string{"note:dev0"},
+			forbidden: []string{"note:devops", "note:team0"},
+		},
+		{
+			name:       "an empty allowed set can read nothing",
+			allowed:    map[string]bool{},
+			wantNoCard: true,
+		},
+		{
+			name:      "nil allowed set is unrestricted",
+			allowed:   nil,
+			wantIDs:   []string{"note:dev0"},
+			forbidden: nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cards, err := r.Retrieve(context.Background(), "deploy pipeline hardening",
+				Options{Limit: 10, NoRerank: true, AllowedScopes: tc.allowed})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := map[string]bool{}
+			for _, c := range cards {
+				got[c.NodeID] = true
+			}
+			if tc.wantNoCard && len(cards) != 0 {
+				t.Fatalf("want no cards, got %v", cardIDs(cards))
+			}
+			for _, id := range tc.wantIDs {
+				if !got[id] {
+					t.Errorf("readable note %s missing from results %v", id, cardIDs(cards))
+				}
+			}
+			for _, id := range tc.forbidden {
+				if got[id] {
+					t.Errorf("out-of-scope note %s leaked into results %v", id, cardIDs(cards))
+				}
+			}
+		})
+	}
+}
+
+// TestScopedSearchLimitsCountOnlyReadableRows pins the same invariant one layer
+// down, at the SQL: the store's LIMIT must be spent on readable rows.
+func TestScopedSearchLimitsCountOnlyReadableRows(t *testing.T) {
+	var srcs []noteSrc
+	for i := 0; i < 30; i++ {
+		n := strconv.Itoa(i)
+		srcs = append(srcs, noteSrc{"dev" + n + ".md",
+			"---\nid: dev" + n + "\ntype: note\nwhen: 2026-01-01\ntitle: Widget " + n + "\nscope: [dev]\n---\n# Widget " + n + "\nwidget widget widget\n"})
+	}
+	srcs = append(srcs, noteSrc{"team.md",
+		"---\nid: team\ntype: note\nwhen: 2026-01-01\ntitle: Widget team\nscope: [team]\n---\n# Widget team\nwidget\n"})
+	r := buildVaultFrom(t, srcs)
+
+	hits, err := r.store.SearchScoped("widget", 5, map[string]bool{"team": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].NodeID != "note:team" {
+		t.Errorf("scoped search should spend its limit on readable rows, got %+v", hits)
+	}
+	scored := r.ranker.ScoreScoped("widget", 5, map[string]bool{"team": true})
+	if len(scored) != 1 || scored[0].Node.ID != "note:team" {
+		t.Errorf("scoped graph ranking should spend its limit on readable nodes, got %d hits", len(scored))
+	}
+	// The unrestricted forms must be unchanged.
+	all, err := r.store.Search("widget", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 5 {
+		t.Errorf("unrestricted search should still fill its limit, got %d", len(all))
+	}
+}
+
+// TestLimitBoundsReturnedCards is the regression for Limit acting only as a fetch
+// knob: the vector arm and the 1-hop expansion added cards nobody counted, so a
+// caller asking for 5 got one card per note in the vault.
+func TestLimitBoundsReturnedCards(t *testing.T) {
+	const n = 30
+	var srcs []noteSrc
+	for i := 0; i < n; i++ {
+		s := strconv.Itoa(i)
+		srcs = append(srcs, noteSrc{"n" + s + ".md",
+			"---\nid: n" + s + "\ntype: note\nwhen: 2026-01-01\n---\n# Storage engine " + s + "\nsqlite storage engine notes " + s + "\n"})
+	}
+	tests := []struct {
+		name    string
+		limit   int
+		vectors bool
+	}{
+		{name: "lexical only", limit: 3},
+		{name: "with the semantic signal on", limit: 5, vectors: true},
+		{name: "limit above the corpus returns everything it found", limit: 500, vectors: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := buildVaultFrom(t, srcs)
+			if tc.vectors {
+				stub := embed.Stub{D: 64}
+				vecs := map[string][][]float32{}
+				for i := 0; i < n; i++ {
+					s := strconv.Itoa(i)
+					ev, _ := stub.Embed(context.Background(), []string{"sqlite storage engine notes " + s})
+					vecs["note:n"+s] = ev
+				}
+				if !r.EnableVectors(stub, "stub-bow", 64, vecs) {
+					t.Fatal("EnableVectors failed")
+				}
+			}
+			cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: tc.limit, NoRerank: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cards) == 0 {
+				t.Fatal("expected results")
+			}
+			if len(cards) > tc.limit {
+				t.Errorf("Limit %d must bound the returned cards, got %d", tc.limit, len(cards))
+			}
+		})
+	}
+}
+
+// TestExpansionSeedRespectsScope is the regression for the 1-hop expansion seeding
+// from notes the caller cannot read: the seed's frontmatter title rode out inside
+// the neighbour's Reason string ("linked from <secret title>") and the seed's score
+// was donated to that neighbour's rank. The vector case matters on its own because
+// the vector arm has no scope information of its own, so it can still put a
+// forbidden note into the fused map after the keyword signals were filtered.
+func TestExpansionSeedRespectsScope(t *testing.T) {
+	const secretTitle = "ACME root credential rotation runbook"
+	srcs := []noteSrc{
+		{"secret.md", "---\nid: secret\ntype: note\nwhen: 2026-01-01\ntitle: " + secretTitle + "\nscope: [dev]\nrelated: [pub]\n---\n# " + secretTitle + "\ncredential rotation runbook for the root account\n"},
+		{"pub.md", "---\nid: pub\ntype: note\nwhen: 2026-01-01\ntitle: Sales onboarding\nscope: [sales]\n---\n# Sales onboarding\nonboarding checklist for new reps\n"},
+	}
+	tests := []struct {
+		name    string
+		vectors bool
+	}{
+		{name: "forbidden seed from the keyword signals"},
+		{name: "forbidden seed from the vector arm", vectors: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := buildVaultFrom(t, srcs)
+			if tc.vectors {
+				// Only the forbidden note carries a vector, so the vector arm is the one
+				// signal that can seed expansion here and pub can only arrive by expansion.
+				stub := embed.Stub{D: 64}
+				ev, _ := stub.Embed(context.Background(), []string{"credential rotation runbook for the root account"})
+				if !r.EnableVectors(stub, "stub-bow", 64, map[string][][]float32{"note:secret": ev}) {
+					t.Fatal("EnableVectors failed")
+				}
+			}
+			cards, err := r.Retrieve(context.Background(), "credential rotation runbook",
+				Options{Limit: 10, NoRerank: true, AllowedScopes: map[string]bool{"sales": true}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range cards {
+				if c.NodeID == "note:secret" {
+					t.Fatalf("out-of-scope note returned: %+v", c)
+				}
+				if strings.Contains(c.Reason, secretTitle) {
+					t.Errorf("out-of-scope title leaked in Reason of %s: %q", c.NodeID, c.Reason)
+				}
+				if c.NodeID == "note:pub" && strings.HasPrefix(c.Reason, "linked from") {
+					t.Errorf("readable note inherited score from a forbidden seed: %+v", c)
+				}
+			}
+		})
+	}
+}
+
+// TestExpansionStillSeedsFromReadableNotes guards the other side of the seed
+// filter: a readable seed must still expand, and it may name itself in the Reason.
+func TestExpansionStillSeedsFromReadableNotes(t *testing.T) {
+	srcs := []noteSrc{
+		{"seed.md", "---\nid: seed\ntype: note\nwhen: 2026-01-01\ntitle: Pricing rollout\nscope: [sales]\nrelated: [leaf]\n---\n# Pricing rollout\nquarterly pricing rollout plan\n"},
+		{"leaf.md", "---\nid: leaf\ntype: note\nwhen: 2026-01-01\ntitle: Discount ladder\nscope: [sales]\n---\n# Discount ladder\nunrelated wording entirely\n"},
+	}
+	r := buildVaultFrom(t, srcs)
+	cards, err := r.Retrieve(context.Background(), "pricing rollout",
+		Options{Limit: 10, NoRerank: true, AllowedScopes: map[string]bool{"sales": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, c := range cards {
+		if c.NodeID == "note:leaf" {
+			found = true
+			if !strings.Contains(c.Reason, "Pricing rollout") {
+				t.Errorf("expanded card should name its readable seed, got %q", c.Reason)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected note:leaf via 1-hop expansion from a readable seed, got %v", cardIDs(cards))
+	}
+}
+
+// TestVectorScoreIsPathIndependent pins the fix for the min-max over a
+// path-dependent candidate set: a note's semantic contribution must depend only on
+// its own cosine, never on what else was fetched. Two retrievals over corpora that
+// differ only in the OTHER notes must give the shared note the same score.
+func TestVectorScoreIsPathIndependent(t *testing.T) {
+	stub := embed.Stub{D: 64}
+	embedOf := func(s string) [][]float32 {
+		v, _ := stub.Embed(context.Background(), []string{s})
+		return v
+	}
+	build := func(extra int) []noteSrc {
+		srcs := []noteSrc{{"target.md", "---\nid: target\ntype: note\nwhen: 2026-01-01\n---\n# Sqlite storage\nsqlite storage engine\n"}}
+		for i := 0; i < extra; i++ {
+			s := strconv.Itoa(i)
+			srcs = append(srcs, noteSrc{"f" + s + ".md",
+				"---\nid: f" + s + "\ntype: note\nwhen: 2026-01-01\n---\n# Filler " + s + "\nsqlite unrelated filler " + s + "\n"})
+		}
+		return srcs
+	}
+	score := func(extra int) float64 {
+		srcs := build(extra)
+		r := buildVaultFrom(t, srcs)
+		vecs := map[string][][]float32{}
+		for _, s := range srcs {
+			id := strings.TrimSuffix(s.path, ".md")
+			body := s.body[strings.LastIndex(s.body, "\n---\n")+5:]
+			vecs["note:"+id] = embedOf(body)
+		}
+		if !r.EnableVectors(stub, "stub-bow", 64, vecs) {
+			t.Fatal("EnableVectors failed")
+		}
+		cards, err := r.Retrieve(context.Background(), "sqlite storage",
+			Options{Limit: 10, WeightFTS: 0, WeightGraph: 0, WeightVec: 1, NoRerank: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range cards {
+			if c.NodeID == "note:target" {
+				return c.Score
+			}
+		}
+		t.Fatal("target note missing from results")
+		return 0
+	}
+	// With a relative (min-max) normalizer the target scored 1.0 in both runs only
+	// because it was the max; the tell is the FILLER set moving the target's score.
+	// Assert the absolute value instead: (cos+1)/2 is fixed, so it cannot move.
+	a, b := score(1), score(20)
+	if math.Abs(a-b) > 1e-9 {
+		t.Errorf("vector contribution moved with the candidate set: %v vs %v", a, b)
+	}
+	if a >= 1.0 {
+		t.Errorf("a normalized cosine of 1.0 means the score is still relative to the candidate set, got %v", a)
+	}
 }
 
 func TestFreshnessDecayReordersTie(t *testing.T) {

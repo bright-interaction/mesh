@@ -48,7 +48,7 @@ type ParsedNote struct {
 // Issue is a non-fatal problem found while parsing or building the graph.
 type Issue struct {
 	Path string
-	Kind string // missing-id|duplicate-id|broken-link
+	Kind string // missing-id|duplicate-id|broken-link|ambiguous-link-key|ambiguous-link
 	Msg  string
 }
 
@@ -69,6 +69,15 @@ func linkKey(target string) string {
 	}
 	t = strings.TrimSuffix(t, ".md")
 	return strings.ToLower(strings.TrimSpace(t))
+}
+
+// pathLinkKey normalizes a note's vault-relative path into the key a slash-bearing
+// wikilink resolves against: forward slashes, no .md extension, lowercased. It mirrors
+// linkKey so [[decisions/deploy]] and decisions/deploy.md meet on the same string.
+func pathLinkKey(p string) string {
+	p = strings.ReplaceAll(p, `\`, "/")
+	p = strings.TrimSuffix(p, ".md")
+	return strings.ToLower(strings.TrimSpace(p))
 }
 
 func ParseFile(path string) (*ParsedNote, error) {
@@ -219,6 +228,19 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 
 	idByKey := make(map[string]string, len(notes))
 	pathByID := make(map[string]string, len(notes))
+	// A wikilink key is the lowercased basename, so two notes in different folders that
+	// share a basename (with distinct frontmatter ids) collide on it. A plain
+	// last-wins assignment handed the key to whichever note happened to be walked last,
+	// which then absorbed EVERY [[basename]] and related: edge in the vault while the
+	// other note silently received none, and no Issue was raised so nothing surfaced it.
+	// Track the owning path per key so a genuine collision is reported and refused
+	// rather than resolved to an arbitrary winner.
+	pathByKey := make(map[string]string, len(notes))
+	ambiguousKeys := map[string][]string{}
+	// idByPath resolves a wikilink that names a path (contains a slash): the author has
+	// disambiguated explicitly, so an exact vault-relative path match wins over the
+	// basename key. This is also the escape hatch out of an ambiguous key.
+	idByPath := make(map[string]string, len(notes))
 	for _, n := range notes {
 		id := effectiveID(n)
 		if n.FM.ID == "" {
@@ -227,8 +249,21 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		if prev, ok := pathByID[id]; ok && prev != n.Path {
 			issues = append(issues, Issue{n.Path, "duplicate-id", "id " + id + " already used by " + prev})
 		}
+		// Only a collision between DIFFERENT ids is ambiguous. Two un-id'd files sharing
+		// a basename resolve to the same effectiveID, which is the duplicate-id case
+		// above and collapses to one node, so the key still points somewhere correct.
+		if prevID, ok := idByKey[n.Key]; ok && prevID != id {
+			if len(ambiguousKeys[n.Key]) == 0 {
+				ambiguousKeys[n.Key] = []string{pathByKey[n.Key]}
+			}
+			ambiguousKeys[n.Key] = append(ambiguousKeys[n.Key], n.Path)
+			issues = append(issues, Issue{n.Path, "ambiguous-link-key",
+				"[[" + n.Key + "]] matches both " + pathByKey[n.Key] + " and " + n.Path + "; links using this name resolve to neither"})
+		}
 		pathByID[id] = n.Path
+		pathByKey[n.Key] = n.Path
 		idByKey[n.Key] = id
+		idByPath[pathLinkKey(n.Path)] = id
 	}
 
 	for _, n := range notes {
@@ -276,6 +311,24 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		addRef := func(rawTarget string, line int) {
 			key := linkKey(rawTarget)
 			if key == "" {
+				return
+			}
+			// A slash in the target means the author named a path, so resolve it exactly
+			// first: that is both the normal folder-qualified link and the way out of an
+			// ambiguous basename below.
+			if strings.Contains(key, "/") {
+				if tid, ok := idByPath[key]; ok {
+					g.AddEdge(graph.Edge{Source: noteNode, Target: "note:" + tid, Relation: "references", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1, SourceLoc: locStr(line)})
+					return
+				}
+			}
+			// Refuse to bind an ambiguous key to an arbitrary winner: guessing produced a
+			// wrong edge (backlinks that cited one note landed on another) which is worse
+			// than no edge, and reported nothing. Report it so mesh lint / mesh structure
+			// / mesh_health can surface it and the author can qualify the link by path.
+			if owners, amb := ambiguousKeys[key]; amb {
+				issues = append(issues, Issue{n.Path, "ambiguous-link",
+					"[[" + strings.TrimSpace(rawTarget) + "]] matches " + strings.Join(owners, " and ") + "; qualify it with the folder path"})
 				return
 			}
 			tid, ok := idByKey[key]

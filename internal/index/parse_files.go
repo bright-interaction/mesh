@@ -4,6 +4,7 @@
 package index
 
 import (
+	"errors"
 	"runtime"
 	"sync"
 )
@@ -13,6 +14,12 @@ type FileError struct {
 	Path string
 	Err  error
 }
+
+// ErrDuplicateNoteID marks a file the incremental reconcile QUARANTINED because another
+// file already claims its note id. It is a distinct condition from unparseable
+// frontmatter and has a distinct remedy (give one of the two notes a new id), so
+// consumers match it with errors.Is rather than reading the message.
+var ErrDuplicateNoteID = errors.New("duplicate note id")
 
 // ParseFiles parses paths concurrently with a bounded worker pool and returns
 // the notes in the original path order, so the graph it feeds is deterministic

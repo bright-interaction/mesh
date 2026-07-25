@@ -26,7 +26,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		Endpoint:    "http://localhost:11434/v1",
 		Model:       "nomic-embed-text",
 		Dim:         768,
-		KeyEnv:      "MY_KEY",
+		KeyEnv:      "MESH_EMBED_KEY", // key_env is allow-listed; see TestSaveRejectsKeyEnvOutsideTheAllowList
 		QueryPrefix: "search_query: ",
 		DocPrefix:   "search_document: ",
 	}

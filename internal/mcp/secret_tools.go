@@ -33,9 +33,10 @@ func (s *Server) secretBridge() (*secretbridge.Client, bool) {
 	base, keyEnv, agentID := "", "MESH_SECRET_BRIDGE_KEY", ""
 	if cfg, err := meshcfg.LoadConfig(s.store.MeshDir()); err == nil {
 		base = cfg.SecretBridge.BaseURL
-		if cfg.SecretBridge.KeyEnv != "" {
-			keyEnv = cfg.SecretBridge.KeyEnv
-		}
+		// key_env NAMES a process secret, so it resolves through the closed allow-list:
+		// a hand-edited config.toml must not be able to point the bridge's X-API-Key at
+		// MESH_UI_TOKEN or MESH_HUB_TOKEN.
+		keyEnv = meshcfg.ResolveKeyEnv("secret_bridge.key_env", cfg.SecretBridge.KeyEnv, keyEnv)
 		agentID = cfg.SecretBridge.AgentID
 	}
 	// Env overrides the file (the universal Mesh contract).
@@ -79,7 +80,14 @@ func notConfigured() any {
 
 // toolSecretStatus reports whether a vault is attached and how to use it, without any
 // network call and without ever echoing the key. It is the whoami of the broker.
-func (s *Server) toolSecretStatus(_ context.Context) (any, *rpcError) {
+func (s *Server) toolSecretStatus(ctx context.Context) (any, *rpcError) {
+	// Gated like list/use, which is what its classification always claimed: the reply
+	// names the bridge agent id, the Dockyard base URL and the proxy base, so an
+	// ungated status hands a read-only hosted viewer the broker's endpoint and identity
+	// even though it may never broker anything. It used to discard the context entirely.
+	if can, set := writeAllowed(ctx); set && !can {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
+	}
 	c, ok := s.secretBridge()
 	if !ok {
 		return notConfigured(), nil

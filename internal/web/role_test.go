@@ -41,17 +41,17 @@ func TestMemberRoleGateAndRevocation(t *testing.T) {
 			return 0, "", false
 		},
 		func(id int64) map[string]bool { return nil }, // unrestricted reads
-		func(id int64) (string, bool) {
+		func(id int64) (string, int64, bool) {
 			switch id {
 			case 1:
 				if !adminExists {
-					return "", false // revoked
+					return "", 0, false // revoked
 				}
-				return "admin", true
+				return "admin", 1000, true
 			case 2:
-				return "viewer", true
+				return "viewer", 2000, true
 			}
-			return "", false
+			return "", 0, false
 		},
 	)
 	ts := httptest.NewServer(srv.Handler())

@@ -7,8 +7,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -32,6 +34,25 @@ type Store struct {
 
 	mu      sync.Mutex  // guards dropped
 	dropped []FileError // notes dropped as unparseable by the last full reindex
+
+	// Telemetry is accumulated in memory and flushed in one batched transaction by the
+	// writer goroutine (see flushTelemetry). It must never be written inline: the
+	// read-only MCP/web tools call IncrMetric/RecordReuse purely for counters AFTER the
+	// answer is already computed, and Write is a synchronous handoff to the single
+	// writer, so a search or fetch used to inherit the latency of whatever transaction
+	// was running (a full reindex) or, with a second mesh process holding the SQLite
+	// write lock, up to the DSN's 30s busy_timeout.
+	telMu    sync.Mutex
+	telCount map[string]int64 // metrics key -> pending increment
+	telReuse []reuseEvent     // pending flywheel reuse events, timestamped at call time
+}
+
+// reuseEvent is one deferred RecordReuse. The timestamp is captured when the fetch
+// happened, not when the batch is flushed, so the gap check stays honest.
+type reuseEvent struct {
+	noteID string
+	gapSec int64
+	at     int64
 }
 
 // SchemaVersion bumps whenever schema.sql changes shape. The index is a derived,
@@ -44,7 +65,15 @@ type Store struct {
 // for a shape change to an existing table, which requires the drop+rebuild below.
 // v3: notes gained review_by + source columns (provenance / lifecycle, Phase A).
 // v4: notes gained a scope column (access-control partition; absent = dev).
-const SchemaVersion = 4
+// v5: no column changed, but retrievalHash gained scope/updated/when/review_by/source,
+// so every stored retrieval_hash is computed from an older, narrower input. The bump
+// forces one rebuild that re-hashes every row; without it a note whose scope was already
+// tightened before the upgrade would keep comparing equal and never reindex, leaving the
+// old (wider) scope live in notes.scope. Kept embeddings survive the rebuild
+// (see schemaKeep and metaKeptWithVectors); their note_hash is stale against the new
+// hash, so they are excluded from retrieval until the next `mesh embed`, which re-stamps
+// them from the content-hash cache without paying for a single new embedding.
+const SchemaVersion = 5
 
 type job struct {
 	fn    func(*sql.Tx) error
@@ -64,6 +93,11 @@ const (
 	// capped by journal_size_limit (autocheckpoint only fires on writes). PASSIVE never
 	// blocks the writer on a reader; TRUNCATE-to-zero is the out-of-process mesh-doctor's job.
 	walCheckpointInterval = 2 * time.Minute
+	// telemetryFlushInterval is how often the writer goroutine drains the in-memory
+	// usage counters into one batched transaction. Short enough that a dashboard is
+	// never meaningfully behind, long enough that a burst of fetches costs one write
+	// instead of three per request.
+	telemetryFlushInterval = 2 * time.Second
 )
 
 func dsn(path string) string {
@@ -145,30 +179,112 @@ var schemaKeep = map[string]bool{"metrics": true, "vectors": true, "note_reuse":
 // table's DDL against a baked-in value; if you change a kept table's columns you must
 // bump this version (which makes that release drop+rebuild the kept tables, accepting
 // the one-time data loss) or otherwise migrate the live rows, and update the guard.
+// ensureSchema stores it under meta.keep_shape_version and compares on every open, so
+// the escape hatch is real: bumping it DOES drop and rebuild the kept tables. It used to
+// be declared and never read, which made the documented remedy a no-op and would have
+// left a newly-added column failing at INSERT time on every deployed hub.
 const keepShapeVersion = 1
+
+// metaKeptWithVectors are meta keys that DESCRIBE a schemaKeep table and therefore have
+// to survive the schema-version rebuild alongside it. `vectors` is kept so a version bump
+// never forces a paid re-embed, but its canonical model/dim live in `meta`, which IS
+// dropped. Losing them left every kept embedding unreadable: LoadVectors, VectorStats and
+// CachedVectors all filter on meta.vector_model, so the rows survived but read back as
+// model="" (semantic search silently degraded to lexical+graph) and the content-hash embed
+// cache missed on every chunk, forcing exactly the full paid re-embed schemaKeep exists to
+// prevent. schema_version itself is deliberately NOT carried: it is rewritten below.
+var metaKeptWithVectors = []string{"vector_model", "vector_dim"}
 
 // ensureSchema applies the schema, dropping and rebuilding if the stored version
 // differs. No data is lost that matters: everything is re-derivable from the
 // markdown vault, so this replaces a migration tool.
 func ensureSchema(db *sql.DB) error {
-	var current int
+	var current, currentKeep int
 	// meta may not exist yet; ignore the scan error in that case.
 	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&current)
+	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='keep_shape_version'`).Scan(&currentKeep)
+	// A zero currentKeep is a database written before keep_shape_version existed, not a
+	// shape change: adopt the current shape below rather than wiping the kept tables.
+	rebuildKept := currentKeep != 0 && currentKeep != keepShapeVersion
+
+	var carried map[string]string
 	if current != 0 && current != SchemaVersion {
+		var err error
+		if carried, err = readMetaKeys(db, metaKeptWithVectors); err != nil {
+			return err
+		}
 		for _, t := range dropOnVersionChange {
 			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 				return err
 			}
 		}
 	}
+	if rebuildKept {
+		for _, t := range sortedKeys(schemaKeep) {
+			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
+				return err
+			}
+		}
+		// The vectors themselves are gone, so their descriptors must not come back:
+		// a model/dim with no rows would misreport the embedding state.
+		carried = nil
+	}
 	if _, err := db.Exec(SchemaSQL); err != nil {
 		return err
 	}
-	_, err := db.Exec(
+	if rebuildKept {
+		if _, err := db.Exec(`DELETE FROM meta WHERE key IN ('vector_model','vector_dim')`); err != nil {
+			return err
+		}
+	}
+	for k, v := range carried {
+		if _, err := db.Exec(
+			`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, k, v,
+		); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(
 		`INSERT INTO meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		fmt.Sprint(SchemaVersion),
+	); err != nil {
+		return err
+	}
+	_, err := db.Exec(
+		`INSERT INTO meta(key,value) VALUES('keep_shape_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		fmt.Sprint(keepShapeVersion),
 	)
 	return err
+}
+
+// readMetaKeys reads the given meta keys, tolerating a missing meta table (a brand-new
+// database) and absent keys. Returns only the keys that exist.
+func readMetaKeys(db *sql.DB, keys []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, k := range keys {
+		var v string
+		err := db.QueryRow(`SELECT value FROM meta WHERE key=?`, k).Scan(&v)
+		switch {
+		case err == sql.ErrNoRows:
+			continue
+		case err != nil:
+			// meta does not exist yet: nothing to carry.
+			return out, nil
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+// sortedKeys returns a map's keys in a deterministic order, so a DROP loop over a set
+// is reproducible (and diffable in logs) rather than map-iteration random.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (s *Store) Path() string { return s.dbPath }
@@ -211,12 +327,24 @@ func (s *Store) writer() {
 	// races a write: the select serves one job OR one checkpoint per iteration.
 	ticker := time.NewTicker(walCheckpointInterval)
 	defer ticker.Stop()
+	// Telemetry counters accumulated by the read paths are flushed here, on the writer
+	// itself, so they cost one batched transaction per interval instead of three
+	// synchronous ones per request. runTx directly (not Write): this IS the writer, so
+	// routing through the jobs channel would deadlock.
+	telTicker := time.NewTicker(telemetryFlushInterval)
+	defer telTicker.Stop()
 	for {
 		select {
 		case <-s.done:
 			return
 		case j := <-s.jobs:
 			j.reply <- s.runTx(j.fn)
+		case <-telTicker.C:
+			if fn, ok := s.drainTelemetry(); ok {
+				if err := s.runTx(fn); err != nil {
+					slog.Warn("mesh: telemetry flush failed; this batch of counters is lost", "err", err)
+				}
+			}
 		case <-ticker.C:
 			// Best-effort and non-blocking; journal_size_limit caps the file. Full
 			// zeroing (TRUNCATE) + reaping stale readers is the hourly mesh-doctor's job.
@@ -262,6 +390,80 @@ func (s *Store) Write(fn func(*sql.Tx) error) error {
 	}
 }
 
+// recordTelemetry accumulates a pending counter increment and/or a reuse event without
+// touching the database. It is the non-blocking half of the telemetry path: callers on
+// a read path (mesh_search, mesh_fetch, the web search API) must never wait on the
+// single writer just to bump a counter.
+func (s *Store) recordTelemetry(key string, n int64, reuse *reuseEvent) {
+	s.telMu.Lock()
+	defer s.telMu.Unlock()
+	if key != "" {
+		if s.telCount == nil {
+			s.telCount = map[string]int64{}
+		}
+		s.telCount[key] += n
+	}
+	if reuse != nil {
+		s.telReuse = append(s.telReuse, *reuse)
+	}
+}
+
+// drainTelemetry takes everything pending and returns the transaction that applies it,
+// or ok=false when there is nothing to write. The pending state is cleared under the
+// lock before the transaction runs, so a concurrent request never blocks on the flush;
+// the trade is that a failed flush loses that batch, which is acceptable for counters
+// that are best-effort at every call site anyway.
+func (s *Store) drainTelemetry() (func(*sql.Tx) error, bool) {
+	s.telMu.Lock()
+	counts, reuses := s.telCount, s.telReuse
+	s.telCount, s.telReuse = nil, nil
+	s.telMu.Unlock()
+	if len(counts) == 0 && len(reuses) == 0 {
+		return nil, false
+	}
+	// Deterministic key order so the batched transaction touches rows in a stable
+	// sequence (reproducible, and no lock-order surprises against another writer).
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return func(tx *sql.Tx) error {
+		for _, k := range keys {
+			if _, err := tx.Exec(
+				`INSERT INTO metrics(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=value+excluded.value`,
+				k, counts[k]); err != nil {
+				return err
+			}
+		}
+		for _, r := range reuses {
+			if _, err := tx.Exec(
+				`UPDATE note_reuse
+				    SET reuse_count = reuse_count + 1,
+				        first_reuse = COALESCE(first_reuse, ?),
+				        last_reuse  = ?
+				  WHERE note_id = ? AND (? - authored_at) >= ?`,
+				r.at, r.at, r.noteID, r.at, r.gapSec); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, true
+}
+
+// flushTelemetry writes any pending counters now, from the CALLER's goroutine (via the
+// jobs channel). Read paths never call it; the reporting surfaces do, so a dashboard or
+// a test reads a consistent picture instead of one that lags the flush ticker.
+func (s *Store) flushTelemetry() {
+	fn, ok := s.drainTelemetry()
+	if !ok {
+		return
+	}
+	if err := s.Write(fn); err != nil {
+		slog.Warn("mesh: telemetry flush failed; this batch of counters is lost", "err", err)
+	}
+}
+
 // Count returns the row count of a table (read pool). The table name is a fixed
 // internal identifier, never user input.
 func (s *Store) Count(table string) (int, error) {
@@ -274,6 +476,9 @@ func (s *Store) Count(table string) (int, error) {
 // drain any in-flight transaction before closing the pools, so a write racing
 // shutdown completes cleanly instead of hitting a closed DB.
 func (s *Store) Close() error {
+	// Land the last batch of in-memory telemetry while the writer is still serving:
+	// after close(s.done) every Write returns "store is closed".
+	s.flushTelemetry()
 	close(s.done)
 	s.wg.Wait()
 	// The writer has drained, so a clean shutdown is the safe moment to TRUNCATE the WAL

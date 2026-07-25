@@ -3,7 +3,11 @@
 
 package retrieve
 
-import "github.com/bright-interaction/mesh/internal/tokenize"
+import (
+	"encoding/json"
+
+	"github.com/bright-interaction/mesh/internal/tokenize"
+)
 
 // estimateTokens returns the token count of a string using the real cl100k_base
 // BPE tokenizer (internal/tokenize). The packer reads token cost through this one
@@ -15,11 +19,24 @@ func estimateTokens(s string) int { return tokenize.Count(s) }
 // arms with the exact same function the packer uses.
 func EstimateTokens(s string) int { return estimateTokens(s) }
 
-// cardTokens estimates the rendered cost of a card (title + path + snippet +
-// reason + a little structural overhead).
+// cardTokens is the token cost of a card as the caller actually receives it.
+//
+// It counts the marshaled JSON, not a hand-picked subset of the fields. The old
+// form summed title+path+snippet+reason and allowed a flat 8 tokens for
+// "structure", but the wire form also carries NodeID, NoteID, Type, Scope, Tier0,
+// a full-precision Score and ten Go field names, which measured at roughly 60
+// tokens per card. The packer therefore fit about 1.7x more cards than the
+// caller's budget allowed and reported a token total short by the same factor.
 func cardTokens(c Card) int {
-	return estimateTokens(c.Title) + estimateTokens(c.Path) +
-		estimateTokens(c.Snippet) + estimateTokens(c.Reason) + 8
+	b, err := json.Marshal(c)
+	if err != nil {
+		// A card that cannot be marshaled cannot be sent either (a NaN Score is the
+		// only realistic cause). Fall back to the field sum so the packer keeps
+		// making progress instead of treating the card as free.
+		return estimateTokens(c.Title) + estimateTokens(c.Path) +
+			estimateTokens(c.Snippet) + estimateTokens(c.Reason) + 8
+	}
+	return estimateTokens(string(b))
 }
 
 // TotalTokens sums the estimated cost of a set of cards.
@@ -44,12 +61,15 @@ func packToBudget(cards []Card, budget int) []Card {
 	picked := make([]Card, len(cards))
 	taken := make([]bool, len(cards))
 
+	// cardTokens now marshals the card, so each call is a real BPE tokenization.
+	// Measure each form once and reuse the number instead of re-counting it.
 	// Pass A: reserve room for the best tier-0 cards (full form).
 	for i, c := range cards {
-		if c.Tier0 && used+cardTokens(c) <= reserve {
+		n := cardTokens(c)
+		if c.Tier0 && used+n <= reserve {
 			picked[i] = c
 			taken[i] = true
-			used += cardTokens(c)
+			used += n
 		}
 	}
 	// Pass B: fill the rest by score. When a full card will not fit, degrade it
@@ -59,18 +79,18 @@ func packToBudget(cards []Card, budget int) []Card {
 		if taken[i] {
 			continue
 		}
-		if used+cardTokens(c) <= budget {
+		if n := cardTokens(c); used+n <= budget {
 			picked[i] = c
 			taken[i] = true
-			used += cardTokens(c)
+			used += n
 			continue
 		}
 		cc := c
 		cc.Snippet = ""
-		if used+cardTokens(cc) <= budget {
+		if n := cardTokens(cc); used+n <= budget {
 			picked[i] = cc
 			taken[i] = true
-			used += cardTokens(cc)
+			used += n
 		}
 	}
 

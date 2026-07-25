@@ -18,6 +18,10 @@ type Reconciliation struct {
 	Reindexed bool
 	Graph     *graph.Graph // non-nil only when Reindexed
 	Dur       time.Duration
+	// Dropped is how many files this pass could not index (unparseable frontmatter, or
+	// a duplicate effective id). They are invisible to search and the graph; the details
+	// are on Store.DroppedNotes and feed mesh_health.
+	Dropped int
 }
 
 // Any reports whether the vault had drifted from the index.
@@ -48,6 +52,7 @@ func Reconcile(s *Store, root string) (Reconciliation, error) {
 	}
 	r.Reindexed = true
 	r.Graph = g
+	r.Dropped = len(s.DroppedNotes()) // recorded by the ReindexFull inside Reindex
 	r.Dur = time.Since(start)
 	return r, nil
 }
@@ -65,7 +70,17 @@ func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast boo
 	if err != nil {
 		return Reconciliation{}, err
 	}
-	r := Reconciliation{Added: len(dd.Drift.Added), Changed: len(dd.Drift.Changed), Removed: len(dd.Drift.Removed)}
+	r := Reconciliation{
+		Added:   len(dd.Drift.Added),
+		Changed: len(dd.Drift.Changed),
+		Removed: len(dd.Drift.Removed),
+		Dropped: len(dd.Dropped),
+	}
+	// Record the drops BEFORE the no-drift early return. A newly added file with broken
+	// frontmatter (or a duplicate id) produces no drift at all, so returning first is
+	// exactly how it stayed invisible: no log line, no DroppedNotes record, and
+	// mesh_health reporting a clean vault while the note was missing from the index.
+	s.recordDropped(root, dd.Dropped)
 	if !dd.Drift.Any() {
 		r.Dur = time.Since(start)
 		return r, nil

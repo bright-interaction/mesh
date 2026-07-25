@@ -37,11 +37,19 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 	return g, notes, nil
 }
 
-// recordDropped remembers and logs the notes ParseFiles could not parse (invalid
-// YAML frontmatter is the usual cause) so a silently dropped note is visible in the
-// logs on EVERY reindex, not only when someone runs `mesh structure`. A broken
-// frontmatter block otherwise removes a note from search and the graph with zero
-// signal, which hid three real notes for weeks. Paths are made vault-relative.
+// recordDropped remembers and logs the notes an index pass could not index (invalid
+// YAML frontmatter is the usual cause; a duplicate effective id is the other) so a
+// silently dropped note is visible in the logs, not only when someone runs
+// `mesh structure`. A broken frontmatter block otherwise removes a note from search and
+// the graph with zero signal, which hid three real notes for weeks. Paths are made
+// vault-relative.
+//
+// The recorded set is REPLACED, not merged: every pass (full or incremental) walks the
+// whole vault, and an unindexed file is by definition absent from the notes table, so it
+// can never be skipped by the incremental mtime fast path (which only applies to files
+// already in the index). Only entries that are NEW since the last record are logged,
+// because the watcher calls this on every reconcile tick and re-warning about the same
+// broken file forever would drown the log the warning exists to be seen in.
 func (s *Store) recordDropped(root string, ferrs []FileError) {
 	rel := make([]FileError, 0, len(ferrs))
 	for _, fe := range ferrs {
@@ -50,15 +58,35 @@ func (s *Store) recordDropped(root string, ferrs []FileError) {
 			p = r
 		}
 		rel = append(rel, FileError{Path: p, Err: fe.Err})
-		slog.Warn("mesh: dropping unparseable note; it is invisible to search and the graph until the frontmatter is fixed",
-			"path", p, "err", fe.Err)
 	}
+
 	s.mu.Lock()
+	prev := make(map[string]string, len(s.dropped))
+	for _, fe := range s.dropped {
+		prev[fe.Path] = errText(fe.Err)
+	}
 	s.dropped = rel
 	s.mu.Unlock()
-	if len(ferrs) > 0 {
-		slog.Warn("mesh reindex dropped unparseable notes", "count", len(ferrs), "root", root)
+
+	fresh := 0
+	for _, fe := range rel {
+		if was, seen := prev[fe.Path]; seen && was == errText(fe.Err) {
+			continue
+		}
+		fresh++
+		slog.Warn("mesh: dropping note; it is invisible to search and the graph until it is fixed",
+			"path", fe.Path, "err", fe.Err)
 	}
+	if fresh > 0 {
+		slog.Warn("mesh reindex dropped notes", "new", fresh, "total", len(rel), "root", root)
+	}
+}
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // DroppedNotes returns the notes the last full reindex dropped as unparseable

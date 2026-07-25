@@ -196,10 +196,13 @@ func TestIncrementalCosmeticEditIsNoOp(t *testing.T) {
 	}
 }
 
-// TestIncrementalRefusesDuplicateID: two live files resolving to the same id must
-// be refused with a clear error (matching the full path's atomic refusal), leaving
-// the existing index intact and NOT clobbering the live note or flip-flopping.
-func TestIncrementalRefusesDuplicateID(t *testing.T) {
+// TestIncrementalQuarantinesDuplicateID: a duplicate effective id must quarantine only
+// the offending file, never abort the delta. Aborting froze the index for the WHOLE
+// vault: after one duplicate appeared, no edit to any other note was indexed until the
+// process restarted, and a restart only postponed it (ReindexFull tolerates the
+// duplicate, so the next incremental failed again). The hosted hub discards the error,
+// so it served a frozen index with zero signal.
+func TestIncrementalQuarantinesDuplicateID(t *testing.T) {
 	dir := writeVault(t)
 	s, err := Open(dir)
 	if err != nil {
@@ -215,13 +218,24 @@ func TestIncrementalRefusesDuplicateID(t *testing.T) {
 	// dup.md declares id "b", already owned by b.md.
 	write(t, dir, "dup.md", "---\nid: b\ntype: note\nwhen: 2026-01-01\n---\n# Dup\nclashing id\n")
 
-	if _, err := live.Reconcile(true); err == nil {
-		t.Fatal("a duplicate note id must be refused with an error, not silently applied")
+	rec, err := live.Reconcile(true)
+	if err != nil {
+		t.Fatalf("a duplicate id must not abort the delta, got err: %v", err)
 	}
-	// The existing index is untouched: original note count, b.md still owns id b.
+	if rec.Dropped != 1 {
+		t.Errorf("the duplicate must be reported as dropped, got Dropped=%d", rec.Dropped)
+	}
+	dropped := s.DroppedNotes()
+	if len(dropped) != 1 || dropped[0].Path != "dup.md" {
+		t.Fatalf("DroppedNotes must name the quarantined file, got %+v", dropped)
+	}
+	if !strings.Contains(dropped[0].Err.Error(), "duplicate note id") {
+		t.Errorf("dropped record must explain the collision, got %q", dropped[0].Err)
+	}
+	// The incumbent is not clobbered and no phantom note appears.
 	after, _ := s.Count("notes")
 	if after != before {
-		t.Errorf("a refused reconcile must not change the index: notes %d -> %d", before, after)
+		t.Errorf("a quarantined duplicate must not change the note count: %d -> %d", before, after)
 	}
 	var path string
 	if err := s.readDB.QueryRow(`SELECT path FROM notes WHERE id='b'`).Scan(&path); err != nil {
@@ -230,9 +244,35 @@ func TestIncrementalRefusesDuplicateID(t *testing.T) {
 	if path != "b.md" {
 		t.Errorf("the live note must not be clobbered: id b is now at %q, want b.md", path)
 	}
-	// It stays a stable error (converges, does not flip-flop) until the dup is fixed.
-	if _, err := live.Reconcile(true); err == nil {
-		t.Fatal("duplicate id must keep erroring until fixed (no flip-flop to success)")
+
+	// THE REGRESSION: an unrelated edit must still be indexed while the duplicate sits
+	// in the vault. This is what the abort broke, and it is silent on the hub.
+	write(t, dir, "c.md", "---\nid: c\ntype: note\nwhen: 2026-01-01\n---\n# C\nfreshly edited body about quarantine\n")
+	if _, err := live.Reconcile(true); err != nil {
+		t.Fatalf("an unrelated edit must still reconcile with a duplicate present, got err: %v", err)
+	}
+	var body string
+	if err := s.readDB.QueryRow(`SELECT body FROM search_index WHERE node_id='note:c'`).Scan(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, "freshly edited body about quarantine") {
+		t.Errorf("the unrelated edit was not indexed (the frozen-index bug); FTS body = %q", body)
+	}
+
+	// Converges: fixing the duplicate clears the quarantine and indexes the file.
+	write(t, dir, "dup.md", "---\nid: dup\ntype: note\nwhen: 2026-01-01\n---\n# Dup\nnow unique\n")
+	if _, err := live.Reconcile(true); err != nil {
+		t.Fatal(err)
+	}
+	if d := s.DroppedNotes(); len(d) != 0 {
+		t.Errorf("quarantine must clear once the id is unique, got %+v", d)
+	}
+	var n int
+	if err := s.readDB.QueryRow(`SELECT count(*) FROM notes WHERE id='dup'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("the de-duplicated note must be indexed, got %d rows for id 'dup'", n)
 	}
 }
 

@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,7 +34,7 @@ func ToolSpecs() []map[string]any {
 	tools := []map[string]any{
 		{
 			"name":        "mesh_search",
-			"description": "Fused retrieval over the vault (full-text + graph proximity), tier-0 boosted (decisions/gotchas/post-mortems first). Returns ranked cards. Pass a token budget to get the best bundle that fits. Start here.",
+			"description": "Fused retrieval over the vault (full-text + graph proximity), tier-0 boosted (decisions/gotchas/post-mortems first). Returns ranked cards. Pass a token budget to get the best bundle that fits (default 8000). limit defaults to 20 and is capped at 100: narrow the query rather than raising it. Start here.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -232,9 +233,10 @@ var toolScopeClass = map[string]toolClass{
 	"mesh_code_context":   classCodeDev,
 	"mesh_setup_hooks":    classOpen,
 	// Secret-broker tools broker an ATTACHED Dockyard vault, not vault-note content, so
-	// no per-note scope crosses a boundary (classOpen). mesh_secret_use additionally
-	// applies the write-role gate inside its handler (a read-only hosted viewer must not
-	// mint capability tokens); list/status are metadata-only reads.
+	// no per-note scope crosses a boundary (classOpen). All three apply the write-role
+	// gate inside their handler: minting a token spends the team's credential, and
+	// listing or status disclose the vault inventory and the broker endpoint, none of
+	// which a read-only hosted viewer should reach.
 	"mesh_secret_status": classOpen,
 	"mesh_secret_list":   classOpen,
 	"mesh_secret_use":    classOpen,
@@ -298,21 +300,35 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 // of waiting on the --watch debounce or restarting a no-watch server. Authoritative
 // = full content-hash check, so it also catches an edit that did not move the mtime.
 func (s *Server) toolReindex(ctx context.Context) (any, *rpcError) {
-	rec, err := s.reconcileOnce(true)
+	// Role write gate: a reindex content-hashes the whole vault, re-indexes the code
+	// roots, and WRITES the result to the DB, so it is not a read even though what it
+	// returns is. A read-only hosted viewer must not be able to drive it.
+	if can, set := writeAllowed(ctx); set && !can {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
+	}
+	// Throttle remote callers only (see reconcileThrottled): the hosted transports are
+	// where back-to-back passes contend with the hub's post-sync reconcile worker for
+	// reloadMu. The local operator's "reindex now" still means now.
+	rec, throttled, err := s.reconcileThrottled(!localOperator(ctx))
 	if err != nil {
 		return nil, internalErr(err)
 	}
 	// Count from the graph THIS reconcile produced, not a fresh snapshot() that a
 	// concurrent watcher tick could have swapped underneath us, so the reported counts
 	// always describe this call's result. Fall back to the snapshot on a no-op pass
-	// (rec.Graph is nil when nothing changed).
+	// (rec.Graph is nil when nothing changed) and on a throttled replay, where the
+	// remembered graph pointer may predate a watcher swap.
 	g := rec.Graph
-	if g == nil {
+	if g == nil || throttled {
 		g, _ = s.snapshot()
 	}
 	out := map[string]any{
 		"reindexed": rec.Reindexed,
 		"ms":        rec.Dur.Milliseconds(),
+	}
+	if throttled {
+		out["throttled"] = true
+		out["note"] = "a reindex ran moments ago; this is that pass's result. Retry in a few seconds to force a fresh one."
 	}
 	// A scope-confined caller must not learn out-of-scope volume: the global graph
 	// totals AND the reconcile deltas (added/changed/removed, which span every scope)
@@ -331,11 +347,15 @@ func (s *Server) toolReindex(ctx context.Context) (any, *rpcError) {
 	// code edits. ok=false means code indexing is not enabled for this vault. The
 	// counts are only returned to callers who may read the (dev-scoped) code index;
 	// a scope-confined caller must not learn the code corpus volume (still refreshed,
-	// just not reported), mirroring the code_search/neighbors gate.
-	if cs, ok, cerr := s.reindexCode(); ok && cerr == nil && !codeScopeDenied(ctx) {
-		out["code_files"] = cs.Files
-		out["code_symbols"] = cs.Symbols
-		out["code_edges"] = cs.Edges
+	// just not reported), mirroring the code_search/neighbors gate. Skipped entirely on
+	// a throttled replay: re-walking the code roots is the other half of the cost the
+	// cooldown exists to bound.
+	if !throttled {
+		if cs, ok, cerr := s.reindexCode(); ok && cerr == nil && !codeScopeDenied(ctx) {
+			out["code_files"] = cs.Files
+			out["code_symbols"] = cs.Symbols
+			out["code_edges"] = cs.Edges
+		}
 	}
 	return textResult(out), nil
 }
@@ -348,6 +368,13 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		Issue string `json:"issue"`
 	}
 	_ = json.Unmarshal(raw, &a)
+	// Role write gate: the health pass reads EVERY note file in the vault and persists
+	// the findings + contradiction rows, so like mesh_reindex it is a state-mutating
+	// expensive operation wearing a read tool's clothes. A read-only hosted viewer must
+	// not be able to drive it repeatedly.
+	if can, set := writeAllowed(ctx); set && !can {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
+	}
 	now := time.Now()
 	if _, err := s.store.ComputeHealth(s.vaultRoot, now); err != nil {
 		return nil, internalErr(err)
@@ -368,15 +395,25 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 	// Surface the ones the last reindex dropped so an operator can find and fix the
 	// note that disappeared. They carry no note id or scope (they never parsed), so
 	// they are operational findings, always shown, never scope-filtered out.
-	if a.Issue == "" || a.Issue == "unparseable" {
-		for _, d := range s.store.DroppedNotes() {
-			detail := ""
-			if d.Err != nil {
-				detail = d.Err.Error()
-			}
-			findings = append(findings, index.HealthFinding{Issue: "unparseable", Path: d.Path, Detail: detail})
-			counts["unparseable"]++
+	//
+	// DroppedNotes carries two distinct causes with two different remedies, so they get
+	// two issue kinds rather than one misleading label: "unparseable" means fix the
+	// frontmatter, "duplicate-id" means the note was quarantined because another note
+	// already holds its id and one of the two needs a new one.
+	for _, d := range s.store.DroppedNotes() {
+		detail := ""
+		if d.Err != nil {
+			detail = d.Err.Error()
 		}
+		kind := "unparseable"
+		if errors.Is(d.Err, index.ErrDuplicateNoteID) {
+			kind = "duplicate-id"
+		}
+		if a.Issue != "" && a.Issue != kind {
+			continue
+		}
+		findings = append(findings, index.HealthFinding{Issue: kind, Path: d.Path, Detail: detail})
+		counts[kind]++
 	}
 	// Scope read check: findings carry a note id + path, so an unfiltered health pass
 	// leaks the existence and paths of notes outside the caller's scope (and the global
@@ -410,12 +447,13 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 // hooks make the agent read the mesh at session start and write back at the end.
 func (s *Server) toolSetupHooks(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	// This tool writes .claude/settings.json under a caller-supplied project_dir on the
-	// SERVER host. It only makes sense for the local solo binary configuring its own
-	// agent; over a hosted hub it would let any authenticated member (a read-only viewer
-	// included) drive a server-side filesystem write at an arbitrary path. A set write
-	// capability means we are on the hosted hub, so refuse it there entirely.
-	if _, set := writeAllowed(ctx); set {
-		return nil, &rpcError{Code: codeInvalidParams, Message: "mesh_setup_hooks is only available on a local mesh install, not the hosted hub"}
+	// SERVER host. It only makes sense for the local binary configuring its own agent;
+	// over any remote transport it lets an authenticated caller drive a server-side
+	// filesystem write at a path they choose. Gate POSITIVELY on the local stdio marker:
+	// the previous check ("is the hosted write capability set?") failed OPEN on
+	// `mesh mcp --http`, which sets neither marker, so a bearer-token holder reached it.
+	if !localOperator(ctx) {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "mesh_setup_hooks is only available on a local mesh install over stdio, not over a network transport"}
 	}
 	var a struct {
 		Action     string `json:"action"`
@@ -439,6 +477,14 @@ func (s *Server) toolSetupHooks(ctx context.Context, raw json.RawMessage) (any, 
 
 	switch a.Action {
 	case "install":
+		// project_dir must already BE a project: hooks.Install does MkdirAll(.claude)
+		// under it, so accepting a path that does not exist turns a typo (or a
+		// hallucinated path from the agent) into directory creation anywhere this
+		// process can write. Installing hooks into a directory nobody is working in
+		// is never the intent, so requiring it to exist costs nothing.
+		if fi, serr := os.Stat(proj); serr != nil || !fi.IsDir() {
+			return nil, &rpcError{Code: codeInvalidParams, Message: "project_dir must be an existing directory"}
+		}
 		res, err := hooks.Install(hooks.Options{ProjectDir: proj, Vault: vaultAbs, Bin: bin, EnforceWriteback: !a.ReadOnly, DryRun: a.DryRun})
 		if err != nil {
 			return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
@@ -479,6 +525,26 @@ func (s *Server) toolSetupHooks(ctx context.Context, raw json.RawMessage) (any, 
 	}
 }
 
+// searchLimitDefault/Max and searchBudgetDefault bound one mesh_search. Without them
+// a single call returned every FTS-matching note as a card (Retrieve only FLOORS the
+// limit, and packToBudget is skipped when Budget is 0), which blows out the calling
+// agent's context and, on the hub, does corpus-sized work per request. The ceilings
+// match what graph_tools.go already enforces on the other tools.
+const (
+	searchLimitDefault  = 20
+	searchLimitMax      = 100
+	searchBudgetDefault = 8000
+)
+
+// searchCard is the MCP wire shape of a retrieval card: the retriever's card plus the
+// provenance the agent needs to judge the snippet. retrieve.Card carries no source
+// field, so Source is derived here from the note path (see importedSource) and set
+// only for third-party ingested notes, keeping the common card byte-identical.
+type searchCard struct {
+	retrieve.Card
+	Source string `json:"Source,omitempty"`
+}
+
 func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		Query  string `json:"query"`
@@ -489,17 +555,40 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	if strings.TrimSpace(a.Query) == "" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query is required"}
 	}
+	limit := clampLimit(a.Limit, searchLimitDefault, searchLimitMax)
+	budget := a.Budget
+	if budget <= 0 {
+		budget = searchBudgetDefault
+	}
 	_, retriever := s.snapshot()
 	var allowed map[string]bool
 	if sf := scopeFromCtx(ctx); sf != nil {
 		allowed = sf.AllowedRead // nil-safe: nil => retriever does not filter
 	}
-	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: a.Limit, Budget: a.Budget, AllowedScopes: allowed})
+	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: allowed})
 	if err != nil {
 		return nil, internalErr(err)
 	}
 	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)
-	return textResult(map[string]any{"cards": cards, "tokens": retrieve.TotalTokens(cards)}), nil
+	return textResult(map[string]any{"cards": labelCards(cards), "tokens": retrieve.TotalTokens(cards)}), nil
+}
+
+// labelCards marks the cards whose note came from a connector import: it stamps the
+// source and wraps the snippet in the data envelope, so third-party text can never
+// reach the agent as an unlabelled instruction-shaped span (the instruction boundary
+// the HTML and TTY sinks already have). Cards from the team's own notes pass through
+// untouched.
+func labelCards(cards []retrieve.Card) []searchCard {
+	out := make([]searchCard, 0, len(cards))
+	for _, c := range cards {
+		sc := searchCard{Card: c}
+		if src, ok := importedSource(c.Path); ok {
+			sc.Source = src
+			sc.Snippet = wrapUntrusted(src, "", c.Snippet)
+		}
+		out = append(out, sc)
+	}
+	return out
 }
 
 func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
@@ -526,8 +615,24 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 		return nil, internalErr(err)
 	}
 	body := string(data)
+	// Provenance is read from the WHOLE file, before any anchor slicing: an anchored
+	// fetch cuts the frontmatter off, and that is exactly the case where the agent
+	// would otherwise get a bare span of third-party prose with nothing saying so.
+	src, srcURL := frontmatterProvenance(body)
 	if a.Anchor != "" {
 		body = sectionByAnchor(body, a.Anchor)
+	}
+	// Connector-ingested text is data, not instructions. Wrap it in the envelope the
+	// contract describes so the agent has an explicit boundary. The frontmatter source
+	// is authoritative (ingest stamps source: import:<connector>); the path check is
+	// the fallback for a note whose frontmatter was hand-edited away.
+	if !strings.HasPrefix(src, importSourcePrefix) {
+		if ps, ok := importedSource(rel); ok {
+			src = ps
+		}
+	}
+	if strings.HasPrefix(src, importSourcePrefix) {
+		body = wrapUntrusted(src, srcURL, body)
 	}
 	_ = s.store.IncrMetric("fetches", 1)            // ROI telemetry (best-effort)
 	_ = s.store.IncrMetric("fetch:"+a.ID, 1)        // per-note reuse (most-reused list)
@@ -669,7 +774,15 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	if err != nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
 	}
-	if err := s.reload(); err != nil {
+	// Make the new note queryable through the INCREMENTAL path, not a full reindex.
+	// reload() re-walked and re-parsed the entire vault and rewrote every notes /
+	// search_index / nodes / edges row in one transaction to publish one small file, so
+	// write-back cost scaled with vault size instead of with the change; because rebuilds
+	// serialize on reloadMu, concurrent hosted write-backs then queued head to tail
+	// against the hub's 30s write timeout. reconcileOnce sees exactly this file as one
+	// Added path (authoritative, so a same-second mtime cannot hide it) and rebuilds the
+	// graph from the parsed-note cache the startup load seeded.
+	if _, err := s.reconcileOnce(true); err != nil {
 		return nil, internalErr(err)
 	}
 	_ = s.store.IncrMetric("writes", 1)         // ROI telemetry (best-effort)

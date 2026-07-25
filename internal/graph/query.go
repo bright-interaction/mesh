@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // BM25 parameters (ported from flow knowledge/search.go). labelWeight repeats
@@ -73,14 +75,29 @@ func (g *Graph) NewRanker() *Ranker {
 
 // Score ranks note nodes against the query by BM25 over label+attrs. Returns
 // nodes with a positive score, sorted by score desc with node id as the
-// deterministic tiebreak.
+// deterministic tiebreak. Unrestricted: see ScoreScoped for the access-controlled
+// form.
 func (r *Ranker) Score(query string, limit int) []ScoredNode {
+	return r.ScoreScoped(query, limit, nil)
+}
+
+// ScoreScoped is Score restricted to nodes whose scope intersects allowed (nil =
+// unrestricted).
+//
+// The filter runs BEFORE the limit truncation, not after: truncating the global
+// ranking first and filtering later let a run of higher-ranked unreadable notes
+// eat the whole limit, so a scoped caller could get nothing back while readable
+// matches existed further down the ranking.
+func (r *Ranker) ScoreScoped(query string, limit int, allowed map[string]bool) []ScoredNode {
 	qterms := Tokenize(query)
 	if len(qterms) == 0 {
 		return nil
 	}
 	var out []ScoredNode
 	for id, tf := range r.tf {
+		if !nodeScopeAllowed(r.node[id], allowed) {
+			continue
+		}
 		dl := float64(r.docLen[id])
 		score := 0.0
 		for _, term := range qterms {
@@ -108,6 +125,23 @@ func (r *Ranker) Score(query string, limit int) []ScoredNode {
 		out = out[:limit]
 	}
 	return out
+}
+
+// nodeScopeAllowed reports whether a node may be scored for a caller holding the
+// allowed-read set. nil allowed = unrestricted. A missing node or a node with no
+// scope attr falls through to vault.ScopeAllowsCSV, whose unlabeled fail-safe is
+// dev-only, so this can never be more permissive than the shared predicate.
+func nodeScopeAllowed(n *Node, allowed map[string]bool) bool {
+	if allowed == nil {
+		return true
+	}
+	var csv string
+	if n != nil {
+		if s, ok := n.Attrs["scope"].(string); ok {
+			csv = s
+		}
+	}
+	return vault.ScopeAllowsCSV(csv, allowed)
 }
 
 func nodeText(n *Node) []string {
