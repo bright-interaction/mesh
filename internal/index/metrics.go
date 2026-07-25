@@ -12,18 +12,26 @@ import (
 // quantify what Mesh did (queries served, notes fetched/written) so a team can see
 // the value, and per-note fetch counts ("fetch:<id>") drive a most-reused list.
 
-// IncrMetric adds n to a counter (upsert). Best-effort at call sites.
+// IncrMetric adds n to a counter (upsert). Best-effort at call sites, and deliberately
+// NON-BLOCKING: it accumulates in memory and the writer goroutine flushes the batch
+// (see Store.drainTelemetry). Every caller is a read path (mesh_search, mesh_fetch, the
+// web search API) that has already computed its answer, so it must not inherit the
+// latency of whatever transaction the single writer is running, nor the SQLite
+// busy_timeout when a second mesh process holds the write lock. Always returns nil; the
+// error return is kept because every call site treats it as best-effort already.
 func (s *Store) IncrMetric(key string, n int64) error {
-	return s.Write(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
-			`INSERT INTO metrics(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=value+excluded.value`,
-			key, n)
-		return err
-	})
+	if key == "" {
+		return nil
+	}
+	s.recordTelemetry(key, n, nil)
+	return nil
 }
 
 // Metric reads one counter (0 if absent).
 func (s *Store) Metric(key string) (int64, error) {
+	// Reporting surface, not a hot path: land pending increments first so a dashboard
+	// never shows a number that lags the flush ticker.
+	s.flushTelemetry()
 	var v int64
 	err := s.readDB.QueryRow(`SELECT value FROM metrics WHERE key=?`, key).Scan(&v)
 	if err == sql.ErrNoRows {
@@ -40,6 +48,7 @@ func (s *Store) TopFetched(limit int) ([]struct {
 	if limit <= 0 {
 		limit = 10
 	}
+	s.flushTelemetry() // reporting surface: include increments not yet flushed
 	rows, err := s.readDB.Query(
 		`SELECT substr(key,7), value FROM metrics WHERE key LIKE 'fetch:%' ORDER BY value DESC LIMIT ?`, limit)
 	if err != nil {

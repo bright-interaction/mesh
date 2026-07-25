@@ -6,6 +6,7 @@ package web
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -15,19 +16,40 @@ import (
 // cookie value is the HMAC-derived session value (never the raw key). This is an open
 // path (reachable unauthenticated) and validates the key itself, constant-time.
 // Accepts the key as JSON {"key":"..."} or a "key" form field.
+//
+// Being the only unauthenticated path that checks a secret makes it a guessing oracle
+// for the shared admin token and for every member client token, so it is throttled per
+// peer and every rejection is logged. Without that, an internet-reachable mesh ui hands
+// out unlimited, silent guesses at a full-vault admin credential.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	peer := peerKey(r)
+	if !s.logins.allow(peer) {
+		slog.Warn("mesh ui: login rate limit hit", "peer", peer)
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "too many login attempts, try again in a minute", http.StatusTooManyRequests)
+		return
+	}
 	// Member mode (mesh ui --hub-db): the key is a hub client token; on success set a
 	// client-bound cookie so the member's view is scoped to them.
 	if s.member != nil {
 		key := loginKey(w, r)
 		id, _, ok := s.member.verify(key)
 		if !ok {
+			slog.Warn("mesh ui: rejected member login", "peer", peer)
+			http.Error(w, "invalid access key", http.StatusUnauthorized)
+			return
+		}
+		// createdAt is signed into the cookie, so a cookie minted for THIS client stops
+		// verifying if the rowid is later recycled to a different member.
+		_, createdAt, exists := s.member.roleFor(id)
+		if !exists {
+			slog.Warn("mesh ui: rejected member login for a revoked client", "peer", peer)
 			http.Error(w, "invalid access key", http.StatusUnauthorized)
 			return
 		}
 		http.SetCookie(w, &http.Cookie{
 			Name:     memberCookie,
-			Value:    s.member.sign(id),
+			Value:    s.member.sign(id, createdAt),
 			Path:     s.cookiePath(),
 			HttpOnly: true,
 			Secure:   true,
@@ -44,6 +66,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	key := loginKey(w, r)
 	if subtle.ConstantTimeCompare([]byte(key), []byte(s.auth.token)) != 1 {
+		slog.Warn("mesh ui: rejected login", "peer", peer)
 		http.Error(w, "invalid access key", http.StatusUnauthorized)
 		return
 	}

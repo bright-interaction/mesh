@@ -40,10 +40,13 @@ func newTestServer(t *testing.T) *Server {
 	return srv
 }
 
+// call dispatches as the LOCAL STDIO transport does (ServeStdio marks its context with
+// WithLocalOperator), so these tests exercise the same trust level a `mesh mcp` session
+// has: local-only tools are reachable and the remote reindex cooldown does not apply.
 func call(t *testing.T, s *Server, method string, params any) map[string]any {
 	t.Helper()
 	raw, _ := json.Marshal(params)
-	res, rerr := s.dispatch(context.Background(), request{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: method, Params: raw})
+	res, rerr := s.dispatch(WithLocalOperator(context.Background()), request{JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: method, Params: raw})
 	if rerr != nil {
 		t.Fatalf("%s: rpc error %d %s", method, rerr.Code, rerr.Message)
 	}

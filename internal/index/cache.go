@@ -126,7 +126,13 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 		}
 		li.cache.Seed(notes)
 		li.seeded = true
-		return Reconciliation{Added: len(notes), Reindexed: true, Graph: g, Dur: time.Since(start)}, nil
+		return Reconciliation{
+			Added:     len(notes),
+			Reindexed: true,
+			Graph:     g,
+			Dropped:   len(li.store.DroppedNotes()), // recorded by ReindexFull
+			Dur:       time.Since(start),
+		}, nil
 	}
 	return ReconcileIncremental(li.store, li.root, li.cache, !authoritative)
 }

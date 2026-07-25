@@ -210,6 +210,66 @@ func TestRemovingDuplicateBaseBlockConflicts(t *testing.T) {
 	}
 }
 
+// TestAppendMergeCountsAndAnchors pins the two placement defects that made
+// appendMerge silently mangle a merge: set-membership placement dropped an
+// incoming block byte-identical to one already at HEAD, and a hash anchor
+// resolved a duplicated block (a "---" break) to its FIRST occurrence, hoisting
+// the appended section above pre-existing content.
+func TestAppendMergeCountsAndAnchors(t *testing.T) {
+	cases := []struct {
+		name        string
+		base        Version
+		hub         Version
+		in          Incoming
+		want        Action
+		wantContent string // exact merged bytes when want is ActionUpsert
+	}{
+		{
+			name:        "duplicate of an existing block is kept, not dropped",
+			base:        ver("# Log\n\n- entry\n"),
+			hub:         ver("# Log\n\n- entry\n\n- hub entry\n"),
+			in:          up("# Log\n\n- entry\n\n- entry\n"),
+			want:        ActionUpsert,
+			wantContent: "# Log\n\n- entry\n\n- entry\n\n- hub entry\n",
+		},
+		{
+			name:        "duplicated anchor places the section at the right occurrence",
+			base:        ver("# Title\n\n---\n\n## A\n\nbody a\n"),
+			hub:         ver("# Title\n\n---\n\n## A\n\nbody a\n\n## C\n"),
+			in:          up("# Title\n\n---\n\n## A\n\nbody a\n\n---\n\n## B\n\nbody b\n"),
+			want:        ActionUpsert,
+			wantContent: "# Title\n\n---\n\n## A\n\nbody a\n\n---\n\n## B\n\nbody b\n\n## C\n",
+		},
+		{
+			name:        "a reorder is not an addition: no duplicated copy",
+			base:        ver("a\n\nb\n"),
+			hub:         ver("a\n\nb\n\nhub add\n"),
+			in:          up("b\n\na\n"),
+			want:        ActionUpsert,
+			wantContent: "a\n\nb\n\nhub add\n",
+		},
+		{
+			name:        "both sides add the same new block: it collapses to one",
+			base:        ver("alpha\n"),
+			hub:         ver("alpha\n\nshared\n\nhub only\n"),
+			in:          up("alpha\n\nshared\n"),
+			want:        ActionUpsert,
+			wantContent: "alpha\n\nshared\n\nhub only\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := MergePath("p.md", c.base, c.hub, c.in, testTime, "u")
+			if got.Action != c.want {
+				t.Fatalf("action = %q, want %q (%+v)", got.Action, c.want, got)
+			}
+			if c.want == ActionUpsert && string(got.Content) != c.wantContent {
+				t.Errorf("merged content =\n%q\nwant\n%q", got.Content, c.wantContent)
+			}
+		})
+	}
+}
+
 func TestUnknownOpIsNoop(t *testing.T) {
 	got := MergePath("p.md", ver("a\n"), ver("a\n"), Incoming{Op: "frobnicate", Content: []byte("x\n")}, testTime, "u")
 	if got.Action != ActionNoop {

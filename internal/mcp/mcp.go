@@ -49,6 +49,10 @@ type Server struct {
 	reloadMu sync.Mutex       // serializes rebuilds across dispatch + watcher
 	cache    *index.NoteCache // parsed-note cache for incremental reconcile; guarded by reloadMu
 
+	reindexMu     sync.Mutex // guards the mesh_reindex throttle state below
+	lastReindexAt time.Time
+	lastReindex   index.Reconciliation
+
 	ready    chan struct{} // closed when retrieval is servable (initial reload done)
 	readyErr error         // written once before ready closes
 	bg       chan struct{} // closed when ALL background startup work is done (enrichment included)
@@ -196,6 +200,32 @@ func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error)
 	return rec, nil
 }
 
+// reindexThrottle is how long a REMOTE mesh_reindex serves the previous pass's
+// result instead of forcing another authoritative reconcile. Each pass content-hashes
+// every note and then re-indexes the code roots, and it takes reloadMu, the same lock
+// the hub's post-sync reconcile worker needs, so an unthrottled remote caller can burn
+// a core on hashing and delay synced notes becoming visible for other members.
+const reindexThrottle = 5 * time.Second
+
+// reconcileThrottled is reconcileOnce(true) with a per-server cooldown for remote
+// callers. remote=false (the local stdio operator, who owns the box and expects
+// "reindex now" to mean now) always runs the real pass. It returns the pass result and
+// whether the cooldown replayed the previous one.
+func (s *Server) reconcileThrottled(remote bool) (index.Reconciliation, bool, error) {
+	s.reindexMu.Lock()
+	defer s.reindexMu.Unlock()
+	if remote && !s.lastReindexAt.IsZero() && time.Since(s.lastReindexAt) < reindexThrottle {
+		return s.lastReindex, true, nil
+	}
+	rec, err := s.reconcileOnce(true)
+	if err != nil {
+		return rec, false, err
+	}
+	s.lastReindexAt = time.Now()
+	s.lastReindex = rec
+	return rec, false, nil
+}
+
 // Watch live-reindexes the vault in the background until ctx is cancelled, so a
 // long-running agent session sees notes a human edits in their editor without a
 // restart. logf must write to stderr: stdout carries the JSON-RPC stream.
@@ -226,6 +256,10 @@ func (s *Server) Watch(ctx context.Context, debounce, reconcile time.Duration, l
 func (s *Server) ServeStdio() error {
 	dec := json.NewDecoder(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
+	// Stdio is the trusted local transport: the operator spawned this process, so its
+	// requests carry the local-operator marker that gates the local-only tools. No
+	// other transport sets it, so they all fail closed (see WithLocalOperator).
+	base := WithLocalOperator(context.Background())
 	for {
 		var req request
 		if err := dec.Decode(&req); err != nil {
@@ -238,7 +272,7 @@ func (s *Server) ServeStdio() error {
 		if len(req.ID) == 0 || string(req.ID) == "null" {
 			continue
 		}
-		result, rerr := s.dispatch(context.Background(), req)
+		result, rerr := s.dispatch(base, req)
 		resp := response{JSONRPC: "2.0", ID: req.ID}
 		if rerr != nil {
 			resp.Error = rerr

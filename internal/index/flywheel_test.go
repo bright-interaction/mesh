@@ -21,6 +21,11 @@ func openTestStore(t *testing.T) *Store {
 
 func reuseRow(t *testing.T, s *Store, id string) (authored, reuseCount int64, firstReuse sql.NullInt64) {
 	t.Helper()
+	// RecordReuse is queued in memory and flushed by the writer's batched ticker (it is
+	// on the read path and must not block), so a direct table read has to land the
+	// pending batch first. The public reporting surfaces (FlywheelStats, TopReused) do
+	// this for themselves.
+	s.flushTelemetry()
 	err := s.readDB.QueryRow(`SELECT authored_at, reuse_count, first_reuse FROM note_reuse WHERE note_id=?`, id).
 		Scan(&authored, &reuseCount, &firstReuse)
 	if err != nil {

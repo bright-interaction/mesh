@@ -7,6 +7,30 @@
 // bytes survive JSON.
 package syncproto
 
+// Protocol versioning. The wire contract used to carry no version at all, so the
+// hub could not tell a current client from one that predates a RESPONSE field and
+// would silently mishandle it. That is not hypothetical: a client that ignores
+// SyncResponse.Rejected records hub-refused bytes as its synced base, so the edit
+// is lost upstream forever with no error and no retry. Every request now declares
+// the protocol it speaks, and the hub refuses (rather than silently degrades) when
+// the response semantics need more than the client declared.
+//
+// Bump ProtoVersion whenever a new RESPONSE field changes what a client must do;
+// add a Proto* constant naming the first version that honors it, and gate on that
+// constant hub-side rather than on ProtoVersion, so old clients keep working for
+// every response that does not need the new field.
+const (
+	// ProtoVersion is the protocol this build speaks. A request carrying 0 is a
+	// pre-versioning client (the field did not exist).
+	ProtoVersion = 1
+	// ProtoRejected is the first version whose client honors SyncResponse.Rejected
+	// by keeping the refused path dirty instead of baselining the un-landed bytes.
+	ProtoRejected = 1
+	// ProtoHeader carries ProtoVersion on every request for the hub's audit log,
+	// so a stale client is visible in the logs even on endpoints with no body.
+	ProtoHeader = "X-Mesh-Proto"
+)
+
 // JoinRequest redeems a one-time invite for a client token.
 type JoinRequest struct {
 	Invite string `json:"invite"`
@@ -40,6 +64,11 @@ type SyncRequest struct {
 	BaseSHA      string       `json:"base_sha"`
 	Outbox       []OutboxItem `json:"outbox"`
 	TombstoneSeq int64        `json:"tombstone_seq,omitempty"` // client's high-water delete seq (0 = none seen)
+	// Proto is the protocol version the client speaks (see ProtoVersion). 0 means a
+	// pre-versioning client: the hub must assume it understands nothing added after
+	// the field appeared, and refuse the round rather than send a response it would
+	// mishandle.
+	Proto int `json:"proto,omitempty"`
 }
 
 // Delta is one change the hub sends back for the client to apply.
@@ -49,8 +78,12 @@ type Delta struct {
 	ContentB64 string `json:"content_b64,omitempty"`
 }
 
-// Conflict reports that Path could not auto-merge; the client's losing version
-// was parked at SiblingPath (delivered among the deltas).
+// Conflict reports that Path could not auto-merge. The hub keeps its own version
+// live at Path and only NAMES the sibling: siblings are per-user resolution
+// artifacts that never enter the hub repo, so the client writes its own losing
+// bytes to SiblingPath locally. SiblingPath therefore always carries the
+// ".sync-conflict-" marker, and the client refuses it if it does not (otherwise
+// the field would be a write-anywhere primitive for a hostile hub).
 type Conflict struct {
 	Path        string `json:"path"`
 	SiblingPath string `json:"sibling_path"`

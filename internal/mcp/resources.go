@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 )
 
 func (s *Server) handleResourcesList() any {
@@ -36,12 +37,17 @@ func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage
 	case "mesh://stats":
 		return contents(p.URI, "application/json", s.statsJSON()), nil
 	case "mesh://capabilities":
-		notes, _ := s.store.Count("notes")
-		nodes, _ := s.store.Count("nodes")
-		edges, _ := s.store.Count("edges")
+		// resources/read is NOT routed through handleToolsCall, so the scope class gate
+		// never runs here: the filtering has to be done inline. A scope-confined caller
+		// must not learn global corpus volume from a resource when mesh_reindex is
+		// careful to hide exactly that, so report the caller's readable view instead.
+		notes, nodes, edges := s.counts(scopeFromCtx(ctx))
 		b, _ := json.Marshal(map[string]any{
-			"server":   map[string]any{"name": serverName, "version": serverVersion},
-			"vault":    s.vaultRoot,
+			"server": map[string]any{"name": serverName, "version": serverVersion},
+			// The vault NAME, never the server's absolute path: on the hosted hub the
+			// full path leaks /opt/mesh/... to every authenticated client, which is
+			// the same disclosure toolWrite and toolReindex already suppress.
+			"vault":    filepath.Base(s.vaultRoot),
 			"counts":   map[string]any{"notes": notes, "nodes": nodes, "edges": edges},
 			"tools":    ToolNames(), // derived from ToolSpecs() so it never drifts from the real surface
 			"contract": "mesh://contract",
@@ -51,6 +57,28 @@ func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage
 	default:
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown resource", Data: p.URI}
 	}
+}
+
+// counts returns the note/node/edge totals VISIBLE to this caller. An unrestricted
+// caller (nil filter or nil AllowedRead: a solo run, an admin) gets the stored totals;
+// a scope-confined caller gets only their readable subgraph, so an aggregate cannot be
+// used to learn the volume of another scope. Same helper mesh_reindex uses, so the two
+// surfaces cannot drift apart again.
+func (s *Server) counts(sf *ScopeFilter) (notes, nodes, edges int) {
+	if sf == nil || sf.AllowedRead == nil {
+		notes, _ = s.store.Count("notes")
+		nodes, _ = s.store.Count("nodes")
+		edges, _ = s.store.Count("edges")
+		return notes, nodes, edges
+	}
+	g, _ := s.snapshot()
+	nodes, edges = scopedGraphCounts(g, sf)
+	for _, n := range g.Nodes() {
+		if n.Kind == "note" && sf.allowsNode(n) {
+			notes++
+		}
+	}
+	return notes, nodes, edges
 }
 
 // statsJSON reports the live retrieval state: which signals will fire and how
@@ -66,7 +94,9 @@ func (s *Server) statsJSON() string {
 		freshPct = float64(live) / float64(total) * 100
 	}
 	b, _ := json.Marshal(map[string]any{
-		"vault": s.vaultRoot,
+		// Vault NAME only: the absolute server path is an infrastructure detail no
+		// client needs (see the capabilities branch above).
+		"vault": filepath.Base(s.vaultRoot),
 		"vectors": map[string]any{
 			"active":          r.VectorsActive(), // embedder configured AND live vectors present
 			"model":           model,
