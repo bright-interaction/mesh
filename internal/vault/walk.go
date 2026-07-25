@@ -11,7 +11,7 @@ import (
 
 var skipDirs = map[string]bool{
 	".git": true, ".mesh": true, "node_modules": true,
-	"codeindex-out": true, "_archive": true,
+	"_archive": true,
 }
 
 // skipDir reports whether a directory (by name, relative to root) should be
