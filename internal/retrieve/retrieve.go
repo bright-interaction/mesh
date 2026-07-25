@@ -38,7 +38,7 @@ const (
 
 	// rerankBlendDefault weights the cross-encoder vs the fused score when reranking
 	// the head: score = a*rerank + (1-a)*fused. 1.0 = pure rerank (the default).
-	// On the Corpus vault an alpha sweep showed pure rerank dominates every blend
+	// On a large production vault an alpha sweep showed pure rerank dominates every blend
 	// (lowering it monotonically hurt paraphrase answer@1 and never recovered the
 	// one keyword case), so 1.0 ships; the MESH_RERANK_BLEND knob stays for corpora
 	// where the lexical/graph signal is strong enough to deserve a vote.

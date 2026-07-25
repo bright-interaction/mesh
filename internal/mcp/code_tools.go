@@ -25,7 +25,7 @@ func codeScopeDenied(ctx context.Context) bool {
 	return sf != nil && !sf.allowsRead(nil) // allowsRead(nil) => AllowedRead["dev"]
 }
 
-// toolCodeSearch is the codeindex replacement: FTS over the source-code symbol
+// toolCodeSearch is FTS over the source-code symbol
 // index, ranked by name match. It returns symbol cards with a file:line locator so
 // an agent can jump straight to a definition instead of grepping the tree. It is
 // deliberately separate from mesh_search so locating a function never competes with

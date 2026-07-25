@@ -11,7 +11,7 @@ import (
 )
 
 // NoteType is the kind of a note. The first five are the canonical Mesh types.
-// concept and map are accepted so `mesh migrate` can ingest a Corpus-style vault
+// concept and map are accepted so `mesh migrate` can ingest a legacy-style vault
 // losslessly (Open Decision 4 default: extend the enum rather than remap).
 type NoteType string
 

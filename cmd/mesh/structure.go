@@ -15,7 +15,7 @@ import (
 
 // structureCmd grades how well a vault is ORGANIZED (canonical types, note-to-note
 // connectivity, tier-0 capture, a map per cluster) against the standard in
-// ORGANIZATION.md. It complements `mesh lint` (frontmatter validity) and
+// the vault structure standard. It complements `mesh lint` (frontmatter validity) and
 // `mesh health` (knowledge lifecycle): validity, organization, lifecycle.
 func structureCmd() *cobra.Command {
 	var verbose bool

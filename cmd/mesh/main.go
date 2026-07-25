@@ -886,12 +886,12 @@ func indexCmd() *cobra.Command {
 	return c
 }
 
-// codeCmd is the source-code index: the pure-Go codeindex replacement. It walks the
+// codeCmd is the source-code index. It walks the
 // configured code roots (separate from the note vault), extracts symbols (Go via the
 // stdlib AST with a call graph; other languages via a declaration scanner), and lets
 // mesh_code_search / mesh_code_neighbors locate definitions by name.
 func codeCmd() *cobra.Command {
-	c := &cobra.Command{Use: "code", Short: "Source-code index (the codeindex replacement): locate symbols + Go call graph"}
+	c := &cobra.Command{Use: "code", Short: "Source-code index: locate symbols + Go call graph"}
 	c.AddCommand(codeReindexCmd(), codeSearchCmd(), codeContextCmd())
 	return c
 }

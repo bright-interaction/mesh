@@ -20,7 +20,7 @@ import (
 // It analyses the REAL built graph, so "orphan" / "hub-only" reflect the exact
 // edges retrieval walks: both [[wikilinks]] and related: frontmatter, between note
 // nodes, ignoring the heading/tag scaffolding edges. The standard it enforces is
-// Corpus/ORGANIZATION.md.
+// the vault structure standard documented in the in-app docs.
 
 // canonicalTypes is the eight-type vocabulary from the structure standard.
 var canonicalTypes = map[string]bool{
@@ -131,7 +131,7 @@ func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote, parseErrs []FileErro
 		case t == "":
 			flag(nodeID, "high", "untyped", pn.Path, "no type; declare one of the 8 canonical types")
 		case !canonicalTypes[t]:
-			flag(nodeID, "high", "unknown-type", pn.Path, "type '"+t+"' is not canonical (see ORGANIZATION.md)")
+			flag(nodeID, "high", "unknown-type", pn.Path, "type '"+t+"' is not canonical (see the vault structure standard in the docs)")
 		}
 
 		refs, hubOnly := noteRefs(g, nodeID, deg)

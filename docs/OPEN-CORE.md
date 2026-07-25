@@ -67,11 +67,10 @@ docker-compose.yml  deploy/Dockerfile.hub  deploy/entrypoint.sh  deploy/hub-imag
 docs/S1-PLAN.md  docs/S2-PLAN.md  docs/M3-PLAN.md  docs/SPEC.md  deploy/DEPLOY.md
 
 # the release tooling and its runbook (they only run from the private monorepo)
-scripts/split-public-repo.sh  scripts/lib/mirror-redaction.sh  scripts/test-release-gates.sh
-docs/RELEASING.md
+the monorepo-only release tooling and its runbook
 
 # retrieval-eval fixtures built from a private vault
-eval/corpus.json  eval/corpus-heldout.json  eval/corpus-semantic.json
+the retrieval-eval fixtures built from a private vault
 ```
 
 The **deployment** files build and run `./cmd/mesh-hub`, which the mirror does not

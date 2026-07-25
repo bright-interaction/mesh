@@ -1,10 +1,11 @@
 # Build artifacts (anchored to repo root so they don't match cmd/mesh/ sources)
 /bin/
 /mesh
-/mesh-hub
 
 # Local index / vault state (derived, never committed)
 *.db
 *.db-wal
 *.db-shm
 .mesh/
+.mcp.json
+/.claude/

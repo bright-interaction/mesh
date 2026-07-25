@@ -17,7 +17,7 @@ const maxChunkChars = 6000
 // self-describing. The default embed path joins these into one whole-note
 // vector; `mesh embed --per-section` stores them separately and scores a note
 // by its best-matching section (max-pool). Per-section showed no recall or
-// answer@1 lift on the Corpus corpus at ~18x the cost, so whole-note is default
+// answer@1 lift on a large production corpus at ~18x the cost, so whole-note is default
 // (see the dogfood decision note), but the structured join is itself a better
 // text representation than the collapsed search body.
 func ChunkText(pn *ParsedNote) []string {

@@ -48,8 +48,7 @@ type Retrieval struct {
 	FreshnessHalfLifeDays int
 }
 
-// Code is the [code] section: the opt-in source-code index (the codeindex
-// replacement). Index gates it on; Roots are the repos to walk (separate from the
+// Code is the [code] section: the opt-in source-code index. Index gates it on; Roots are the repos to walk (separate from the
 // note vault, since source lives elsewhere); Languages is an allowlist of language
 // tags (empty = all supported). Env MESH_CODE_INDEX / MESH_CODE_ROOTS override.
 type Code struct {
@@ -185,7 +184,7 @@ blend = %g
 hnsw_threshold = %d
 
 [code]
-# Source-code index (the codeindex replacement). Opt-in. index=true walks the roots
+# Source-code index  Opt-in. index=true walks the roots
 # below and lets mesh_code_search / mesh_code_neighbors locate functions, types, and
 # the Go call graph. Roots are SEPARATE from the note vault (they are other repos);
 # comma-separated. languages is a comma list of tags (go,ts,tsx,js,jsx,svelte,astro,
