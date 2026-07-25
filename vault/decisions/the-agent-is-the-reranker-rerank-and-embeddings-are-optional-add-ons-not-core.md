@@ -34,4 +34,3 @@ status: accepted
 ## Related
 <!-- linked notes from the related: field render in the graph -->
 
-<!-- authored by claude+tom -->

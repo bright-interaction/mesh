@@ -12,7 +12,7 @@ tags:
     - eval
 do: Keep vectors on (BYOAI); they recover the relevant note FTS misses when the query is paraphrased
 dont: Judge vector value on FTS-friendly evals where queries echo note vocabulary - vectors look marginal there and the win is invisible
-why: 'On a 20-query semantic-stress set (low lexical overlap, eval/corpus-semantic.json), vectors lifted surfacing recall 13/20 to 19/20 (+46%) vs FTS-only; the win appears exactly where keyword search breaks. Weighted-sum fusion handles this: a note FTS missed still surfaces via its vector score'
+why: 'On a 20-query semantic-stress set (low lexical overlap, the semantic-stress eval set), vectors lifted surfacing recall 13/20 to 19/20 (+46%) vs FTS-only; the win appears exactly where keyword search breaks. Weighted-sum fusion handles this: a note FTS missed still surfaces via its vector score'
 ---
 
 # Vectors decisively lift recall on paraphrase queries

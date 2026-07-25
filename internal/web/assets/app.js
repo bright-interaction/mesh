@@ -58,7 +58,7 @@
     { label: "Sales / Outreach", color: "#e8629a", tags: ["sales","outreach","leads","prospecting","legal","crm"] },
     { label: "Security / Compliance", color: "#e0524e", tags: ["security","gdpr","audit","compliance","owasp","pii","encryption","secrets","vault"] },
     { label: "Design", color: "#38c5d0", tags: ["design","branding","typography","visual","taste","css","font"] },
-    { label: "Knowledge / Learning", color: "#b08cf0", tags: ["claude-skill","learning","networking","fundamentals","reference","concept","skill","basics","guide","patterns"] },
+    { label: "Knowledge / Learning", color: "#b08cf0", tags: ["claude-skill","learning","fundamentals","reference","concept","skill","basics","guide","patterns"] },
     { label: "General", color: "#8a8f9a", tags: [] },
   ];
   const GENERAL_DOMAIN = DOMAIN_DEFS.length - 1;

@@ -16,7 +16,7 @@ tags:
     - eval
     - byoai
 do: Use mesh tune <cases.json> --test <held-out.json> to fit fusion weights (FTS/graph/vector) to your corpus and apply via MESH_WEIGHT_FTS/GRAPH/VEC. It matters most for a vectors-on, rerank-off deployment, where vector-dominant weights lift answer@1 a lot.
-dont: 'Do not bake the Corpus-tuned weights (fts=0.2 graph=0 vec=0.8) as a global default: graph=0 is corpus-specific and the held-out gain is only +1/24. And do not expect tuning to help when rerank is on; the cross-encoder owns the head and fusion weights are byte-for-byte washed out.'
+dont: 'Do not bake the corpus-tuned weights (fts=0.2 graph=0 vec=0.8) as a global default: graph=0 is corpus-specific and the held-out gain is only +1/24. And do not expect tuning to help when rerank is on; the cross-encoder owns the head and fusion weights are byte-for-byte washed out.'
 why: 'Grid search (rerank off) found vec-dominant weights beat the hand-picked 0.5/0.2/0.3: rerank-OFF answer@1 semantic 3->9, keyword 15->21, held-out 21->22. With rerank ON: identical (10/10, 14/14, 22/22). The hand-picked 0.3 vec weight was too conservative; the right home for the gain is the per-corpus mesh tune lever, not a global default change.'
 status: accepted
 ---
@@ -35,4 +35,3 @@ status: accepted
 ## Related
 <!-- linked notes from the related: field render in the graph -->
 
-<!-- authored by claude+tom -->

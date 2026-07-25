@@ -10,7 +10,7 @@ tags:
     - scope
 do: Build M0+M1+L and prove the token win on a real measurement harness before anything bigger
 dont: Commit to the full binary (sync hub, TUI, WebGL) upfront
-why: codeindex already does ~70% of the retrieval wedge; the binary is justified by distribution + one-process indexing, not novelty
+why: an existing code-index tool already covered ~70% of the retrieval wedge; the binary is justified by distribution + one-process indexing, not novelty
 ---
 
 # Lean binary prove Gate 1 first
