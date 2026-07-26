@@ -21,7 +21,16 @@ artifact and the markdown is the source of truth. There is nothing else to insta
 1. Open an issue first for anything non-trivial, so we can agree on the shape before
    you spend time on it.
 2. Keep the change focused. One concern per pull request.
-3. `gofmt` your code and make sure `go build ./...` and `go test ./...` pass.
+3. `gofmt` your code, then run the full CI suite locally:
+
+   ```
+   bash scripts/ci.sh
+   ```
+
+   That is the same script GitHub Actions runs, so if it passes here CI will not
+   tell you anything new. It reports every failing check rather than stopping at the
+   first. Offline, `MESH_CI_SKIP_SCANNERS=1` skips the two scanners that need to
+   download a tool, and says plainly that it skipped them.
 4. Write a clear commit message: what changed and why.
 
 ## Contribution license (important)
