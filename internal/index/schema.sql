@@ -1,3 +1,5 @@
+-- SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+-- Copyright (C) 2026 Bright Interaction AB
 -- Mesh SQLite index schema (spec section 3.2). Pure-Go modernc.org/sqlite, WAL.
 -- The index is a derived, deletable artifact; the markdown vault is the source
 -- of truth. No vec0 virtual table: modernc cannot load C extensions, so vectors

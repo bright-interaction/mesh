@@ -212,6 +212,7 @@ Inspect and maintain:
 | Command | Purpose |
 |---|---|
 | `mesh status [vault]` | Index row counts + which retrieval signals are active |
+| `mesh version` | The commit this binary was built from, plus the Go version. Include it in a security report (see SECURITY.md) |
 | `mesh lint [vault]` | Frontmatter / links / filenames (non-zero exit for CI) |
 | `mesh doctor [vault]` | Index freshness (drift), counts, health |
 | `mesh health [vault]` | Knowledge lifecycle: dead source refs, overdue reviews, contradictions |

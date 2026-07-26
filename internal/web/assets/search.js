@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // search.js: the Search view. A query box runs the same fused retrieval the agent
 // gets over MCP (GET /api/search) and renders ranked cards; opening a card fetches
 // the note (GET /api/note/{id}) into a reading pane, with a jump back to the graph.

@@ -11,8 +11,8 @@
 # own build gate. internal/llm was reclassified open; internal/hub got a build-tag
 # seam (cmd/mesh/ui_hubteam_{pro,stub}.go). This check stops the rot recurring.
 #
-# Run standalone (cd mesh && scripts/check-open-core-boundary.sh) or via the release
-# gate in split-public-repo.sh and the repo pre-commit hook.
+# Run it yourself from the repo root: scripts/check-open-core-boundary.sh
+# CI runs it on every push and pull request.
 #
 # The pro PACKAGE import paths below must stay in sync with the exclude set in
 # docs/OPEN-CORE.md (and, in the private monorepo, with the release script that strips
@@ -22,10 +22,11 @@
 # are not listed here.
 set -euo pipefail
 
-cd "$(git rev-parse --show-toplevel)/mesh" 2>/dev/null || {
-  # Allow running from inside mesh/ directly too.
-  [ -f go.mod ] || { echo "error: run from the mesh module" >&2; exit 1; }
-}
+# The module root. In the public repo that is the repo root; in the monorepo the
+# module lives one level down, so try that too.
+cd "20 20 12 61 79 80 81 98 701 33 100 204 250 395 398 399 400git rev-parse --show-toplevel)" 2>/dev/null || true
+[ -f go.mod ] || cd mesh 2>/dev/null || true
+[ -f go.mod ] || { echo "error: run this from the Mesh module root (the directory holding go.mod)" >&2; exit 1; }
 
 # internal/flarereport is pro too: it is the pro binaries' error-reporting shim, it
 # carries the commercial license header, and it is not part of the published mirror. An
