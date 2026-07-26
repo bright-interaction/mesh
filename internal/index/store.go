@@ -135,7 +135,7 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		return nil, err
 	}
 
-	if err := ensureSchemaWithRetry(writeDB); err != nil {
+	if err := ensureSchemaChecked(writeDB); err != nil {
 		writeDB.Close()
 		readDB.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
@@ -210,51 +210,33 @@ func isBusy(err error) bool {
 	return strings.Contains(m, "database is locked") || strings.Contains(m, "SQLITE_BUSY")
 }
 
-// ensureSchemaWithRetry is ensureSchema with a bounded retry on SQLITE_BUSY.
+// ensureSchemaChecked is ensureSchema with an error a human can act on.
 //
-// WHY, given the DSN already sets busy_timeout(30000). That timeout only helps when
-// SQLite invokes the busy handler, and it does not invoke it for every conflict: an
-// upgrade that would risk deadlock returns SQLITE_BUSY immediately instead of waiting.
-// Schema application hits exactly that case when another mesh process (the sync daemon
-// or `mesh mcp --watch`) is mid-write, which in a live vault is most of the time.
-// Verified on the real index: the connection genuinely reports busy_timeout=30000 and
-// journal_mode=wal, and it still failed instantly.
+// THE REAL CAUSE, measured rather than assumed. A full reindex runs entirely inside one
+// transaction (IndexVault and the code index each wrap the whole operation in a single
+// s.Write), which for this vault means ~884 notes plus ~4800 code files under one write
+// lock for MINUTES. Any second indexer therefore waits out the DSN's 30s busy_timeout
+// and dies. Timed on the live vault: a plain `mesh index` failed after 31s, exactly the
+// timeout, so the busy handler IS running and simply loses.
 //
-// The observed symptom was `mesh index` needing two to four manual attempts on nearly
-// every run. It always succeeded eventually, so this was never data loss, but it is the
-// single thing most likely to make someone conclude Mesh is broken when it is not. The
-// retry is what the operator was doing by hand.
+// That single long transaction is deliberate: it is what lets a concurrent reader see a
+// consistent index rather than a half-swapped one. So the defect was never the locking,
+// it was the error, which said "database is locked" and left the operator guessing and
+// retrying by hand.
 //
-// Bounded on purpose: ~6s total. A lock held longer than that is a real problem worth
-// surfacing rather than hiding behind a longer spin.
-func ensureSchemaWithRetry(db *sql.DB) error {
-	return retryOnBusy(func() error { return ensureSchema(db) }, 8)
-}
-
-// retryOnBusy runs attempt until it stops returning SQLITE_BUSY, backing off between
-// tries. Split out from ensureSchemaWithRetry so the loop is testable without needing to
-// win a race against a real second process: the live contention could not be reproduced
-// on demand, so the mechanism is pinned by unit test instead.
-//
-// Bounded on purpose (~6s across 8 attempts). A lock held longer than that is a real
-// problem worth surfacing, not something to hide behind a longer spin, so the final
-// error names the two processes that plausibly hold it.
-func retryOnBusy(attempt func() error, attempts int) error {
-	delay := 25 * time.Millisecond
-	var err error
-	for i := 0; i < attempts; i++ {
-		if err = attempt(); !isBusy(err) {
-			return err
-		}
-		if i == attempts-1 {
-			break
-		}
-		time.Sleep(delay)
-		if delay < 2*time.Second {
-			delay *= 2
-		}
+// An earlier version of this retried 8 times with backoff. That was wrong and made it
+// worse: each attempt inherits the same 30s timeout, so it turned a 31s failure into a
+// 247s hang (measured) without ever succeeding. Do not reintroduce a retry here. If two
+// indexers must coexist, the fix is chunking the reindex transaction, not spinning on
+// the lock.
+func ensureSchemaChecked(db *sql.DB) error {
+	err := ensureSchema(db)
+	if !isBusy(err) {
+		return err
 	}
-	return fmt.Errorf("%w (another mesh process held the write lock for the whole retry window; check for a stuck `mesh sync` or `mesh mcp --watch`)", err)
+	return fmt.Errorf("another mesh process is indexing this vault and holds the write lock "+
+		"(a full reindex is one transaction and can take minutes on a large vault). "+
+		"Wait for it to finish, or stop the `mesh sync --watch` / `mesh mcp --watch` daemon, then retry: %w", err)
 }
 
 func ensureSchema(db *sql.DB) error {
