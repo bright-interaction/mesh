@@ -59,10 +59,10 @@ func TestEnsureSchemaCheckedExplainsTheLock(t *testing.T) {
 // that the message tells you what to do.
 func TestBusyErrorTextIsActionable(t *testing.T) {
 	busy := errors.New("database is locked (5) (SQLITE_BUSY)")
-	wrapped := fmt.Errorf("another mesh process is indexing this vault and holds the write lock "+
-		"(a full reindex is one transaction and can take minutes on a large vault). "+
-		"Wait for it to finish, or stop the `mesh sync --watch` / `mesh mcp --watch` daemon, then retry: %w", busy)
-	for _, want := range []string{"another mesh process", "mesh sync --watch", "mesh mcp --watch", "can take minutes"} {
+	wrapped := fmt.Errorf("another mesh process holds the write lock (most likely a `mesh sync --watch` "+
+		"or `mesh mcp --watch` daemon mid-write; a reindex itself only holds it for a few seconds). "+
+		"Wait a moment and retry, or stop the daemon if it persists: %w", busy)
+	for _, want := range []string{"another mesh process", "mesh sync --watch", "mesh mcp --watch", "only holds it for a few seconds"} {
 		if !strings.Contains(wrapped.Error(), want) {
 			t.Errorf("error must mention %q, got: %v", want, wrapped)
 		}
