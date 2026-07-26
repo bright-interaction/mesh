@@ -1178,10 +1178,27 @@ func scopeBackfillCmd() *cobra.Command {
 }
 
 func lintCmd() *cobra.Command {
-	return &cobra.Command{
+	var showAll bool
+	c := &cobra.Command{
 		Use:   "lint [vault]",
-		Short: "Check vault health (frontmatter, links, ids, filenames)",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Check vault health: ERRORS break retrieval, NOTICES are authoring debt",
+		Long: `Check vault health.
+
+Lint reports two different things and does not conflate them:
+
+  ERRORS   break retrieval. A note that will not parse is invisible to search and the
+           graph; a duplicate or ambiguous id makes one note absorb another's links.
+           These are defects. Non-zero exit.
+
+  NOTICES  are work, not damage. A [[link]] to a note nobody has written yet is a
+           deliberate marker (see the vault structure standard), and an unfilled
+           do/dont/why on a decision is authoring debt only a human can settle, which
+           is why no tool fills them in. Zero exit.
+
+This split exists because the old single count reported ~1100 "problems" for a vault
+whose retrieval was entirely healthy, so the number meant nothing and got ignored. A
+check that cannot fail meaningfully is worse than no check.`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := vaultArg(args)
 			files, err := vault.Walk(root)
@@ -1191,41 +1208,66 @@ func lintCmd() *cobra.Command {
 			notes, ferrs := index.ParseFiles(files, 0)
 			_, issues := index.BuildGraph(notes)
 
-			byKind := map[string]int{}
-			for _, is := range issues {
-				byKind[is.Kind]++
-			}
+			type item struct{ where, what string }
+			var errorsList, noticesList []item
+
 			for _, fe := range ferrs {
-				_ = fe
-				byKind["parse-error"]++
+				errorsList = append(errorsList, item{fe.Path, "will not parse, so it is invisible to search and the graph: " + fe.Err.Error()})
+			}
+			for _, is := range issues {
+				switch is.Kind {
+				case "broken-link":
+					noticesList = append(noticesList, item{is.Path, is.Msg})
+				default: // missing-id, duplicate-id, ambiguous-link-key, ambiguous-link
+					errorsList = append(errorsList, item{is.Path, is.Kind + ": " + is.Msg})
+				}
 			}
 			for _, pn := range notes {
 				for _, e := range pn.FM.Validate() {
 					if e == "missing id" {
-						continue // already counted via BuildGraph issues
+						continue // already reported via BuildGraph
 					}
-					byKind["frontmatter"]++
+					if strings.Contains(e, "not filled") || e == "missing when" {
+						noticesList = append(noticesList, item{pn.Path, e})
+						continue
+					}
+					errorsList = append(errorsList, item{pn.Path, e})
 				}
 				if !isKebab(filepath.Base(pn.Path)) {
-					byKind["filename"]++
+					noticesList = append(noticesList, item{pn.Path, "filename is not kebab-case"})
 				}
 			}
 
-			total := 0
-			for _, n := range byKind {
-				total += n
+			show := func(label string, list []item) {
+				if len(list) == 0 {
+					return
+				}
+				fmt.Printf("\n%s (%d):\n", label, len(list))
+				limit := len(list)
+				if !showAll && limit > 15 {
+					limit = 15
+				}
+				for _, it := range list[:limit] {
+					fmt.Printf("  %s: %s\n", it.where, it.what)
+				}
+				if limit < len(list) {
+					fmt.Printf("  ... and %d more (--all to list every one)\n", len(list)-limit)
+				}
 			}
-			fmt.Printf("lint %s: %d files, %d problems\n", root, len(files), total)
-			for _, kv := range sortedCounts(byKind) {
-				fmt.Printf("  %-14s %d\n", kv.k, kv.v)
+
+			fmt.Printf("lint %s: %d files, %d errors, %d notices\n", root, len(files), len(errorsList), len(noticesList))
+			show("ERRORS (these break retrieval)", errorsList)
+			show("NOTICES (work, not damage)", noticesList)
+
+			if len(errorsList) > 0 {
+				return fmt.Errorf("%d error(s) break retrieval", len(errorsList))
 			}
-			if total > 0 {
-				return fmt.Errorf("%d lint problems", total)
-			}
-			fmt.Println("clean")
+			fmt.Println("\nno errors: retrieval is healthy")
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&showAll, "all", false, "list every item instead of the first 15 per section")
+	return c
 }
 
 func vaultArg(args []string) string {

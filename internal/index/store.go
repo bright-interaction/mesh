@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,7 +135,7 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		return nil, err
 	}
 
-	if err := ensureSchema(writeDB); err != nil {
+	if err := ensureSchemaWithRetry(writeDB); err != nil {
 		writeDB.Close()
 		readDB.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
@@ -198,6 +199,64 @@ var metaKeptWithVectors = []string{"vector_model", "vector_dim"}
 // ensureSchema applies the schema, dropping and rebuilding if the stored version
 // differs. No data is lost that matters: everything is re-derivable from the
 // markdown vault, so this replaces a migration tool.
+// isBusy reports whether err is SQLite's "database is locked" (SQLITE_BUSY). Matched on
+// the message rather than a driver error type so this stays correct if the driver is
+// swapped; the string is SQLite's own and has been stable for years.
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := err.Error()
+	return strings.Contains(m, "database is locked") || strings.Contains(m, "SQLITE_BUSY")
+}
+
+// ensureSchemaWithRetry is ensureSchema with a bounded retry on SQLITE_BUSY.
+//
+// WHY, given the DSN already sets busy_timeout(30000). That timeout only helps when
+// SQLite invokes the busy handler, and it does not invoke it for every conflict: an
+// upgrade that would risk deadlock returns SQLITE_BUSY immediately instead of waiting.
+// Schema application hits exactly that case when another mesh process (the sync daemon
+// or `mesh mcp --watch`) is mid-write, which in a live vault is most of the time.
+// Verified on the real index: the connection genuinely reports busy_timeout=30000 and
+// journal_mode=wal, and it still failed instantly.
+//
+// The observed symptom was `mesh index` needing two to four manual attempts on nearly
+// every run. It always succeeded eventually, so this was never data loss, but it is the
+// single thing most likely to make someone conclude Mesh is broken when it is not. The
+// retry is what the operator was doing by hand.
+//
+// Bounded on purpose: ~6s total. A lock held longer than that is a real problem worth
+// surfacing rather than hiding behind a longer spin.
+func ensureSchemaWithRetry(db *sql.DB) error {
+	return retryOnBusy(func() error { return ensureSchema(db) }, 8)
+}
+
+// retryOnBusy runs attempt until it stops returning SQLITE_BUSY, backing off between
+// tries. Split out from ensureSchemaWithRetry so the loop is testable without needing to
+// win a race against a real second process: the live contention could not be reproduced
+// on demand, so the mechanism is pinned by unit test instead.
+//
+// Bounded on purpose (~6s across 8 attempts). A lock held longer than that is a real
+// problem worth surfacing, not something to hide behind a longer spin, so the final
+// error names the two processes that plausibly hold it.
+func retryOnBusy(attempt func() error, attempts int) error {
+	delay := 25 * time.Millisecond
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = attempt(); !isBusy(err) {
+			return err
+		}
+		if i == attempts-1 {
+			break
+		}
+		time.Sleep(delay)
+		if delay < 2*time.Second {
+			delay *= 2
+		}
+	}
+	return fmt.Errorf("%w (another mesh process held the write lock for the whole retry window; check for a stuck `mesh sync` or `mesh mcp --watch`)", err)
+}
+
 func ensureSchema(db *sql.DB) error {
 	var current, currentKeep int
 	// meta may not exist yet; ignore the scan error in that case.
