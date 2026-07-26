@@ -2,6 +2,12 @@ module github.com/bright-interaction/mesh
 
 go 1.26.4
 
+// Pinned to the first toolchain with the crypto/tls Encrypted Client Hello privacy
+// fix (GO-2026-5856), which govulncheck reports as reachable from the hub's TLS
+// server and every outbound BYOAI call. CI resolves its Go from this file
+// (go-version-file: go.mod), so the pin covers local builds, CI and the images alike.
+toolchain go1.26.5
+
 require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -12,8 +18,10 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/getsentry/sentry-go v0.47.0
 	github.com/gomarkdown/markdown v0.0.0-20260614204949-e08cff860f76
+	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/spf13/cobra v1.8.1
 	github.com/tiktoken-go/tokenizer v0.8.0
+	golang.org/x/net v0.54.0
 	golang.org/x/oauth2 v0.36.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.52.0
@@ -52,7 +60,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.19 // indirect
-	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
@@ -63,9 +70,8 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
-	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
