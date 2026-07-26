@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+# Copyright (C) 2026 Bright Interaction AB
 #!/usr/bin/env python3
 """Sovereign local cross-encoder rerank server for Mesh (BYOAI).
 

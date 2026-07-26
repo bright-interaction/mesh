@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // dashboard.js: the Dashboard view. The ROI + knowledge-health snapshot a champion
 // shows their boss: usage, estimated tokens saved vs naive RAG, coverage, the most
 // reused notes, a contributor leaderboard, and lifecycle health. Reads

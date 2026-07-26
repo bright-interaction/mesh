@@ -22,8 +22,8 @@ import (
 // mesh_secret_use returns a capability token + the proxy URL, and Dockyard injects the
 // real value server-side at forward time. So no tool result, prompt, Mesh env, claude
 // -p child env, or note ever carries a secret value. All crypto/rotation stays in
-// Dockyard; Mesh holds only a thin HTTP client (internal/secretbridge). See the note
-// "Dockyard Secrets Bridge (Capability Mode)".
+// Dockyard; Mesh holds only a thin HTTP client (internal/secretbridge). See the agents
+// doc (internal/web/docs/04-agents.md) for the operator-facing setup.
 
 // secretBridge resolves the attached-vault config the same way retrieval resolves its
 // keys: the config file names the setup, env always overrides, and the API key is read

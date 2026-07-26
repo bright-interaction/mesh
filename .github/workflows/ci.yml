@@ -42,19 +42,24 @@ jobs:
       # the header is how a reader (and a downstream packager) knows it. A file without
       # it is either an unlicensed contribution or a file that belongs in the commercial
       # repo instead, and both have happened. One awk pass per file, no network.
-      - name: License headers (SPDX on every Go file)
+      # Covers every source language we ship, not just Go. The header is how a reader
+      # and a downstream packager know the licence, and the front-end assets are the
+      # files most likely to be lifted out of the repo on their own, so a Go-only check
+      # advertised a guarantee narrower than it delivered.
+      - name: License headers (SPDX on every source file)
         run: |
-          missing=$(git ls-files '*.go' | while read -r f; do
+          missing=$(git ls-files '*.go' '*.js' '*.css' '*.sql' '*.py' '*.html' '*.sh' | while read -r f; do
             awk 'NR<=5 && /SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License/ { found=1; exit } END { exit !found }' "$f" \
               || printf '%s\n' "$f"
           done)
           if [ -n "$missing" ]; then
-            echo "These Go files lack the SPDX header 'LicenseRef-Mesh-Sustainable-Use-License' in their first 5 lines:"
+            echo "These files lack the SPDX header 'LicenseRef-Mesh-Sustainable-Use-License' in their first 5 lines:"
             echo "$missing"
-            echo "Add it (see any file in internal/ for the exact two-line form), or the file does not belong here."
+            echo "Add it in that file type's comment syntax (// for Go/JS/CSS, -- for SQL, # for Python/shell,"
+            echo "<!-- --> for HTML), or the file does not belong here."
             exit 1
           fi
-          echo "every tracked Go file carries the open SPDX header"
+          echo "every tracked source file carries the open SPDX header"
 
       - name: Secret scan (gitleaks)
         run: |

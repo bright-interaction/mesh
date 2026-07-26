@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // shell.js: the app-shell router. Owns the left-nav sections (Graph / Search /
 // Settings / Docs / API), the auth-aware /api fetch helper, and the rail status.
 // The Graph section is driven by app.js (the canvas engine); the other sections are

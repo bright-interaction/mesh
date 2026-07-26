@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // settings.js: the Settings view. Reads /api/config (effective config, per-field
 // source + editable), renders grouped forms, writes changes back with PUT
 // /api/config, and offers Status + Reindex. Env-overridden fields are shown
