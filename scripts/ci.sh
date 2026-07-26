@@ -35,15 +35,19 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || true
 [ -f go.mod ] || { echo "error: run this from the Mesh module root (the directory holding go.mod)" >&2; exit 1; }
 
 FAILED=()
+SKIPPED=()
+# Exit code 99 means "this check did not run". It is distinct from pass and from fail
+# on purpose: a skipped security scan that prints ok is worse than no scan at all,
+# because it looks like evidence.
 step() {
-  local name="$1"; shift
+  local name="$1" rc; shift
   printf '\n=== %s ===\n' "$name"
-  if "$@"; then
-    printf 'ok: %s\n' "$name"
-  else
-    printf 'FAIL: %s\n' "$name" >&2
-    FAILED+=("$name")
-  fi
+  "$@"; rc=$?
+  case "$rc" in
+    0)  printf 'ok: %s\n' "$name" ;;
+    99) printf 'SKIPPED: %s\n' "$name"; SKIPPED+=("$name") ;;
+    *)  printf 'FAIL: %s\n' "$name" >&2; FAILED+=("$name") ;;
+  esac
 }
 
 # Are we in the published mirror, or in the private monorepo the mirror is cut from?
@@ -96,8 +100,8 @@ license_headers() {
 scan() {
   local name="$1" mod="$2"; shift 2
   if [ "${MESH_CI_SKIP_SCANNERS:-0}" = "1" ]; then
-    echo "SKIPPED ($name): MESH_CI_SKIP_SCANNERS=1"
-    return 0
+    echo "not run: MESH_CI_SKIP_SCANNERS=1"
+    return 99
   fi
   go install "$mod" >/dev/null 2>&1 || { echo "could not install $name (offline?)" >&2; return 1; }
   "$(go env GOPATH)/bin/$name" "$@"
@@ -123,10 +127,17 @@ fi
 step "vulnerability scan" scan govulncheck golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 printf '\n'
+if [ ${#SKIPPED[@]} -ne 0 ]; then
+  printf "ci: %d check(s) DID NOT RUN: %s\n" "${#SKIPPED[@]}" "${SKIPPED[*]}" >&2
+fi
 if [ ${#FAILED[@]} -ne 0 ]; then
   # Report EVERY failure, not just the first. A run that stops at the first problem
   # costs a full round trip per issue.
   printf 'ci: %d check(s) failed: %s\n' "${#FAILED[@]}" "${FAILED[*]}" >&2
   exit 1
+fi
+if [ ${#SKIPPED[@]} -ne 0 ]; then
+  echo "ci: every check that RAN passed, but some did not run (see above)"
+  exit 0
 fi
 echo "ci: all checks passed"
