@@ -63,6 +63,11 @@ func noteKey(path string) string {
 func linkKey(target string) string {
 	t := strings.TrimSpace(target)
 	t = strings.Trim(t, "[]")
+	// A markdown-escaped closing bracket, [[note\]], leaves a trailing backslash on the
+	// target, so the link resolved to nothing and showed up as a dangling reference to a
+	// note whose name ended in "\". Authors escape brackets when a renderer would
+	// otherwise eat them, and they mean the note, not a different one.
+	t = strings.TrimRight(t, `\`)
 	t = strings.TrimSpace(t)
 	if i := strings.IndexByte(t, '#'); i >= 0 {
 		t = t[:i]

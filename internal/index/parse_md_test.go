@@ -142,3 +142,23 @@ func hasEdge(edges []graph.Edge, target, rel string) bool {
 	}
 	return false
 }
+
+// TestLinkKeyTrimsEscapedBracket: a markdown-escaped closing bracket, [[note\]], used to
+// leave the backslash on the target, so the link resolved to nothing and lint reported a
+// dangling reference to a note whose name ended in "\". Authors escape brackets when a
+// renderer would otherwise eat them; they mean the note.
+func TestLinkKeyTrimsEscapedBracket(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{`data-pipelines\`, "data-pipelines"},
+		{`monitoring-and-alerting\`, "monitoring-and-alerting"},
+		{`plain-note`, "plain-note"},
+		{`Spaced Note `, "spaced note"},
+		{`note.md`, "note"},
+		{`note#section`, "note"},
+	}
+	for _, tc := range tests {
+		if got := linkKey(tc.in); got != tc.want {
+			t.Errorf("linkKey(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
