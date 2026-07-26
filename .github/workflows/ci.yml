@@ -1,7 +1,19 @@
-# CI for the public fair-code open core (github.com/bright-interaction/mesh). Build + vet
-# + test + the open-core boundary guard + license headers + a secret scan + govulncheck,
-# so a contribution cannot merge if it breaks the build, reaches into the commercial pro
-# layer, ships an unlicensed file, or adds a credential.
+# CI for the public fair-code open core (github.com/bright-interaction/mesh).
+#
+# THIS FILE IS DELIBERATELY THIN. Every actual check lives in scripts/ci.sh, which you
+# can run yourself:
+#
+#   bash scripts/ci.sh
+#
+# Two reasons for the split. A contributor can reproduce CI locally instead of
+# discovering a failure after pushing. And this repository is a filtered mirror
+# published by a CI job that authenticates with a repository deploy key, which GitHub
+# does not permit to create or update anything under .github/workflows/. Keeping the
+# steps out of this file means a change to a check no longer blocks the publish.
+#
+# So: edit scripts/ci.sh freely. Editing THIS file is a rare, deliberate act (an action
+# version bump, a trigger change) and needs a push from a credential holding the
+# `workflow` scope.
 name: ci
 
 on:
@@ -19,54 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # gitleaks scans the full history, not just the tip
+          fetch-depth: 0 # the secret scan reads the full history, not just the tip
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test ./... -count=1
-
-      - name: Open-core boundary (no open package may import a pro package)
-        run: bash scripts/check-open-core-boundary.sh
-
-      # Every Go file in this repository is under the Mesh Sustainable Use License, and
-      # the header is how a reader (and a downstream packager) knows it. A file without
-      # it is either an unlicensed contribution or a file that belongs in the commercial
-      # repo instead, and both have happened. One awk pass per file, no network.
-      # Covers every source language we ship, not just Go. The header is how a reader
-      # and a downstream packager know the licence, and the front-end assets are the
-      # files most likely to be lifted out of the repo on their own, so a Go-only check
-      # advertised a guarantee narrower than it delivered.
-      - name: License headers (SPDX on every source file)
-        run: |
-          missing=$(git ls-files '*.go' '*.js' '*.css' '*.sql' '*.py' '*.html' '*.sh' | while read -r f; do
-            awk 'NR<=5 && /SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License/ { found=1; exit } END { exit !found }' "$f" \
-              || printf '%s\n' "$f"
-          done)
-          if [ -n "$missing" ]; then
-            echo "These files lack the SPDX header 'LicenseRef-Mesh-Sustainable-Use-License' in their first 5 lines:"
-            echo "$missing"
-            echo "Add it in that file type's comment syntax (// for Go/JS/CSS, -- for SQL, # for Python/shell,"
-            echo "<!-- --> for HTML), or the file does not belong here."
-            exit 1
-          fi
-          echo "every tracked source file carries the open SPDX header"
-
-      - name: Secret scan (gitleaks)
-        run: |
-          go install github.com/zricethezav/gitleaks/v8@latest
-          "$(go env GOPATH)/bin/gitleaks" detect --source . --no-banner --redact
-
-      - name: Vulnerability scan (govulncheck)
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
+      - name: All checks (build, vet, test, boundary, licenses, secrets, vulnerabilities)
+        run: bash scripts/ci.sh
