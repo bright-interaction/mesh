@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // docs.js: the Docs view. Lists the embedded doc pages (GET /api/docs) in a side
 // nav and renders the selected page's server-rendered HTML (GET /api/docs/{slug}).
 // The HTML is produced from trusted, compiled-in markdown, so it is injected as-is.

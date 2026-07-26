@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // review.js: the Review queue. Auto-extracted write-back candidates (the input side of
 // the flywheel) that a human promotes into the vault with one click, or discards. This
 // is what makes auto-extraction safe: nothing lands unreviewed. Reads GET /api/pending;

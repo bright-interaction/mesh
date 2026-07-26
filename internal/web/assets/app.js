@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // mesh ui: a sovereign canvas graph viewer. No dependencies. Two living views over
 // one graph: an Obsidian-style force graph (a continuous velocity sim you can grab
 // and fling) and a galaxy orbiting the index note. Nodes are additive glow blobs;

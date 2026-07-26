@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // ask.js: the Ask view. A natural-language question answered from the team's own notes
 // + code (BYOAI, grounded with citations). The conversational second brain. POSTs
 // /api/ask. Registers Mesh.views.ask. Vanilla, no deps.

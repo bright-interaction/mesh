@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // api.js: the API view. Two references: the agent (MCP) tools, single-sourced from
 // the server (GET /api/mcp-tools) with the retrieval contract + a paste-ready agent
 // config; and the HTTP API, rendered from the OpenAPI spec (GET /openapi.json).

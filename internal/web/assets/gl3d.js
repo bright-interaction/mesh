@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
 // mesh ui 3D galaxy: a raw WebGL2 renderer (no three.js, no CDN, no deps). A real
 // spiral galaxy: community clusters strung along spiral arms on a thin disc that
 // slowly turns (differential rotation, inner faster), a blazing multi-layer core
