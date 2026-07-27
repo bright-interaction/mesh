@@ -1,0 +1,2 @@
+# Substrings exempted from the home-path half of mirror_blob_sanity_check.
+# One per line, with the reason. Empty by default.
