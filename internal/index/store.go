@@ -212,31 +212,42 @@ func isBusy(err error) bool {
 
 // ensureSchemaChecked is ensureSchema with an error a human can act on.
 //
-// WHAT IS MEASURED, and what is not. Two earlier explanations of the SQLITE_BUSY that
-// operators hit on `mesh index` were written here confidently and were both wrong, so
+// WHAT IS MEASURED, and what is not. The SQLITE_BUSY that operators hit on `mesh index`
+// got three confident explanations here before the real one, and all three were wrong, so
 // this records evidence rather than a story.
 //
-// Measured on the live vault:
+// RESOLVED: leaked read snapshots pinned the WAL. A `for rows.Next()` loop only closes its
+// result set when it runs to exhaustion, so every early return inside the loop leaked an
+// open *sql.Rows, and in WAL mode an open Rows holds a READ SNAPSHOT that no checkpoint can
+// reclaim past. Seven sites in this package did that, DriftReport among them, which both
+// watch daemons call on every reconcile. So the leaks accumulated for as long as the daemon
+// lived, the WAL grew past journal_size_limit, and writers starved. Fixed by `defer
+// rows.Close()` at all seven; TestWalPinnedByLeakedRows pins the mechanism and
+// TestEveryQueryClosesItsRows stops it recurring. Note the shape of this bug: it was in the
+// READ paths, and it only hurt a THIRD process, hours later. Symptom and cause shared
+// neither a code path nor a process.
+//
+// Measured on the live vault, and still worth keeping because it rules out the wrong fixes:
 //   - a plain `mesh index` against a held lock fails after 31s, i.e. exactly the DSN's
-//     busy_timeout(30000). The busy handler runs; it loses. (So it is NOT "the timeout
-//     is never applied", which was the first explanation.)
+//     busy_timeout(30000). The busy handler runs; it loses. (So it was NOT "the timeout
+//     is never applied", explanation one.)
 //   - a full reindex holds the write lock for about 3 seconds, not minutes: the note
 //     transaction is ~377ms for 894 notes and the code transaction ~2.6s for 3056 files
-//     / 235k edges. (So it is NOT "one long transaction blocks everyone", which was the
-//     second explanation, and chunking that transaction would not help.)
-//   - it is intermittent: 12 concurrent `mesh index` runs succeeded when the daemons
-//     were idle, and 5 of 5 consecutive runs failed twenty minutes later.
+//     / 235k edges. (So it was NOT "one long transaction blocks everyone", explanation
+//     two, and chunking that transaction would not have helped.)
+//   - `Exec(SchemaSQL)` succeeds against a held write lock, so the schema check is not the
+//     thing that blocks. (Explanation three.)
+//   - the symptom tracked daemon UPTIME, not load: a 32-hour `mesh sync --watch` won 0 of
+//     276 lock attempts in 45s with a 24MB WAL and failed `mesh index` 8 of 8, while a
+//     freshly restarted one showed 0% busy and a 0MB WAL. That is what pointed at an
+//     unbounded accumulation rather than a race.
 //
-// The leading hypothesis, NOT yet proven, is cross-process writer starvation: the
-// `mesh sync --watch` and `mesh mcp --watch` daemons issue many short writes, and SQLite
-// has no fair queue, so a third process can lose every retry until its timeout expires.
-// If you set out to fix this, prove that first; do not add a retry loop (tried, measured,
-// it turned a 31s failure into a 247s hang because every attempt inherits the same
-// timeout) and do not chunk the reindex (more transactions would make starvation worse).
+// If this ever comes back, measure before theorising. Do not add a retry loop (tried,
+// measured, it turned a 31s failure into a 247s hang because every attempt inherits the
+// same timeout) and do not chunk the reindex (more transactions make starvation worse).
 //
-// What this function does is the part that is unambiguously right: the error said
-// "database is locked" and left the operator guessing, so it now names the processes
-// that plausibly hold it and what to do.
+// The message below stays regardless: the error said "database is locked" and left the
+// operator guessing, so it names the processes that plausibly hold it and what to do.
 func ensureSchemaChecked(db *sql.DB) error {
 	err := ensureSchema(db)
 	if !isBusy(err) {
