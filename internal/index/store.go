@@ -82,17 +82,25 @@ type job struct {
 }
 
 const (
-	// walSizeLimit caps mesh.db-wal on disk. SQLite's WAL autocheckpoint is PASSIVE:
-	// it resets the write pointer but NEVER shrinks the file, and nothing here ever
-	// issued a TRUNCATE, so the WAL only grew to its high-water mark and stayed there
-	// (observed 223MB, which starved writers into SQLITE_BUSY). journal_size_limit
-	// makes every checkpoint truncate the WAL back to at most this size. 16MB holds
-	// the largest single reindex transaction's frames without thrashing.
+	// walSizeLimit is the size mesh.db-wal is held near on disk. SQLite's WAL
+	// autocheckpoint is PASSIVE: it resets the write pointer but NEVER shrinks the file,
+	// so without help the WAL only grows to its high-water mark and stays there (observed
+	// 223MB, which starved writers into SQLITE_BUSY).
+	//
+	// journal_size_limit is set from this, but do NOT read that as a guarantee. It only
+	// applies when a checkpoint RESETS the WAL, and a PASSIVE checkpoint cannot reset it
+	// while any reader holds a snapshot, which is the normal state under a watch daemon.
+	// This comment previously claimed "every checkpoint truncates the WAL back to at most
+	// this size" and the live vault disproved it at 26.44MB. What actually bounds the file
+	// is the writer loop escalating to TRUNCATE when it sees the file over this size; see
+	// writer() and TestPassiveCheckpointDoesNotBoundTheWAL.
+	//
+	// 16MB holds the largest single reindex transaction's frames without thrashing.
 	walSizeLimit = 16 * 1024 * 1024
-	// walCheckpointInterval is how often the single writer goroutine runs a PASSIVE
-	// checkpoint, so a WAL left behind by an idle stretch still gets checkpointed and
-	// capped by journal_size_limit (autocheckpoint only fires on writes). PASSIVE never
-	// blocks the writer on a reader; TRUNCATE-to-zero is the out-of-process mesh-doctor's job.
+	// walCheckpointInterval is how often the single writer goroutine checkpoints: PASSIVE
+	// every tick (never blocks the writer on a reader), escalating to a best-effort
+	// TRUNCATE only when the file is actually over walSizeLimit. Autocheckpoint alone
+	// fires only on writes, so an idle stretch would otherwise leave the WAL as it was.
 	walCheckpointInterval = 2 * time.Minute
 	// telemetryFlushInterval is how often the writer goroutine drains the in-memory
 	// usage counters into one batched transaction. Short enough that a dashboard is
@@ -406,9 +414,24 @@ func (s *Store) writer() {
 				}
 			}
 		case <-ticker.C:
-			// Best-effort and non-blocking; journal_size_limit caps the file. Full
-			// zeroing (TRUNCATE) + reaping stale readers is the hourly mesh-doctor's job.
+			// PASSIVE first: it returns at once and never blocks the writer on a live
+			// reader.
 			_, _ = s.writeDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+			// PASSIVE alone does NOT bound the file, and the comment here used to claim
+			// it did. journal_size_limit only applies when a checkpoint RESETS the WAL,
+			// and a PASSIVE checkpoint that cannot fully drain (any reader mid-snapshot,
+			// which is normal under a watch daemon) never resets it. Measured on the live
+			// vault after 9 hours: 26.44MB against a 16MB limit, reclaimable to 0 the
+			// moment a TRUNCATE ran. So escalate on the size we can actually see.
+			//
+			// Only when it is over the limit, because TRUNCATE waits for readers to
+			// drain. checkpointTruncateBestEffort caps that on its own connection (2s
+			// busy_timeout, 3s context) so a busy vault degrades to "not this tick"
+			// instead of stalling the writer, which is the failure this whole area
+			// already produced once.
+			if s.walBytes() > walSizeLimit {
+				s.checkpointTruncateBestEffort()
+			}
 		}
 	}
 }
@@ -562,6 +585,17 @@ func (s *Store) Close() error {
 // blocking Close for the DSN's 30s busy_timeout. Full durability across never-closing
 // multi-writer processes remains the deferred read-only-MCP refactor (see the mesh WAL
 // decision note); this only covers the clean-restart path.
+// walBytes is the size of mesh.db-wal on disk, or 0 if it cannot be read. The on-disk
+// size is the only honest signal here: PRAGMA wal_checkpoint reports frames, not the file
+// length, and the file is what fills a disk and what an operator sees.
+func (s *Store) walBytes() int64 {
+	fi, err := os.Stat(s.dbPath + "-wal")
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
 func (s *Store) checkpointTruncateBestEffort() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
