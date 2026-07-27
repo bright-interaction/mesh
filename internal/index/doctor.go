@@ -30,6 +30,10 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 	if err != nil {
 		return Drift{}, err
 	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
+	defer rows.Close()
 	dbHash := map[string]string{}
 	for rows.Next() {
 		var p, h string
@@ -114,6 +118,10 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 	if err != nil {
 		return DriftDelta{}, err
 	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
+	defer rows.Close()
 	type rec struct {
 		id, hash string
 		mtime    int64

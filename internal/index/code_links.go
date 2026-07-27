@@ -63,6 +63,10 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
+	defer rows.Close()
 	type noteMeta struct{ id, path, title string }
 	var notes []noteMeta
 	for rows.Next() {
@@ -246,6 +250,9 @@ func (s *Store) NotesForSymbolName(name string) ([]NoteCodeRef, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
 	defer rows.Close()
 	var out []NoteCodeRef
 	for rows.Next() {
