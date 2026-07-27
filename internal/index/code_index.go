@@ -156,6 +156,10 @@ func rebuildCodeEdges(tx *sql.Tx) error {
 	if err != nil {
 		return err
 	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
+	defer rows.Close()
 	type caller struct {
 		id    string
 		calls []string
