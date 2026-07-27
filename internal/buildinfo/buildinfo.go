@@ -10,23 +10,42 @@ package buildinfo
 import (
 	"html"
 	"os"
+	"runtime/debug"
 )
 
 // Version is the build version. Stamp it at build time with
 //
 //	-ldflags "-X github.com/bright-interaction/mesh/internal/buildinfo.Version=$(git rev-parse --short HEAD)"
 //
-// or override at runtime with MESH_VERSION. Defaults to "dev".
+// or override at runtime with MESH_VERSION. Defaults to "dev", which is then resolved
+// from the binary's embedded module version (see Ver).
 var Version = "dev"
 
 // License is the SPDX identifier of the Mesh core.
 const License = "LicenseRef-Mesh-Sustainable-Use-License"
 
-// Ver returns the effective version: the MESH_VERSION env override if set, else the
-// build-stamped Version.
+// Ver returns the effective version, most explicit source first: the MESH_VERSION env
+// override, then a build-time ldflags stamp, then the module version Go embeds in the
+// binary.
+//
+// That last fallback is what the primary install path actually needs.
+// `go install github.com/bright-interaction/mesh/cmd/mesh@v0.4.0` passes no ldflags, so
+// without it every released binary reported "dev" and a bug report could not be tied to
+// a version. Go records the module version in the binary itself, so read it rather than
+// requiring a build incantation users never run.
 func Ver() string {
 	if v := os.Getenv("MESH_VERSION"); v != "" {
 		return v
+	}
+	if Version != "dev" {
+		return Version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		// "(devel)" is what a local `go build` in a checkout reports; it is no more
+		// informative than "dev", so keep the friendlier word.
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
 	}
 	return Version
 }
