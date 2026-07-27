@@ -133,6 +133,9 @@ func (s *Store) LoadVectors() (model string, dim int, byNode map[string][][]floa
 	if err != nil {
 		return model, dim, byNode, err
 	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
 	defer rows.Close()
 	for rows.Next() {
 		var id string

@@ -19,6 +19,10 @@ func (s *Store) LoadGraph() (*graph.Graph, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
+	defer nrows.Close()
 	for nrows.Next() {
 		n := &graph.Node{}
 		var attrs string
