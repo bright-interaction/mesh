@@ -336,6 +336,25 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		for _, r := range n.FM.Related {
 			addRef(r, 0)
 		}
+		// do/dont/why are prose, and they are the prose a search card actually shows, so
+		// authors write [[links]] in them and reasonably expect those to be links. They
+		// were silently dropped: 82 of them resolved to real notes in the live vault and
+		// produced no edge at all, while the handful that did not resolve went unreported,
+		// so neither the author nor the graph got anything. Read through the same markup
+		// scanner as the body, so a backticked `[[note-id]]` stays the syntax example it is.
+		for _, field := range []string{n.FM.Do, n.FM.Dont, n.FM.Why} {
+			if field == "" {
+				continue
+			}
+			clean, _ := vault.StripNonContent(field)
+			p := &ParsedNote{}
+			for _, line := range strings.Split(clean, "\n") {
+				p.appendLinks(line, 0)
+			}
+			for _, l := range p.Links {
+				addRef(l.Target, 0)
+			}
+		}
 	}
 	// Degrees are computed in a final pass so they do not depend on the interleaved
 	// AddNode/AddEdge order above (an edge to a later note would otherwise undercount
