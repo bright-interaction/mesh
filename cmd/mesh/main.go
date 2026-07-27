@@ -1218,6 +1218,11 @@ check that cannot fail meaningfully is worse than no check.`,
 				switch is.Kind {
 				case "broken-link":
 					noticesList = append(noticesList, item{is.Path, is.Msg})
+				case "unterminated-comment":
+					// Work, not damage: it is confined to one note and only the author knows
+					// whether the tail was meant to be hidden. Reported because the alternative
+					// is what it used to be, which is nothing at all.
+					noticesList = append(noticesList, item{is.Path, is.Msg})
 				default: // missing-id, duplicate-id, ambiguous-link-key, ambiguous-link
 					errorsList = append(errorsList, item{is.Path, is.Kind + ": " + is.Msg})
 				}

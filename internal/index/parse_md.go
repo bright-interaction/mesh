@@ -43,12 +43,15 @@ type ParsedNote struct {
 	Links    []Link
 	Tags     []Tag
 	Mtime    int64 // file modification time (unix seconds); set by ParseFile from the on-disk file, 0 for byte-only Parse
+	// Issues found while reading this one file, folded into BuildGraph's list so lint,
+	// doctor and health surface them next to the graph-level ones.
+	Issues []Issue
 }
 
 // Issue is a non-fatal problem found while parsing or building the graph.
 type Issue struct {
 	Path string
-	Kind string // missing-id|duplicate-id|broken-link|ambiguous-link-key|ambiguous-link
+	Kind string // missing-id|duplicate-id|broken-link|ambiguous-link-key|ambiguous-link|unterminated-comment
 	Msg  string
 }
 
@@ -106,7 +109,8 @@ func ParseFile(path string) (*ParsedNote, error) {
 }
 
 // Parse extracts the deterministic structure of a markdown document. Wikilinks
-// and tags inside fenced code blocks and inline code spans are ignored.
+// and tags inside fenced code blocks, inline code spans, and HTML comments are
+// ignored.
 func Parse(path string, data []byte) (*ParsedNote, error) {
 	fmText, body, _ := vault.SplitFrontmatter(string(data))
 	fm, raw, err := vault.ParseFrontmatter([]byte(fmText))
@@ -115,26 +119,29 @@ func Parse(path string, data []byte) (*ParsedNote, error) {
 	}
 	pn := &ParsedNote{Path: path, Key: noteKey(path), FM: fm, Raw: raw, Body: body}
 
-	inFence := false
-	for i, line := range strings.Split(body, "\n") {
+	// An HTML comment is not content: what it hides is invisible to every reader, so the
+	// wikilinks and tags inside one are not real. Fences, code spans and comments are all
+	// resolved in one pass (vault.StripNonContent) because they can only be told apart
+	// together, and the same pass feeds the FTS body, the embedding chunks and migrate,
+	// so every part of Mesh agrees on what a note says.
+	clean, openComment := vault.StripNonContent(body)
+	if openComment > 0 {
+		// Everything below an unterminated marker drops out of the graph AND out of
+		// search. That used to happen silently, which is the worst version of it: the note
+		// looks indexed and half of it simply is not there.
+		pn.Issues = append(pn.Issues, Issue{path, "unterminated-comment",
+			"<!-- on line " + strconv.Itoa(openComment) + " is never closed, so the rest of the note is hidden from the graph and from search; close it with -->"})
+	}
+	for i, line := range strings.Split(clean, "\n") {
 		ln := i + 1
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
-			continue
-		}
-		clean := stripInlineCode(line)
-		if h, ok := parseHeading(clean); ok {
+		if h, ok := parseHeading(line); ok {
 			h.Line = ln
 			pn.Headings = append(pn.Headings, h)
-			pn.appendLinks(clean, ln)
+			pn.appendLinks(line, ln)
 			continue
 		}
-		pn.appendLinks(clean, ln)
-		pn.appendTags(clean, ln)
+		pn.appendLinks(line, ln)
+		pn.appendTags(line, ln)
 	}
 	return pn, nil
 }
@@ -196,27 +203,6 @@ func parseHeading(line string) (Heading, bool) {
 	return Heading{Level: i, Text: text, Anchor: vault.Slugify(text)}, true
 }
 
-func stripInlineCode(line string) string {
-	if !strings.Contains(line, "`") {
-		return line
-	}
-	var b strings.Builder
-	inCode := false
-	for _, r := range line {
-		if r == '`' {
-			inCode = !inCode
-			b.WriteByte(' ')
-			continue
-		}
-		if inCode {
-			b.WriteByte(' ')
-		} else {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
 func isSpace(r rune) bool  { return r == ' ' || r == '\t' }
 func isLetter(r rune) bool { return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' }
 func isTagRune(r rune) bool {
@@ -248,6 +234,7 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	idByPath := make(map[string]string, len(notes))
 	for _, n := range notes {
 		id := effectiveID(n)
+		issues = append(issues, n.Issues...) // what Parse found in the file itself
 		if n.FM.ID == "" {
 			issues = append(issues, Issue{n.Path, "missing-id", "no frontmatter id; using filename (run mesh migrate)"})
 		}

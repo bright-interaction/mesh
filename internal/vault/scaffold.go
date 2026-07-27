@@ -305,6 +305,12 @@ const tmplNote = `## Overview
 <!-- linked notes from the related: field render in the graph -->
 `
 
+// linkPlaceholder shows the wikilink syntax in backticks, so it reads as the example it
+// is rather than as a link. A bare [[note-id]] in a template made every note Mesh
+// scaffolds ship a real link to a note nobody had written, so the author inherited a
+// broken-link notice from the skeleton itself.
+const linkPlaceholder = "`[[note-id]]`"
+
 // tmplEntity / tmplConcept / tmplMap follow the LLM-wiki (Karpathy) shape: a bold
 // one-line card up top (the atomic summary that also becomes the retrieval snippet),
 // then a few dense, type-specific sections, then Related links. The AI fills the
@@ -322,7 +328,7 @@ const tmplEntity = `**One-liner.** <!-- TODO: what this is and why it matters, i
 <!-- TODO: the non-obvious things a teammate needs (constraints, gotchas, status, repo) -->
 
 ## Related
-<!-- link the concepts it uses and the decisions that shaped it: [[note-id]] (also fill related: above) -->
+<!-- link the concepts it uses and the decisions that shaped it: ` + linkPlaceholder + ` (also fill related: above) -->
 `
 
 const tmplConcept = `**One-liner.** <!-- TODO: the idea in one sentence -->
@@ -334,10 +340,10 @@ const tmplConcept = `**One-liner.** <!-- TODO: the idea in one sentence -->
 <!-- TODO: the mechanism, the model, the steps -->
 
 ## How it applies to our work
-<!-- TODO: where we use it, with [[links]] to the entities that apply it -->
+<!-- TODO: where we use it, with ` + linkPlaceholder + ` links to the entities that apply it -->
 
 ## Related
-<!-- [[note-id]] -->
+<!-- ` + linkPlaceholder + ` -->
 `
 
 const tmplMap = `**One-liner.** <!-- TODO: the domain this maps, in one sentence -->
@@ -346,5 +352,5 @@ const tmplMap = `**One-liner.** <!-- TODO: the domain this maps, in one sentence
      writing long prose here it wants to be a concept instead. -->
 
 ## <!-- TODO: a section per sub-area -->
-- [[note-id]] - <!-- why it matters -->
+- ` + linkPlaceholder + ` - <!-- why it matters -->
 `
