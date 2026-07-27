@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/bright-interaction/mesh/internal/buildinfo"
 	"github.com/bright-interaction/mesh/internal/embed"
@@ -1238,7 +1239,7 @@ check that cannot fail meaningfully is worse than no check.`,
 					}
 					errorsList = append(errorsList, item{pn.Path, e})
 				}
-				if !isKebab(filepath.Base(pn.Path)) {
+				if base := filepath.Base(pn.Path); !isKebab(base) && !isConventionalDoc(base) {
 					noticesList = append(noticesList, item{pn.Path, "filename is not kebab-case"})
 				}
 			}
@@ -1291,6 +1292,25 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// isConventionalDoc reports whether a filename is one of the SHOUTING-CASE documents every
+// repository is expected to carry. README.md, CLAUDE.md and ORGANIZATION.md are supposed to
+// look like that, so flagging them as badly named is the tool reporting a non-defect, which
+// costs a reader more than it saves: notices only stay useful while every one of them is
+// worth acting on. Matched by shape (all caps, no lowercase) rather than by a fixed list, so
+// a vault's own AGENTS.md or CONTRIBUTING.md is covered without an edit here.
+func isConventionalDoc(filename string) bool {
+	stem := strings.TrimSuffix(filename, filepath.Ext(filename))
+	if stem == "" {
+		return false
+	}
+	for _, r := range stem {
+		if unicode.IsLower(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func isKebab(filename string) bool {
