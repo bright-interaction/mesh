@@ -170,11 +170,18 @@ func fileMtimeDate(path string) string {
 
 // relatedLinks collects the [[basenames]] under a "## Related" (or "## See also")
 // section, deduped and in order.
+//
+// It reads the same stripped body the parser reads. A raw regex over the section lifted
+// [[links]] out of HTML comments and code spans, and frontmatter related: is
+// authoritative, so migrate promoted commented-out guidance into a real edge that no
+// parser fix can suppress: `mesh new` followed by `mesh migrate` manufactured the exact
+// broken link the scaffold had just stopped shipping.
 func relatedLinks(body string) []string {
+	clean, _ := StripNonContent(body)
 	var out []string
 	seen := map[string]bool{}
 	inRelated := false
-	for _, line := range strings.Split(body, "\n") {
+	for _, line := range strings.Split(clean, "\n") {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, "## ") {
 			h := strings.ToLower(strings.TrimSpace(t[3:]))

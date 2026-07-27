@@ -3,7 +3,11 @@
 
 package index
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/bright-interaction/mesh/internal/vault"
+)
 
 // maxChunkChars caps a single chunk so a runaway section never blows past a
 // small embedding model's context window (nomic-embed-text tops out ~8k tokens;
@@ -34,7 +38,10 @@ func ChunkText(pn *ParsedNote) []string {
 	}
 	chunks := []string{truncate(collapse(header))}
 
-	body := htmlCommentRe.ReplaceAllString(pn.Body, " ")
+	// Same comment stripping as the parser and the FTS body, so a chunk never carries
+	// text the rest of Mesh treats as hidden. Code stays: it is what people embed and
+	// search for.
+	body, _ := vault.StripComments(pn.Body)
 	var cur []string
 	flush := func() {
 		seg := strings.TrimSpace(strings.Join(cur, "\n"))
@@ -45,7 +52,7 @@ func ChunkText(pn *ParsedNote) []string {
 		chunks = append(chunks, truncate(title+"\n"+seg))
 	}
 	for _, line := range strings.Split(body, "\n") {
-		if _, ok := parseHeading(stripInlineCode(line)); ok && len(cur) > 0 {
+		if _, ok := parseHeading(vault.StripCodeSpans(line)); ok && len(cur) > 0 {
 			flush()
 		}
 		cur = append(cur, line)
