@@ -200,6 +200,16 @@ func TestNewFromEnv(t *testing.T) {
 	}
 }
 
+// generousTimeout is for the tests that are NOT about timing. They spawn a trivial /bin/sh
+// script, so any deadline is incidental to what they assert, and a tight one only buys
+// flakes: on a loaded CI runner or a laptop mid-build, forking a shell can take seconds.
+// Both of these were observed failing with "context deadline exceeded" against a 5s cap on
+// a freshly cloned mirror while other builds were running, then passing on a rerun. A test
+// that fails for reasons unrelated to its subject teaches people to rerun until green.
+// TestCLITimeout below deliberately keeps a 50ms deadline, because there the deadline IS
+// the subject.
+const generousTimeout = 60 * time.Second
+
 // writeScript writes an executable shell script to a temp dir and returns its path.
 func writeScript(t *testing.T, body string) string {
 	t.Helper()
@@ -213,7 +223,7 @@ func writeScript(t *testing.T, body string) string {
 func TestCLIComplete(t *testing.T) {
 	// `cat` echoes stdin to stdout, so the completion is exactly the prompt we sent:
 	// proves the prompt reaches the subprocess on stdin and the reply is read back.
-	c := &cliClient{argv: []string{writeScript(t, "cat")}, timeout: 5 * time.Second}
+	c := &cliClient{argv: []string{writeScript(t, "cat")}, timeout: generousTimeout}
 	out, err := c.Complete(context.Background(), "SYS-INSTRUCTIONS", "USER-PAYLOAD")
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +261,7 @@ func TestCLIErrorTaxonomy(t *testing.T) {
 			if argv == nil {
 				argv = []string{writeScript(t, tc.script)}
 			}
-			c := &cliClient{argv: argv, timeout: 5 * time.Second}
+			c := &cliClient{argv: argv, timeout: generousTimeout}
 			_, err := c.Complete(context.Background(), "s", "u")
 			if err == nil {
 				t.Fatal("want an error")
