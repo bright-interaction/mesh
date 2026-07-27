@@ -6,6 +6,7 @@ package index
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -325,7 +326,8 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			}
 			tid, ok := idByKey[key]
 			if !ok {
-				issues = append(issues, Issue{n.Path, "broken-link", "[[" + strings.TrimSpace(rawTarget) + "]] resolves to nothing"})
+				issues = append(issues, Issue{n.Path, "broken-link",
+					"[[" + strings.TrimSpace(rawTarget) + "]] " + brokenLinkReason(strings.TrimSpace(rawTarget))})
 				return
 			}
 			g.AddEdge(graph.Edge{Source: noteNode, Target: "note:" + tid, Relation: "references", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1, SourceLoc: locStr(line)})
@@ -362,6 +364,28 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	// LoadGraph's, so the MCP (BuildGraph) and CLI (LoadGraph) retrieval paths agree.
 	g.RecomputeDegrees()
 	return g, issues
+}
+
+// foreignStoreID matches the filename shape of a Claude MEMORY file: a type prefix,
+// then snake_case. Vault ids are kebab-case, so the two never collide.
+var foreignStoreID = regexp.MustCompile(`^(feedback|project|reference|user)_[a-z0-9]+(_[a-z0-9]+)+$`)
+
+// brokenLinkReason explains a dangling link, naming the cause when the shape gives it away.
+//
+// "resolves to nothing" is true but leaves the author guessing, and the single most common
+// cause here is not a typo: an agent writes a link to one of its own Claude memory files
+// ([[feedback_verify_before_shipping]], [[project_mesh_open_core]]). Those live in a
+// DIFFERENT store and no note in this vault will ever carry that id, so the advice is to
+// stop linking it, not to go hunting for the note. 27 of one vault's dangling links were a
+// single memory slug, and the pattern kept coming back because the message never said so.
+func brokenLinkReason(target string) string {
+	if foreignStoreID.MatchString(target) {
+		return "looks like a Claude memory filename, not a note id in this vault. " +
+			"Those live in a different store and will never resolve here: drop the brackets " +
+			"and leave it as `" + target + "` in the prose, or link the vault note that covers " +
+			"the same ground."
+	}
+	return "resolves to nothing"
 }
 
 func effectiveID(n *ParsedNote) string {
