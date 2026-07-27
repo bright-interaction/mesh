@@ -8,19 +8,24 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"regexp"
 	"strings"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
-
-var htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
 
 // searchText is the body Mesh indexes into FTS5: the prose with comment noise
 // stripped, plus the flywheel fields (do/dont/why) and tags, which carry the
 // institutional memory but live in frontmatter, not the body.
+//
+// It strips through the same scanner as the parser. A `(?s)<!--.*?-->` regex looks
+// equivalent and is not: it cannot match a comment that is never closed, so text the
+// graph treated as hidden stayed fully searchable, and the two halves of the product
+// disagreed about whether that text existed. Code, unlike comments, IS content here:
+// people search for the command in a code span.
 func searchText(pn *ParsedNote) string {
-	parts := []string{htmlCommentRe.ReplaceAllString(pn.Body, " ")}
+	body, _ := vault.StripComments(pn.Body)
+	parts := []string{body}
 	for _, v := range []string{pn.FM.Do, pn.FM.Dont, pn.FM.Why} {
 		if v != "" {
 			parts = append(parts, v)
