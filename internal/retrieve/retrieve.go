@@ -470,7 +470,8 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		if seeded >= expandSeeds {
 			break
 		}
-		if !scopeAllowed(r.card(seed.id).Scope, opt.AllowedScopes) {
+		seedCard, seedOK := r.card(seed.id)
+		if !seedOK || !scopeAllowed(seedCard.Scope, opt.AllowedScopes) {
 			continue
 		}
 		seeded++
@@ -486,7 +487,16 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// Enrich into cards, apply the tier-0 boost.
 	cards := make([]Card, 0, len(fused))
 	for id, score := range fused {
-		c := r.card(id)
+		c, ok := r.card(id)
+		// The FTS index and the in-memory graph are refreshed independently, so a
+		// long-running `mesh mcp --watch` can match a note its graph has not loaded yet.
+		// Returning the shell card was worse than returning nothing: the caller got a
+		// result with no title, no path and no id, so it could not fetch or even name
+		// what matched, and it still cost budget. Observed on a live vault against a
+		// daemon that had been up 10 hours.
+		if !ok {
+			continue
+		}
 		// Scope read boundary: drop notes the caller may not read BEFORE they reach
 		// the head, the reranker, or the budget packer. Covers every signal at once.
 		if !scopeAllowed(c.Scope, opt.AllowedScopes) {
@@ -721,12 +731,13 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card) 
 }
 
 // card builds a Card from a node id, reading title/path/type/tier-0 from the
-// in-memory graph node.
-func (r *Retriever) card(id string) Card {
+// in-memory graph node. The bool is false when the node is not in the graph, in which
+// case the Card is a shell the caller must NOT return: see the drop in Retrieve.
+func (r *Retriever) card(id string) (Card, bool) {
 	c := Card{NodeID: id}
 	n, ok := r.graph.Node(id)
 	if !ok {
-		return c
+		return c, false
 	}
 	c.Title = n.Label
 	c.Path = n.NotePath
@@ -738,7 +749,7 @@ func (r *Retriever) card(id string) Card {
 	if sc, ok := n.Attrs["scope"].(string); ok {
 		c.Scope = sc
 	}
-	return c
+	return c, true
 }
 
 // scopeAllowed reports whether a card may be returned given an allowed-scope set.
