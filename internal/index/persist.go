@@ -26,8 +26,11 @@ import (
 func searchText(pn *ParsedNote) string {
 	body, _ := vault.StripComments(pn.Body)
 	parts := []string{body}
+	// vault.Unfilled, not v != "": a scaffolded note carries the literal "TODO" here, and
+	// indexing it made 77 notes in one vault match a search for "TODO" with their own
+	// placeholder as the excerpt. An unfilled field must contribute nothing.
 	for _, v := range []string{pn.FM.Do, pn.FM.Dont, pn.FM.Why} {
-		if v != "" {
+		if !vault.Unfilled(v) {
 			parts = append(parts, v)
 		}
 	}
