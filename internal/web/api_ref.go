@@ -16,10 +16,10 @@ func (s *Server) handleMCPTools(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"tools":    mcp.ToolSpecs(),
 		"contract": mcp.Contract(),
-		"vault":    s.vaultRoot,
+		"vault":    s.exposedVaultRoot(),
 		"config": map[string]any{
 			"command": "mesh",
-			"args":    []string{"mcp", "--vault", s.vaultRoot, "--watch"},
+			"args":    []string{"mcp", "--vault", s.exposedVaultRoot(), "--watch"},
 		},
 	})
 }
