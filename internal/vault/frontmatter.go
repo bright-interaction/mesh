@@ -74,6 +74,11 @@ type Frontmatter struct {
 	Dont       string     `yaml:"dont,omitempty"`
 	Why        string     `yaml:"why,omitempty"`
 	Status     string     `yaml:"status,omitempty"`
+	// ExpectDeadRefs marks a note whose subject IS a deletion: the file paths it cites
+	// are meant to be gone, so dead_ref would flag it forever and correctly. Six such
+	// notes (retired services, an old audit) were permanently red, and a health check
+	// with permanent known-good findings is one people learn to skim past.
+	ExpectDeadRefs bool `yaml:"expect_dead_refs,omitempty"`
 	Supersedes StringList `yaml:"supersedes,omitempty"`
 	Severity   string     `yaml:"severity,omitempty"`
 	Role       string     `yaml:"role,omitempty"`
