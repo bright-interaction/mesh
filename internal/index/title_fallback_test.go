@@ -26,9 +26,14 @@ func TestTitleFallsBackToSomethingReadable(t *testing.T) {
 		},
 		{
 			name: "a title that merely repeats the id is treated as absent",
-			note: &ParsedNote{Key: "paas-resurrected-weekly", FM: &vault.Frontmatter{
-				ID: "paas-resurrected-weekly", Title: "paas-resurrected-weekly"}},
-			want: "PaaS resurrected weekly",
+			// Synthetic key on purpose. The first version used a real product name and the
+			// mirror's redaction rewrote it inside the test, so the fixture asserted
+			// something different downstream than it did upstream and the publish gate
+			// refused. Same trap that shipped a red suite in another product; test data
+			// must be meaningless to the redactor.
+			note: &ParsedNote{Key: "widget-reticulated-nightly", FM: &vault.Frontmatter{
+				ID: "widget-reticulated-nightly", Title: "widget-reticulated-nightly"}},
+			want: "Widget reticulated nightly",
 		},
 		{
 			name: "the note's own H1 is preferred over the key",
@@ -50,8 +55,8 @@ func TestTitleFallsBackToSomethingReadable(t *testing.T) {
 		},
 		{
 			name: "no title and no H1 falls back to a readable key",
-			note: &ParsedNote{Key: "flare-has-a-built-in-mcp", FM: &vault.Frontmatter{ID: "flare-has-a-built-in-mcp"}},
-			want: "Flare has a built in mcp",
+			note: &ParsedNote{Key: "sprocket-has-a-built-in-widget", FM: &vault.Frontmatter{ID: "sprocket-has-a-built-in-widget"}},
+			want: "Sprocket has a built in widget",
 		},
 	}
 	for _, tc := range cases {
