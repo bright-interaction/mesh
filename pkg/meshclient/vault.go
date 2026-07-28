@@ -58,13 +58,25 @@ func writeState(vaultDir string, s syncState) error {
 		return err
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
-	return os.WriteFile(statePath(vaultDir), b, 0o600)
+	// Atomic, like every other write in this package. This was the one truncate-then-write
+	// left, 30 lines above the writeFileAtomic that exists precisely because a half-written
+	// file is a hazard, and mirrored on the hub side. A crash mid-write left a truncated
+	// state file whose unmarshal error readState then swallowed, silently resetting the
+	// base to empty: the drop gates become no-ops and the next sync is a noisy full
+	// re-push with mass conflict siblings. Recoverable, but avoidable for one line.
+	return writeFileAtomic(statePath(vaultDir), b)
 }
 
 func readState(vaultDir string) syncState {
 	s := syncState{Hashes: map[string]string{}}
 	if b, err := os.ReadFile(statePath(vaultDir)); err == nil {
-		_ = json.Unmarshal(b, &s)
+		// Log rather than discard. A corrupt state file silently resets the sync base,
+		// and the resulting full re-push looks like a mystery rather than a consequence.
+		if uerr := json.Unmarshal(b, &s); uerr != nil {
+			slog.Warn("sync: sync.json is unreadable; treating the vault as never synced",
+				"path", statePath(vaultDir), "err", uerr)
+			s = syncState{Hashes: map[string]string{}}
+		}
 	}
 	if s.Hashes == nil {
 		s.Hashes = map[string]string{}
@@ -82,6 +94,7 @@ type Summary struct {
 	Protected        []string // external-editor race: incoming hub version parked here
 	Dropped          []string // full-reconcile: locals removed because deleted upstream
 	Rejected         []string // hub refused these (viewer/ACL/scope/oversize); kept dirty to retry
+	Remaining        int      // dirty notes deferred to the next round because the batch was bounded
 }
 
 func contentHash(b []byte) string {
@@ -491,6 +504,23 @@ func SyncVault(vaultDir string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	// Bound the push. The hub caps one request at maxSyncOutboxItems and answers 413 with
+	// "split the push into smaller batches", but the client had no batching, so a vault
+	// with more dirty notes than the cap 413'd on EVERY round and no state ever advanced:
+	// permanently unsyncable, with the remedy addressed to a caller that could not follow
+	// it. Reachable by `mesh join` into a directory that already holds a large vault, or a
+	// deleted .mesh/sync.json on a vault that has since grown.
+	//
+	// Truncating rather than looping keeps this change small and each round durable: the
+	// batch lands, state advances, and the next round picks up the remainder. A watch
+	// daemon converges on its own; a manual `mesh sync` reports what is left.
+	truncated := 0
+	if len(outbox) > maxOutboxPerSync {
+		truncated = len(outbox) - maxOutboxPerSync
+		outbox = outbox[:maxOutboxPerSync]
+		slog.Info("sync: pushing a bounded batch; the rest follow next round",
+			"batch", len(outbox), "remaining", truncated)
+	}
 	resp, err := New(creds.HubURL, creds.Token).Sync(syncproto.SyncRequest{BaseSHA: state.HeadSHA, Outbox: outbox, TombstoneSeq: state.TombSeq})
 	if err != nil {
 		return Summary{}, err
@@ -559,6 +589,8 @@ func SyncVault(vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	sum := Summary{Pushed: len(outbox) - len(resp.Rejected), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped, Rejected: resp.Rejected}
+	// Tell the caller work remains, rather than letting a bounded batch look complete.
+	sum.Remaining = truncated
 	for _, c := range resp.Conflicts {
 		sum.ConflictSiblings = append(sum.ConflictSiblings, c.SiblingPath)
 	}
@@ -642,3 +674,7 @@ func tomlSectionString(toml, section, key string) string {
 	}
 	return ""
 }
+
+// maxOutboxPerSync mirrors the hub's maxSyncOutboxItems. Kept slightly under it so a
+// client a version ahead of its hub still fits.
+const maxOutboxPerSync = 4000
