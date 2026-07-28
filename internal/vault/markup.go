@@ -25,14 +25,14 @@ const (
 // what a note actually says goes through it: the parser (links, tags, headings), the
 // FTS body, the embedding chunks, and the related: lift in migrate. They used to strip
 // with three different rules and disagreed about what a note contained.
-func StripNonContent(body string) (string, int) { return stripMarkup(body, true) }
+func StripNonContent(body string) (string, int) { return stripMarkup(body, true, true) }
 
 // StripComments blanks only the HTML comments, keeping code text intact. Search and
 // embeddings want `mesh index --workers 4` to be findable, so code is content there
 // even though it is not a place to read links from. Comment, fence and code-span
 // boundaries are detected exactly as in StripNonContent, so both agree on which markers
 // are real markup and neither can see a comment the other one does not.
-func StripComments(body string) (string, int) { return stripMarkup(body, false) }
+func StripComments(body string) (string, int) { return stripMarkup(body, false, false) }
 
 // StripCodeSpans blanks the inline code spans in a single line, for callers that work
 // line by line on an already comment-stripped body.
@@ -65,14 +65,14 @@ func StripCodeSpans(line string) string {
 //
 // blankCode selects what is erased once the scan knows where everything is: the
 // comments only, or the code as well. The state machine is identical either way.
-func stripMarkup(body string, blankCode bool) (string, int) {
+func stripMarkup(body string, blankFences, blankSpans bool) (string, int) {
 	lines := strings.Split(body, "\n")
 	out := make([]string, len(lines))
 	// Openers proven to be literal text by a scan that ran off the end of the file, keyed
 	// by (line, column). See the unterminated-comment handling in stripLines.
 	var literal map[[2]int]bool
 	for {
-		ln, col, atLineStart := stripLines(lines, out, blankCode, literal)
+		ln, col, atLineStart := stripLines(lines, out, blankFences, blankSpans, literal)
 		if ln == 0 || atLineStart {
 			return strings.Join(out, "\n"), ln
 		}
@@ -95,7 +95,7 @@ func stripMarkup(body string, blankCode bool) (string, int) {
 // renders as the literal text it is, the note below it is perfectly visible, and hiding
 // it would drop content nobody asked to hide. Whether the marker terminates is only
 // known at the end of the file, so the caller marks that opener literal and rescans.
-func stripLines(lines, out []string, blankCode bool, literal map[[2]int]bool) (openLine, openCol int, atLineStart bool) {
+func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[2]int]bool) (openLine, openCol int, atLineStart bool) {
 	var b strings.Builder
 	inFence, inComment := false, false
 	for li, line := range lines {
@@ -107,11 +107,11 @@ func stripLines(lines, out []string, blankCode bool, literal map[[2]int]bool) (o
 			trimmed := strings.TrimSpace(line)
 			if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
 				inFence = !inFence
-				out[li] = keepOrBlank(line, blankCode)
+				out[li] = keepOrBlank(line, blankFences)
 				continue
 			}
 			if inFence {
-				out[li] = keepOrBlank(line, blankCode)
+				out[li] = keepOrBlank(line, blankFences)
 				continue
 			}
 			if strings.IndexByte(line, '`') < 0 && !strings.Contains(line, commentOpen) {
@@ -152,7 +152,7 @@ func stripLines(lines, out []string, blankCode bool, literal map[[2]int]bool) (o
 			}
 			if line[i] == '`' {
 				if end := closingBacktick(line, i); end >= 0 {
-					if blankCode {
+					if blankSpans {
 						writeSpaces(&b, end+1-i)
 					} else {
 						b.WriteString(line[i : end+1])
@@ -221,3 +221,13 @@ func writeSpaces(b *strings.Builder, n int) {
 	}
 	b.WriteString(pad[:n])
 }
+
+// StripFencesAndComments blanks fenced code blocks and HTML comments but KEEPS inline code
+// spans, for callers that care whether a token was written as an example or as a reference.
+//
+// A path in a fence is a command you could run ("npx vitest src/lib/utils.test.ts"). A path
+// in backticks mid-sentence is how anyone writes a filename in prose, so treating those as
+// examples too would suppress the real citations the caller is looking for. mesh health's
+// dead-ref pass wants exactly this split: it lost a genuine finding (a procedure step
+// pointing at a deleted script) when it briefly used StripNonContent instead.
+func StripFencesAndComments(body string) (string, int) { return stripMarkup(body, true, false) }
