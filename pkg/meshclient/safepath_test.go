@@ -127,7 +127,7 @@ func TestApplyDeltasRefusesHostilePaths(t *testing.T) {
 	// A percent-encoded traversal is a literal filename: it must land INSIDE.
 	deltas = append(deltas, syncproto.Delta{Path: "..%2f..%2f.zshrc", Op: "upsert", ContentB64: b64("literal\n")})
 
-	if _, err := applyDeltas(vaultDir, deltas, map[string]string{}); err != nil {
+	if _, err := applyDeltas(vaultDir, deltas, map[string]string{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	// No hostile payload may have landed anywhere, inside or outside the vault.
@@ -174,7 +174,7 @@ func TestWriteConflictSiblingsRefusesHostilePaths(t *testing.T) {
 		{Path: "notes/a.md", SiblingPath: "notes/victim.md"},
 		{Path: "../../.zshrc", SiblingPath: "notes/a.sync-conflict-20260101-hub-1234.md"},
 	}
-	if err := writeConflictSiblings(vaultDir, conflicts); err != nil {
+	if _, err := writeConflictSiblings(vaultDir, conflicts); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "stolen.md")); err == nil {

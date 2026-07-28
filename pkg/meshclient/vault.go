@@ -142,12 +142,14 @@ type park struct {
 // so an unvalidated Join is arbitrary file write outside the vault. An unsafe
 // path is skipped and logged, never fatal, so one bad entry cannot stop the rest
 // of a legitimate sync.
-func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[string]string) ([]park, error) {
+func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[string]string, rejected map[string]bool) ([]park, error) {
 	var parked []park
 	for _, d := range deltas {
 		abs, perr := safeNotePath(vaultDir, d.Path)
 		if perr != nil {
 			slog.Warn("sync: refusing hub delta path", "path", d.Path, "err", perr)
+			//safe-skip: this is INBOUND hub content we are refusing to write, not a
+			// local note. Nothing of the user's is dropped; the local file is untouched.
 			continue
 		}
 		onDisk, readErr := os.ReadFile(abs)
@@ -156,6 +158,26 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 		// different) or a delete (absent now, but present at send time).
 		locallyChanged := (readErr == nil && contentHash(onDisk) != sentHash) ||
 			(readErr != nil && wasSent)
+		// A REJECTED path is locally changed by definition, whatever the hashes say.
+		//
+		// syncproto states the contract plainly: "The client keeps its local copy; the
+		// edit simply did not land upstream." Without this, it did the opposite. The
+		// comparison above is against sentHashes, i.e. the disk state at OUTBOX time, so
+		// an edit made BEFORE the sync (which is the normal order: you edit, then you
+		// sync) hashes equal and reads as unchanged. If the same round also carried a
+		// delta for that path, the hub version was written straight over the user's
+		// bytes, with no conflict, no sibling and no curation job, while Summary.Rejected
+		// told them it had been kept and to retry.
+		//
+		// Treating it as changed routes it into the park-and-keep branch below, which is
+		// what Protected and keepParkedDirty already exist for: the local bytes stay, the
+		// hub version lands in a sibling, and the path re-pushes next round.
+		// Only when there ARE local bytes to protect. If the file is absent there is
+		// nothing at risk, and forcing the flag would block a legitimate delta from
+		// landing at all.
+		if rejected[d.Path] && readErr == nil {
+			locallyChanged = true
+		}
 
 		if d.Op == "delete" {
 			if locallyChanged {
@@ -164,6 +186,7 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
 				return parked, err
 			}
+			//safe-skip: the delete was applied above. Nothing is being dropped here.
 			continue
 		}
 
@@ -301,17 +324,39 @@ func dropFullReconcileOrphans(vaultDir string, deltas []syncproto.Delta, tombsto
 			continue // present in the authoritative snapshot: alive
 		}
 		baseHash, syncedBefore := base[rel]
-		if !syncedBefore && !tomb[rel] {
-			continue // no evidence of an upstream delete: keep (e.g. a new local note)
+		// A TOMBSTONE IS REQUIRED, not merely "absent from the snapshot".
+		//
+		// Absence plus a matching base hash proves "these bytes are the version the hub
+		// last had". It does NOT prove the hub deleted the note, because a hub whose
+		// history rolled BACKWARDS produces byte-identical evidence. Restore the hub
+		// volume from a backup (the most common DR action there is) and every client
+		// would delete everything created since that backup: no tombstone exists, because
+		// nobody deleted anything. The paths were then dropped from the outbox too, so
+		// the clients could not even re-push to heal the hub.
+		//
+		// Requiring the tombstone inverts that outcome: on a rollback the clients keep
+		// their notes and push them back. The cost is that a note whose tombstone has
+		// been GC'd can linger locally, which this design already accepts, because data
+		// loss outranks a rare resurrection.
+		//
+		// Safe against the full path specifically: on a full reconcile the hub sends
+		// AllTombstones() (internal/hub/sync.go), not a since-seq slice, so a genuine
+		// delete always carries its tombstone here.
+		if !tomb[rel] {
+			//safe-skip: KEEP decision. Skipping here preserves the local file.
+			continue
 		}
 		// SAFETY GATE: only remove bytes identical to the exact version we last
 		// synced. A path with no base hash (state reset) or any local change since
 		// fails here and is kept, so we never destroy unacknowledged local content.
 		if !syncedBefore {
+			//safe-skip: KEEP decision. Skipping here preserves the local file.
 			continue
 		}
 		onDisk, readErr := os.ReadFile(f)
 		if readErr != nil {
+			//safe-skip: KEEP decision. Unreadable means we cannot prove the bytes match
+			// the synced version, so the file stays. Failing closed preserves data.
 			continue
 		}
 		if contentHash(onDisk) != baseHash {
@@ -341,6 +386,8 @@ func dropTombstoned(vaultDir string, tombstones []string, base map[string]string
 		abs, perr := safeNotePath(vaultDir, rel)
 		if perr != nil {
 			slog.Warn("sync: refusing hub tombstone path", "path", rel, "err", perr)
+			//safe-skip: KEEP decision. We refuse a hub-supplied delete path we cannot
+			// validate, so the local file survives.
 			continue
 		}
 		onDisk, err := os.ReadFile(abs)
@@ -366,27 +413,40 @@ func dropTombstoned(vaultDir string, tombstones []string, base map[string]string
 // must be a safe path that actually carries the sync-conflict marker, so the hub
 // cannot use the sibling field to write a local copy over an arbitrary note (or
 // over a file outside the vault entirely).
-func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) error {
+// Returns the paths whose local version could NOT be parked. The caller must protect
+// those from applyDeltas, or the hub's winning version silently overwrites the user's
+// losing version with no copy anywhere.
+func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]string, error) {
+	var unparked []string
 	for _, cf := range conflicts {
 		noteAbs, perr := safeNotePath(vaultDir, cf.Path)
 		if perr != nil {
+			// Refuse the hostile path, but do NOT fail the round: a malicious or buggy
+			// hub could otherwise wedge sync entirely with one bad path. Report it so
+			// the caller protects the local bytes from being overwritten instead.
 			slog.Warn("sync: refusing hub conflict path", "path", cf.Path, "err", perr)
+			unparked = append(unparked, cf.Path)
 			continue
 		}
 		sibAbs, perr := safeSiblingPath(vaultDir, cf.SiblingPath)
 		if perr != nil {
+			// Same reasoning: no sibling to park it in, so protect the local bytes
+			// rather than losing them or wedging the client.
 			slog.Warn("sync: refusing hub conflict sibling path", "path", cf.SiblingPath, "err", perr)
+			unparked = append(unparked, cf.Path)
 			continue
 		}
 		local, err := os.ReadFile(noteAbs)
 		if err != nil {
-			continue // nothing local to preserve (e.g. we deleted it)
+			//safe-skip: nothing local to preserve (e.g. we deleted it), so there are no
+			// bytes at risk.
+			continue
 		}
 		if err := writeFileAtomic(sibAbs, local); err != nil {
-			return err
+			return unparked, err
 		}
 	}
-	return nil
+	return unparked, nil
 }
 
 // writeFileAtomic writes b to path via a temp file in the same directory then
@@ -435,11 +495,23 @@ func SyncVault(vaultDir string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	// Build the protected set BEFORE applying deltas. Two things go in it, for the same
+	// reason: applyDeltas must not overwrite local bytes that nothing else is holding.
+	//   - paths the hub REJECTED (the contract says the client keeps its local copy)
+	//   - paths whose conflict sibling could not be written (nothing holds the loser)
+	rejectedSet := make(map[string]bool, len(resp.Rejected))
+	for _, rel := range resp.Rejected {
+		rejectedSet[rel] = true
+	}
 	// Preserve our losing versions locally before deltas overwrite the paths.
-	if err := writeConflictSiblings(vaultDir, resp.Conflicts); err != nil {
+	unparked, err := writeConflictSiblings(vaultDir, resp.Conflicts)
+	if err != nil {
 		return Summary{}, err
 	}
-	parked, err := applyDeltas(vaultDir, resp.Deltas, sentHashes)
+	for _, rel := range unparked {
+		rejectedSet[rel] = true // no sibling holds this local version: protect it
+	}
+	parked, err := applyDeltas(vaultDir, resp.Deltas, sentHashes, rejectedSet)
 	if err != nil {
 		return Summary{}, err
 	}

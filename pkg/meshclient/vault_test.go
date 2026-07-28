@@ -86,7 +86,7 @@ func TestApplyDeltasExternalEditorGuard(t *testing.T) {
 	sent := map[string]string{"x.md": contentHash([]byte("what we sent\n"))} // disk != sent => changed since send
 	deltas := []syncproto.Delta{{Path: "x.md", Op: "upsert", ContentB64: b64("hub version\n")}}
 
-	parked, err := applyDeltas(dir, deltas, sent)
+	parked, err := applyDeltas(dir, deltas, sent, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestApplyDeltasDeleteRaceNoResurrect(t *testing.T) {
 	sent := map[string]string{"x.md": contentHash([]byte("was here at send\n"))}
 	deltas := []syncproto.Delta{{Path: "x.md", Op: "upsert", ContentB64: b64("hub version\n")}}
 
-	parked, err := applyDeltas(dir, deltas, sent)
+	parked, err := applyDeltas(dir, deltas, sent, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestApplyDeltasNormalOverwrite(t *testing.T) {
 	sent := map[string]string{"x.md": contentHash([]byte("as sent\n"))}
 	deltas := []syncproto.Delta{{Path: "x.md", Op: "upsert", ContentB64: b64("hub version\n")}}
 
-	parked, err := applyDeltas(dir, deltas, sent)
+	parked, err := applyDeltas(dir, deltas, sent, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestApplyDeltasDeleteGuard(t *testing.T) {
 	sent := map[string]string{"x.md": contentHash([]byte("old\n"))} // changed since send
 	deltas := []syncproto.Delta{{Path: "x.md", Op: "delete"}}
 
-	if _, err := applyDeltas(dir, deltas, sent); err != nil {
+	if _, err := applyDeltas(dir, deltas, sent, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "x.md")); err != nil {
