@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -764,6 +765,22 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	source := strings.TrimSpace(a.Source)
 	if source == "" {
 		source = "agent"
+	}
+	// Refuse to scaffold a flywheel note with no guidance in it. 65 notes in one live vault
+	// were created this way and never filled: a long, specific title, then "TODO" in all
+	// three fields and an empty Symptom/Cause/Fix body. They looked like knowledge in
+	// search, carried none, and were eventually deleted wholesale.
+	//
+	// The write is the only moment the caller still has the context to say what it learned.
+	// Asking then is cheap; a stub is a permanent debt nobody can pay off later, because by
+	// the time anyone notices, the reasoning is gone.
+	if vault.NoteType(t).RequiresFlywheel() &&
+		vault.Unfilled(a.Do) && vault.Unfilled(a.Dont) && vault.Unfilled(a.Why) {
+		return nil, &rpcError{Code: codeInvalidParams, Message: fmt.Sprintf(
+			"a %s needs at least one of do/dont/why: they are what makes it retrievable, "+
+				"and they go into the embedding header of every chunk of the note. Write the "+
+				"one line you would tell the next agent. A note with only a title and TODO "+
+				"placeholders is worse than no note: it looks like knowledge and carries none.", t)}
 	}
 	res, err := vault.CreateNote(s.vaultRoot, vault.NewNoteSpec{
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
