@@ -28,8 +28,11 @@ func ChunkText(pn *ParsedNote) []string {
 	title := titleOf(pn)
 
 	header := title
+	// Placeholders must not reach the embedding header: it is prepended to EVERY chunk of
+	// the note, so "TODO" three times over dragged unfilled notes together in vector space
+	// and diluted their real content.
 	for _, v := range []string{pn.FM.Do, pn.FM.Dont, pn.FM.Why} {
-		if v != "" {
+		if !vault.Unfilled(v) {
 			header += "\n" + v
 		}
 	}

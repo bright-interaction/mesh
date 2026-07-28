@@ -201,10 +201,35 @@ func (f *Frontmatter) Validate() []string {
 
 // unfilled reports whether a flywheel field is still empty or a TODO placeholder
 // (mesh new leaves "TODO" sentinels for the author to replace).
-func unfilled(s string) bool {
+// Unfilled reports whether a flywheel field is still a placeholder rather than authored
+// guidance. Exported because the INDEXER needs the same answer lint does: `mesh new` writes
+// the literal "TODO" into do/dont/why, and indexing that made every unfilled note match a
+// search for "TODO" with its own placeholder as the excerpt, while the embedding header
+// (prepended to EVERY chunk of a note) read "TODO\nTODO\nTODO" and pulled unfilled notes
+// toward each other in vector space on a token carrying no meaning. One definition, shared,
+// so a field can never be nagged about and indexed at the same time.
+func Unfilled(s string) bool {
 	s = strings.TrimSpace(s)
-	return s == "" || strings.HasPrefix(strings.ToUpper(s), "TODO")
+	if s == "" {
+		return true
+	}
+	u := strings.ToUpper(s)
+	if !strings.HasPrefix(u, "TODO") {
+		return false
+	}
+	// Match TODO as a WORD, not as a prefix. "todos are tracked in the tracker" is authored
+	// guidance that happens to start with those four letters; treating it as a placeholder
+	// would nag the author AND, now that the indexer shares this, drop real content out of
+	// search.
+	rest := u[len("TODO"):]
+	if rest == "" {
+		return true
+	}
+	c := rest[0]
+	return !(c >= 'A' && c <= 'Z' || c >= '0' && c <= '9')
 }
+
+func unfilled(s string) bool { return Unfilled(s) }
 
 // SplitFrontmatter separates a leading YAML frontmatter block from the body. It
 // returns the inner YAML (no --- markers), the body after the closing marker,
