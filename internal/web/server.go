@@ -300,10 +300,39 @@ func (s *Server) exposedVaultRoot() string {
 // handleStatus reports index counts and which retrieval signals are active, the
 // browser equivalent of `mesh status`.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	notes, _ := s.store.Count("notes")
-	nodes, _ := s.store.Count("nodes")
-	edges, _ := s.store.Count("edges")
-	vectors, _ := s.store.Count("vectors")
+	// Count what THIS caller may read, not the whole corpus. The stored totals span
+	// every scope, so a scope-confined member could read them off /api/status and learn
+	// how many notes exist outside their partition, then poll to watch another scope
+	// grow. The same aggregate is deliberately scoped in internal/mcp/tools.go ("A
+	// scope-confined caller must not learn out-of-scope volume") and admin-gated on
+	// /api/dashboard; this route was the one surface that reported it raw.
+	var notes, nodes, edges, vectors int
+	if allowed := s.allowedScopes(r); allowed != nil {
+		g := s.graph
+		if g != nil {
+			seen := map[string]bool{}
+			for _, n := range g.Nodes() {
+				if !scopeVisible(n, allowed) {
+					continue
+				}
+				nodes++
+				if n.Kind == "note" && !seen[n.NoteID] {
+					seen[n.NoteID] = true
+					notes++
+				}
+				for _, e := range g.Neighbors(n.ID) {
+					if tn, ok := g.Node(e.Target); ok && scopeVisible(tn, allowed) {
+						edges++
+					}
+				}
+			}
+		}
+		vectors = 0 // per-scope vector counts are not tracked; do not leak the global
+	} else {
+		nodes, _ = s.store.Count("nodes")
+		edges, _ = s.store.Count("edges")
+		vectors, _ = s.store.Count("vectors")
+	}
 	writeJSON(w, map[string]any{
 		"vault":  s.exposedVaultRoot(),
 		"counts": map[string]int{"notes": notes, "nodes": nodes, "edges": edges, "vectors": vectors},
