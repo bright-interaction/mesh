@@ -248,10 +248,36 @@ func pruneOrphanVectors(tx *sql.Tx) error {
 }
 
 func titleOf(pn *ParsedNote) string {
-	if pn.FM.Title != "" {
-		return pn.FM.Title
+	if t := pn.FM.Title; t != "" && t != pn.FM.ID {
+		return t
 	}
-	return pn.Key
+	// Fall back to the note's own H1, then to a readable form of the key. Returning the
+	// raw key meant 33 notes in one vault showed up in search as
+	// "paas-resurrected-weekly-by-root-maintenance-cron", which is the identifier, not
+	// a title: harder to scan, and it is the FIRST thing an agent or a human reads on a
+	// result card. A title that merely repeats the id is treated as absent for the same
+	// reason. Nothing is invented here, both fallbacks are the note's own words.
+	for _, h := range pn.Headings {
+		if h.Level == 1 && h.Text != "" && h.Text != pn.FM.ID {
+			return h.Text
+		}
+	}
+	return humanizeKey(pn.Key)
+}
+
+// humanizeKey turns a kebab-case note key into something readable: hyphens to spaces and
+// a leading capital. Deliberately minimal, since anything cleverer (title casing, acronym
+// detection) would start guessing at words it cannot know.
+func humanizeKey(key string) string {
+	if key == "" {
+		return key
+	}
+	out := strings.ReplaceAll(key, "-", " ")
+	r := []rune(out)
+	if r[0] >= 'a' && r[0] <= 'z' {
+		r[0] -= 32
+	}
+	return string(r)
 }
 
 // RetrievalHash is the exported retrieval hash for a parsed note: it is what the

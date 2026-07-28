@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // Knowledge-lifecycle health. A note's value rots silently: it cites a file that
@@ -62,17 +64,24 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 	var findings []HealthFinding
 	var candidates []HealthFinding
 	for _, n := range notes {
-		body, err := os.ReadFile(filepath.Join(vaultRoot, n.path))
+		raw, err := os.ReadFile(filepath.Join(vaultRoot, n.path))
 		if err != nil {
 			continue
 		}
+		// Fences and comments only, NOT inline spans. A path inside a fenced block is a
+		// command you could run ("npx vitest src/lib/utils.test.ts" in a testing guide), so
+		// it is an example and not a claim about the tree. A path in backticks mid-sentence
+		// is just how a filename is written in prose, and suppressing those loses the real
+		// findings: doing so briefly hid a procedure step pointing at a deleted script.
+		cleanBody, _ := vault.StripFencesAndComments(string(raw))
+		body := []byte(cleanBody)
 		// Dead source-file references (only meaningful once the code index exists).
 		// Changelogs are exempt: an append-only history log records file paths as they
 		// were at the time, so a reference that later points at a moved/deleted file is
 		// expected history, not rot. Flagging every changelog line buries the genuine
 		// cases (a live note claiming a current file that is gone), so skip them here,
 		// the same high-precision spirit as the "don't judge dirs we don't index" guard.
-		if len(codeFiles) > 0 && !isChangelogNote(n.id) {
+		if len(codeFiles) > 0 && !isChangelogNote(n.id) && !n.expectDeadRefs {
 			seen := map[string]bool{}
 			for _, m := range codePathRe.FindAllString(string(body), -1) {
 				ref := strings.TrimLeft(m, "./")
@@ -327,10 +336,13 @@ func (s *Store) HealthCounts() (map[string]int, error) {
 	return out, rows.Err()
 }
 
-type noteRow struct{ id, path, reviewBy string }
+type noteRow struct {
+	id, path, reviewBy string
+	expectDeadRefs     bool
+}
 
 func (s *Store) noteList() ([]noteRow, error) {
-	rows, err := s.readDB.Query(`SELECT id, path, COALESCE(review_by,'') FROM notes`)
+	rows, err := s.readDB.Query(`SELECT id, path, COALESCE(review_by,''), frontmatter FROM notes`)
 	if err != nil {
 		return nil, err
 	}
@@ -338,9 +350,19 @@ func (s *Store) noteList() ([]noteRow, error) {
 	var out []noteRow
 	for rows.Next() {
 		var n noteRow
-		if err := rows.Scan(&n.id, &n.path, &n.reviewBy); err != nil {
+		var fmJSON string
+		if err := rows.Scan(&n.id, &n.path, &n.reviewBy, &fmJSON); err != nil {
 			return nil, err
 		}
+		// Frontmatter is stored as JSON, so read the one flag rather than unmarshalling
+		// the whole struct for every note on every health run.
+		var fmFlags struct {
+			ExpectDeadRefs bool `json:"ExpectDeadRefs"`
+		}
+		if fmJSON != "" {
+			_ = json.Unmarshal([]byte(fmJSON), &fmFlags)
+		}
+		n.expectDeadRefs = fmFlags.ExpectDeadRefs
 		out = append(out, n)
 	}
 	return out, rows.Err()
