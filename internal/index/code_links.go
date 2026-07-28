@@ -266,8 +266,17 @@ func (s *Store) NotesForSymbolName(name string) ([]NoteCodeRef, error) {
 }
 
 // NoteCountForSymbol returns how many notes reference a symbol (for result badges).
+//
+// JOINed to notes deliberately. note_code_links is written ONLY by LinkNotesToCode, which
+// no reindex path calls, so a deleted note leaves its link row behind forever. The two
+// sibling readers (NotesForSymbol, NotesForSymbolName) join and therefore filter those
+// orphans; this one did not, so mesh_code_search stamped a "2 notes" badge on a symbol
+// that mesh_code_context then showed 1 note for. The badge is the more visible of the two
+// and was the wrong one.
 func (s *Store) NoteCountForSymbol(symbolID string) int {
 	var n int
-	_ = s.readDB.QueryRow(`SELECT count(*) FROM note_code_links WHERE symbol_id = ?`, symbolID).Scan(&n)
+	_ = s.readDB.QueryRow(`SELECT count(*) FROM note_code_links l
+	    JOIN notes n ON n.id = l.note_id
+	    WHERE l.symbol_id = ?`, symbolID).Scan(&n)
 	return n
 }

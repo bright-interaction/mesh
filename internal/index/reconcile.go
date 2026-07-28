@@ -91,6 +91,12 @@ func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast boo
 	if _, err := s.IndexVaultIncremental(dd.Upserts, dd.RemovedIDs, g); err != nil {
 		return Reconciliation{}, err
 	}
+	// Refresh the note<->code bridge whenever notes actually changed. Without this a note
+	// written during a session never linked to any symbol, because mesh_append_note takes
+	// this incremental path and note_code_links was only ever written by the code-index
+	// commands. Reached only when there IS a delta, and LinkNotesToCode returns
+	// immediately when the code index is empty, so a vault without one pays nothing.
+	_, _ = s.LinkNotesToCode(root)
 	r.Reindexed = true
 	r.Graph = g
 	r.Dur = time.Since(start)

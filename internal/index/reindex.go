@@ -34,6 +34,12 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 	if _, err := s.IndexVault(notes, g); err != nil {
 		return nil, nil, err
 	}
+	// Refresh the note<->code bridge. note_code_links was written ONLY by the code-index
+	// commands, never by a note reindex, so a note written after startup never linked to
+	// any symbol and a deleted note left its rows behind. Best-effort and cheap when
+	// there is no code index: LinkNotesToCode returns immediately if code_symbols is
+	// empty, so a vault with the code index disabled pays nothing.
+	_, _ = s.LinkNotesToCode(root)
 	return g, notes, nil
 }
 

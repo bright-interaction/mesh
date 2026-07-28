@@ -98,6 +98,8 @@ func stripMarkup(body string, blankFences, blankSpans bool) (string, int) {
 func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[2]int]bool) (openLine, openCol int, atLineStart bool) {
 	var b strings.Builder
 	inFence, inComment := false, false
+	var fenceChar byte
+	var fenceRun int
 	for li, line := range lines {
 		ln := li + 1
 		if !inComment {
@@ -105,10 +107,33 @@ func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[
 			// marker inside a fence is sample text, so the two states cannot toggle each
 			// other: inComment is only ever set below, where inFence is false.
 			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
-				inFence = !inFence
-				out[li] = keepOrBlank(line, blankFences)
-				continue
+			// CommonMark: a fence closes only on the SAME character, at least as long as
+			// the opener, with no info string. Toggling on any run of three inverted the
+			// state for a nested block, so an outer ````markdown fence containing an inner
+			// ```ts opener CLOSED the outer fence at that inner line, and everything the
+			// documentation block was quoting became real graph content: phantom heading
+			// nodes, phantom reference edges and phantom tags built from an example. With
+			// an odd count the inverse happened and real prose below was hidden.
+			if ch, run, info := fenceMarker(trimmed); run > 0 {
+				switch {
+				case !inFence:
+					if !info { // an opener may carry an info string; a closer may not
+						inFence, fenceChar, fenceRun = true, ch, run
+					} else {
+						inFence, fenceChar, fenceRun = true, ch, run
+					}
+					out[li] = keepOrBlank(line, blankFences)
+					continue
+				case ch == fenceChar && run >= fenceRun && !info:
+					inFence, fenceChar, fenceRun = false, 0, 0
+					out[li] = keepOrBlank(line, blankFences)
+					continue
+				default:
+					// A shorter run, a different char, or an info string inside an open
+					// fence is CONTENT of that fence, not a delimiter.
+					out[li] = keepOrBlank(line, blankFences)
+					continue
+				}
 			}
 			if inFence {
 				out[li] = keepOrBlank(line, blankFences)
@@ -231,3 +256,34 @@ func writeSpaces(b *strings.Builder, n int) {
 // dead-ref pass wants exactly this split: it lost a genuine finding (a procedure step
 // pointing at a deleted script) when it briefly used StripNonContent instead.
 func StripFencesAndComments(body string) (string, int) { return stripMarkup(body, true, false) }
+
+// fenceMarker reports the fence character, its run length and whether an info string
+// follows, for a trimmed line. run is 0 when the line is not a fence marker at all.
+//
+// Split out because "starts with three backticks" is not what CommonMark means by a
+// fence: the closer must match the opener's character and be at least as long, and a
+// closer may not carry an info string. Treating every run of three as a toggle is what
+// let a nested documentation fence invert the state.
+func fenceMarker(trimmed string) (ch byte, run int, info bool) {
+	if len(trimmed) < 3 {
+		return 0, 0, false
+	}
+	c := trimmed[0]
+	if c != '`' && c != '~' {
+		return 0, 0, false
+	}
+	i := 0
+	for i < len(trimmed) && trimmed[i] == c {
+		i++
+	}
+	if i < 3 {
+		return 0, 0, false
+	}
+	rest := strings.TrimSpace(trimmed[i:])
+	// A backtick fence's info string may not contain a backtick (CommonMark), which is
+	// what keeps an inline span like `` `a` `` from reading as a fence.
+	if c == '`' && strings.ContainsRune(rest, '`') {
+		return 0, 0, false
+	}
+	return c, i, rest != ""
+}

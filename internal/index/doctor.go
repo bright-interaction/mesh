@@ -206,6 +206,24 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 		pn.Path = rel
 		id := effectiveID(pn)
 		if !claim(id, rel) {
+			// A file Mesh REFUSES to index must not keep its previous index entry. This
+			// used to `continue` before ever consulting dbByPath, so the row the file was
+			// last indexed under was neither refreshed nor removed: search kept serving
+			// the PRE-EDIT body, the graph kept the stale node, its tags and its edges,
+			// and mesh_fetch resolved the id to a file that now declares a different id
+			// and different content. Search and fetch disagreed about what the note was.
+			//
+			// No reconcile healed it, authoritative or not, because only ReindexFull
+			// rebuilds from scratch, and a long-running MCP server does an incremental
+			// reconcile rather than a full reload after startup. The warning even said
+			// the note was "invisible to search and the graph until it is fixed", which
+			// was the exact opposite of what happened.
+			//
+			// Do what the unparseable branch above does: drop the stale row too.
+			if r, ok := dbByPath[rel]; ok {
+				dd.Drift.Removed = append(dd.Drift.Removed, rel)
+				removed[r.id] = true
+			}
 			continue
 		}
 		r, ok := dbByPath[rel]
