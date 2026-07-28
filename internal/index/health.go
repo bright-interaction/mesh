@@ -6,7 +6,9 @@ package index
 import (
 	"database/sql"
 	"encoding/json"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -58,6 +60,7 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 	// illustrative filename ("Next.js", "components/X.svelte") cries wolf.
 	indexedDirs := indexedDirSet(codeFiles)
 	var findings []HealthFinding
+	var candidates []HealthFinding
 	for _, n := range notes {
 		body, err := os.ReadFile(filepath.Join(vaultRoot, n.path))
 		if err != nil {
@@ -85,13 +88,33 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 				}
 				seen[ref] = true
 				if !codeFileKnown(codeFiles, ref) {
-					findings = append(findings, HealthFinding{NoteID: n.id, Path: n.path, Issue: "dead_ref", Detail: ref})
+					// Candidate only. The index may simply be behind the tree, so this is
+					// confirmed against the filesystem below before it becomes a finding.
+					candidates = append(candidates, HealthFinding{NoteID: n.id, Path: n.path, Issue: "dead_ref", Detail: ref})
 				}
 			}
 		}
 		// Overdue review_by.
 		if n.reviewBy != "" && n.reviewBy < today {
 			findings = append(findings, HealthFinding{NoteID: n.id, Path: n.path, Issue: "overdue", Detail: "review_by " + n.reviewBy})
+		}
+	}
+	// Confirm the candidates against the filesystem. A note citing a file the code index
+	// has not seen yet is not rot: the index is built from a shared working tree whose
+	// branch is whatever the last session left checked out, so it is routinely behind. On
+	// the live vault this turned 25 findings into 0, because every referenced file was
+	// present in main and only the index was stale. One walk, and only when there is
+	// something to confirm.
+	if len(candidates) > 0 {
+		refs := make(map[string]bool, len(candidates))
+		for _, c := range candidates {
+			refs[c.Detail] = true
+		}
+		onDisk := existsUnderRoots(s.codeRoots(), refs)
+		for _, c := range candidates {
+			if !onDisk[c.Detail] {
+				findings = append(findings, c)
+			}
 		}
 	}
 	// Replace dead_ref + overdue rows atomically (keep contradiction rows).
@@ -380,4 +403,123 @@ func codeFileKnown(codeFiles map[string]bool, ref string) bool {
 		}
 	}
 	return false
+}
+
+// setCodeRoots records the directories the code index was built from.
+func (s *Store) setCodeRoots(roots []string) error {
+	_, err := s.writeDB.Exec(
+		`INSERT OR REPLACE INTO meta(key, value) VALUES('code_roots', ?)`,
+		strings.Join(roots, "\n"))
+	return err
+}
+
+func (s *Store) codeRoots() []string {
+	var v string
+	if err := s.readDB.QueryRow(`SELECT value FROM meta WHERE key='code_roots'`).Scan(&v); err != nil {
+		return nil
+	}
+	var out []string
+	for _, r := range strings.Split(v, "\n") {
+		if r = strings.TrimSpace(r); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// existsUnderRoots reports which refs name a file that really exists, matched the same
+// suffix way codeFileKnown matches indexed paths.
+//
+// This is the difference between "the file is gone" and "the index has not caught up".
+// The code index is built from a shared working tree whose branch is whatever the last
+// session checked out, so it is routinely behind: a note citing a file added an hour ago,
+// or living on another branch, is not rot. Reporting it as rot cost 25 false findings in a
+// 900-note vault, every one of which existed in main, and a health check that is wrong 25
+// times out of 25 is one nobody reads.
+//
+// Walked lazily and once per health run, only when there is at least one candidate, so a
+// clean vault pays nothing.
+func existsUnderRoots(roots []string, refs map[string]bool) map[string]bool {
+	found := make(map[string]bool, len(refs))
+	if len(refs) == 0 {
+		return found
+	}
+	// Ask git as well as the filesystem. A code root is typically a SHARED working tree
+	// whose branch is whatever the last session checked out, so "not on disk right now"
+	// routinely means "on another branch", not "deleted". Checking the mainline too is
+	// what separates the two; without it, a file added an hour ago on main reads as rot.
+	for _, root := range roots {
+		markGitKnown(root, refs, found)
+	}
+	for _, root := range roots {
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil //nolint:nilerr // an unreadable dir must not fail the health run
+			}
+			if d.IsDir() {
+				switch d.Name() {
+				case ".git", "node_modules", "vendor", "dist", "build":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			slashed := filepath.ToSlash(path)
+			for ref := range refs {
+				if found[ref] {
+					continue
+				}
+				if slashed == ref || strings.HasSuffix(slashed, "/"+ref) {
+					found[ref] = true
+				}
+			}
+			return nil
+		})
+	}
+	return found
+}
+
+// markGitKnown marks every ref that the repository at root knows about on its mainline.
+//
+// Consulted in addition to the working tree because a code root is usually shared between
+// concurrent sessions: whichever branch was checked out last is what is on disk, and a
+// file that lives on main but not on that branch is emphatically not rot. Falls back
+// through the usual mainline names and does nothing at all outside a git repo, so a
+// non-git code root keeps the plain filesystem behaviour.
+func markGitKnown(root string, refs map[string]bool, found map[string]bool) {
+	allFound := true
+	for ref := range refs {
+		if !found[ref] {
+			allFound = false
+			break
+		}
+	}
+	if allFound {
+		return
+	}
+	// Every plausible mainline, and the UNION of them, not the first that resolves. A repo
+	// may have no remote (a fresh clone-less checkout), or a local main that is ahead of
+	// origin, or be detached mid-rebase. Stopping at the first resolvable rev meant a repo
+	// whose only mainline was a local `main` fell through to HEAD, which is exactly the
+	// branch that may be missing the file.
+	for _, rev := range []string{"origin/HEAD", "origin/main", "origin/master", "main", "master", "HEAD"} {
+		cmd := exec.Command("git", "-C", root, "ls-tree", "-r", "--name-only", rev)
+		out, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			for ref := range refs {
+				if found[ref] {
+					continue
+				}
+				if line == ref || strings.HasSuffix(line, "/"+ref) {
+					found[ref] = true
+				}
+			}
+		}
+	}
 }
