@@ -442,6 +442,12 @@ func reindexCode(s *Store, roots []string, langs map[string]bool, full bool) (Co
 	if err != nil {
 		return CodeStats{}, err
 	}
+	// Record the roots. ComputeHealth needs them to tell "this file is gone" from "the
+	// index has not caught up yet", and without that it reported 25 dead references in a
+	// vault where every single one of the files still existed.
+	if err := s.setCodeRoots(roots); err != nil {
+		return CodeStats{}, err
+	}
 	refs := make([]code.FileRef, 0, len(abs))
 	for _, p := range abs {
 		if rel, ok := relToRoots(roots, p); ok {
