@@ -33,6 +33,9 @@ type Store struct {
 	done    chan struct{}
 	wg      sync.WaitGroup // tracks the writer goroutine so Close can join it
 
+	closeOnce sync.Once // Close is idempotent: a second close(s.done) would panic
+	closeErr  error     // the first Close's result, replayed to later callers
+
 	mu      sync.Mutex  // guards dropped
 	dropped []FileError // notes dropped as unparseable by the last full reindex
 
@@ -558,7 +561,18 @@ func (s *Store) Count(table string) (int, error) {
 // Close stops the writer goroutine and closes both pools. It waits for the writer to
 // drain any in-flight transaction before closing the pools, so a write racing
 // shutdown completes cleanly instead of hitting a closed DB.
+// A second Close must not panic. `close(s.done)` on an already-closed channel takes
+// the whole process down, and Close sits on shutdown paths where a double call is
+// easy to arrange: Server.Close calls it, and so does any caller that closed the
+// store itself first. A panic during shutdown loses whatever the rest of the
+// shutdown was going to flush, which is the worst possible moment for it.
+// Idempotent instead, replaying the first result to every later caller.
 func (s *Store) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.shutdown() })
+	return s.closeErr
+}
+
+func (s *Store) shutdown() error {
 	// Land the last batch of in-memory telemetry while the writer is still serving:
 	// after close(s.done) every Write returns "store is closed".
 	s.flushTelemetry()
