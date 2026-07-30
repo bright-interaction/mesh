@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -782,8 +783,24 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	// against the hub's 30s write timeout. reconcileOnce sees exactly this file as one
 	// Added path (authoritative, so a same-second mtime cannot hide it) and rebuilds the
 	// graph from the parsed-note cache the startup load seeded.
+	//
+	// A failure here must NOT be reported as a failed write. The note is already
+	// durably on disk, so returning -32603 tells the agent "nothing was written",
+	// it retries, and Mesh mints a near-duplicate with a -2 id suffix. Two notes on
+	// one topic split retrieval and the next agent reads whichever ranks first,
+	// which is worse than the error. That happened three times (2026-07-26, 07-28,
+	// 07-30), the last two with a warning gotcha already in the vault, which is
+	// what settled that a note cannot fix a tool that misreports its own outcome.
+	//
+	// reconcileOnce writes to the store, so it fails whenever a `mesh sync --watch`
+	// daemon holds the write lock. That is a refresh problem, never a durability
+	// problem. So: succeed, and say the index is stale, so the caller knows to run
+	// mesh_reindex and knows not to retry the write.
+	var indexStale string
 	if _, err := s.reconcileOnce(true); err != nil {
-		return nil, internalErr(err)
+		slog.Error("mesh write: the note was saved but the index did not refresh",
+			"id", res.ID, "path", res.Path, "error", err)
+		indexStale = err.Error()
 	}
 	_ = s.store.IncrMetric("writes", 1)         // ROI telemetry (best-effort)
 	_ = s.store.RecordWriteback(res.ID, source) // flywheel: stamp authoring time for reuse measurement
@@ -796,7 +813,15 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	} else {
 		notePath = filepath.Base(res.Path)
 	}
-	return textResult(map[string]any{"id": res.ID, "path": notePath, "when": res.When, "todo": res.TODOs}), nil
+	out := map[string]any{"id": res.ID, "path": notePath, "when": res.When, "todo": res.TODOs}
+	if indexStale != "" {
+		out["index_stale"] = true
+		out["index_error"] = indexStale
+		out["warning"] = "The note IS saved at the path above. Only the index refresh failed, " +
+			"so it is not queryable yet. Do NOT call this tool again: a retry creates a " +
+			"duplicate note. Call mesh_reindex instead."
+	}
+	return textResult(out), nil
 }
 
 // flywheelReuseGap is how long after a write-back a fetch must land to count as reuse
