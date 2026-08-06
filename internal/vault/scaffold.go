@@ -234,7 +234,7 @@ func renderNote(fm *Frontmatter, by string) (string, error) {
 	b.WriteString("---\n\n# ")
 	b.WriteString(fm.Title)
 	b.WriteString("\n\n")
-	b.WriteString(bodyTemplate(fm.Type))
+	b.WriteString(renderBody(fm))
 	if by != "" {
 		b.WriteString("\n<!-- authored by ")
 		b.WriteString(by)
@@ -243,14 +243,28 @@ func renderNote(fm *Frontmatter, by string) (string, error) {
 	return b.String(), nil
 }
 
+// renderBody builds a note's body. For the three flywheel types (decision, gotcha,
+// post-mortem) the body is PROJECTED from the same do/dont/why the author already put in
+// frontmatter, via bodySections below, so a filled note reads as prose under real
+// headings instead of a TODO skeleton sitting under a wall of YAML. Frontmatter is left
+// untouched by this: retrieve.Card and internal/index read do/dont/why from there, so
+// those fields stay exactly as CreateNote set them regardless of what the body ends up
+// saying. Every other type (entity/concept/map/note) is not fed by do/dont/why at all
+// (see NewNoteSpec/CreateNote), so its body is still the fixed bodyTemplate skeleton.
+func renderBody(fm *Frontmatter) string {
+	if sections := bodySections(fm.Type); sections != nil {
+		return renderSections(fm, sections)
+	}
+	return bodyTemplate(fm.Type)
+}
+
 func bodyTemplate(t NoteType) string {
+	if sections := bodySections(t); sections != nil {
+		// Total for every type: an empty *Frontmatter reproduces the plain skeleton,
+		// so this stays a single source of truth instead of a second copy of the text.
+		return renderSections(&Frontmatter{}, sections)
+	}
 	switch t {
-	case TypeDecision:
-		return tmplDecision
-	case TypeGotcha:
-		return tmplGotcha
-	case TypePostMortem:
-		return tmplPostMortem
 	case TypeEntity:
 		return tmplEntity
 	case TypeConcept:
@@ -262,41 +276,87 @@ func bodyTemplate(t NoteType) string {
 	}
 }
 
-const tmplDecision = `## Context
-<!-- TODO: what forced a decision; the situation and constraints -->
+// bodySection is one heading of a flywheel note's body: its title, the placeholder shown
+// while nothing is authored, and the frontmatter field (if any) that fills it once the
+// author supplies real content.
+type bodySection struct {
+	heading     string
+	placeholder string
+	field       func(fm *Frontmatter) string
+}
 
-## Decision
-<!-- TODO: what was decided, stated plainly -->
+func fieldDo(fm *Frontmatter) string   { return fm.Do }
+func fieldDont(fm *Frontmatter) string { return fm.Dont }
+func fieldWhy(fm *Frontmatter) string  { return fm.Why }
 
-## Consequences
-<!-- TODO: trade-offs accepted; what this makes easy or hard -->
+// bodySections returns the ordered body sections for a type that is fed by do/dont/why,
+// or nil for a type that is not (entity/concept/map/note keep the fixed skeleton from
+// bodyTemplate).
+//
+// The mapping is the SAME shape for all three flywheel types, because do/dont/why mean
+// the same three things everywhere in Mesh (ORGANIZATION.md: a decision/gotcha's
+// "required body" is literally "**Do:** ... **Don't:** ... **Why:** ..."):
+//
+//   - why is the causal, explanatory field -> the type's causal section
+//     (Context / Cause / Root cause).
+//   - do is the actionable recommendation -> the type's action section
+//     (Decision / Fix / Follow-ups).
+//   - dont is the cautionary field, which in practice describes what goes wrong when the
+//     advice is ignored -> the type's consequence section
+//     (Consequences / Symptom / Impact).
+//
+// post-mortem has a fourth section, "What happened", with no corresponding field: it is
+// the plain narrative of the incident, and do/dont/why carry judgments (a recommendation,
+// a warning, a reason), not a timeline. It keeps its TODO placeholder even when the other
+// three sections are filled, on purpose: inventing a fourth field's content from the
+// other three would be fabrication, and an honest gap is better than invented history
+// (see the post-mortem on the 65 title-only note stubs: guidance that cannot be sourced
+// from the note itself must never be authored on the note's behalf).
+func bodySections(t NoteType) []bodySection {
+	switch t {
+	case TypeDecision:
+		return []bodySection{
+			{"Context", "<!-- TODO: what forced a decision; the situation and constraints -->", fieldWhy},
+			{"Decision", "<!-- TODO: what was decided, stated plainly -->", fieldDo},
+			{"Consequences", "<!-- TODO: trade-offs accepted; what this makes easy or hard -->", fieldDont},
+			{"Related", "<!-- linked notes from the related: field render in the graph -->", nil},
+		}
+	case TypeGotcha:
+		return []bodySection{
+			{"Symptom", "<!-- TODO: how the problem shows up -->", fieldDont},
+			{"Cause", "<!-- TODO: the root cause -->", fieldWhy},
+			{"Fix", "<!-- TODO: the resolution or workaround -->", fieldDo},
+		}
+	case TypePostMortem:
+		return []bodySection{
+			{"What happened", "<!-- TODO: the incident, plainly -->", nil},
+			{"Impact", "<!-- TODO: who or what was affected and for how long -->", fieldDont},
+			{"Root cause", "<!-- TODO: the underlying cause, not just the trigger -->", fieldWhy},
+			{"Follow-ups", "<!-- TODO: concrete actions, owners, dates -->", fieldDo},
+		}
+	default:
+		return nil
+	}
+}
 
-## Related
-<!-- linked notes from the related: field render in the graph -->
-`
-
-const tmplGotcha = `## Symptom
-<!-- TODO: how the problem shows up -->
-
-## Cause
-<!-- TODO: the root cause -->
-
-## Fix
-<!-- TODO: the resolution or workaround -->
-`
-
-const tmplPostMortem = `## What happened
-<!-- TODO: the incident, plainly -->
-
-## Impact
-<!-- TODO: who or what was affected and for how long -->
-
-## Root cause
-<!-- TODO: the underlying cause, not just the trigger -->
-
-## Follow-ups
-<!-- TODO: concrete actions, owners, dates -->
-`
+// renderSections fills each heading with its mapped frontmatter field when the author
+// supplied real content, and its placeholder comment otherwise. Unfilled is the SAME
+// predicate lint and the indexer use for "the author left this blank" (empty, or the
+// literal "TODO" sentinel the scaffold writes), so a section and its frontmatter field can
+// never disagree about whether they are filled.
+func renderSections(fm *Frontmatter, sections []bodySection) string {
+	parts := make([]string, len(sections))
+	for i, s := range sections {
+		content := s.placeholder
+		if s.field != nil {
+			if v := strings.TrimSpace(s.field(fm)); !Unfilled(v) {
+				content = v
+			}
+		}
+		parts[i] = "## " + s.heading + "\n" + content
+	}
+	return strings.Join(parts, "\n\n") + "\n"
+}
 
 const tmplNote = `## Overview
 <!-- TODO: the substance of this note -->

@@ -158,3 +158,68 @@ func TestCreateNoteCollisionSuffixes(t *testing.T) {
 		t.Errorf("collision id = %q, want same-title-2", b.ID)
 	}
 }
+
+// A note authored with do/dont/why must carry that content in its BODY, under the
+// type's real headings, not leave a TODO skeleton while the only copy of the content
+// sits in frontmatter. Every agent write-back had that shape, so a reader saw a wall of
+// YAML followed by four empty sections.
+func TestRenderedBodyCarriesAuthoredContent(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		noteType NoteType
+		wantPair [][2]string // heading -> content that must appear under it
+	}{
+		{"decision", TypeDecision, [][2]string{{"## Context", "BECAUSE-WHY"}, {"## Decision", "THE-DO"}, {"## Consequences", "THE-DONT"}}},
+		{"gotcha", TypeGotcha, [][2]string{{"## Symptom", "THE-DONT"}, {"## Cause", "BECAUSE-WHY"}, {"## Fix", "THE-DO"}}},
+		{"post-mortem", TypePostMortem, [][2]string{{"## Impact", "THE-DONT"}, {"## Root cause", "BECAUSE-WHY"}, {"## Follow-ups", "THE-DO"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := CreateNote(t.TempDir(), NewNoteSpec{
+				Type: tc.noteType, Title: "A note", Do: "THE-DO", Dont: "THE-DONT", Why: "BECAUSE-WHY",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(res.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, body, had := SplitFrontmatter(string(data))
+			if !had {
+				t.Fatal("note has no frontmatter block")
+			}
+			for _, hp := range tc.wantPair {
+				heading, content := hp[0], hp[1]
+				i := strings.Index(body, heading)
+				if i < 0 {
+					t.Fatalf("body missing heading %q:\n%s", heading, body)
+				}
+				rest := body[i:]
+				if j := strings.Index(rest[len(heading):], "\n## "); j >= 0 {
+					rest = rest[:len(heading)+j]
+				}
+				if !strings.Contains(rest, content) {
+					t.Errorf("section %q does not carry %q (the content is stranded in frontmatter):\n%s", heading, content, rest)
+				}
+				if strings.Contains(rest, "<!-- TODO") {
+					t.Errorf("section %q still holds a TODO stub despite authored content:\n%s", heading, rest)
+				}
+			}
+		})
+	}
+}
+
+// An unauthored note must still scaffold its TODO skeleton, so `mesh new` keeps
+// prompting a human for what to write.
+func TestRenderedBodyKeepsSkeletonWhenUnauthored(t *testing.T) {
+	res, err := CreateNote(t.TempDir(), NewNoteSpec{Type: TypeGotcha, Title: "Empty one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(res.Path)
+	for _, want := range []string{"## Symptom", "## Cause", "## Fix", "<!-- TODO"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("scaffold lost %q for an unauthored note:\n%s", want, data)
+		}
+	}
+}
