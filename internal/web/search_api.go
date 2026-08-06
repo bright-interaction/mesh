@@ -4,6 +4,7 @@
 package web
 
 import (
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -60,10 +61,33 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "read failed", http.StatusInternalServerError)
 		return
 	}
-	// html is server-rendered (gomarkdown) so every reader shows formatted prose. Note
-	// bodies are UNTRUSTED (ingested connector content can carry raw HTML), so render
-	// with the sanitising path; markdown is kept verbatim for any raw consumer.
-	writeJSON(w, map[string]any{"id": id, "path": rel, "markdown": string(data), "html": renderMDSafe(data)})
+	// Split the YAML frontmatter off before rendering, so the reader only shows prose,
+	// not "id: ...\ntitle: ..." dumped as markdown text above the note. markdown stays
+	// the full raw file (unchanged) for any existing caller; body/meta are the new,
+	// separated pieces. A frontmatter parse error is logged and degrades to an empty
+	// meta rather than failing the whole note fetch.
+	fmYAML, body, _ := vault.SplitFrontmatter(string(data))
+	meta := map[string]any{}
+	if fm, _, ferr := vault.ParseFrontmatter([]byte(fmYAML)); ferr != nil {
+		slog.Warn("mesh ui: note frontmatter did not parse", "id", id, "path", rel, "error", ferr)
+	} else {
+		meta = map[string]any{
+			"title": fm.Title, "type": fm.Type, "when": fm.When, "severity": fm.Severity,
+			"tags": fm.Tags, "scope": fm.Scope, "confidence": fm.Confidence, "source": fm.Source,
+			"related": fm.Related, "do": fm.Do, "dont": fm.Dont, "why": fm.Why,
+		}
+	}
+	// html is server-rendered (gomarkdown) from the body only, so the frontmatter never
+	// shows up as prose above the content. Note bodies are UNTRUSTED (ingested connector
+	// content can carry raw HTML), so render with the sanitising path; markdown is kept
+	// verbatim (full file, frontmatter included) for any raw consumer.
+	writeJSON(w, map[string]any{
+		"id": id, "path": rel,
+		"markdown": string(data),
+		"body":     body,
+		"meta":     meta,
+		"html":     renderMDSafe([]byte(body)),
+	})
 }
 
 // scopeIntersect reports whether a note's scopes intersect the allowed set. Empty
