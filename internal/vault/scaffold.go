@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -110,11 +111,9 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	id, path := uniquePath(dir, base)
 	date := Now().Format("2006-01-02")
 
 	fm := &Frontmatter{
-		ID:         id,
 		Type:       spec.Type,
 		Title:      title,
 		When:       date,
@@ -140,38 +139,56 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		fm.Do, fm.Dont, fm.Why = spec.Do, spec.Dont, spec.Why
 	}
 
-	content, err := renderNote(fm, spec.By)
-	if err != nil {
-		return nil, err
+	// Claim the filename by CREATING it, and let the id follow the claim. The old shape
+	// picked a free path with os.Stat and then wrote it with os.WriteFile, which is
+	// check-then-act: two agents writing back the same title concurrently both saw the
+	// base path free, both rendered `id: <base>`, and the second write TRUNCATED the
+	// first. Both got a success receipt naming a note that no longer existed - silent
+	// loss of exactly the write-back the flywheel exists to capture, and reachable from
+	// any concurrent caller (mesh mcp --http, the hub's /mcp, internal/web/pending_api).
+	// O_EXCL makes the claim atomic, so a loser sees ErrExist and takes the next suffix.
+	for n := 1; n <= maxIDAttempts; n++ {
+		id := base
+		if n > 1 {
+			id = fmt.Sprintf("%s-%d", base, n)
+		}
+		path := filepath.Join(dir, id+".md")
+		fm.ID = id
+
+		content, err := renderNote(fm, spec.By)
+		if err != nil {
+			return nil, err
+		}
+		// Guard: a note whose frontmatter does not re-parse would be silently dropped
+		// from the index (invalid YAML removes it from search and the graph with no
+		// warning). yaml.Marshal quotes values correctly today, so this should never
+		// fire, but it makes that a hard invariant: Mesh's own tools never write a note
+		// that would vanish.
+		if err := validateRoundTrip(content, id); err != nil {
+			return nil, err
+		}
+
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			continue // taken, by an earlier note or by a concurrent writer
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, err := f.Write([]byte(content)); err != nil {
+			f.Close()
+			return nil, err
+		}
+		if err := f.Close(); err != nil {
+			return nil, err
+		}
+		return &CreateResult{Path: path, ID: id, When: date, TODOs: fm.Validate()}, nil
 	}
-	// Guard: a note whose frontmatter does not re-parse would be silently dropped
-	// from the index (invalid YAML removes it from search and the graph with no
-	// warning). yaml.Marshal quotes values correctly today, so this should never
-	// fire, but it makes that a hard invariant: Mesh's own tools never write a note
-	// that would vanish.
-	if err := validateRoundTrip(content, id); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return nil, err
-	}
-	return &CreateResult{Path: path, ID: id, When: date, TODOs: fm.Validate()}, nil
+	return nil, fmt.Errorf("could not claim a free id for %q after %d attempts", base, maxIDAttempts)
 }
 
-func uniquePath(dir, base string) (id, path string) {
-	id = base
-	path = filepath.Join(dir, id+".md")
-	for n := 2; fileExists(path); n++ {
-		id = fmt.Sprintf("%s-%d", base, n)
-		path = filepath.Join(dir, id+".md")
-	}
-	return id, path
-}
-
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
+// maxIDAttempts bounds the suffix search so a pathological directory cannot spin forever.
+const maxIDAttempts = 1000
 
 func orTODO(s string) string {
 	if strings.TrimSpace(s) == "" {

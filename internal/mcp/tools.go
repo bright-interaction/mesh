@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -622,7 +623,13 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 	// would otherwise get a bare span of third-party prose with nothing saying so.
 	src, srcURL := frontmatterProvenance(body)
 	if a.Anchor != "" {
-		body = sectionByAnchor(body, a.Anchor)
+		sec, ok := sectionByAnchor(body, a.Anchor)
+		if !ok {
+			return nil, &rpcError{Code: codeInvalidParams, Message: fmt.Sprintf(
+				"note %q has no section with anchor %q; available anchors: %s",
+				a.ID, a.Anchor, strings.Join(anchorsOf(body), ", "))}
+		}
+		body = sec
 	}
 	// Connector-ingested text is data, not instructions. Wrap it in the envelope the
 	// contract describes so the agent has an explicit boundary. The frontmatter source
@@ -647,9 +654,11 @@ func (s *Server) toolGodNodes(ctx context.Context, raw json.RawMessage) (any, *r
 		Limit int `json:"limit"`
 	}
 	json.Unmarshal(raw, &a)
-	if a.Limit <= 0 {
-		a.Limit = 10
-	}
+	// Cap it like every other limit-taking tool. This was the one that called neither
+	// clampLimit nor anything else, so mesh_god_nodes{"limit":1000000} returned the whole
+	// note corpus as "hubs" - the orientation call, the one an agent makes FIRST, was the
+	// one that could blow out its context before it had read anything.
+	a.Limit = clampLimit(a.Limit, 10, 100)
 	type hub struct {
 		ID        string `json:"id"`
 		Title     string `json:"title"`
@@ -845,8 +854,11 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 const flywheelReuseGap = 600 // seconds (10 min)
 
 // sectionByAnchor returns the markdown of the heading section whose slug matches
-// anchor (from that heading until the next heading of the same or higher level).
-func sectionByAnchor(body, anchor string) string {
+// anchor (from that heading until the next heading of the same or higher level), and
+// whether such a heading existed. A miss must NOT fall back to the whole note: this is a
+// narrowing function, and returning its unnarrowed input turned one wrong character in an
+// anchor into a multi-megabyte reply that no caller asked for and none can afford.
+func sectionByAnchor(body, anchor string) (string, bool) {
 	lines := strings.Split(body, "\n")
 	start, level := -1, 0
 	inFence := false
@@ -868,7 +880,7 @@ func sectionByAnchor(body, anchor string) string {
 		}
 	}
 	if start < 0 {
-		return body // anchor not found; hand back the whole note
+		return "", false
 	}
 	end := len(lines)
 	inFence = false
@@ -888,7 +900,32 @@ func sectionByAnchor(body, anchor string) string {
 			break
 		}
 	}
-	return strings.Join(lines[start:end], "\n")
+	return strings.Join(lines[start:end], "\n"), true
+}
+
+// anchorsOf lists the slugs a note actually offers, so an anchor miss can name the real
+// options instead of leaving the caller to guess. Slugify is ASCII-only, so a Swedish
+// heading like "## Atgarder" does not slug to anything a caller would predict; listing
+// them is what makes those sections reachable at all.
+func anchorsOf(body string) []string {
+	var out []string
+	inFence := false
+	for _, ln := range strings.Split(body, "\n") {
+		if isCodeFence(ln) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		h := strings.TrimLeft(ln, "#")
+		if lvl := len(ln) - len(h); lvl >= 1 && lvl <= 6 && strings.HasPrefix(h, " ") {
+			if s := slugify(strings.TrimSpace(h)); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // isCodeFence reports whether a line opens or closes a fenced code block (``` / ~~~).

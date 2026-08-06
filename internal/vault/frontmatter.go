@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -236,18 +237,45 @@ func Unfilled(s string) bool {
 
 func unfilled(s string) bool { return Unfilled(s) }
 
-// SplitFrontmatter separates a leading YAML frontmatter block from the body. It
-// returns the inner YAML (no --- markers), the body after the closing marker,
-// and whether a block was present.
-func SplitFrontmatter(content string) (fm string, body string, had bool) {
+// ErrUnterminatedFrontmatter is returned for a note that opens a frontmatter block
+// with --- and never closes it. That file is not "a note without frontmatter": every
+// field the author declared (type, title, tags, related, do/dont/why) silently becomes
+// body prose, so the note indexes with fabricated defaults - type note, no tags, no
+// edges, an id-as-prose title - and pollutes the graph with a record that contradicts
+// what the file plainly says. Invalid YAML inside a closed block has always been a hard
+// error; this is the same class and is now treated the same way.
+var ErrUnterminatedFrontmatter = errors.New("frontmatter opened with --- but is never closed, so every declared field (type, title, tags, related) would be read as body prose; add a closing --- line")
+
+// splitFM is the single scanner behind SplitFrontmatter and UnterminatedFrontmatter.
+// They share one pass on purpose: this vault already paid for three readers of the same
+// markdown disagreeing about where a construct begins and ends, and a second scanner that
+// answered "is this block closed" independently could drift from the one that splits it.
+func splitFM(content string) (fm, body string, had, unterminated bool) {
 	lines := strings.Split(content, "\n")
 	if len(lines) == 0 || strings.TrimRight(lines[0], "\r") != "---" {
-		return "", content, false
+		return "", content, false, false
 	}
 	for i := 1; i < len(lines); i++ {
 		if strings.TrimRight(lines[i], "\r") == "---" {
-			return strings.Join(lines[1:i], "\n"), strings.Join(lines[i+1:], "\n"), true
+			return strings.Join(lines[1:i], "\n"), strings.Join(lines[i+1:], "\n"), true, false
 		}
 	}
-	return "", content, false
+	return "", content, false, true
+}
+
+// SplitFrontmatter separates a leading YAML frontmatter block from the body. It
+// returns the inner YAML (no --- markers), the body after the closing marker,
+// and whether a block was present. An unterminated block reports had=false; callers
+// that must tell that apart from "no frontmatter at all" ask UnterminatedFrontmatter.
+func SplitFrontmatter(content string) (fm string, body string, had bool) {
+	fm, body, had, _ = splitFM(content)
+	return fm, body, had
+}
+
+// UnterminatedFrontmatter reports whether content opens a frontmatter block that is
+// never closed. Callers that write or index a note must refuse it rather than treat it
+// as an unlabeled note; see ErrUnterminatedFrontmatter.
+func UnterminatedFrontmatter(content string) bool {
+	_, _, _, unterminated := splitFM(content)
+	return unterminated
 }

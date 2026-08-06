@@ -35,6 +35,15 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Refuse an unclosed block. Migrating it takes the !had branch below and prepends a
+	// SECOND, closed block declaring type: note, demoting the author's real declaration to
+	// body prose and reporting success - which turns one missing line into a note that
+	// authoritatively lies about itself. writeNoteChecked cannot catch it: the output it
+	// inspects has perfectly valid frontmatter. This is exactly what `mesh lint` used to
+	// recommend for such a note.
+	if UnterminatedFrontmatter(string(data)) {
+		return nil, fmt.Errorf("%s: %w", path, ErrUnterminatedFrontmatter)
+	}
 	fmText, body, had := SplitFrontmatter(string(data))
 	fm, raw, err := ParseFrontmatter([]byte(fmText))
 	if err != nil {
@@ -110,6 +119,12 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 	if err != nil {
 		return nil, err
 	}
+	// Same refusal as MigrateFile: this writer carries the identical !had branch, so it
+	// corrupts an unclosed-frontmatter note the same way. Fixing only one of the two is
+	// the half-migration this repo keeps paying for.
+	if UnterminatedFrontmatter(string(data)) {
+		return nil, fmt.Errorf("%s: %w", path, ErrUnterminatedFrontmatter)
+	}
 	fmText, body, had := SplitFrontmatter(string(data))
 	_, raw, err := ParseFrontmatter([]byte(fmText))
 	if err != nil {
@@ -156,7 +171,7 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 	}
 	fmText, body, had := SplitFrontmatter(string(data))
 	if !had {
-		return nil, fmt.Errorf("%s: no frontmatter block; refusing to rewrite", path)
+		return nil, noFrontmatterErr(path, string(data))
 	}
 	_, raw, err := ParseFrontmatter([]byte(fmText))
 	if err != nil {
@@ -223,7 +238,7 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 	}
 	fmText, body, had := SplitFrontmatter(string(data))
 	if !had {
-		return nil, fmt.Errorf("%s: no frontmatter block; refusing to rewrite", path)
+		return nil, noFrontmatterErr(path, string(data))
 	}
 	fm, _, err := ParseFrontmatter([]byte(fmText))
 	if err != nil {
@@ -265,6 +280,16 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+// noFrontmatterErr names which of the two shapes a had=false file actually is. They need
+// different fixes and "no frontmatter block" describes only one of them: it sends an author
+// off to add a block that is already there, when the real repair is one missing closing ---.
+func noFrontmatterErr(path, content string) error {
+	if UnterminatedFrontmatter(content) {
+		return fmt.Errorf("%s: %w", path, ErrUnterminatedFrontmatter)
+	}
+	return fmt.Errorf("%s: no frontmatter block; refusing to rewrite", path)
 }
 
 // writeNoteChecked is the single guarded write path for a note Mesh authors itself. It

@@ -71,7 +71,14 @@ func newClient(timeout time.Duration, allowPrivate bool) *http.Client {
 			// Anthropic, X-Flare-Key for ingest), so on a redirect to a different host those
 			// would be replayed to the target and leak the key. Strip them when the host
 			// changes; a same-host redirect keeps them so a normal 30x still authenticates.
-			if len(via) > 0 && req.URL.Host != via[len(via)-1].URL.Host {
+			// Compare against the ORIGINAL host, not the previous hop. Go's
+			// makeHeadersCopier re-copies from the initial request's header map on every
+			// hop and runs before CheckRedirect, so a header deleted at hop 1 is restored
+			// at hop 2 - and hop 2 back to the attacker's own host is same-host, so the
+			// old previous-hop test did not fire and handed the key straight over. Two
+			// hops are free inside the 3-redirect budget, so one open redirect on a
+			// trusted host was enough. Once off-origin, stay stripped for the whole chain.
+			if len(via) > 0 && req.URL.Host != via[0].URL.Host {
 				for _, h := range []string{"X-Api-Key", "Anthropic-Version", "X-Flare-Key", "X-Api-Token"} {
 					req.Header.Del(h)
 				}

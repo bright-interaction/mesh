@@ -4,6 +4,7 @@
 package index
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -113,6 +114,15 @@ func ParseFile(path string) (*ParsedNote, error) {
 // and tags inside fenced code blocks, inline code spans, and HTML comments are
 // ignored.
 func Parse(path string, data []byte) (*ParsedNote, error) {
+	// Refuse an unclosed block instead of indexing the note with defaults. Left alone,
+	// SplitFrontmatter hands back the whole file as body, ParseFrontmatter stamps
+	// type: note onto an empty struct, and Parse returns no error at all - so the note
+	// never reaches FileError, never reaches DroppedNotes, and never reaches mesh health.
+	// A decision indexed as an untagged, unlinked note is worse than one that refuses to
+	// index, because nothing anywhere says it went wrong.
+	if vault.UnterminatedFrontmatter(string(data)) {
+		return nil, fmt.Errorf("frontmatter: %w", vault.ErrUnterminatedFrontmatter)
+	}
 	fmText, body, _ := vault.SplitFrontmatter(string(data))
 	fm, raw, err := vault.ParseFrontmatter([]byte(fmText))
 	if err != nil {
