@@ -127,7 +127,12 @@ func fillNoteBodies(root string, files []string, apply bool) error {
 	if !apply {
 		fmt.Println("dry run (pass --apply to write); scanning for TODO-skeleton bodies with filled frontmatter")
 	}
-	var changed, skipped int
+	// failed, not "skipped". This counter was named skipped but only ever incremented
+	// on an error, and the function returned nil regardless, so a run that failed on
+	// every note printed the failures and exited 0 and every script wrapping it read a
+	// no-op as success. `mesh migrate` and `mesh scope backfill` were fixed to exit
+	// non-zero on the same shape; this one is their twin and was left behind.
+	var changed, failed int
 	for _, path := range files {
 		rel := path
 		if r, err := filepath.Rel(root, path); err == nil {
@@ -136,7 +141,7 @@ func fillNoteBodies(root string, files []string, apply bool) error {
 		res, err := vault.BackfillBodyFile(path, !apply)
 		if err != nil {
 			fmt.Printf("  !! %s: %v\n", rel, err)
-			skipped++
+			failed++
 			continue
 		}
 		if !res.Changed {
@@ -153,12 +158,15 @@ func fillNoteBodies(root string, files []string, apply bool) error {
 		verb = "filled"
 	}
 	fmt.Printf("\n%s %d note body(ies)", verb, changed)
-	if skipped > 0 {
-		fmt.Printf(", skipped %d", skipped)
+	if failed > 0 {
+		fmt.Printf(", failed on %d", failed)
 	}
 	fmt.Println()
 	if apply && changed > 0 {
 		fmt.Printf("run `mesh index %s` to pick the new bodies up\n", root)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d note(s) failed to fill", failed, len(files))
 	}
 	return nil
 }
@@ -195,7 +203,14 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 	if !apply {
 		fmt.Printf("%d orphan(s); proposing up to 3 links each (dry run, pass --apply to write)\n\n", len(orphans))
 	}
-	var changed, skipped int
+	// One counter used to absorb three unrelated outcomes: "retrieval found no
+	// candidate links" (benign, the note simply has no neighbours yet), "the note
+	// already declares related" (benign, and the whole point of the idempotence), and
+	// "the write failed" (an error). Summing them made the number meaningless, and
+	// because the third was buried in it the function could fail on every note, print
+	// each failure, and still return nil. Splitting the counters is what makes a
+	// non-zero exit possible at all, so it has to come first.
+	var changed, noLinks, alreadyRelated, failed int
 	for _, f := range orphans {
 		path := filepath.Join(root, f.Path)
 		id := strings.TrimSuffix(filepath.Base(f.Path), filepath.Ext(f.Path))
@@ -205,17 +220,17 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 		query := strings.ReplaceAll(id, "-", " ")
 		links := relate.Derive(cmd.Context(), rt, ig, query, id, relate.TagsOf(ig, id), 3)
 		if len(links) == 0 {
-			skipped++
+			noLinks++
 			continue
 		}
 		res, err := vault.BackfillRelatedFile(path, links, !apply)
 		if err != nil {
 			fmt.Printf("  !! %s: %v\n", f.Path, err)
-			skipped++
+			failed++
 			continue
 		}
 		if !res.Changed {
-			skipped++
+			alreadyRelated++
 			continue
 		}
 		changed++
@@ -228,9 +243,16 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 	if apply {
 		verb = "wired"
 	}
-	fmt.Printf("\n%s %d note(s), skipped %d\n", verb, changed, skipped)
+	fmt.Printf("\n%s %d note(s), skipped %d (%d with no candidate links, %d already declaring related)\n",
+		verb, changed, noLinks+alreadyRelated, noLinks, alreadyRelated)
+	if failed > 0 {
+		fmt.Printf("failed on %d note(s)\n", failed)
+	}
 	if apply && changed > 0 {
 		fmt.Printf("run `mesh index %s` to pick the new links up\n", root)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d orphan(s) failed to wire", failed, len(orphans))
 	}
 	return nil
 }

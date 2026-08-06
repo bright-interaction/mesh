@@ -39,11 +39,14 @@ func tier0AtTheBottom(n int) []Card {
 }
 
 // TestTier0ReserveHoldsACardAtSmallBudgets is the regression for reserve =
-// budget/5. A real card measures 73-76 tokens by the packer's own counter, so a
-// fifth of any budget under ~380 could not hold one and the reserve silently held
-// nothing: budget 200 gave 2 cards and 0 tier-0, budget 300 gave 4 cards and 0
-// tier-0, on a set with two tier-0 candidates. Only a budget <= 0 gets the 8000
-// default, so caller-supplied small budgets pass straight through.
+// budget/5. Measured on this fixture with the packer's own cardTokens, a card is 127
+// tokens, so a fifth of any budget under 635 could not hold one and the reserve
+// silently held nothing: budget 200 gave 1 card and 0 tier-0, budget 300 gave 2 cards
+// and 0 tier-0, budget 400 gave 3 cards and 0 tier-0, on a set with two tier-0
+// candidates. (An earlier version of this comment claimed 73-76 tokens per card and a
+// ~380 threshold; nothing in the package reproduces those, and every derived number
+// was wrong with them.) Only a budget <= 0 gets the 8000 default, so caller-supplied
+// small budgets pass straight through.
 func TestTier0ReserveHoldsACardAtSmallBudgets(t *testing.T) {
 	cards := tier0AtTheBottom(12)
 	tests := []struct {

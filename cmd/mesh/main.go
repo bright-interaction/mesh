@@ -723,14 +723,48 @@ func healthCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Every finding above is computed from INDEX ROWS, and a note that will not
+			// parse never became a row. So health used to print "vault healthy" and exit
+			// 0 for a vault whose every note was unparseable: nothing to have a dead ref,
+			// nothing to be overdue, nothing to contradict anything. That is the same
+			// blind spot `mesh doctor` had (it discarded the []FileError from ParseFiles),
+			// and doctor was fixed while its twin here was not.
+			//
+			// A note that does not parse is invisible to search, to the graph, and to
+			// every check below, which outranks any lifecycle finding: the content is
+			// simply not in the knowledge base. It is read from the FILES, not the index,
+			// because the index is exactly what it is missing from.
+			files, werr := vault.Walk(root)
+			if werr != nil {
+				return werr
+			}
+			_, ferrs := index.ParseFiles(files, 0)
+			if len(ferrs) > 0 {
+				fmt.Printf("health: BROKEN - %d note(s) do not parse, so they are invisible to search, "+
+					"to the graph, and to every lifecycle check below\n  fix: mesh lint %s\n\n", len(ferrs), root)
+				for _, fe := range ferrs {
+					rel := fe.Path
+					if r, rerr := filepath.Rel(root, fe.Path); rerr == nil {
+						rel = r
+					}
+					fmt.Printf("  [unparseable] %s - %v\n", rel, fe.Err)
+				}
+				fmt.Println()
+			}
 			if len(findings) == 0 {
-				fmt.Println("vault healthy: no dead refs, overdue reviews, or contradictions")
-				return nil
+				if len(ferrs) == 0 {
+					fmt.Println("vault healthy: no dead refs, overdue reviews, or contradictions")
+					return nil
+				}
+				return fmt.Errorf("%d note(s) invisible to search", len(ferrs))
 			}
 			fmt.Printf("health: %d dead refs, %d overdue, %d contradictions\n\n",
 				counts["dead_ref"], counts["overdue"], counts["contradiction"])
 			for _, f := range findings {
 				fmt.Printf("  [%s] %s - %s\n", f.Issue, f.Path, f.Detail)
+			}
+			if len(ferrs) > 0 {
+				return fmt.Errorf("%d note(s) invisible to search", len(ferrs))
 			}
 			return nil
 		},
@@ -1639,15 +1673,8 @@ func syncCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				fmt.Printf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)\n", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
-				for _, sib := range sum.ConflictSiblings {
-					fmt.Printf("  conflict: hub version kept; your version saved at %s (resolve, then sync)\n", sib)
-				}
-				for _, sib := range sum.Protected {
-					fmt.Printf("  protected your unsaved local edit; incoming hub version saved at %s\n", sib)
-				}
-				for _, rej := range sum.Rejected {
-					fmt.Printf("  rejected by hub (no write permission, scope, or too large): %s -- kept local, will retry\n", rej)
+				for _, line := range syncSummaryLines(sum) {
+					fmt.Println(line)
 				}
 				return nil
 			}
@@ -1690,17 +1717,13 @@ func syncCmd() *cobra.Command {
 					}
 					// Log a sync-centric line ourselves only when something moved, then
 					// return Reindexed:false so the watcher does not also log its
-					// generic reindex line.
-					if sum.Pushed > 0 || sum.Pulled > 0 || sum.Conflicts > 0 || len(sum.Protected) > 0 || len(sum.Rejected) > 0 {
-						logf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
-						for _, sib := range sum.ConflictSiblings {
-							logf("  conflict: hub version kept; your version saved at %s", sib)
-						}
-						for _, sib := range sum.Protected {
-							logf("  protected your local edit; incoming hub version saved at %s", sib)
-						}
-						for _, rej := range sum.Rejected {
-							logf("  rejected by hub (permission/scope/too large): %s -- kept local, will retry", rej)
+					// generic reindex line. The lines come from the SAME renderer the
+					// one-shot path uses: these two had already drifted into two
+					// wordings of the same four lines, which is how one of them ends up
+					// with a fix the other never gets.
+					if syncSummaryMoved(sum) {
+						for _, line := range syncSummaryLines(sum) {
+							logf("%s", line)
 						}
 					}
 					return watch.Result{Reindexed: false}, nil
@@ -1714,6 +1737,58 @@ func syncCmd() *cobra.Command {
 	c.Flags().DurationVar(&debounce, "debounce", 500*time.Millisecond, "quiet window to coalesce a burst of local saves before syncing")
 	c.Flags().DurationVar(&reconcile, "reconcile", 60*time.Second, "periodic safety-net sync interval (0 to disable)")
 	return c
+}
+
+// syncSummaryLines renders one sync round for the operator: a headline, then one
+// indented line per thing that needs a decision. Shared by the one-shot path and the
+// --watch loop, which had drifted into two different wordings of the same four lines.
+//
+// The Remaining line is the operator half of the bounded-batch fix. SyncVault caps how
+// many dirty notes one round pushes and defers the rest (Summary.Remaining), but
+// Remaining was set and then read by nobody outside the tests, so a user with 12000
+// dirty notes saw "synced: pushed 4000, pulled 0, 0 conflict(s)" and had no way to
+// learn that 8000 edits were still local and invisible to the team. A number nobody
+// prints is the same as no fix at all, so it says what to do next, not just a count.
+func syncSummaryLines(sum meshclient.Summary) []string {
+	lines := syncHeadlineLines(sum)
+	for _, sib := range sum.ConflictSiblings {
+		lines = append(lines, fmt.Sprintf("  conflict: hub version kept; your version saved at %s (resolve, then sync)", sib))
+	}
+	for _, sib := range sum.Protected {
+		lines = append(lines, fmt.Sprintf("  protected your unsaved local edit; incoming hub version saved at %s", sib))
+	}
+	for _, rej := range sum.Rejected {
+		lines = append(lines, fmt.Sprintf("  rejected by hub (no write permission, scope, or too large): %s -- kept local, will retry", rej))
+	}
+	return lines
+}
+
+// syncHeadlineLines renders the part of a sync round that is true wherever the round
+// was triggered from: what moved, and whether the push was complete.
+//
+// It is split out because there is a THIRD caller of SyncVault in the CLI besides
+// `mesh sync` and its --watch loop: `mesh conflicts resolve --take-mine` pushes the
+// version it just restored. That one had its own hand-rolled copy of the headline
+// format and therefore never grew the remainder line either, so resolving a conflict
+// on a vault with a deferred backlog printed a headline that read complete. One
+// format string, three callers; TestSyncHeadlineHasOneRenderer fails on a fourth copy.
+func syncHeadlineLines(sum meshclient.Summary) []string {
+	lines := []string{fmt.Sprintf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)",
+		sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))}
+	if sum.Remaining > 0 {
+		lines = append(lines, fmt.Sprintf("  %d more changed note(s) are still queued and NOT on the hub yet "+
+			"(one round pushes a bounded batch); run `mesh sync` again to send them", sum.Remaining))
+	}
+	return lines
+}
+
+// syncSummaryMoved reports whether a round is worth a log line under --watch, which
+// idles at a periodic reconcile and would otherwise print a no-op every tick.
+// Remaining counts: a round that pushed a full batch and deferred the rest has moved,
+// and the deferred tail is exactly what the operator needs to be told about.
+func syncSummaryMoved(sum meshclient.Summary) bool {
+	return sum.Pushed > 0 || sum.Pulled > 0 || sum.Conflicts > 0 ||
+		sum.Remaining > 0 || len(sum.Protected) > 0 || len(sum.Rejected) > 0
 }
 
 func short8(s string) string {

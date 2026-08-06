@@ -64,12 +64,12 @@ func TotalTokens(cards []Card) int {
 // Raising it cannot overrun: reserve is capped at the budget, and pass B still
 // measures against the full budget.
 //
-// Known residual: below one FULL card's cost the reserve still holds nothing, because
-// pass A only ever measures the full form while pass B may degrade a card to the
-// compact (no-snippet) one. On the same fixture a budget of 100 returns one ordinary
-// compact card and no tier-0 card, even though a compact tier-0 card would have fit.
-// Closing that means teaching pass A to degrade too, which is a wider change than
-// this reserve.
+// Between the compact and the full cost the reserve measures the COMPACT form,
+// because packToBudget can emit that form and a reserve that only ever priced the
+// full one held nothing across the whole band. Measured on the same fixture: a
+// compact card is 81 tokens, so at budget 100 pass A used to take nothing and the
+// caller got one ordinary compact card and zero tier-0 cards even though a compact
+// tier-0 card fit. It now gets the tier-0 card.
 func tier0Reserve(cards []Card, budget int) int {
 	reserve := budget / 5
 	for _, c := range cards {
@@ -77,10 +77,15 @@ func tier0Reserve(cards []Card, budget int) int {
 			continue
 		}
 		// Cards arrive sorted by score desc, so this is the best tier-0 card that can
-		// fit at all. One that cannot fit the whole budget would not fit any reserve.
+		// fit at all. Price the full form first and fall back to the compact one, which
+		// is what pass A will place when the full form overruns the whole budget. A
+		// card whose compact form still does not fit cannot be reserved for at all.
 		n := cardTokens(c)
 		if n > budget {
-			continue
+			n = cardTokens(compact(c))
+			if n > budget {
+				continue
+			}
 		}
 		if n > reserve {
 			reserve = n
@@ -88,6 +93,13 @@ func tier0Reserve(cards []Card, budget int) int {
 		break
 	}
 	return reserve
+}
+
+// compact is the no-snippet form of a card: the degraded shape both packing passes
+// fall back to when the full form will not fit.
+func compact(c Card) Card {
+	c.Snippet = ""
+	return c
 }
 
 // packToBudget selects the highest-scoring cards that fit the token budget,
@@ -105,13 +117,30 @@ func packToBudget(cards []Card, budget int) []Card {
 
 	// cardTokens now marshals the card, so each call is a real BPE tokenization.
 	// Measure each form once and reuse the number instead of re-counting it.
-	// Pass A: reserve room for the best tier-0 cards (full form).
+	// Pass A: reserve room for the best tier-0 cards. Full form first; when the full
+	// form does not fit the whole BUDGET, fall back to the compact one, matching what
+	// pass B would emit. The budget test is what keeps this from costing snippets: a
+	// full card the budget can afford is left for pass B to place whole, so the
+	// degradation only ever happens where the alternative is no tier-0 card at all.
 	for i, c := range cards {
+		if !c.Tier0 {
+			continue
+		}
 		n := cardTokens(c)
-		if c.Tier0 && used+n <= reserve {
+		if used+n <= reserve {
 			picked[i] = c
 			taken[i] = true
 			used += n
+			continue
+		}
+		if n <= budget {
+			continue
+		}
+		cc := compact(c)
+		if cn := cardTokens(cc); used+cn <= reserve {
+			picked[i] = cc
+			taken[i] = true
+			used += cn
 		}
 	}
 	// Pass B: fill the rest by score. When a full card will not fit, degrade it
@@ -127,8 +156,7 @@ func packToBudget(cards []Card, budget int) []Card {
 			used += n
 			continue
 		}
-		cc := c
-		cc.Snippet = ""
+		cc := compact(c)
 		if n := cardTokens(cc); used+n <= budget {
 			picked[i] = cc
 			taken[i] = true
@@ -150,7 +178,7 @@ func packToBudget(cards []Card, budget int) []Card {
 	if len(out) == 0 && len(cards) > 0 {
 		best := cards[0]
 		if cardTokens(best) > budget {
-			best.Snippet = ""
+			best = compact(best)
 		}
 		out = append(out, best)
 	}

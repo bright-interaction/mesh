@@ -489,7 +489,22 @@ func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]s
 // survives and the note's bytes do not, the note reverts locally while state.Hashes
 // records the new hash, and the next round pushes the OLD bytes as an upsert that
 // the hub fast-forwards, reverting the team's copy with no conflict and no sibling.
-// internal/hub/repo.go holds the identical twin; keep the two in step.
+//
+// There are FOUR copies of this write in the tree, not two. The comment here used to
+// name only internal/hub/repo.go, and that undercount is exactly how this estate
+// keeps fixing one twin and shipping the other: the durability pass landed on this
+// file and repo.go, and the other two kept writing note bytes with no fsync at all.
+// The full list, all four fsync-before-rename plus syncDir-after-rename now:
+//
+//	pkg/meshclient/vault.go     writeFileAtomic  (this one; applies the hub's deltas)
+//	internal/hub/repo.go        writeFileAtomic  (lands a note in the hub worktree)
+//	cmd/mesh/conflicts.go       writeFileAtomic  (mesh conflicts resolve, take-mine)
+//	internal/curator/merge_note.go writeAtomic   (writes the curator's LLM merge)
+//
+// Keep all four in step. Do not trust this list on its own: it is a comment and a
+// comment cannot fail a build. cmd/mesh/atomic_write_durability_test.go DISCOVERS
+// every temp-create + rename writer in the tree from the AST and fails on any one
+// that does not fsync, so a fifth copy is caught the day it is written.
 func writeFileAtomic(path string, b []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

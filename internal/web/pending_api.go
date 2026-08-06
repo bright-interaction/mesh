@@ -5,10 +5,13 @@ package web
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
@@ -63,7 +66,15 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 		By:         "mesh-extract",
 	})
 	if err != nil {
-		http.Error(w, "create note failed: "+err.Error(), http.StatusInternalServerError)
+		// Never echo the raw error. Everything vault.CreateNote raises about the
+		// FILESYSTEM names the note's ABSOLUTE path, so a promote that hit an unwritable
+		// note directory answered "create note failed: open <server vault root>/gotchas/
+		// <slug>.md: permission denied" and handed a member the server's layout. Same
+		// leak internal/mcp closed on its own write path; both surfaces now call the one
+		// scrubber, so a fix to it cannot land on only one of them again. Detail stays in
+		// the server log, where it is free.
+		slog.Error("mesh ui: promoting a pending candidate failed", "id", req.ID, "type", p.Type, "error", err)
+		http.Error(w, "create note failed: "+mcp.ScrubPathsUnder(err.Error(), s.vaultRoot), http.StatusInternalServerError)
 		return
 	}
 	// Promoting a candidate IS a write-back, so stamp it in the flywheel now (source
@@ -82,7 +93,18 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 		s.cachedRetriever.Store(nil)
 		s.mu.Unlock()
 	}
-	writeJSON(w, map[string]any{"promoted": true, "id": res.ID, "path": res.Path})
+	// Return a vault-relative path, never the server's absolute filesystem path. This one
+	// leaked on EVERY successful promote, not just on an error: in member mode the caller
+	// is a remote teammate, and exposedVaultRoot already keeps the absolute root off
+	// /api/status for exactly that reason. Same relativization the MCP write path does,
+	// and the same shape /api/note already returns.
+	notePath := res.Path
+	if rel, err := filepath.Rel(s.vaultRoot, res.Path); err == nil && !strings.HasPrefix(rel, "..") {
+		notePath = rel
+	} else {
+		notePath = filepath.Base(res.Path)
+	}
+	writeJSON(w, map[string]any{"promoted": true, "id": res.ID, "path": notePath})
 }
 
 func (s *Server) handlePendingDiscard(w http.ResponseWriter, r *http.Request) {
