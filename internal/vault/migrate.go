@@ -198,6 +198,75 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 	return res, nil
 }
 
+// BackfillBodyFile repairs a note whose body is still the TODO skeleton an older Mesh
+// scaffolded (the fixed bodyTemplate text, byte-for-byte) while its do/dont/why content
+// already sits in frontmatter, unread by anyone looking at the body. It reuses
+// bodySections, the SAME type-to-heading mapping renderBody uses for brand-new notes (see
+// scaffold.go), so a repaired note converges on exactly the body CreateNote would have
+// written today instead of drifting into a second, hand-maintained mapping.
+//
+// Only decision/gotcha/post-mortem are fed by do/dont/why (bodySections returns nil for
+// every other type, so BackfillBodyFile is a no-op there). Within those, a section is only
+// touched when its body content is STILL the placeholder comment verbatim AND the mapped
+// frontmatter field has real content (Unfilled decides "real" the same way lint and the
+// scaffold do). An author who already replaced a placeholder with their own prose keeps it
+// exactly as written, even if it disagrees with the frontmatter field: this backfill fills
+// gaps, it never overwrites judgment. post-mortem's "What happened" has no mapped field
+// (bodySections leaves it nil) and is never touched, on purpose, matching renderBody.
+//
+// Idempotent: once a section holds real content it no longer matches its placeholder
+// verbatim, so a second run finds nothing left to do.
+func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	fmText, body, had := SplitFrontmatter(string(data))
+	if !had {
+		return nil, fmt.Errorf("%s: no frontmatter block; refusing to rewrite", path)
+	}
+	fm, _, err := ParseFrontmatter([]byte(fmText))
+	if err != nil {
+		return nil, err
+	}
+	res := &MigrateResult{Path: path}
+	sections := bodySections(fm.Type)
+	if sections == nil {
+		return res, nil // not a flywheel type: body is not fed by do/dont/why
+	}
+
+	newBody := body
+	var filled []string
+	for _, s := range sections {
+		if s.field == nil {
+			continue
+		}
+		v := strings.TrimSpace(s.field(fm))
+		if Unfilled(v) {
+			continue // frontmatter itself has nothing real to offer yet
+		}
+		old := "## " + s.heading + "\n" + s.placeholder
+		if !strings.Contains(newBody, old) {
+			continue // not still the verbatim placeholder: authored already, or heading absent
+		}
+		newBody = strings.Replace(newBody, old, "## "+s.heading+"\n"+v, 1)
+		filled = append(filled, s.heading)
+	}
+	if len(filled) == 0 {
+		return res, nil // idempotent no-op
+	}
+	res.Changed = true
+	res.Actions = append(res.Actions, "filled body section(s): "+strings.Join(filled, ", "))
+	if dryRun {
+		return res, nil
+	}
+	out := "---\n" + fmText + "\n---\n" + newBody
+	if err := writeNoteChecked(path, out); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 // writeNoteChecked is the single guarded write path for a note Mesh authors itself. It
 // re-parses the rendered content and refuses to write when the frontmatter would not
 // come back out, because an unparseable frontmatter block removes the note from search
