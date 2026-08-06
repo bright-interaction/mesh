@@ -406,7 +406,14 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 	for _, d := range s.store.DroppedNotes() {
 		detail := ""
 		if d.Err != nil {
-			detail = d.Err.Error()
+			// The THIRD copy of the same shape, and the one that survived the sweep that
+			// closed the other two: a relativized Path sitting next to a raw error, which
+			// reads as already handled. These errors come from ParseFile, which os.ReadFile
+			// calls with the ABSOLUTE path, so an unreadable note answered
+			// detail = "open <abs vault root>/decisions/x.md: permission denied" while the
+			// path field beside it said "decisions/x.md". Duplicate-id details name only
+			// vault-relative paths, so the scrub leaves those untouched.
+			detail = ScrubPathsUnder(d.Err.Error(), s.vaultRoot)
 		}
 		kind := "unparseable"
 		if errors.Is(d.Err, index.ErrDuplicateNoteID) {
@@ -874,7 +881,7 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 			return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
 		}
 		slog.Error("mesh write: the note could not be created", "type", t, "error", err)
-		return nil, &rpcError{Code: codeInvalidParams, Message: "the note could not be written: " + scrubPaths(err.Error())}
+		return nil, &rpcError{Code: codeInvalidParams, Message: "the note could not be written: " + ScrubPathsUnder(err.Error(), s.vaultRoot)}
 	}
 	// Make the new note queryable through the INCREMENTAL path, not a full reindex.
 	// reload() re-walked and re-parsed the entire vault and rewrote every notes /
@@ -901,7 +908,12 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	if _, err := s.reconcileOnce(true); err != nil {
 		slog.Error("mesh write: the note was saved but the index did not refresh",
 			"id", res.ID, "path", res.Path, "error", err)
-		indexStale = err.Error()
+		// Scrubbed like every other message that leaves this process. This one is easy to
+		// miss because it sits right next to a "path" field that IS relativized, but the
+		// reconcile walks the vault, so its errors are filesystem errors: an unreadable
+		// subdirectory came back as "open <abs vault root>/locked: permission denied" and
+		// shipped the whole server layout inside the staleness warning.
+		indexStale = ScrubPathsUnder(err.Error(), s.vaultRoot)
 	}
 	_ = s.store.IncrMetric("writes", 1)         // ROI telemetry (best-effort)
 	_ = s.store.RecordWriteback(res.ID, source) // flywheel: stamp authoring time for reuse measurement
@@ -925,15 +937,43 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	return textResult(out), nil
 }
 
+// ScrubPathsUnder makes an error message safe to hand a caller, for a process serving the
+// vault at root. It is THE entry point for every surface: internal/web's promote handler
+// calls it too, because the identical leak shipped on both surfaces and a second private
+// copy of the logic is exactly how one of them keeps the bug after the other is fixed.
+//
+// The symlink-resolved spelling of root is scrubbed as well, because the server can be
+// started with one spelling while the kernel names the other in an error (a symlinked
+// /tmp resolves to /private/tmp on macOS).
+func ScrubPathsUnder(msg, root string) string {
+	roots := []string{root}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
+		roots = append(roots, resolved)
+	}
+	return scrubPaths(msg, roots...)
+}
+
 // scrubPaths rewrites every absolute path in an error message down to its base name, so
 // a message that reaches a remote agent cannot carry the server's directory layout.
 // It replaces rather than deletes, because the base name (the note's own slug) is the
-// part the caller supplied and the part that makes the message useful. Matching on
-// filepath.IsAbs rather than on the vault root is deliberate: the root the server was
-// started with and the root the kernel names in an error can differ (a symlinked
-// /tmp resolves to /private/tmp on macOS), and a prefix comparison would miss exactly
-// then. Full detail is logged server-side by the caller.
-func scrubPaths(msg string) string {
+// part the caller supplied and the part that makes the message useful. Full detail is
+// logged server-side by the caller.
+//
+// roots are the absolute paths this process KNOWS it serves. They are matched as
+// substrings, which is the only thing that works for a root CONTAINING A SPACE: this
+// estate's own vault lives under ".../Automation HQ/...", and the whitespace scan below
+// saw that as two tokens, rewrote the first to "<path>/Automation" and left the tail
+// ("HQ/vault/gotchas/x.md") standing, so most of the layout still shipped.
+//
+// The whitespace scan stays as the fallback for prefixes this process was never told
+// about, which is what a root-only comparison would miss.
+func scrubPaths(msg string, roots ...string) string {
+	known := append([]string(nil), roots...)
+	// Longest first, so a nested root is not half-consumed by its parent.
+	sort.Slice(known, func(i, j int) bool { return len(known[i]) > len(known[j]) })
+	for _, root := range known {
+		msg = scrubRoot(msg, root)
+	}
 	fields := strings.Fields(msg)
 	for i, f := range fields {
 		trimmed := strings.TrimRight(f, ":;,")
@@ -943,6 +983,53 @@ func scrubPaths(msg string) string {
 		fields[i] = "<path>/" + filepath.Base(trimmed) + f[len(trimmed):]
 	}
 	return strings.Join(fields, " ")
+}
+
+// scrubRoot cuts every path that STARTS at a known root down to "<path>/<base>". It scans
+// from the END of the root, so whitespace inside the root cannot end the match: that is
+// the whole reason it exists, and why tokenizing on whitespace alone was not enough.
+func scrubRoot(msg, root string) string {
+	root = strings.TrimRight(root, string(filepath.Separator))
+	// A relative root would match all over a message, and "/" trims to "" here, so both
+	// are refused rather than allowed to swallow the text.
+	if root == "" || !filepath.IsAbs(root) {
+		return msg
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(msg, root)
+		if i < 0 {
+			break
+		}
+		end := i + len(root)
+		for end < len(msg) && !endsPath(msg[end]) {
+			end++
+		}
+		span := msg[i:end]
+		tail := strings.TrimRight(span, ":;,")                      // trailing punctuation is prose, not path
+		path := strings.TrimRight(tail, string(filepath.Separator)) // "<root>/" still names the root
+		b.WriteString(msg[:i])
+		b.WriteString("<path>")
+		if base := filepath.Base(path); path != root && base != "." && base != string(filepath.Separator) {
+			b.WriteString(string(filepath.Separator))
+			b.WriteString(base)
+		}
+		b.WriteString(span[len(tail):]) // put the punctuation back
+		msg = msg[end:]
+	}
+	b.WriteString(msg)
+	return b.String()
+}
+
+// endsPath reports whether c cannot be part of a filesystem path inside an error message.
+// Whitespace and quotes end one; ':' does not, because it is both the separator in
+// "open <path>: reason" and legal in a filename, so the trailing run is trimmed instead.
+func endsPath(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '"', '\'', '`':
+		return true
+	}
+	return false
 }
 
 // flywheelReuseGap is how long after a write-back a fetch must land to count as reuse

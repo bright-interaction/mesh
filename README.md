@@ -94,6 +94,13 @@ editor and it is searchable at once, no commit, no manual `mesh index`. It
 reconciles at startup, on every change (debounced), and on a periodic safety
 tick that always converges, so a missed file event never leaves the index stale.
 
+`mesh doctor` is the one to put in CI, so treat its exit code as the contract: **0 only
+when the index is fresh and every note parsed**. It exits non-zero when the index is
+stale, when there is no index yet, and when any note fails to parse. That last one
+matters most: a note that does not parse is invisible to search and to the graph, so
+doctor names the offending files and reports `status: BROKEN` instead of a healthy
+looking summary.
+
 Already have a Foam / Obsidian-style vault? Bring it up to the Mesh schema in one idempotent pass:
 
 ```

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,13 +47,58 @@ func parseSince(s string) (time.Time, error) {
 }
 
 // reindexVault re-reads the vault and rebuilds the index so freshly imported notes
-// are immediately searchable (mirrors `mesh index`).
-func reindexVault(vaultRoot string) error {
+// are immediately searchable (mirrors `mesh index`, including how `mesh index` treats
+// a note that will not parse).
+//
+// ownedFolders are the vault-relative folders THIS ingest just wrote into (one per
+// connector, e.g. imported/github). The split matters because the two kinds of parse
+// failure are not the same event:
+//
+//   - a note under an owned folder did not parse, so the item this run just imported
+//     is invisible to search and the graph. The import produced nothing usable and
+//     must not report success; the connector's renderer is the bug.
+//   - a note elsewhere did not parse, so the vault was already damaged before this
+//     run touched it. That is real and gets printed, but failing the ingest for it
+//     would make every scheduled pull red for something the pull did not cause, and
+//     a red that is always red gets muted.
+//
+// Before this, the line read `notes, _ := index.ParseFiles(files, 0)` and neither
+// kind was mentioned at all: the run printed "reindexed; imported notes are
+// searchable" and exited 0 while the notes it had just written were in neither the
+// index nor the graph. That is the same defect `mesh doctor` carried.
+//
+// BuildGraph's issues (broken links, duplicate ids) stay unreported here on purpose:
+// they do not remove a note from search, and `mesh lint` / `mesh index` already
+// report them in full.
+func reindexVault(vaultRoot string, ownedFolders ...string) error {
 	files, err := vault.Walk(vaultRoot)
 	if err != nil {
 		return err
 	}
-	notes, _ := index.ParseFiles(files, 0)
+	notes, ferrs := index.ParseFiles(files, 0)
+	var ownedBad int
+	for _, fe := range ferrs {
+		rel := fe.Path
+		if r, rerr := filepath.Rel(vaultRoot, fe.Path); rerr == nil {
+			rel = r
+		}
+		owned := false
+		for _, folder := range ownedFolders {
+			if folder == "" {
+				continue
+			}
+			if within(filepath.ToSlash(folder), filepath.ToSlash(rel)) {
+				owned = true
+				break
+			}
+		}
+		if owned {
+			ownedBad++
+			fmt.Fprintf(os.Stderr, "ingest: just-imported note %s will not parse, so it is invisible to search and the graph: %v\n", rel, fe.Err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "warning: %s will not parse, so it stays invisible to search and the graph (it predates this import): %v\n", rel, fe.Err)
+	}
 	for _, pn := range notes {
 		if rel, err := filepath.Rel(vaultRoot, pn.Path); err == nil {
 			pn.Path = rel
@@ -65,8 +111,27 @@ func reindexVault(vaultRoot string) error {
 		return err
 	}
 	defer store.Close()
-	_, err = store.IndexVault(notes, g)
-	return err
+	if _, err := store.IndexVault(notes, g); err != nil {
+		return err
+	}
+	// Reported AFTER the index is written, not instead of it: the notes that DID
+	// parse still belong in the index, so the healthy part of the import lands and
+	// the failure is what the exit code carries.
+	if ownedBad > 0 {
+		return fmt.Errorf("%d just-imported note(s) will not parse and are invisible to search; the connector wrote them, so this is an import failure, not vault damage", ownedBad)
+	}
+	return nil
+}
+
+// within reports whether the vault-relative path rel sits inside folder. Both are
+// slash-separated. Prefix matching alone is wrong here: "imported/githubs/x.md"
+// starts with "imported/github" without being inside it.
+func within(folder, rel string) bool {
+	folder = strings.Trim(folder, "/")
+	if folder == "" {
+		return false
+	}
+	return rel == folder || strings.HasPrefix(rel, folder+"/")
 }
 
 // watchLoop runs cycle once, then repeats every f.watch until interrupted (or just
@@ -117,7 +182,7 @@ func runConnector(f ingestFlags, build func() (ingest.Connector, error)) error {
 			return err
 		}
 		fmt.Printf("ingested %d %s item(s) -> %s/ (%d written)\n", res.Pulled, conn.Name(), res.Folder, res.Written)
-		if err := reindexVault(f.vault); err != nil {
+		if err := reindexVault(f.vault, res.Folder); err != nil {
 			return err
 		}
 		fmt.Println("reindexed; imported notes are searchable")
@@ -240,6 +305,7 @@ func ingestAllCmd() *cobra.Command {
 			first := true
 			return watchLoop(f, func(ctx context.Context) error {
 				total := 0
+				var folders []string
 				for _, cc := range cfg.Connectors {
 					conn, err := cc.Build()
 					if err != nil {
@@ -257,10 +323,11 @@ func ingestAllCmd() *cobra.Command {
 					}
 					fmt.Printf("  %s: %d pulled, %d written\n", conn.Name(), res.Pulled, res.Written)
 					total += res.Written
+					folders = append(folders, res.Folder)
 				}
 				first = false
 				if total > 0 {
-					if err := reindexVault(f.vault); err != nil {
+					if err := reindexVault(f.vault, folders...); err != nil {
 						return err
 					}
 					fmt.Printf("reindexed (%d new/updated notes)\n", total)

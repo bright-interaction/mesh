@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -236,7 +237,12 @@ func conflictsResolveCmd() *cobra.Command {
 				// re-conflict the re-parked sibling is byte-identical to the original
 				// (same path/user/content), so we just report where it now lives; on a
 				// different day there may be a second sibling. Either way nothing is lost.
-				fmt.Printf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)\n", sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))
+				// Same renderer as `mesh sync` and its watch loop. This site used to
+				// hand-roll the headline, which is why it never learned to mention a
+				// deferred remainder: a bounded round here reported a complete push.
+				for _, line := range syncHeadlineLines(sum) {
+					fmt.Println(line)
+				}
 				fmt.Println("the note advanced again, so your version was re-parked (no data lost):")
 				for _, s := range sum.ConflictSiblings {
 					fmt.Printf("  %s  (review: mesh conflicts diff %s)\n", textdiff.Sanitize(s), s)
@@ -248,13 +254,35 @@ func conflictsResolveCmd() *cobra.Command {
 				return err
 			}
 			reindexBestEffort(vaultDir)
-			fmt.Printf("resolved %s: took your version and pushed it (HEAD %s).\n", textdiff.Sanitize(baseRel), short8(sum.Head))
+			for _, line := range takeMineReceipt(baseRel, sum) {
+				fmt.Println(line)
+			}
 			return nil
 		},
 	}
 	c.Flags().BoolVar(&keepBase, "keep-base", false, "accept the current note (delete your parked sibling)")
 	c.Flags().BoolVar(&takeMine, "take-mine", false, "overwrite the note with your parked version, then sync")
 	return c
+}
+
+// takeMineReceipt renders what `mesh conflicts resolve --take-mine` tells the user
+// after the push returned without a re-conflict.
+//
+// "pushed it" is only true when the round was complete. SyncVault pushes a bounded
+// batch and defers the rest, and the resolved note is an ordinary dirty path in that
+// outbox, so on a vault with a backlog it can be in the deferred tail: the sibling is
+// dropped, the receipt says the hub has the rescued version, and the hub does not.
+// Nothing is lost (the bytes are at the note's own path and stay dirty until a later
+// round sends them) but the receipt has to say so, or the user stops here believing
+// the team can see it.
+func takeMineReceipt(baseRel string, sum meshclient.Summary) []string {
+	lines := []string{fmt.Sprintf("resolved %s: took your version and pushed it (HEAD %s).",
+		textdiff.Sanitize(baseRel), short8(sum.Head))}
+	if sum.Remaining > 0 {
+		lines = append(lines, fmt.Sprintf("  the round was bounded: %d changed note(s) are still queued and "+
+			"NOT on the hub yet, and this note may be one of them; run `mesh sync` again.", sum.Remaining))
+	}
+	return lines
 }
 
 // validateSibling enforces that arg is a real conflict sibling inside vaultDir and
@@ -306,7 +334,22 @@ func reindexBestEffort(vaultDir string) {
 	}
 }
 
-// writeFileAtomic writes b to path via a temp file + rename in the same directory.
+// writeFileAtomic writes b to path via a temp file + rename in the same directory,
+// and fsyncs both the data and the parent directory so the resolved note survives a
+// power cut.
+//
+// Temp+rename alone buys crash-atomicity for a concurrent READER, not durability.
+// This is the note-byte writer for `mesh conflicts resolve`, which is the ONE place
+// where the losing side of a true conflict is restored: take-mine writes the parked
+// sibling's bytes back over the note and then deletes the sibling. If the rename
+// reaches the disk and the data blocks do not, the sibling is already gone and the
+// note reverts to the hub version, so the user's rescued edit is lost with nothing
+// left on disk to rescue it from a second time.
+//
+// This is the third of FOUR copies of this write; see the note on
+// pkg/meshclient/vault.go writeFileAtomic for the full list, and
+// TestEveryTempRenameWriterFsyncs in atomic_write_durability_test.go for the guard
+// that finds any new one.
 func writeFileAtomic(path string, b []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -322,6 +365,12 @@ func writeFileAtomic(path string, b []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
+	// Flush the data to the device BEFORE the rename publishes the name.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		return err
@@ -330,7 +379,25 @@ func writeFileAtomic(path string, b []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
+	syncDir(dir)
 	return nil
+}
+
+// syncDir fsyncs a directory so a rename that just landed in it survives a power cut.
+// Best effort on purpose: opening or fsyncing a directory handle is a no-op or an
+// error on some platforms and network filesystems (Windows cannot open one at all),
+// and that is not a failed write, so the bytes still count as written and the refusal
+// is only logged. The data itself is already fsynced by the caller.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		slog.Debug("conflicts: cannot open the note directory to fsync it", "dir", dir, "err", err)
+		return
+	}
+	if err := d.Sync(); err != nil {
+		slog.Debug("conflicts: directory fsync not supported here", "dir", dir, "err", err)
+	}
+	d.Close()
 }
 
 // siblingMeta best-effort parses the user and date out of a sibling filename for

@@ -77,8 +77,12 @@ func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (R
 	}
 	_ = dir // ensured above; RenderDoc returns a path under it
 	written := 0
+	onDisk := func(rel string) bool {
+		_, serr := os.Stat(filepath.Join(vaultRoot, filepath.FromSlash(rel)))
+		return serr == nil
+	}
 	for _, d := range docs {
-		rel, content, err := RenderDoc(c.Name(), d)
+		rel, content, err := RenderDocResolved(c.Name(), d, onDisk)
 		if err != nil {
 			return Result{}, err
 		}
@@ -96,8 +100,82 @@ func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (R
 // local CLI path. The path is deterministic per (connector, ExternalID) so a
 // re-pull upserts the same note.
 func RenderDoc(connectorName string, d Doc) (relPath string, content []byte, err error) {
+	return renderDocAs(connectorName, d, importedID(connectorName, vault.Slugify(d.ExternalID)))
+}
+
+// RenderDocResolved is RenderDoc with the legacy-path fallback: when the note this
+// doc would write to does not exist yet but the note the SAME doc was ingested to
+// under the pre-fold slug does, it re-renders that note in place, keeping both its
+// path and its frontmatter id.
+//
+// Why it is needed: the id is derived from vault.Slugify(ExternalID), and Slugify
+// learned to fold diacritics to their ASCII base ("arende-1" where it used to drop
+// the letter and produce "rende-1"). All-ASCII ids are byte-identical across that
+// change, so nothing moves for GitHub or Notion. But ExternalID is upstream or
+// operator data, not ours: the Slack connector builds it from the configured
+// channel string, and Jira/Linear pass through a remote issue key. Nothing in this
+// package constrains any of them to ASCII, so without this fallback the first pull
+// after the upgrade would mint a SECOND note for an already-ingested item instead of
+// updating it, and every later pull would keep both alive.
+//
+// Re-rendering under the legacy id rather than moving the note to the new one is
+// deliberate: the frontmatter id is the graph identity (nodes are note:<id>), so
+// keeping it preserves every edge and every agent citation that already points at
+// the imported note. New items still get the new, guessable slug.
+//
+// exists reports whether a vault-relative slash path is already present. Run passes
+// an os.Stat over the vault; a caller that writes through a repo instead of the
+// filesystem (the hub commits imports as a Change) passes its own lookup.
+func RenderDocResolved(connectorName string, d Doc, exists func(relPath string) bool) (relPath string, content []byte, err error) {
+	id := importedID(connectorName, vault.Slugify(d.ExternalID))
+	if exists == nil {
+		return renderDocAs(connectorName, d, id)
+	}
+	legacySlug := legacySlugify(d.ExternalID)
+	legacyID := importedID(connectorName, legacySlug)
+	// An empty legacy slug is not a match candidate: every doc whose ExternalID was
+	// entirely non-ASCII collapsed onto the same "<connector>-.md" bucket back then,
+	// so adopting it would make unrelated docs overwrite each other forever.
+	if legacySlug == "" || legacyID == id {
+		return renderDocAs(connectorName, d, id)
+	}
+	if !exists(importedPath(connectorName, id)) && exists(importedPath(connectorName, legacyID)) {
+		return renderDocAs(connectorName, d, legacyID)
+	}
+	return renderDocAs(connectorName, d, id)
+}
+
+func importedID(connectorName, slug string) string { return connectorName + "-" + slug }
+
+func importedPath(connectorName, id string) string {
+	return filepath.ToSlash(filepath.Join("imported", connectorName, id+".md"))
+}
+
+// legacySlugify reproduces the ASCII-only slug Mesh minted before vault.Slugify
+// folded diacritics: anything outside [a-z0-9] became a separator, so non-ASCII
+// letters were dropped. It is a FROZEN copy of a historical on-disk format used only
+// to recognise notes already written, so it must not be refactored to call Slugify:
+// any future change there would silently change which old files we match.
+func legacySlugify(s string) string {
+	var b strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func renderDocAs(connectorName string, d Doc, id string) (relPath string, content []byte, err error) {
 	now := time.Now().Format("2006-01-02")
-	id := connectorName + "-" + vault.Slugify(d.ExternalID)
 	fm := &vault.Frontmatter{
 		ID:         id,
 		Type:       vault.TypeNote,
@@ -114,7 +192,7 @@ func RenderDoc(connectorName string, d Doc) (relPath string, content []byte, err
 	if err != nil {
 		return "", nil, err
 	}
-	return filepath.ToSlash(filepath.Join("imported", connectorName, id+".md")), []byte(s), nil
+	return importedPath(connectorName, id), []byte(s), nil
 }
 
 // Opts controls an incremental run.
