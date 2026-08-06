@@ -141,6 +141,63 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 	return res, nil
 }
 
+// BackfillRelatedFile adds `related:` entries to a note that carries none, so an
+// orphaned note joins the graph instead of floating beside it. Idempotent in the way
+// that matters: a note that already declares `related` is left alone, because an
+// author's own links are the ground truth and a derived list must never overwrite them.
+//
+// It goes through writeNoteChecked like every other writer here: a rewritten block
+// that will not parse removes the note from search and the graph silently, which is a
+// strictly worse outcome than the disconnection this is trying to fix.
+func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateResult, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	fmText, body, had := SplitFrontmatter(string(data))
+	if !had {
+		return nil, fmt.Errorf("%s: no frontmatter block; refusing to rewrite", path)
+	}
+	_, raw, err := ParseFrontmatter([]byte(fmText))
+	if err != nil {
+		return nil, err
+	}
+	res := &MigrateResult{Path: path}
+	if v, ok := raw["related"]; ok {
+		// Present but empty counts as "already handled": an empty list is how a note
+		// records that its links were considered and there are none.
+		if l, isList := v.([]any); !isList || len(l) > 0 {
+			return res, nil
+		}
+	}
+	var clean []string
+	seen := map[string]bool{}
+	for _, r := range related {
+		if r = strings.TrimSpace(r); r != "" && !seen[r] {
+			seen[r] = true
+			clean = append(clean, r)
+		}
+	}
+	if len(clean) == 0 {
+		return res, nil
+	}
+	res.Changed = true
+	res.Actions = append(res.Actions, fmt.Sprintf("added %d related link(s)", len(clean)))
+	if dryRun {
+		return res, nil
+	}
+	var b strings.Builder
+	b.WriteString("related:\n")
+	for _, r := range clean {
+		b.WriteString("    - " + r + "\n")
+	}
+	out := "---\n" + b.String() + fmText + "\n---\n" + body
+	if err := writeNoteChecked(path, out); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 // writeNoteChecked is the single guarded write path for a note Mesh authors itself. It
 // re-parses the rendered content and refuses to write when the frontmatter would not
 // come back out, because an unparseable frontmatter block removes the note from search

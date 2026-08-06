@@ -94,3 +94,69 @@ func TestMigrateReportsFlywheelTODOs(t *testing.T) {
 		t.Errorf("expected 3 flywheel issues for a decision missing do/dont/why, got %v", res.Issues)
 	}
 }
+
+func TestBackfillRelatedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		content    string
+		related    []string
+		wantChange bool
+		wantHas    []string
+	}{
+		{
+			name:       "adds links to a note with none",
+			content:    "---\nid: alpha\ntype: gotcha\ntags:\n    - mesh\n---\n# Alpha\nbody\n",
+			related:    []string{"beta", "gamma"},
+			wantChange: true,
+			wantHas:    []string{"related:", "- beta", "- gamma"},
+		},
+		{
+			name:       "never overwrites an author's own links",
+			content:    "---\nid: alpha\nrelated:\n    - mine\n---\n# Alpha\n",
+			related:    []string{"derived"},
+			wantChange: false,
+			wantHas:    []string{"- mine"},
+		},
+		{
+			name:       "deduplicates and drops blanks",
+			content:    "---\nid: alpha\n---\n# Alpha\n",
+			related:    []string{"beta", "  ", "beta"},
+			wantChange: true,
+			wantHas:    []string{"- beta"},
+		},
+		{
+			name:       "no links means no rewrite",
+			content:    "---\nid: alpha\n---\n# Alpha\n",
+			related:    nil,
+			wantChange: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "n.md")
+			if err := os.WriteFile(p, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res, err := BackfillRelatedFile(p, tc.related, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Changed != tc.wantChange {
+				t.Fatalf("Changed = %v, want %v", res.Changed, tc.wantChange)
+			}
+			out, _ := os.ReadFile(p)
+			for _, want := range tc.wantHas {
+				if !strings.Contains(string(out), want) {
+					t.Errorf("output missing %q:\n%s", want, out)
+				}
+			}
+			// Whatever we wrote must still parse, or the note vanishes from the index.
+			fmStr, _, had := SplitFrontmatter(string(out))
+			if !had {
+				t.Fatal("rewritten note lost its frontmatter block")
+			}
+			if _, _, err := ParseFrontmatter([]byte(fmStr)); err != nil {
+				t.Fatalf("rewritten frontmatter does not parse (index would drop the note): %v", err)
+			}
+		})
+	}
+}
