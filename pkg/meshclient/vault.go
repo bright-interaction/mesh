@@ -246,6 +246,23 @@ func keepParkedDirty(current, base map[string]string, parked []park) {
 	}
 }
 
+// keepDeferredDirty rewrites current so each path the bounded push left OUT of this
+// batch keeps its pre-sync base hash (or no entry at all if it had none), exactly like
+// keepParkedDirty does for a guard-parked path. The new base must describe what was
+// actually SENT, not what is on disk: a deferred path recomputed from disk reads as
+// synced, so the next computeOutbox emits nothing for it and the note is never pushed.
+// A deferred delete keeps its base hash while the file is absent, which is what makes
+// the next round re-emit the delete rather than forget it.
+func keepDeferredDirty(current, base map[string]string, deferred []string) {
+	for _, rel := range deferred {
+		if old, ok := base[rel]; ok {
+			current[rel] = old
+		} else {
+			delete(current, rel)
+		}
+	}
+}
+
 // keepWindowEditsDirty stops a local write made DURING the sync window from being
 // silently recorded as already synced. current is recomputed from disk after the
 // round trip, so any file the user (or the indexer, or another agent) touched
@@ -463,7 +480,16 @@ func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]s
 }
 
 // writeFileAtomic writes b to path via a temp file in the same directory then
-// rename, so a reader never sees a partially written note.
+// rename, so a reader never sees a partially written note, and fsyncs both the
+// data and the parent directory so the note survives a power cut.
+//
+// Temp+rename alone buys crash-atomicity for a concurrent READER, not durability:
+// the rename can reach the disk while the data blocks it points at have not, and
+// the note write and the sync.json write can land in either order. If sync.json
+// survives and the note's bytes do not, the note reverts locally while state.Hashes
+// records the new hash, and the next round pushes the OLD bytes as an upsert that
+// the hub fast-forwards, reverting the team's copy with no conflict and no sibling.
+// internal/hub/repo.go holds the identical twin; keep the two in step.
 func writeFileAtomic(path string, b []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -475,10 +501,16 @@ func writeFileAtomic(path string, b []byte) error {
 	}
 	tmpName := tmp.Name()
 	_, werr := tmp.Write(b)
+	// Flush the data to the device BEFORE the rename publishes the name.
+	serr := tmp.Sync()
 	cerr := tmp.Close()
 	if werr != nil {
 		os.Remove(tmpName)
 		return werr
+	}
+	if serr != nil {
+		os.Remove(tmpName)
+		return serr
 	}
 	if cerr != nil {
 		os.Remove(tmpName)
@@ -488,7 +520,25 @@ func writeFileAtomic(path string, b []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
+	syncDir(dir)
 	return nil
+}
+
+// syncDir fsyncs a directory so a rename that just landed in it survives a power
+// cut. Best effort on purpose: opening or fsyncing a directory handle is a no-op or
+// an error on some platforms and network filesystems (Windows cannot open one at
+// all), and that is not a failed write, so the bytes still count as written and the
+// refusal is only logged. The data itself is already fsynced by the caller.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		slog.Debug("sync: cannot open the note directory to fsync it", "dir", dir, "err", err)
+		return
+	}
+	if err := d.Sync(); err != nil {
+		slog.Debug("sync: directory fsync not supported here", "dir", dir, "err", err)
+	}
+	d.Close()
 }
 
 // SyncVault runs one reconcile round against the joined hub: push local edits,
@@ -514,23 +564,47 @@ func SyncVault(vaultDir string) (Summary, error) {
 	// Truncating rather than looping keeps this change small and each round durable: the
 	// batch lands, state advances, and the next round picks up the remainder. A watch
 	// daemon converges on its own; a manual `mesh sync` reports what is left.
-	truncated := 0
+	//
+	// The remainder only comes back if it stays DIRTY. The new base below is recomputed
+	// from the whole disk, and the truncated notes are still on disk, so their current
+	// hashes would become the base: the next computeOutbox sees prev[rel] == h and emits
+	// nothing, and keepWindowEditsDirty cannot rescue them either (sentHashes is the full
+	// on-disk map, so current[rel] == sentHashes[rel] and no restore fires). The deferred
+	// notes were then never pushed to the team while Summary reported convergence, and
+	// since deletes are appended last they truncate FIRST, so a locally deleted note stayed
+	// alive on the hub forever. deferred carries those paths to keepDeferredDirty below.
+	var deferred []string
 	if len(outbox) > maxOutboxPerSync {
-		truncated = len(outbox) - maxOutboxPerSync
+		for _, it := range outbox[maxOutboxPerSync:] {
+			deferred = append(deferred, it.Path)
+		}
 		outbox = outbox[:maxOutboxPerSync]
 		slog.Info("sync: pushing a bounded batch; the rest follow next round",
-			"batch", len(outbox), "remaining", truncated)
+			"batch", len(outbox), "remaining", len(deferred))
 	}
 	resp, err := New(creds.HubURL, creds.Token).Sync(syncproto.SyncRequest{BaseSHA: state.HeadSHA, Outbox: outbox, TombstoneSeq: state.TombSeq})
 	if err != nil {
 		return Summary{}, err
 	}
-	// Build the protected set BEFORE applying deltas. Two things go in it, for the same
+	// Build the protected set BEFORE applying deltas. Three things go in it, for the same
 	// reason: applyDeltas must not overwrite local bytes that nothing else is holding.
 	//   - paths the hub REJECTED (the contract says the client keeps its local copy)
+	//   - paths the bounded batch DEFERRED (the hub never saw those bytes this round)
 	//   - paths whose conflict sibling could not be written (nothing holds the loser)
-	rejectedSet := make(map[string]bool, len(resp.Rejected))
+	rejectedSet := make(map[string]bool, len(resp.Rejected)+len(deferred))
 	for _, rel := range resp.Rejected {
+		rejectedSet[rel] = true
+	}
+	// A deferred path sits in exactly the position a rejected one does: the hub did not
+	// see our version, so any delta it sends for that path is built on a base that does
+	// not contain the local change. Unprotected, applyDeltas compares disk against
+	// sentHashes, finds them equal (sentHashes is the on-disk map, dirty files included),
+	// concludes nothing changed locally, and writes the hub version straight over the
+	// deferred edit with no conflict and no sibling. keepDeferredDirty cannot undo that:
+	// the local bytes are already gone. Reachable whenever a truncated round is also a
+	// full reconcile (a reset sync.json on a grown vault), because then the hub sends a
+	// delta for every path while our push is capped.
+	for _, rel := range deferred {
 		rejectedSet[rel] = true
 	}
 	// Preserve our losing versions locally before deltas overwrite the paths.
@@ -572,6 +646,10 @@ func SyncVault(vaultDir string) (Summary, error) {
 	}
 	keepParkedDirty(current, state.Hashes, parked)
 	keepWindowEditsDirty(current, sentHashes, resp.Deltas, dropped)
+	// AFTER keepWindowEditsDirty on purpose: that one resets a path to its send-time
+	// hash, which for a deferred path is exactly the hash that would mark it synced.
+	// Proven by ablation: swapping these two lines puts the never-pushed remainder back.
+	keepDeferredDirty(current, state.Hashes, deferred)
 	// Hub-rejected paths (viewer role, folder ACL, out-of-scope, or oversize/binary
 	// content) were NOT landed by the hub. Keep them dirty exactly like a parked path
 	// so the next sync re-attempts the push, and never record the local (un-landed)
@@ -590,7 +668,7 @@ func SyncVault(vaultDir string) (Summary, error) {
 	}
 	sum := Summary{Pushed: len(outbox) - len(resp.Rejected), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped, Rejected: resp.Rejected}
 	// Tell the caller work remains, rather than letting a bounded batch look complete.
-	sum.Remaining = truncated
+	sum.Remaining = len(deferred)
 	for _, c := range resp.Conflicts {
 		sum.ConflictSiblings = append(sum.ConflictSiblings, c.SiblingPath)
 	}

@@ -97,9 +97,49 @@ tick that always converges, so a missed file event never leaves the index stale.
 Already have a Foam / Obsidian-style vault? Bring it up to the Mesh schema in one idempotent pass:
 
 ```
-mesh migrate my-vault              # synthesize ids, updated->when, lift ## Related into related:
+mesh migrate my-vault              # dry run: shows what it would change, writes nothing
+mesh migrate my-vault --apply      # synthesize ids, updated->when, lift ## Related into related:
 mesh index my-vault
 ```
+
+`mesh migrate` and `mesh scope backfill` rewrite every note in the vault in place,
+so both are a **dry run unless you pass `--apply`**. They also exit non-zero if any
+file failed, so a partial rewrite never reads as success in a script.
+
+## Recovery: the index is derived, so it is always safe to delete
+
+`.mesh/mesh.db` is built from your markdown. The markdown is the source of truth and
+nothing lives only in the index, so deleting it never loses a note.
+
+If a command reports `file is not a database (26)` or `database disk image is malformed
+(11)`, the index file is corrupt. Those are SQLite's two ways of saying the same thing:
+26 means the file is not SQLite at all (something wrote over it), 11 means the header is
+fine and a page inside it is not (a crash mid-write, a bad sector, a copy taken while a
+write was in flight). Both are handled the same way. Rebuild it:
+
+```
+mesh index my-vault                # detects the corrupt file, discards it, rebuilds
+```
+
+Or do it by hand, which is the same thing:
+
+```
+rm -f my-vault/.mesh/mesh.db my-vault/.mesh/mesh.db-wal my-vault/.mesh/mesh.db-shm
+mesh index my-vault
+```
+
+Two related failures that are **not** corruption and must not be fixed by deleting
+anything:
+
+- `database is locked (SQLITE_BUSY)` means another mesh process (usually a
+  `mesh sync --watch` or `mesh mcp --watch` daemon) holds the write lock. Wait and
+  retry, or stop the daemon. A full reindex only holds it for a few seconds.
+- `no index at <path>` means there is no database yet. Run `mesh index <vault>`.
+
+Embeddings are the one thing a rebuild costs you: they are kept across schema upgrades
+precisely because re-creating them is a paid API call, but they cannot survive a file
+that SQLite cannot read. After recovering a corrupt index, re-run `mesh embed` if you
+use semantic search.
 
 ## Optional: semantic search + rerank (BYOAI, sovereign)
 
@@ -189,7 +229,7 @@ Set up and capture:
 | `mesh install` | One-shot setup: register the MCP server with your agent (plus the auto-onboard hook on Claude Code) |
 | `mesh init [path]` | Bootstrap a new vault |
 | `mesh new <type> "<title>"` | Scaffold a note (id, date, placement, skeleton auto-filled) |
-| `mesh migrate [vault]` | Bring a Foam / Obsidian-style vault up to the Mesh schema |
+| `mesh migrate [vault]` | Bring a Foam / Obsidian-style vault up to the Mesh schema (dry run unless `--apply`) |
 | `mesh ingest <source>` | Pull external knowledge (GitHub, Slack, Linear, Jira, Notion) into the vault, incrementally |
 | `mesh extract <transcript>` | Turn an agent session transcript into candidate write-back notes to keep or discard |
 | `mesh hooks install` | Wire Claude Code session hooks: read Mesh at session start, nudge write-back at the end |
@@ -214,12 +254,12 @@ Inspect and maintain:
 | `mesh status [vault]` | Index row counts + which retrieval signals are active |
 | `mesh version` | The commit this binary was built from, plus the Go version. Include it in a security report (see SECURITY.md) |
 | `mesh lint [vault]` | Frontmatter / links / filenames (non-zero exit for CI) |
-| `mesh doctor [vault]` | Index freshness (drift), counts, health |
+| `mesh doctor [vault]` | Index freshness (drift), counts, health. Non-zero if the index is stale or any note is invisible to search |
 | `mesh health [vault]` | Knowledge lifecycle: dead source refs, overdue reviews, contradictions |
 | `mesh structure [vault]` | Grade the vault's organization: types, connectivity, tier-0, maps |
 | `mesh flywheel [vault]` | Write-back reuse metrics: does written-back knowledge get used again? |
 | `mesh guards <list\|suggest>` | Turn gotchas into candidate pre-commit guards (knowledge to enforcement) |
-| `mesh scope backfill` | Stamp an explicit access scope on notes that have none (which notes a given member may see) |
+| `mesh scope backfill` | Stamp an explicit access scope on notes that have none (which notes a given member may see; dry run unless `--apply`) |
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |
 | `mesh tune <cases.json>` | Learn fusion weights from labelled queries (validated on held-out) |
 

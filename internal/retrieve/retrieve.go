@@ -409,7 +409,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	for i, h := range ftsHits {
 		fScores[i] = h.Score
 	}
-	fNorm := minMax(fScores)
+	fNorm := minMaxFloored(fScores)
 	for i, h := range ftsHits {
 		fused[h.NodeID] += wFTS * fNorm[i]
 		snippet[h.NodeID] = h.Snippet
@@ -421,7 +421,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	for i, h := range graphHits {
 		gScores[i] = h.Score
 	}
-	gNorm := minMax(gScores)
+	gNorm := minMaxFloored(gScores)
 	for i, h := range graphHits {
 		fused[h.Node.ID] += wGraph * gNorm[i]
 		if reason[h.Node.ID] == "" {
@@ -502,15 +502,9 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		if !scopeAllowed(c.Scope, opt.AllowedScopes) {
 			continue
 		}
-		c.Score = score
 		c.Snippet = snippet[id]
 		c.Reason = reason[id]
-		if c.Tier0 {
-			c.Score *= tier0Mult
-		}
-		if r.freshHalfLife > 0 {
-			c.Score *= r.freshnessMult(c)
-		}
+		c.Score = score * r.boostMult(c)
 		cards = append(cards, c)
 	}
 	sortCards(cards)
@@ -521,7 +515,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// endpoint error leaves the fused order intact. Skipped when tuning the fusion
 	// itself (NoRerank), so the fused order is what gets measured.
 	if !opt.NoRerank {
-		r.rerankHead(ctx, query, cards)
+		r.rerankHead(ctx, query, cards, fused)
 	}
 
 	// Limit bounds the RETURNED set, after the reranker has had its say (so it can
@@ -645,7 +639,14 @@ func sortCards(cards []Card) {
 // rerankHead reorders the top-K cards in place using the configured
 // cross-encoder. Reranked cards are rescored above any fused tail card so the
 // head stays on top after the final sort, with the tier-0 nudge preserved.
-func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card) {
+//
+// fusedRaw carries the PRE-BOOST fused score per node id (the map Retrieve built),
+// because this function ASSIGNS head[i].Score rather than adjusting it. Reading the
+// fused component back off head[i].Score instead had two consequences: the tier-0
+// factor was folded in twice (once by the card loop, once here, an effective 1.21x
+// on the fused half of the blend), and the freshness decay was applied to the tail
+// only, so the head never decayed at all.
+func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, fusedRaw map[string]float64) {
 	if r.rr == nil || len(cards) < 2 {
 		return
 	}
@@ -691,16 +692,18 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card) 
 	if hi == lo {
 		return
 	}
-	norm := minMax(scores)
-	// Capture the head's fused scores before we overwrite them, normalized over the
-	// head, so the blend can give the lexical/graph/vector signal a real vote
-	// instead of discarding it. Pure rerank (alpha=1) threw away a correct fused
-	// top-1 on keyword queries; blending keeps a strong fused hit in contention.
+	norm := minMaxFloored(scores)
+	// The head's fused scores, normalized over the head, so the blend can give the
+	// lexical/graph/vector signal a real vote instead of discarding it. Pure rerank
+	// (alpha=1) threw away a correct fused top-1 on keyword queries; blending keeps a
+	// strong fused hit in contention. Read from fusedRaw, NOT from head[i].Score:
+	// head[i].Score already carries the tier-0 and freshness multipliers, and this
+	// loop applies them again below.
 	fused := make([]float64, k)
 	for i := range head {
-		fused[i] = head[i].Score
+		fused[i] = fusedRaw[head[i].NodeID]
 	}
-	fusedNorm := minMax(fused)
+	fusedNorm := minMaxFloored(fused)
 	// Lift the reranked head above the untouched fused tail. Derive the base from
 	// the actual max tail score (not a fixed constant) so the invariant holds
 	// regardless of edge-weight magnitudes in graph expansion.
@@ -714,12 +717,11 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card) 
 	for i := range head {
 		// Convex blend of cross-encoder relevance and fused score, both in [0,1].
 		rel := a*norm[i] + (1-a)*fusedNorm[i]
-		// The tier-0 nudge multiplies the relevance component only, never the
-		// offset, so institutional-memory notes get a small (<=0.1) tiebreak among
-		// near-equal scores without overriding a clearly better pick.
-		if head[i].Tier0 {
-			rel *= tier0Mult
-		}
+		// The tier-0 nudge and the freshness decay multiply the relevance component
+		// only, never the offset, so institutional-memory notes get a small (<=0.1)
+		// tiebreak among near-equal scores without overriding a clearly better pick,
+		// and the head decays with age exactly like the tail does.
+		rel *= r.boostMult(head[i])
 		head[i].Score = base + rel
 		if head[i].Reason != "" {
 			head[i].Reason += " +reranked"
@@ -784,6 +786,27 @@ var freshnessTypes = map[string]bool{"note": true, "status": true, "": true}
 // 40%, never buried) while staying strictly monotonic in age forever, so
 // freshness always breaks a tie in favour of the fresher note.
 const freshnessFloor = 0.6
+
+// boostMult is everything that multiplies a card's fused signal: the tier-0 nudge
+// and the freshness decay. It lives in one place because the head (rerankHead) and
+// the tail (the card loop in Retrieve) must apply exactly the same factors.
+//
+// They did not. rerankHead ASSIGNS head[i].Score, so every multiplier the card loop
+// folded in was discarded for the whole head, and rerankK (30) is larger than the
+// default Limit (20), which makes the head the entire returned set. The tier-0 nudge
+// was re-applied there by hand; the freshness decay was not, so
+// MESH_FRESHNESS_HALFLIFE_DAYS was a silent no-op on any deployment with a rerank
+// endpoint configured (freshness on and off produced identical scores).
+func (r *Retriever) boostMult(c Card) float64 {
+	m := 1.0
+	if c.Tier0 {
+		m *= tier0Mult
+	}
+	if r.freshHalfLife > 0 {
+		m *= r.freshnessMult(c)
+	}
+	return m
+}
 
 func (r *Retriever) freshnessMult(c Card) float64 {
 	r.freshOnce.Do(func() {
@@ -915,6 +938,30 @@ func minMax(xs []float64) []float64 {
 	}
 	for i, x := range xs {
 		out[i] = (x - lo) / (hi - lo)
+	}
+	return out
+}
+
+// normFloor is the share of a normalized signal that every candidate keeps, so the
+// weakest one never normalizes to exactly 0.
+//
+// minMax maps the minimum to 0, and 0 * tier0Mult == 0, so a multiplicative boost
+// had nothing to act on over part of its own domain: the weakest of three FTS
+// matches scored exactly 0.000000, and when that was a decision note its
+// institutional-memory nudge bought it nothing at all - it sorted dead last on the
+// alphabetical NodeID tie-break. Same shape as the historic 0.6 freshness clamp
+// documented above freshnessMult: a boost that cannot discriminate over part of the
+// corpus it exists to rank. A candidate that never matched a signal is simply absent
+// from that signal's slice, so the floor lifts weak MATCHES only, never non-matches.
+const normFloor = 0.02
+
+// minMaxFloored is minMax lifted off zero by normFloor. Every fused signal and both
+// halves of the rerank blend go through it, so the multiplicative boosts always have
+// a positive quantity to move.
+func minMaxFloored(xs []float64) []float64 {
+	out := minMax(xs)
+	for i, v := range out {
+		out[i] = normFloor + (1-normFloor)*v
 	}
 	return out
 }

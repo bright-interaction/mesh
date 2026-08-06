@@ -63,28 +63,28 @@ func (s *StringList) UnmarshalYAML(value *yaml.Node) error {
 // Frontmatter is the whitelisted view of a note's YAML header. Raw YAML is
 // never spread into storage; only known keys are kept (the JSONB house rule).
 type Frontmatter struct {
-	ID         string     `yaml:"id"`
-	Type       NoteType   `yaml:"type"`
-	Title      string     `yaml:"title"`
-	When       string     `yaml:"when"`
-	Created    string     `yaml:"created,omitempty"`
-	Updated    string     `yaml:"updated,omitempty"`
-	Related    StringList `yaml:"related,omitempty"`
-	Tags       StringList `yaml:"tags,omitempty"`
-	Do         string     `yaml:"do,omitempty"`
-	Dont       string     `yaml:"dont,omitempty"`
-	Why        string     `yaml:"why,omitempty"`
-	Status     string     `yaml:"status,omitempty"`
+	ID      string     `yaml:"id"`
+	Type    NoteType   `yaml:"type"`
+	Title   string     `yaml:"title"`
+	When    string     `yaml:"when"`
+	Created string     `yaml:"created,omitempty"`
+	Updated string     `yaml:"updated,omitempty"`
+	Related StringList `yaml:"related,omitempty"`
+	Tags    StringList `yaml:"tags,omitempty"`
+	Do      string     `yaml:"do,omitempty"`
+	Dont    string     `yaml:"dont,omitempty"`
+	Why     string     `yaml:"why,omitempty"`
+	Status  string     `yaml:"status,omitempty"`
 	// ExpectDeadRefs marks a note whose subject IS a deletion: the file paths it cites
 	// are meant to be gone, so dead_ref would flag it forever and correctly. Six such
 	// notes (retired services, an old audit) were permanently red, and a health check
 	// with permanent known-good findings is one people learn to skim past.
-	ExpectDeadRefs bool `yaml:"expect_dead_refs,omitempty"`
-	Supersedes StringList `yaml:"supersedes,omitempty"`
-	Severity   string     `yaml:"severity,omitempty"`
-	Role       string     `yaml:"role,omitempty"`
-	Stack      StringList `yaml:"stack,omitempty"`
-	RepoPath   string     `yaml:"repo_path,omitempty"`
+	ExpectDeadRefs bool       `yaml:"expect_dead_refs,omitempty"`
+	Supersedes     StringList `yaml:"supersedes,omitempty"`
+	Severity       string     `yaml:"severity,omitempty"`
+	Role           string     `yaml:"role,omitempty"`
+	Stack          StringList `yaml:"stack,omitempty"`
+	RepoPath       string     `yaml:"repo_path,omitempty"`
 	// Provenance: who/what wrote this note, where it came from, when to recheck.
 	// Feeds the audit trail, the knowledge-lifecycle health checks, and the
 	// contributor/ROI views. All optional.

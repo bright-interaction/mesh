@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -188,8 +189,17 @@ func doctorCmd() *cobra.Command {
 			}
 			fmt.Printf("drift:  +%d new  ~%d changed  -%d removed\n", len(drift.Added), len(drift.Changed), len(drift.Removed))
 
-			files, _ := vault.Walk(root)
-			parsed, _ := index.ParseFiles(files, 0)
+			files, err := vault.Walk(root)
+			if err != nil {
+				return err
+			}
+			// ferrs are notes that will not parse. Discarding them (this line read
+			// `parsed, _ :=`) made doctor the one command that LIES: a vault whose every
+			// note was unparseable indexed to zero notes, counted zero lint problems and
+			// printed "status: healthy" with exit 0, while `mesh lint` on the same vault
+			// exited 1. An unparseable note is invisible to search and the graph, which is
+			// the most severe thing doctor can find, not something it may drop.
+			parsed, ferrs := index.ParseFiles(files, 0)
 			_, issues := index.BuildGraph(parsed)
 			lintProblems := 0
 			for _, pn := range parsed {
@@ -199,10 +209,16 @@ func doctorCmd() *cobra.Command {
 					}
 				}
 			}
-			lintProblems += len(issues)
+			lintProblems += len(issues) + len(ferrs)
 			fmt.Printf("lint:   %d problems (run mesh lint for detail)\n", lintProblems)
 
 			switch {
+			case len(ferrs) > 0:
+				for _, fe := range ferrs {
+					fmt.Printf("  %s: %v\n", fe.Path, fe.Err)
+				}
+				fmt.Printf("status: BROKEN - %d note(s) invisible to search (they do not parse)\n  fix: mesh lint %s\n", len(ferrs), root)
+				return fmt.Errorf("%d note(s) invisible to search", len(ferrs))
 			case drift.Any():
 				fmt.Println("status: STALE - run mesh index")
 				return fmt.Errorf("index stale")
@@ -869,11 +885,21 @@ func indexCmd() *cobra.Command {
 			if dryRun {
 				return nil
 			}
-			store, err := index.Open(root)
+			// OpenRebuild, not Open: this command IS the rebuild, so a database it cannot
+			// read is the thing being replaced, not a dead end. Before this, a corrupt
+			// .mesh/mesh.db failed search, doctor, health AND index with the same
+			// "file is not a database (26)", so the repair command was itself blocked.
+			// It discards the file only for that one error class; see recoverCorruptIndex.
+			store, recovered, err := index.OpenRebuild(root)
 			if err != nil {
 				return err
 			}
 			defer store.Close()
+			if recovered {
+				fmt.Fprintf(os.Stderr, "warning: %s was corrupt and unreadable; removed it and rebuilt from the markdown. "+
+					"Notes are intact. Any stored embeddings went with it, so re-run mesh embed if you use semantic search.\n",
+					filepath.Join(root, ".mesh", "mesh.db"))
+			}
 			n, err := store.IndexVault(notes, g)
 			if err != nil {
 				return err
@@ -939,7 +965,7 @@ func codeReindexCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			links, _ := store.LinkNotesToCode(root) // refresh the note<->code bridge
+			links := refreshNoteCodeLinks(os.Stderr, store, root)
 			fmt.Printf("code index: %d files parsed (%d unchanged, %d removed), %d symbols, %d edges, %d note links in %s\n  roots: %s\n  db:    %s\n",
 				st.Files, st.Unchanged, st.Removed, st.Symbols, st.Edges, links, time.Since(start).Round(time.Millisecond), strings.Join(roots, ", "), store.Path())
 			return nil
@@ -949,6 +975,26 @@ func codeReindexCmd() *cobra.Command {
 	c.Flags().StringVar(&langsFlag, "languages", "", "comma list of language tags (default: config or all)")
 	c.Flags().BoolVar(&full, "full", false, "wipe and rebuild the whole index instead of the incremental mtime-drift refresh")
 	return c
+}
+
+// noteCodeLinker is the one method refreshNoteCodeLinks needs, so the failure path can be
+// exercised without a database that refuses to answer.
+type noteCodeLinker interface {
+	LinkNotesToCode(vaultRoot string) (int, error)
+}
+
+// refreshNoteCodeLinks rebuilds the note<->code bridge and SAYS SO when it fails. The
+// error used to be dropped (`links, _ := store.LinkNotesToCode(root)`) and the zero count
+// printed inside the success line, so a bridge that never ran read exactly like a vault
+// whose notes mention no code: the operator's only signal was a 0 that has a legitimate
+// meaning. The count is still returned so the summary line keeps its shape.
+func refreshNoteCodeLinks(w io.Writer, l noteCodeLinker, root string) int {
+	links, err := l.LinkNotesToCode(root)
+	if err != nil {
+		fmt.Fprintf(w, "warning: note<->code bridge not refreshed (%v); the note-link count below is not a real 0\n", err)
+		return 0
+	}
+	return links
 }
 
 func codeSearchCmd() *cobra.Command {
@@ -1085,16 +1131,27 @@ func sortedCounts(m map[string]int) []kvCount {
 }
 
 func migrateCmd() *cobra.Command {
-	var dryRun bool
+	var apply, dryRunCompat bool
 	c := &cobra.Command{
 		Use:   "migrate [vault]",
-		Short: "Bring a legacy pre-Mesh markdown vault up to the Mesh schema (idempotent)",
+		Short: "Bring a legacy pre-Mesh markdown vault up to the Mesh schema (dry run unless --apply; idempotent)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := vaultArg(args)
+			// Dry run by DEFAULT, writing only on --apply, matching `mesh structure
+			// --fill-bodies`. This rewrites every note in the vault in place with no
+			// backup, so one `mesh migrate` typed at the wrong directory used to rewrite
+			// the whole thing; the safe direction has to be the one you get by accident.
+			// The legacy --dry-run still WINS over --apply rather than being ignored: it
+			// is hidden now, so anyone still passing it cannot read its help, and a flag
+			// whose name promises "do not write" must never be the reason something wrote.
+			dryRun := !apply || dryRunCompat
 			files, err := vault.Walk(root)
 			if err != nil {
 				return err
+			}
+			if dryRun {
+				fmt.Println("dry run (pass --apply to write); nothing on disk is changed")
 			}
 			var changed, flywheel, errored int
 			for _, f := range files {
@@ -1119,10 +1176,17 @@ func migrateCmd() *cobra.Command {
 			if flywheel > 0 {
 				fmt.Printf("note:   %d flywheel notes still need do/dont/why (author them; never auto-filled)\n", flywheel)
 			}
+			// A migrate that failed on 800 of 1150 files used to print the failures and
+			// exit 0, so every script wrapping it read a partial rewrite as success.
+			if errored > 0 {
+				return fmt.Errorf("%d file(s) failed to migrate", errored)
+			}
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&dryRun, "dry-run", false, "preview changes without writing")
+	c.Flags().BoolVar(&apply, "apply", false, "write the changes into the notes (without it this is a dry run)")
+	c.Flags().BoolVar(&dryRunCompat, "dry-run", false, "compatibility: a dry run is the default now, and this still forces one")
+	_ = c.Flags().MarkHidden("dry-run") // kept so existing scripts still parse, and still honoured
 	return c
 }
 
@@ -1136,20 +1200,27 @@ func scopeCmd() *cobra.Command {
 }
 
 func scopeBackfillCmd() *cobra.Command {
-	var dryRun bool
+	var apply, dryRunCompat bool
 	var scope string
 	c := &cobra.Command{
 		Use:   "backfill [vault]",
-		Short: "Stamp an explicit scope on every note that has none (idempotent; default dev)",
+		Short: "Stamp an explicit scope on every note that has none (dry run unless --apply; idempotent; default dev)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := vaultArg(args)
+			// Same inversion as migrate, legacy --dry-run included: this is the second
+			// bulk in-place rewriter, and the two have to agree or the safe default is a
+			// coin flip per command.
+			dryRun := !apply || dryRunCompat
 			if strings.TrimSpace(scope) == "" {
 				scope = "dev"
 			}
 			files, err := vault.Walk(root)
 			if err != nil {
 				return err
+			}
+			if dryRun {
+				fmt.Println("dry run (pass --apply to write); nothing on disk is changed")
 			}
 			var changed, errored int
 			for _, f := range files {
@@ -1170,10 +1241,15 @@ func scopeBackfillCmd() *cobra.Command {
 			fmt.Printf("%s %d of %d notes with scope %q (%d already scoped, %d errored)\n",
 				verb, changed, len(files), scope, len(files)-changed-errored, errored)
 			fmt.Println("note: unlabeled notes already behave as dev by the fail-safe; this just makes it explicit so they can be relabeled.")
+			if errored > 0 {
+				return fmt.Errorf("%d note(s) failed to backfill", errored)
+			}
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&dryRun, "dry-run", false, "preview without writing")
+	c.Flags().BoolVar(&apply, "apply", false, "write the changes into the notes (without it this is a dry run)")
+	c.Flags().BoolVar(&dryRunCompat, "dry-run", false, "compatibility: a dry run is the default now, and this still forces one")
+	_ = c.Flags().MarkHidden("dry-run") // kept so existing scripts still parse, and still honoured
 	c.Flags().StringVar(&scope, "scope", "dev", "scope to stamp on unlabeled notes")
 	return c
 }

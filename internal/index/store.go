@@ -6,6 +6,7 @@ package index
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -149,6 +150,9 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 	if err := ensureSchemaChecked(writeDB); err != nil {
 		writeDB.Close()
 		readDB.Close()
+		if isUnreadableDB(err) {
+			return nil, corruptIndexError(vaultRoot, dbPath, err)
+		}
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 
@@ -219,6 +223,110 @@ func isBusy(err error) bool {
 	}
 	m := err.Error()
 	return strings.Contains(m, "database is locked") || strings.Contains(m, "SQLITE_BUSY")
+}
+
+// ErrIndexCorrupt marks a .mesh/mesh.db that SQLite refuses to read at all: a truncated,
+// half-written or overwritten file (SQLITE_NOTADB, result code 26). It is the OTHER
+// operator-facing SQLite failure next to SQLITE_BUSY, and unlike a busy lock it never
+// clears by waiting. It is a sentinel so callers match with errors.Is instead of reading
+// the message, because exactly one caller is allowed to act on it destructively
+// (recoverCorruptIndex) and matching a string there would be far too loose.
+var ErrIndexCorrupt = errors.New("index database is corrupt")
+
+// isUnreadableDB reports whether err is SQLite refusing the file itself, in EITHER of the
+// two ways it can. Matched on the message rather than a driver error type for the same
+// reason isBusy is: so this survives swapping the driver. The strings are SQLite's own.
+//
+//   - SQLITE_NOTADB (26), "file is not a database": the 16-byte header does not match, so
+//     the file is not SQLite at all. That is what junk written over the whole file gives.
+//   - SQLITE_CORRUPT (11), "database disk image is malformed": the header is fine and a
+//     page is not. This is the ORDINARY damage (a crash mid-write, a bad sector, a copy
+//     taken while a write was in flight) and covering only code 26 left it with the exact
+//     dead end this whole path exists to remove.
+//
+// Both mean the same thing to Mesh: the index cannot be opened and cannot be repaired in
+// place, and since it is derived from the markdown the only answer is to rebuild it.
+func isUnreadableDB(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := err.Error()
+	return strings.Contains(m, "file is not a database") || strings.Contains(m, "SQLITE_NOTADB") ||
+		strings.Contains(m, "database disk image is malformed") || strings.Contains(m, "SQLITE_CORRUPT")
+}
+
+// indexFiles are the three files one SQLite index occupies: the database plus the WAL and
+// shared-memory sidecars. A corrupt database has to take its sidecars with it, or the
+// rebuilt database inherits frames written against the old, unreadable one.
+func indexFiles(dbPath string) []string {
+	return []string{dbPath, dbPath + "-wal", dbPath + "-shm"}
+}
+
+// corruptIndexError turns result code 26 into something an operator can act on. The bare
+// driver message ("apply schema: file is not a database (26)") is emitted identically by
+// search, doctor, health AND index, which is a dead end: `mesh index` is the command that
+// would rebuild, so the operator is told to fix it by the one thing that cannot run. The
+// message therefore names the absolute path, says the notes are safe (the index is derived
+// from the markdown, which is the source of truth), and gives the repair verbatim.
+func corruptIndexError(vaultRoot, dbPath string, cause error) error {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		abs = dbPath
+	}
+	root, err := filepath.Abs(vaultRoot)
+	if err != nil {
+		root = vaultRoot
+	}
+	return fmt.Errorf("%w: %s is not a readable SQLite database (truncated, overwritten, damaged mid-write, or not SQLite at all)\n"+
+		"  your notes are safe: the index is derived from the markdown, so it is throwaway\n"+
+		"  repair:  mesh index %s   (discards the corrupt file, then rebuilds)\n"+
+		"  by hand: rm -f %s %s-wal %s-shm\n"+
+		"  stored embeddings go with it, so re-run mesh embed if you use semantic search\n"+
+		"  cause:   %w",
+		ErrIndexCorrupt, abs, root, abs, abs, abs, cause)
+}
+
+// recoverCorruptIndex deletes an unreadable index so it can be rebuilt, and does so ONLY
+// for ErrIndexCorrupt. Every other open failure returns untouched: a busy lock, a
+// permission problem or a disk error all leave a database that is still perfectly good,
+// and deleting on those would turn a wait-and-retry into permanent loss of the embed cache
+// (a paid re-embed). The narrow condition is the whole point of the function, which is why
+// it is separate from OpenRebuild and tested on its own.
+func recoverCorruptIndex(dbPath string, openErr error) (bool, error) {
+	if !errors.Is(openErr, ErrIndexCorrupt) {
+		return false, openErr
+	}
+	for _, p := range indexFiles(dbPath) {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return false, errors.Join(openErr, err)
+		}
+	}
+	return true, nil
+}
+
+// OpenRebuild is Open for the one command whose job is to REBUILD the index. `mesh index`
+// reads the markdown and writes the database from scratch, so a database it cannot even
+// open is not an obstacle, it is the thing being replaced. Anything else (the hub, the MCP
+// server, search, doctor) must keep using Open and report the error instead.
+//
+// The bool reports whether a corrupt index was discarded, so the caller can say so out
+// loud: silently deleting a file on the operator's disk is not acceptable even when the
+// file is garbage.
+func OpenRebuild(vaultRoot string) (*Store, bool, error) {
+	s, err := Open(vaultRoot)
+	if err == nil {
+		return s, false, nil
+	}
+	dbPath := filepath.Join(vaultRoot, ".mesh", "mesh.db")
+	recovered, rerr := recoverCorruptIndex(dbPath, err)
+	if !recovered {
+		return nil, false, rerr
+	}
+	s, err = Open(vaultRoot)
+	if err != nil {
+		return nil, false, err
+	}
+	return s, true, nil
 }
 
 // ensureSchemaChecked is ensureSchema with an error a human can act on.
