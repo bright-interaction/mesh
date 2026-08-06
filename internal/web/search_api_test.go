@@ -42,3 +42,37 @@ func TestSearchAndNote(t *testing.T) {
 		t.Errorf("unknown note = %d, want 404", code)
 	}
 }
+
+// TestNoteBodyStripsFrontmatter guards the drawer bug: the client renders "body" (and
+// the server-rendered "html" derived from it) as the note's prose. Neither may still
+// carry the YAML frontmatter block, or a reader sees "id: n\ntype: note\n..." dumped
+// above the actual content. "markdown" is exempt on purpose: it stays the raw file,
+// frontmatter included, for any existing caller that relied on the old shape.
+func TestNoteBodyStripsFrontmatter(t *testing.T) {
+	s, _ := cfgServer(t) // note "n": "---\nid: n\ntype: note\nwhen: 2026-01-01\n---\n# N\nbody\n"
+	h := s.Handler()
+
+	code, note := doJSON(t, h, "GET", "/api/note/n", "")
+	if code != 200 {
+		t.Fatalf("note fetch = %d %+v", code, note)
+	}
+	body, _ := note["body"].(string)
+	if strings.HasPrefix(strings.TrimSpace(body), "---") {
+		t.Errorf("body still starts with a frontmatter fence:\n%s", body)
+	}
+	if strings.Contains(body, "id: n") || strings.Contains(body, "type: note") {
+		t.Errorf("body still carries frontmatter keys:\n%s", body)
+	}
+	if !strings.Contains(body, "# N") {
+		t.Errorf("body dropped the note's markdown heading:\n%s", body)
+	}
+	meta, _ := note["meta"].(map[string]any)
+	if meta == nil || meta["title"] != "" || meta["type"] != "note" || meta["when"] != "2026-01-01" {
+		t.Errorf("meta did not parse frontmatter fields: %+v", meta)
+	}
+	// markdown stays the full raw file for backward compatibility.
+	md, _ := note["markdown"].(string)
+	if !strings.Contains(md, "id: n") {
+		t.Errorf("markdown should still carry the raw frontmatter for old callers: %+v", md)
+	}
+}
