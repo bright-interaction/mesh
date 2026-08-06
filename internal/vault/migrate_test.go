@@ -160,3 +160,68 @@ func TestBackfillRelatedFile(t *testing.T) {
 		})
 	}
 }
+
+func TestBackfillBodyFile(t *testing.T) {
+	const authored = "---\nid: g\ntype: gotcha\ntitle: G\ndo: RUN-THIS\ndont: AVOID-THIS\nwhy: BECAUSE\n---\n\n# G\n\n" +
+		"## Symptom\n<!-- TODO: how the problem shows up -->\n\n" +
+		"## Cause\n<!-- TODO: the root cause -->\n\n" +
+		"## Fix\n<!-- TODO: the resolution or workaround -->\n"
+
+	t.Run("fills TODO sections from frontmatter", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "n.md")
+		os.WriteFile(p, []byte(authored), 0o644)
+		res, err := BackfillBodyFile(p, false)
+		if err != nil || !res.Changed {
+			t.Fatalf("Changed=%v err=%v", res.Changed, err)
+		}
+		out, _ := os.ReadFile(p)
+		for _, want := range []string{"RUN-THIS", "AVOID-THIS", "BECAUSE"} {
+			if !strings.Contains(string(out), want) {
+				t.Errorf("body missing %q:\n%s", want, out)
+			}
+		}
+		// The frontmatter copy must survive: retrieval reads do/dont/why from there.
+		fmStr, _, had := SplitFrontmatter(string(out))
+		if !had || !strings.Contains(fmStr, "do:") {
+			t.Errorf("frontmatter lost its fields, retrieval cards would degrade:\n%s", out)
+		}
+	})
+
+	t.Run("is idempotent", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "n.md")
+		os.WriteFile(p, []byte(authored), 0o644)
+		BackfillBodyFile(p, false)
+		first, _ := os.ReadFile(p)
+		res, _ := BackfillBodyFile(p, false)
+		second, _ := os.ReadFile(p)
+		if res.Changed || string(first) != string(second) {
+			t.Errorf("second run changed the file (Changed=%v)", res.Changed)
+		}
+	})
+
+	t.Run("never overwrites an authored section", func(t *testing.T) {
+		src := strings.Replace(authored, "## Fix\n<!-- TODO: the resolution or workaround -->", "## Fix\nHUMAN-WROTE-THIS", 1)
+		p := filepath.Join(t.TempDir(), "n.md")
+		os.WriteFile(p, []byte(src), 0o644)
+		BackfillBodyFile(p, false)
+		out, _ := os.ReadFile(p)
+		// Scope the check to the BODY: `do: RUN-THIS` legitimately stays in the
+		// frontmatter, so asserting over the whole file would fail on the copy we
+		// deliberately keep.
+		_, body, _ := SplitFrontmatter(string(out))
+		if !strings.Contains(body, "HUMAN-WROTE-THIS") {
+			t.Errorf("lost the authored section:\n%s", body)
+		}
+		if strings.Contains(body, "RUN-THIS") {
+			t.Errorf("overwrote the authored Fix section with the `do` field:\n%s", body)
+		}
+	})
+
+	t.Run("refuses a note with no frontmatter", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "n.md")
+		os.WriteFile(p, []byte("# no frontmatter\n"), 0o644)
+		if _, err := BackfillBodyFile(p, false); err == nil {
+			t.Error("expected an error for a note with no frontmatter block")
+		}
+	})
+}

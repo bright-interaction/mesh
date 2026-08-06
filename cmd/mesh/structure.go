@@ -20,7 +20,7 @@ import (
 // the vault structure standard. It complements `mesh lint` (frontmatter validity) and
 // `mesh health` (knowledge lifecycle): validity, organization, lifecycle.
 func structureCmd() *cobra.Command {
-	var verbose, wireOrphans, apply bool
+	var verbose, wireOrphans, apply, fillBodies bool
 	c := &cobra.Command{
 		Use:   "structure [vault]",
 		Short: "Grade the vault's organization: types, connectivity, tier-0, maps",
@@ -48,6 +48,9 @@ func structureCmd() *cobra.Command {
 
 			if wireOrphans {
 				return wireOrphanNotes(cmd, root, rep, apply)
+			}
+			if fillBodies {
+				return fillNoteBodies(root, files, apply)
 			}
 
 			fmt.Printf("structure: grade %s  (%d/100)\n", rep.Grade, rep.Score)
@@ -108,8 +111,56 @@ func structureCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&verbose, "verbose", false, "list every finding with its note path")
 	c.Flags().BoolVar(&wireOrphans, "wire-orphans", false, "propose `related:` links for every orphan note (dry run unless --apply)")
-	c.Flags().BoolVar(&apply, "apply", false, "with --wire-orphans, write the links into the notes")
+	c.Flags().BoolVar(&fillBodies, "fill-bodies", false, "fill a note's TODO-skeleton body sections from its already-authored do/dont/why (dry run unless --apply)")
+	c.Flags().BoolVar(&apply, "apply", false, "with --wire-orphans or --fill-bodies, write the changes into the notes")
 	return c
+}
+
+// fillNoteBodies repairs every note whose body is still the TODO skeleton scaffolded by an
+// older Mesh while its do/dont/why already sit in frontmatter (see vault.BackfillBodyFile).
+// It is a dry run unless --apply, matching wireOrphanNotes: this rewrites the author's
+// files, so the default has to be "show me".
+//
+// BackfillBodyFile is idempotent (a filled section no longer matches its placeholder), so
+// running this twice is safe and the second run reports nothing to do.
+func fillNoteBodies(root string, files []string, apply bool) error {
+	if !apply {
+		fmt.Println("dry run (pass --apply to write); scanning for TODO-skeleton bodies with filled frontmatter")
+	}
+	var changed, skipped int
+	for _, path := range files {
+		rel := path
+		if r, err := filepath.Rel(root, path); err == nil {
+			rel = r
+		}
+		res, err := vault.BackfillBodyFile(path, !apply)
+		if err != nil {
+			fmt.Printf("  !! %s: %v\n", rel, err)
+			skipped++
+			continue
+		}
+		if !res.Changed {
+			continue
+		}
+		changed++
+		fmt.Printf("  %s\n", rel)
+		for _, a := range res.Actions {
+			fmt.Printf("      %s\n", a)
+		}
+	}
+	verb := "would fill"
+	if apply {
+		verb = "filled"
+	}
+	fmt.Printf("\n%s %d note body(ies)", verb, changed)
+	if skipped > 0 {
+		fmt.Printf(", skipped %d", skipped)
+	}
+	fmt.Println()
+	if apply && changed > 0 {
+		fmt.Printf("run `mesh index %s` to pick the new bodies up\n", root)
+	}
+	return nil
 }
 
 // wireOrphanNotes gives every orphan note a `related:` list derived from Mesh's own
