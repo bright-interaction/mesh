@@ -123,3 +123,30 @@ func TestDashboardAPI(t *testing.T) {
 		t.Errorf("coverage[note] = %d, want 3", d.Coverage["note"])
 	}
 }
+
+// An unrestricted caller (owner/admin, or the standalone viewer) must get a real
+// counts.notes. The web app decides whether to show the "this vault is empty"
+// overlay from that number, so a zero here hid a fully populated vault behind an
+// empty-state card for exactly the people allowed to see all of it. The scoped
+// branch counted notes in its own loop; the unrestricted branch never assigned the
+// variable at all.
+func TestStatusCountsNotesUnrestricted(t *testing.T) {
+	ts := testServer(t)
+
+	code, body, _ := get(t, ts, "/api/status")
+	if code != 200 {
+		t.Fatalf("/api/status = %d, want 200", code)
+	}
+	var st struct {
+		Counts map[string]int `json:"counts"`
+	}
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Counts["notes"] != 3 {
+		t.Errorf("counts.notes = %d, want 3 (the vault has 3 notes; 0 trips the empty-state overlay)", st.Counts["notes"])
+	}
+	if st.Counts["nodes"] < 3 {
+		t.Errorf("counts.nodes = %d, want >= 3", st.Counts["nodes"])
+	}
+}

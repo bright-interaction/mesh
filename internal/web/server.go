@@ -329,6 +329,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		vectors = 0 // per-scope vector counts are not tracked; do not leak the global
 	} else {
+		// An unrestricted caller (owner/admin, or the standalone single-token viewer)
+		// still needs the note count: the web app reads counts.notes to decide whether
+		// to show the "this vault is empty" overlay, so leaving it at zero here put a
+		// full vault behind an empty-state card for exactly the people who can see all
+		// of it.
+		notes, _ = s.store.Count("notes")
 		nodes, _ = s.store.Count("nodes")
 		edges, _ = s.store.Count("edges")
 		vectors, _ = s.store.Count("vectors")
