@@ -25,6 +25,13 @@ func codeScopeDenied(ctx context.Context) bool {
 	return sf != nil && !sf.allowsRead(nil) // allowsRead(nil) => AllowedRead["dev"]
 }
 
+// codeSearchLimitDefault matches the floor index.SearchCode already applied, so nothing
+// changes for a caller that omits limit; codeSearchLimitMax is the ceiling it never had.
+const (
+	codeSearchLimitDefault = 12
+	codeSearchLimitMax     = 100
+)
+
 // toolCodeSearch is FTS over the source-code symbol
 // index, ranked by name match. It returns symbol cards with a file:line locator so
 // an agent can jump straight to a definition instead of grepping the tree. It is
@@ -46,6 +53,13 @@ func (s *Server) toolCodeSearch(ctx context.Context, raw json.RawMessage) (any, 
 	if strings.TrimSpace(a.Query) == "" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query required"}
 	}
+	// Cap the limit like every other limit-taking tool. SearchCode only FLOORS it
+	// (index/code_index.go: `if limit <= 0 { limit = 12 }`) and then over-fetches 4x for
+	// the test-code re-rank, so mesh_code_search{"limit":1000000} asked SQLite for four
+	// million rows and returned every matching symbol in the estate's code index straight
+	// into the caller's context. The default matches SearchCode's own floor, so an
+	// unspecified limit behaves exactly as before.
+	a.Limit = clampLimit(a.Limit, codeSearchLimitDefault, codeSearchLimitMax)
 	hits, err := s.store.SearchCode(a.Query, a.Limit, a.Languages)
 	if err != nil {
 		return nil, internalErr(err)

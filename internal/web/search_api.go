@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
@@ -25,8 +26,18 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "q is required", http.StatusBadRequest)
 		return
 	}
-	limit := atoiOr(r.URL.Query().Get("limit"), 12)
-	budget := atoiOr(r.URL.Query().Get("budget"), 0)
+	// Bound the request with the SAME numbers the MCP twin enforces, single-sourced from
+	// internal/mcp so the two surfaces over one retriever cannot drift apart again. This
+	// one had no bound at all: retrieve.Retrieve only FLOORS Limit, and it skips
+	// packToBudget entirely when Budget is 0, which was the default here. Measured on a
+	// 400-note vault, ?q=deploy returned 12 cards / 974 tokens while
+	// ?q=deploy&limit=100000 returned 401 cards / 30950 tokens / 116654 bytes, and the
+	// server paid corpus-sized retrieval work for it.
+	limit := atoiOr(r.URL.Query().Get("limit"), mcp.SearchLimitDefault)
+	if limit > mcp.SearchLimitMax {
+		limit = mcp.SearchLimitMax
+	}
+	budget := atoiOr(r.URL.Query().Get("budget"), mcp.SearchBudgetDefault)
 	rt := s.retriever()
 	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r)})
 	if err != nil {

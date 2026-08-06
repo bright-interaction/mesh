@@ -60,8 +60,8 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_changed_since",
-			"description": "Notes modified after a unix timestamp, newest first. Pull only deltas when resuming.",
-			"inputSchema": obj(map[string]any{"type": "object", "required": []string{"since"}, "properties": map[string]any{"since": intp}}),
+			"description": "Notes modified after a unix timestamp, newest first. Pull only deltas when resuming. `since` is UNIX SECONDS, not milliseconds: a millisecond stamp is refused rather than silently matching nothing. limit defaults to 100 and is capped at 500; a capped reply sets truncated=true, so an absent truncated flag means you have the complete delta.",
+			"inputSchema": obj(map[string]any{"type": "object", "required": []string{"since"}, "properties": map[string]any{"since": intp, "limit": intp}}),
 		},
 		{
 			"name":        "mesh_neighbors",
@@ -113,7 +113,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_code_search",
-			"description": "Locate SOURCE-CODE symbols (functions, types, methods, classes) by name across the indexed repos, ranked by name match. Returns cards with a file:line locator and signature so you jump straight to a definition instead of grepping the tree. Use this for 'where is X defined / what's in this area of the code'. This is the code index; mesh_search is for notes/knowledge.",
+			"description": "Locate SOURCE-CODE symbols (functions, types, methods, classes) by name across the indexed repos, ranked by name match. Returns cards with a file:line locator and signature so you jump straight to a definition instead of grepping the tree. Use this for 'where is X defined / what's in this area of the code'. This is the code index; mesh_search is for notes/knowledge. limit defaults to 12 and is capped at 100: narrow the query rather than raising it.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -539,6 +539,18 @@ const (
 	searchBudgetDefault = 8000
 )
 
+// SearchLimitDefault/Max and SearchBudgetDefault export the caps above for the OTHER
+// surface over the same retriever: internal/web's GET /api/search, which shipped with
+// neither and let ?limit=100000 return 401 cards / ~31k tokens / 114 KB from a 400-note
+// vault, and made the hub do corpus-sized work per unauthenticated-ish page request.
+// Exported as aliases rather than as a rename so package-internal callers stay as they
+// were, and so the two surfaces cannot drift apart again by editing one number.
+const (
+	SearchLimitDefault  = searchLimitDefault
+	SearchLimitMax      = searchLimitMax
+	SearchBudgetDefault = searchBudgetDefault
+)
+
 // searchCard is the MCP wire shape of a retrieval card: the retriever's card plus the
 // provenance the agent needs to judge the snippet. retrieve.Card carries no source
 // field, so Source is derived here from the note path (see importedSource) and set
@@ -690,11 +702,44 @@ func (s *Server) toolGodNodes(ctx context.Context, raw json.RawMessage) (any, *r
 	return textResult(map[string]any{"hubs": hubs}), nil
 }
 
+// changedSince* bound one delta. ChangedSince is a bare "WHERE mtime > ? ORDER BY mtime
+// DESC" with no LIMIT and no validation, and the same parameter had two opposite traps.
+//
+// Too small: since=0 (or a negative) returned every note in the vault, unbounded, from
+// the tool an agent calls on RESUME, when its context is already loaded.
+//
+// Too large: since is UNIX SECONDS, and passing milliseconds is the single most likely
+// caller mistake, because most runtimes hand out milliseconds by default. A millisecond
+// stamp is a year-57578 timestamp, so the query matched nothing and the tool answered
+// "changed": null. The agent reads that as "nothing changed since I left" and proceeds
+// on stale context, which is worse than an error: it is a wrong answer with no signal.
+// So a future `since` is refused, and the refusal names the likely cause.
+const (
+	changedSinceLimitDefault = 100
+	changedSinceLimitMax     = 500
+	// changedSinceFutureSlack is how far ahead of the server's clock a `since` may sit
+	// before it is a caller mistake rather than clock skew between two machines.
+	changedSinceFutureSlack = int64(3600) // seconds
+)
+
 func (s *Server) toolChangedSince(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var a struct {
 		Since int64 `json:"since"`
+		Limit int   `json:"limit"`
 	}
 	json.Unmarshal(raw, &a)
+	now := time.Now().Unix()
+	if a.Since > now+changedSinceFutureSlack {
+		msg := fmt.Sprintf("since=%d is in the future (server time is %d), so this can only ever report that nothing changed", a.Since, now)
+		if a.Since/1000 <= now+changedSinceFutureSlack {
+			msg += fmt.Sprintf("; that looks like MILLISECONDS, and since is UNIX SECONDS: pass %d", a.Since/1000)
+		}
+		return nil, &rpcError{Code: codeInvalidParams, Message: msg}
+	}
+	if a.Since < 0 {
+		a.Since = 0 // "everything" is a legitimate ask; the limit below is what bounds it
+	}
+	limit := clampLimit(a.Limit, changedSinceLimitDefault, changedSinceLimitMax)
 	refs, err := s.store.ChangedSince(a.Since)
 	if err != nil {
 		return nil, internalErr(err)
@@ -713,7 +758,27 @@ func (s *Server) toolChangedSince(ctx context.Context, raw json.RawMessage) (any
 		}
 		refs = kept
 	}
-	return textResult(map[string]any{"changed": refs}), nil
+	// An explicit truncated flag is what lets a caller tell a CAPPED delta from a
+	// complete one. Without it a capped list is indistinguishable from "that is all
+	// there is", which is the same silent-wrong-answer shape as the millisecond case.
+	// The refs are newest-first, so the cap keeps the newest and drops the oldest.
+	total := len(refs)
+	truncated := total > limit
+	if truncated {
+		refs = refs[:limit]
+	}
+	if refs == nil {
+		refs = []index.NoteRef{} // never "changed": null; an empty delta says so as [] plus count 0
+	}
+	out := map[string]any{"changed": refs, "count": len(refs)}
+	if truncated {
+		out["truncated"] = true
+		out["total"] = total
+		out["limit"] = limit
+		out["note"] = fmt.Sprintf("%d notes changed since that timestamp; only the %d most recent are listed. "+
+			"Pass a more recent `since`, or a larger `limit` (max %d).", total, limit, changedSinceLimitMax)
+	}
+	return textResult(out), nil
 }
 
 func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType string) (any, *rpcError) {
@@ -797,7 +862,19 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 		Confidence: a.Confidence, ReviewBy: a.ReviewBy, By: agent, Scope: noteScope,
 	})
 	if err != nil {
-		return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
+		// Do NOT echo a raw error here. Everything vault.CreateNote raises about the
+		// FILESYSTEM names the note's absolute path, so a too-long title came back as
+		// "open /srv/hub/vault/gotchas/<slug>.md: file name too long" and handed the
+		// agent the server's absolute vault root - the exact leak the success path 30
+		// lines below goes out of its way to prevent by relativizing res.Path. Errors
+		// about the caller's own input (vault.ErrInvalidSpec, which now covers the
+		// too-long title) are authored in that package, carry no path, and are the ones
+		// worth reading, so those go back verbatim.
+		if errors.Is(err, vault.ErrInvalidSpec) {
+			return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
+		}
+		slog.Error("mesh write: the note could not be created", "type", t, "error", err)
+		return nil, &rpcError{Code: codeInvalidParams, Message: "the note could not be written: " + scrubPaths(err.Error())}
 	}
 	// Make the new note queryable through the INCREMENTAL path, not a full reindex.
 	// reload() re-walked and re-parsed the entire vault and rewrote every notes /
@@ -848,6 +925,26 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	return textResult(out), nil
 }
 
+// scrubPaths rewrites every absolute path in an error message down to its base name, so
+// a message that reaches a remote agent cannot carry the server's directory layout.
+// It replaces rather than deletes, because the base name (the note's own slug) is the
+// part the caller supplied and the part that makes the message useful. Matching on
+// filepath.IsAbs rather than on the vault root is deliberate: the root the server was
+// started with and the root the kernel names in an error can differ (a symlinked
+// /tmp resolves to /private/tmp on macOS), and a prefix comparison would miss exactly
+// then. Full detail is logged server-side by the caller.
+func scrubPaths(msg string) string {
+	fields := strings.Fields(msg)
+	for i, f := range fields {
+		trimmed := strings.TrimRight(f, ":;,")
+		if !filepath.IsAbs(trimmed) {
+			continue
+		}
+		fields[i] = "<path>/" + filepath.Base(trimmed) + f[len(trimmed):]
+	}
+	return strings.Join(fields, " ")
+}
+
 // flywheelReuseGap is how long after a write-back a fetch must land to count as reuse
 // by a LATER session rather than a re-read inside the same work burst (the
 // cross-session proxy that works for both the solo CLI and the long-lived hub).
@@ -873,7 +970,7 @@ func sectionByAnchor(body, anchor string) (string, bool) {
 		h := strings.TrimLeft(ln, "#")
 		lvl := len(ln) - len(h)
 		if lvl >= 1 && lvl <= 6 && strings.HasPrefix(h, " ") {
-			if slugify(strings.TrimSpace(h)) == anchor {
+			if anchorMatches(strings.TrimSpace(h), anchor) {
 				start, level = i, lvl
 				break
 			}
@@ -904,9 +1001,8 @@ func sectionByAnchor(body, anchor string) (string, bool) {
 }
 
 // anchorsOf lists the slugs a note actually offers, so an anchor miss can name the real
-// options instead of leaving the caller to guess. Slugify is ASCII-only, so a Swedish
-// heading like "## Atgarder" does not slug to anything a caller would predict; listing
-// them is what makes those sections reachable at all.
+// options instead of leaving the caller to guess. It is the same vault.Slugify the index
+// uses to build heading nodes, so what it lists is exactly what resolves.
 func anchorsOf(body string) []string {
 	var out []string
 	inFence := false
@@ -920,7 +1016,7 @@ func anchorsOf(body string) []string {
 		}
 		h := strings.TrimLeft(ln, "#")
 		if lvl := len(ln) - len(h); lvl >= 1 && lvl <= 6 && strings.HasPrefix(h, " ") {
-			if s := slugify(strings.TrimSpace(h)); s != "" {
+			if s := vault.Slugify(strings.TrimSpace(h)); s != "" {
 				out = append(out, s)
 			}
 		}
@@ -934,7 +1030,24 @@ func isCodeFence(ln string) bool {
 	return strings.HasPrefix(t, "```") || strings.HasPrefix(t, "~~~")
 }
 
-func slugify(s string) string {
+// anchorMatches reports whether a heading answers to the given anchor. It accepts the
+// CURRENT slug (vault.Slugify, which folds diacritics) and the legacy ASCII-only one,
+// because for a while both were minted for the same heading and the old ones are still
+// in circulation: the index stores a heading node per anchor and only refreshes it on
+// reindex, so between a binary upgrade and the next reindex a caller can be holding
+// "tg-rder" for a heading that now slugs to "atgarder". Accepting both costs one string
+// compare on the miss path and keeps those fetches working.
+func anchorMatches(heading, anchor string) bool {
+	if anchor == "" {
+		return false
+	}
+	return vault.Slugify(heading) == anchor || slugifyLegacy(heading) == anchor
+}
+
+// slugifyLegacy reproduces the slug Mesh emitted before vault.Slugify learned to fold
+// diacritics: keep [a-z0-9], collapse everything else to a dash. It is a LOOKUP
+// fallback only (see anchorMatches). Nothing new is ever minted in this form.
+func slugifyLegacy(s string) string {
 	var b strings.Builder
 	prevDash := false
 	for _, r := range strings.ToLower(s) {

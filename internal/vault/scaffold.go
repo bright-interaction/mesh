@@ -71,12 +71,39 @@ func DirForType(t NoteType) string {
 	}
 }
 
-// Slugify turns arbitrary text into a kebab-case slug. Used for ids, filenames,
-// and heading anchors.
+// slugFold maps the Latin-1 and Scandinavian letters a real vault actually contains
+// onto their ASCII base. It exists because the [a-z0-9] filter below DELETED them
+// instead: the Swedish heading "Atgarder" (a-ring, a-umlaut) slugged to "tg-rder", an
+// anchor no caller can guess, and a Swedish title minted a note id nobody can type.
+// Folding runs before the filter, so the output is still pure ASCII and every
+// all-ASCII input slugs byte-identically to what it always did.
+// The keys are written as escapes on purpose: a literal diacritic in this source file
+// is one careless editor round trip away from being normalised to plain ASCII, which
+// would turn an entry into a silent duplicate of 'a' and change nothing at runtime.
+var slugFold = map[rune]string{
+	'\u00e0': "a", '\u00e1': "a", '\u00e2': "a", '\u00e3': "a", '\u00e4': "a", '\u00e5': "a", // a grave acute circumflex tilde diaeresis ring
+	'\u00e6': "ae", '\u00e7': "c",
+	'\u00e8': "e", '\u00e9': "e", '\u00ea': "e", '\u00eb': "e", // e grave acute circumflex diaeresis
+	'\u00ec': "i", '\u00ed': "i", '\u00ee': "i", '\u00ef': "i", // i grave acute circumflex diaeresis
+	'\u00f0': "d", '\u00f1': "n",
+	'\u00f2': "o", '\u00f3': "o", '\u00f4': "o", '\u00f5': "o", '\u00f6': "o", '\u00f8': "o", // o grave acute circumflex tilde diaeresis stroke
+	'\u00f9': "u", '\u00fa': "u", '\u00fb': "u", '\u00fc': "u", // u grave acute circumflex diaeresis
+	'\u00fd': "y", '\u00ff': "y",
+	'\u00fe': "th", '\u00df': "ss", '\u0153': "oe",
+}
+
+// Slugify turns arbitrary text into a kebab-case ASCII slug. Used for ids, filenames,
+// and heading anchors. Diacritics are folded to their ASCII base (see slugFold), never
+// dropped.
 func Slugify(s string) string {
 	var b strings.Builder
 	prevDash := false
 	for _, r := range strings.ToLower(s) {
+		if folded, ok := slugFold[r]; ok {
+			b.WriteString(folded)
+			prevDash = false
+			continue
+		}
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
@@ -91,21 +118,41 @@ func Slugify(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+// ErrInvalidSpec marks the errors CreateNote raises about the CALLER's input, as
+// opposed to the ones the filesystem raises. Every message wrapping it is authored
+// here, names only caller-supplied values, and never contains a server path, so a
+// remote surface can hand it back verbatim instead of guessing what is safe to echo.
+var ErrInvalidSpec = errors.New("invalid note spec")
+
+// maxSlugLen bounds the id, and therefore the filename, so an over-long title is
+// refused with an actionable message instead of an ENAMETOOLONG from the kernel whose
+// text carries the server's ABSOLUTE vault path. The budget is NAME_MAX (255 bytes on
+// APFS and ext4) minus the ".md" extension and the widest collision suffix the loop
+// below can append ("-1000"): 255 - 3 - 5 = 247. Measured on APFS, a 247-byte base
+// writes and a 248-byte one fails, and the longest real filename in the reference
+// vault is 250 bytes (a 247-byte base plus ".md"), so this refuses only what the
+// filesystem would refuse anyway.
+const maxSlugLen = 247
+
 // CreateNote writes a new note with everything derivable already filled: id from
 // the title (collision-suffixed), when/created auto-stamped, placed in the
 // type's subdirectory, with a type-specific body skeleton. The author only fills
 // the judgment fields. Returns the path and any flywheel fields still to fill.
 func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	if !spec.Type.Valid() {
-		return nil, fmt.Errorf("invalid type %q", spec.Type)
+		return nil, fmt.Errorf("%w: invalid type %q", ErrInvalidSpec, spec.Type)
 	}
 	title := strings.TrimSpace(spec.Title)
 	if title == "" {
-		return nil, fmt.Errorf("title is required")
+		return nil, fmt.Errorf("%w: title is required", ErrInvalidSpec)
 	}
 	base := Slugify(title)
 	if base == "" {
 		base = "note"
+	}
+	if len(base) > maxSlugLen {
+		return nil, fmt.Errorf("%w: title too long: it slugs to %d characters and the filename limit is %d, so shorten the title by at least %d characters",
+			ErrInvalidSpec, len(base), maxSlugLen, len(base)-maxSlugLen)
 	}
 	dir := filepath.Join(root, DirForType(spec.Type))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
