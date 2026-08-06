@@ -16,6 +16,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/relate"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
@@ -766,9 +767,23 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	if source == "" {
 		source = "agent"
 	}
+	// `related` is optional, and an agent that omits it writes a note with no
+	// note-to-note edge: findable by full-text, invisible to graph proximity, and a
+	// disconnected dot in the web app. That is not a rare slip. On 2026-08-06 the
+	// reference vault carried 111 such notes out of 1140, and they skewed tier-0
+	// (67 gotchas, 31 decisions, 13 post-mortems), so the material retrieval is meant
+	// to surface first was the least reachable. Derive the links from the note's own
+	// text when the caller supplies none; an explicit list always wins, including an
+	// explicit decision to pass none that survives as an empty non-nil slice.
+	related := a.Related
+	if len(related) == 0 {
+		g, rt := s.snapshot()
+		related = relate.Derive(ctx, rt, g,
+			strings.TrimSpace(a.Title+"\n"+a.Do+"\n"+a.Why), "", a.Tags, 3)
+	}
 	res, err := vault.CreateNote(s.vaultRoot, vault.NewNoteSpec{
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
-		Related: a.Related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
+		Related: related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
 		Author: a.Author, Agent: agent, Source: source, SourceURL: a.SourceURL,
 		Confidence: a.Confidence, ReviewBy: a.ReviewBy, By: agent, Scope: noteScope,
 	})

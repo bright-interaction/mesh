@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/relate"
+	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -18,7 +20,7 @@ import (
 // the vault structure standard. It complements `mesh lint` (frontmatter validity) and
 // `mesh health` (knowledge lifecycle): validity, organization, lifecycle.
 func structureCmd() *cobra.Command {
-	var verbose bool
+	var verbose, wireOrphans, apply bool
 	c := &cobra.Command{
 		Use:   "structure [vault]",
 		Short: "Grade the vault's organization: types, connectivity, tier-0, maps",
@@ -43,6 +45,10 @@ func structureCmd() *cobra.Command {
 			g, _ := index.BuildGraph(parsed)
 			g.DetectCommunities(0)
 			rep := index.AnalyzeStructure(g, parsed, parseErrs)
+
+			if wireOrphans {
+				return wireOrphanNotes(cmd, root, rep, apply)
+			}
 
 			fmt.Printf("structure: grade %s  (%d/100)\n", rep.Grade, rep.Score)
 			fmt.Printf("  %d notes, %d clusters, %d tier-0 (decisions/gotchas/post-mortems)\n", rep.Notes, rep.Clusters, rep.Tier0)
@@ -101,5 +107,79 @@ func structureCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&verbose, "verbose", false, "list every finding with its note path")
+	c.Flags().BoolVar(&wireOrphans, "wire-orphans", false, "propose `related:` links for every orphan note (dry run unless --apply)")
+	c.Flags().BoolVar(&apply, "apply", false, "with --wire-orphans, write the links into the notes")
 	return c
+}
+
+// wireOrphanNotes gives every orphan note a `related:` list derived from Mesh's own
+// retrieval, so notes stop arriving disconnected and staying that way. It is a dry run
+// unless --apply: this rewrites the author's files, so the default has to be "show me".
+//
+// Notes that already declare `related` are skipped by BackfillRelatedFile, so running
+// this twice is safe and the second run reports nothing to do.
+func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport, apply bool) error {
+	var orphans []index.StructureFinding
+	for _, f := range rep.Findings {
+		if f.Kind == "orphan" {
+			orphans = append(orphans, f)
+		}
+	}
+	if len(orphans) == 0 {
+		fmt.Println("no orphans: every note links to at least one other note")
+		return nil
+	}
+
+	store, err := index.Open(root)
+	if err != nil {
+		return fmt.Errorf("wire-orphans needs a built index (run: mesh index %s): %w", root, err)
+	}
+	defer store.Close()
+	ig, err := store.LoadGraph()
+	if err != nil {
+		return err
+	}
+	rt := retrieve.NewFromEnv(store, ig)
+
+	if !apply {
+		fmt.Printf("%d orphan(s); proposing up to 3 links each (dry run, pass --apply to write)\n\n", len(orphans))
+	}
+	var changed, skipped int
+	for _, f := range orphans {
+		path := filepath.Join(root, f.Path)
+		id := strings.TrimSuffix(filepath.Base(f.Path), filepath.Ext(f.Path))
+		// The slug IS the title, hyphenated: Slugify built it from the title when the
+		// note was scaffolded, so it is the closest thing to the note's own words that
+		// is available here without re-reading the file.
+		query := strings.ReplaceAll(id, "-", " ")
+		links := relate.Derive(cmd.Context(), rt, ig, query, id, relate.TagsOf(ig, id), 3)
+		if len(links) == 0 {
+			skipped++
+			continue
+		}
+		res, err := vault.BackfillRelatedFile(path, links, !apply)
+		if err != nil {
+			fmt.Printf("  !! %s: %v\n", f.Path, err)
+			skipped++
+			continue
+		}
+		if !res.Changed {
+			skipped++
+			continue
+		}
+		changed++
+		fmt.Printf("  %s\n", f.Path)
+		for _, l := range links {
+			fmt.Printf("      -> %s\n", l)
+		}
+	}
+	verb := "would wire"
+	if apply {
+		verb = "wired"
+	}
+	fmt.Printf("\n%s %d note(s), skipped %d\n", verb, changed, skipped)
+	if apply && changed > 0 {
+		fmt.Printf("run `mesh index %s` to pick the new links up\n", root)
+	}
+	return nil
 }
