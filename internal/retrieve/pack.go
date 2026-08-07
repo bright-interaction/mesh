@@ -5,6 +5,7 @@ package retrieve
 
 import (
 	"encoding/json"
+	"math"
 
 	"github.com/bright-interaction/mesh/internal/tokenize"
 )
@@ -27,23 +28,63 @@ func EstimateTokens(s string) int { return estimateTokens(s) }
 // a full-precision Score and ten Go field names, which measured at roughly 60
 // tokens per card. The packer therefore fit about 1.7x more cards than the
 // caller's budget allowed and reported a token total short by the same factor.
+//
+// The marshal-failure path used to keep that same field sum, so the package still
+// carried TWO counters that disagreed about what a card costs: measured on the
+// pack_reserve_test.go fixture, the field sum priced a full card at 75 against the
+// marshaled 127 and a compact card at 29 against 81, i.e. 41% and 64% short. That is
+// not a safe degradation, it is the original overrun re-entering through the one path
+// meant to keep the packer moving. There is now one counter: the only field that can
+// fail to encode is a non-finite Score (everything else is a string or a bool), so
+// that field is sanitized and the SAME wire shape is priced.
 func cardTokens(c Card) int {
+	if math.IsNaN(c.Score) || math.IsInf(c.Score, 0) {
+		c.Score = 0
+	}
 	b, err := json.Marshal(c)
 	if err != nil {
-		// A card that cannot be marshaled cannot be sent either (a NaN Score is the
-		// only realistic cause). Fall back to the field sum so the packer keeps
-		// making progress instead of treating the card as free.
-		return estimateTokens(c.Title) + estimateTokens(c.Path) +
-			estimateTokens(c.Snippet) + estimateTokens(c.Reason) + 8
+		return cardTokensNoMarshal(c)
 	}
 	return estimateTokens(string(b))
 }
 
+// cardTokensNoMarshal prices a card without marshaling it. Unreachable in practice
+// (cardTokens sanitizes the only unencodable field first), but a counter that returns
+// 0 makes a card look free and lets the packer take everything, so it stays. It is
+// built on the same basis as the marshaled form rather than on a flat allowance: every
+// string field plus the measured structure of an empty card.
+// TestCountersAgreeOnWhatACardCosts pins the two within a few percent so they cannot
+// drift apart again.
+func cardTokensNoMarshal(c Card) int {
+	n := 0
+	// json.Marshal of a plain string cannot fail, and encoding each value the way the
+	// marshaler would (quotes and escapes included) is what keeps this close to the
+	// real wire count instead of ~10% under it: the quote is part of the token that
+	// starts and ends every field.
+	for _, s := range []string{c.NodeID, c.NoteID, c.Title, c.Path, c.Type, c.Scope, c.Snippet, c.Reason} {
+		if b, err := json.Marshal(s); err == nil {
+			n += estimateTokens(string(b))
+		}
+	}
+	if b, err := json.Marshal(Card{}); err == nil { // the ten field names, the separators, Score, Tier0
+		n += estimateTokens(string(b))
+	}
+	return n
+}
+
 // TotalTokens sums the estimated cost of a set of cards.
-func TotalTokens(cards []Card) int {
+func TotalTokens(cards []Card) int { return TotalTokensFunc(cards, nil) }
+
+// TotalTokensFunc sums a card set priced by cost (nil = cardTokens). A surface that
+// packs with its own CardCost must report with the same one, otherwise the number it
+// hands the caller is not the number it packed to.
+func TotalTokensFunc(cards []Card, cost CardCost) int {
+	if cost == nil {
+		cost = cardTokens
+	}
 	n := 0
 	for _, c := range cards {
-		n += cardTokens(c)
+		n += cost(c)
 	}
 	return n
 }
@@ -57,9 +98,9 @@ func TotalTokens(cards []Card) int {
 // uses), so the old reserve was 40 at budget 200, 60 at 300 and 80 at 400, and pass A
 // could not fit a single tier-0 card in any of them: 1, 2 and 3 packed cards
 // respectively, none tier-0, on a set holding two tier-0 candidates. Callers do pass
-// small budgets (both the MCP tool and the /api/search handler forward any positive
-// budget verbatim; only a budget <= 0 gets the 8000 default), so the "never crowded
-// out by ordinary notes" promise held on large budgets only.
+// small budgets (every caller below forwards any positive budget verbatim and only
+// defaults a budget <= 0), so the "never crowded out by ordinary notes" promise held
+// on large budgets only.
 //
 // Raising it cannot overrun: reserve is capped at the budget, and pass B still
 // measures against the full budget.
@@ -70,7 +111,29 @@ func TotalTokens(cards []Card) int {
 // compact card is 81 tokens, so at budget 100 pass A used to take nothing and the
 // caller got one ordinary compact card and zero tier-0 cards even though a compact
 // tier-0 card fit. It now gets the tier-0 card.
-func tier0Reserve(cards []Card, budget int) int {
+//
+// The full list of budget-forwarding callers, because two of them were missed when the
+// reserve was first written up and someone will look for them here:
+//
+//	internal/mcp/tools.go        mesh_search, any positive budget verbatim, else 8000
+//	internal/web/search_api.go   GET /api/search, same, else 8000
+//	internal/ask/ask.go          Answer(), any positive budget verbatim, else 3000
+//	internal/curator/curator.go  gatherContext(), Curator.Budget, else 3000
+//	cmd/mesh/main.go             mesh search --budget, verbatim, NO default (0 = unpacked)
+//	internal/eval/eval.go        mesh eval --budget, verbatim, NO default (0 = unpacked)
+//
+// The last two default to 0, so they skip the packer entirely rather than getting a
+// default budget, and neither rewrites a card after packing: the CLI reports with
+// TotalTokens over the same cards it prints, and eval measures the same set it scores.
+//
+// ask and curator ARE subject to this reserve (at their 3000 default it resolves to
+// 600, comfortably more than the 127 a fixture card costs, so it holds; below ~635 the
+// floor above is what saves them). Neither is subject to the mcp overrun that made the
+// cost injectable: both render each card into prose and DROP most of it, measured at 73
+// and 68 tokens against the 127 the packer charged, so they under-spend their budget
+// rather than blowing it. Do not "fix" that by packing them with a cheaper cost: their
+// renders are lossy, and the packer has to keep pricing the card it hands back.
+func tier0Reserve(cards []Card, budget int, cost CardCost) int {
 	reserve := budget / 5
 	for _, c := range cards {
 		if !c.Tier0 {
@@ -80,9 +143,9 @@ func tier0Reserve(cards []Card, budget int) int {
 		// fit at all. Price the full form first and fall back to the compact one, which
 		// is what pass A will place when the full form overruns the whole budget. A
 		// card whose compact form still does not fit cannot be reserved for at all.
-		n := cardTokens(c)
+		n := cost(c)
 		if n > budget {
-			n = cardTokens(compact(c))
+			n = cost(compact(c))
 			if n > budget {
 				continue
 			}
@@ -102,21 +165,41 @@ func compact(c Card) Card {
 	return c
 }
 
-// packToBudget selects the highest-scoring cards that fit the token budget,
+// CardCost prices one card the way the CALLER will actually receive it. The default is
+// cardTokens, which prices retrieve.Card's own JSON.
+//
+// It is injectable because a surface can put different bytes on the wire than the card
+// carries, and a budget priced on bytes nobody sends is a lie: internal/mcp wraps the
+// snippet of every connector-ingested card in a provenance envelope and adds a Source
+// field AFTER retrieval, which measured 41% over an 8000-token budget (11284 tokens
+// sent against 7988 reported) before that surface started packing with its own cost.
+// If you rewrite a card after packing, pass the cost of the rewritten form here
+// instead, and report with TotalTokensFunc using the same function.
+type CardCost func(Card) int
+
+// packToBudget packs with the plain card cost: the retriever's own callers get exactly
+// the bytes the packer priced.
+func packToBudget(cards []Card, budget int) []Card { return PackToBudget(cards, budget, nil) }
+
+// PackToBudget selects the highest-scoring cards that fit the token budget,
 // reserving part of it (see tier0Reserve) for the institutional-memory tier so
 // decisions, gotchas, and post-mortems are never crowded out by ordinary notes.
 // Input is assumed sorted by score desc; output preserves that order.
-func packToBudget(cards []Card, budget int) []Card {
+// cost prices a card (nil = cardTokens); see CardCost.
+func PackToBudget(cards []Card, budget int, cost CardCost) []Card {
+	if cost == nil {
+		cost = cardTokens
+	}
 	if budget <= 0 {
 		return cards
 	}
-	reserve := tier0Reserve(cards, budget)
+	reserve := tier0Reserve(cards, budget, cost)
 	used := 0
 	picked := make([]Card, len(cards))
 	taken := make([]bool, len(cards))
 
-	// cardTokens now marshals the card, so each call is a real BPE tokenization.
-	// Measure each form once and reuse the number instead of re-counting it.
+	// cost marshals the card, so each call is a real BPE tokenization. Measure each
+	// form once and reuse the number instead of re-counting it.
 	// Pass A: reserve room for the best tier-0 cards. Full form first; when the full
 	// form does not fit the whole BUDGET, fall back to the compact one, matching what
 	// pass B would emit. The budget test is what keeps this from costing snippets: a
@@ -126,7 +209,7 @@ func packToBudget(cards []Card, budget int) []Card {
 		if !c.Tier0 {
 			continue
 		}
-		n := cardTokens(c)
+		n := cost(c)
 		if used+n <= reserve {
 			picked[i] = c
 			taken[i] = true
@@ -137,7 +220,7 @@ func packToBudget(cards []Card, budget int) []Card {
 			continue
 		}
 		cc := compact(c)
-		if cn := cardTokens(cc); used+cn <= reserve {
+		if cn := cost(cc); used+cn <= reserve {
 			picked[i] = cc
 			taken[i] = true
 			used += cn
@@ -150,14 +233,14 @@ func packToBudget(cards []Card, budget int) []Card {
 		if taken[i] {
 			continue
 		}
-		if n := cardTokens(c); used+n <= budget {
+		if n := cost(c); used+n <= budget {
 			picked[i] = c
 			taken[i] = true
 			used += n
 			continue
 		}
 		cc := compact(c)
-		if n := cardTokens(cc); used+n <= budget {
+		if n := cost(cc); used+n <= budget {
 			picked[i] = cc
 			taken[i] = true
 			used += n
@@ -177,7 +260,7 @@ func packToBudget(cards []Card, budget int) []Card {
 	// form the passes above already prefer whenever the full one does not fit.
 	if len(out) == 0 && len(cards) > 0 {
 		best := cards[0]
-		if cardTokens(best) > budget {
+		if cost(best) > budget {
 			best = compact(best)
 		}
 		out = append(out, best)

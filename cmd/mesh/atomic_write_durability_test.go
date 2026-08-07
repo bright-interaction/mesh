@@ -18,77 +18,135 @@ import (
 	"testing"
 )
 
-// This file is the estate-wide guard for the temp-file + rename write, after the
-// same durability bug was fixed on one twin and left on the others twice.
+// This file is the estate-wide guard for durable note writes, after the same durability
+// bug was fixed on one twin and left on the others, twice.
 //
-// History: the durability pass added f.Sync() plus a parent-directory fsync to
-// pkg/meshclient/vault.go and internal/hub/repo.go, and each of those files grew a
-// guard that pins ITSELF by name. Two more copies (cmd/mesh/conflicts.go
-// writeFileAtomic, internal/curator/merge_note.go writeAtomic) were writing note
-// bytes with no fsync at all, and neither self-pinning guard could see them, because
-// a guard that names one file can only ever protect that file.
+// History, in two chapters. First, the durability pass added f.Sync() plus a parent-
+// directory fsync to pkg/meshclient/vault.go and internal/hub/repo.go, and each of those
+// files grew a guard that pinned ITSELF by name. Two more copies (cmd/mesh/conflicts.go
+// writeFileAtomic, internal/curator/merge_note.go writeAtomic) were writing note bytes
+// with no fsync at all, and neither self-pinning guard could see them, because a guard
+// that names one file can only ever protect that file. So this one names no file: it
+// DISCOVERS the writers.
 //
-// So this one names no file. It DISCOVERS every function in the module that creates
-// a temp file and renames it into place, and requires each to fsync the data before
-// the rename and the directory after it. A fifth copy fails this test on the day it
-// is written, which is the only version of this guard that ends the twin pattern.
+// Second chapter, and the reason this file was rewritten: the discovery anchored on
+// os.Rename, so it could only ever find writers that ALREADY had the temp+rename shape.
+// That is circular. A census of every function in the module that writes note bytes found
+// seven, and the guard was watching four. The three it could not see were exactly the
+// three that never renamed anything: internal/vault/migrate.go (the write path behind
+// every bulk in-place `--apply` rewrite of a whole vault), internal/vault/scaffold.go
+// CreateNote (the primary note-authoring path for the entire flywheel), and
+// internal/ingest/ingest.go Run. Two of them carried more traffic than anything the guard
+// did cover.
+//
+// So discovery no longer requires the fix to be present in order to notice the writer.
+// It finds byte writes by ANY spelling (os.WriteFile, os.OpenFile + Write, os.CreateTemp
+// + Rename) and decides in-scope from what the bytes ARE, not from how they are written.
+// (This test was called TestEveryTempRenameWriterFsyncs before that rewrite; the name is
+// recorded here so a reference to the old name still leads someone to this file.)
 
-// tempRenameWriter is one discovered writer: a function whose body writes bytes to a
-// temp path (os.CreateTemp, os.WriteFile or os.OpenFile) and renames it into place.
+// noteByteWriter is one discovered writer: a function whose body writes bytes that land
+// in a vault. How it writes them is not part of the definition, on purpose.
 //
-// Residual limit, stated so the next reader does not over-trust this: a writer that
-// takes an already-open *os.File from its caller and only renames it here would still
-// be missed, because this function's body holds no byte-writing call. Nothing in the
-// tree does that today.
-type tempRenameWriter struct {
-	rel  string // module-relative file path
-	fn   string // function name
-	body string // the function's CODE, comments stripped
+// Residual limit, stated so the next reader does not over-trust this: a writer that takes
+// an already-open *os.File from its caller and only renames it here would still be
+// missed, because this function's body holds no byte-writing call. Nothing in the tree
+// does that today.
+type noteByteWriter struct {
+	rel     string   // module-relative file path
+	fn      string   // function name
+	body    string   // the function's CODE, comments stripped
+	dests   []string // destination expression of each byte-writing call, as source text
+	renames bool     // the body also renames a file into place
+	why     string   // which signal put it in scope, for the failure message
 }
 
-// dirSyncCall matches the parent-directory fsync, however it is spelled. All four
-// note writers call a local syncDir helper; matching the suffix keeps the guard
-// working if one of them ever renames it (fsyncDir, syncParentDir, ...) without
-// letting an unrelated identifier through.
+// dirSyncCall matches the parent-directory fsync, however it is spelled. Every note
+// writer calls a local syncDir helper; matching the suffix keeps the guard working if one
+// of them ever renames it (fsyncDir, syncParentDir, ...) without letting an unrelated
+// identifier through.
 var dirSyncCall = regexp.MustCompile(`\b\w*[sS]yncDir\(`)
 
-// fileSyncCall matches an fsync on the temp file handle itself. Any receiver is
-// accepted (tmp, f, fh, ...) so the guard pins the BEHAVIOUR, not one file's naming.
+// fileSyncCall matches an fsync on the file handle itself. Any receiver is accepted (tmp,
+// f, fh, ...) so the guard pins the BEHAVIOUR, not one file's naming.
 var fileSyncCall = regexp.MustCompile(`\b\w+\.Sync\(\)`)
 
-// unguardedWriters are the temp+rename writers that are knowingly NOT durable yet,
-// each with the reason it is acceptable. Anything not on this list must fsync.
+// mdPathLiteral matches a markdown path literal anywhere in a writer's code, which is how
+// a function that builds its own note filename gives itself away (`id + ".md"`,
+// "index.md"). Comments are stripped before this runs, so a path named only in prose does
+// not count.
+var mdPathLiteral = regexp.MustCompile(`"[^"\n]*\.md"`)
+
+// vaultDest matches a destination expression built from a vault root
+// (filepath.Join(vaultRoot, rel), credPath(vaultDir), ...). It is applied ONLY to the
+// destination argument of the write call, never to the whole body: half the module takes
+// a vaultAbs parameter it merely reads, and matching that would put every unrelated
+// writer in scope.
+var vaultDest = regexp.MustCompile(`(?i)vault`)
+
+// frontmatterCode matches a writer that handles note frontmatter. Nothing but a note
+// carries frontmatter in this module, so a function that both parses it and writes bytes
+// is writing a note whatever its path expression looks like. This is the signal that
+// covers internal/vault/migrate.go writeNoteChecked if a later change ever inlines a
+// plain os.WriteFile back into it.
 //
-// The list is checked in BOTH directions: an entry that has since been fixed fails
-// the test as stale, so the exemption cannot outlive its reason and quietly cover a
-// regression later.
+// It is a case-insensitive substring, NOT `\bFrontmatter\b`: every real call is
+// SplitFrontmatter or ParseFrontmatter, where the F has a word character in front of it
+// and the word-boundary form matches nothing at all. Verified by planting the regression
+// this signal exists to catch; the anchored version stayed green on it.
+var frontmatterCode = regexp.MustCompile(`(?i)frontmatter`)
+
+// unguardedWriters are the discovered writers that are knowingly NOT fsynced, each with
+// the reason it is acceptable. Anything not on this list must fsync.
+//
+// The list is checked in BOTH directions: an entry that has since been fixed fails the
+// test as stale, so the exemption cannot outlive its reason and quietly cover a
+// regression later. An entry naming a function that no longer exists fails too.
+//
+// Every entry here is a file that is NOT a note: losing it costs a re-run, not knowledge.
+// A note is the one thing in a vault that cannot be regenerated from anything else, which
+// is the whole reason the fsync rule exists and the only reason these are out of it.
 var unguardedWriters = map[string]string{
 	"internal/meshcfg/config.go:SaveConfig": "writes .mesh/config.toml, not note bytes. " +
-		"Losing it costs a re-run of `mesh init`, and every field is re-derivable from env " +
-		"or defaults, so it is not in the same class as the four note writers. Out of the " +
-		"file group of the durability pass that added this guard; give it the same " +
-		"treatment and delete this line.",
+		"Every field is re-derivable from env or defaults and a lost config costs a re-run " +
+		"of `mesh init`, so it is not in the same class as the note writers.",
+	"cmd/mesh/main.go:initCmd": "writes the starter index.md into an EMPTY vault, and only " +
+		"when the walk found no files at all. It holds no authored content (a heading and a " +
+		"pointer to `mesh new`), and `mesh init` re-creates it verbatim on the next run.",
+	"internal/hub/init.go:Bootstrap": "writes the hub's mesh.toml and the same trivially " +
+		"re-creatable starter index.md, once, into a fresh repo. Bootstrap commits the " +
+		"worktree immediately afterwards, so git's own durability covers the content that " +
+		"matters and a lost file is re-created by re-running bootstrap.",
+	"internal/ingest/state.go:saveState": "writes .mesh/ingest-state.json, the per-connector " +
+		"high-water mark. Losing it re-pulls a window that has already been pulled, and every " +
+		"import is a deterministic upsert onto the same path, so the cost is a slower run and " +
+		"never a lost or duplicated note.",
+	"pkg/meshclient/vault.go:writeCredentials": "writes .mesh/credentials.json (the hub URL " +
+		"and token), not note bytes, at 0600. A lost credential file is re-obtained by " +
+		"running `mesh join` again; no knowledge is in it.",
 }
 
-// TestEveryTempRenameWriterFsyncs walks the whole module, finds every temp+rename
-// writer from the AST, and requires the two fsyncs in the right ORDER:
+// TestEveryNoteByteWriterFsyncs walks the whole module, finds every function that writes
+// note bytes from the AST, and requires the two fsyncs in the right ORDER:
 //
-//	tmp.Sync()   BEFORE the rename, or the rename can publish blocks that were
-//	             never written and the file comes back short or empty
-//	syncDir(dir) AFTER  the rename, or the fsync does not cover the new directory
-//	             entry and the rename itself can be lost
+//	f.Sync()     BEFORE the rename (or simply before the directory fsync, for a writer
+//	             that claims its final name directly), because a rename can publish
+//	             blocks that were never written and the file comes back short or empty
+//	syncDir(dir) AFTER  the write, or the fsync does not cover the new directory entry
+//	             and the rename (or the freshly created file) itself can be lost
 //
-// For a note that means the local copy silently reverts while sync.json records the
-// new hash, and the next sync round pushes the STALE bytes as an upsert that the hub
+// For a note that means the local copy silently reverts while sync.json records the new
+// hash, and the next sync round pushes the STALE bytes as an upsert that the hub
 // fast-forwards, reverting the team's copy with no conflict and no sibling.
-func TestEveryTempRenameWriterFsyncs(t *testing.T) {
+func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 	root := moduleRoot(t)
-	writers := findTempRenameWriters(t, root)
+	writers := findNoteByteWriters(t, root)
 	// A discovery guard that discovers nothing passes vacuously, which is the exact
-	// failure mode that let the twins survive. Pin a floor.
-	if len(writers) < 4 {
-		t.Fatalf("found only %d temp+rename writer(s) in the module; the four note writers alone "+
-			"should be found, so the scanner is broken, not the code", len(writers))
+	// failure mode that let the twins survive. Pin a floor: the six durable note writers
+	// plus the five exempted non-note writers are all known to be findable.
+	if len(writers) < 9 {
+		t.Fatalf("found only %d note-byte writer(s) in the module; at least the six note writers "+
+			"and the exempted non-note writers should be found, so the scanner is broken, not the code", len(writers))
 	}
 
 	seen := map[string]bool{}
@@ -119,38 +177,43 @@ func TestEveryTempRenameWriterFsyncs(t *testing.T) {
 
 			switch {
 			case fileSyncAt < 0:
-				t.Errorf("%s does not fsync the temp file before renaming it. A rename can be "+
-					"durable while the data blocks it points at are not, so a power cut leaves the "+
-					"file short or empty at a path everything else treats as written.", key)
-			case fileSyncAt > renameAt:
-				t.Errorf("%s fsyncs the temp file AFTER the rename; the rename can publish unwritten "+
+				t.Errorf("%s writes note bytes (%s) and does not fsync the file. The bytes can sit "+
+					"in the page cache while everything downstream treats the write as done, so a "+
+					"power cut leaves a short or empty file at a path the index, sync.json and the "+
+					"caller's receipt all name as written.", key, w.why)
+			case renameAt >= 0 && fileSyncAt > renameAt:
+				t.Errorf("%s fsyncs the file AFTER the rename; the rename can publish unwritten "+
 					"blocks, so the ordering is the whole point", key)
 			}
 			switch {
 			case dirSyncAt < 0:
-				t.Errorf("%s does not fsync the parent directory after the rename. The directory "+
-					"entry itself can be lost, leaving the previous file (or no file) behind even "+
-					"though the data was fsynced.", key)
-			case dirSyncAt < renameAt:
+				t.Errorf("%s writes note bytes (%s) and does not fsync the parent directory. The "+
+					"directory entry itself can be lost, leaving the previous file (or no file) "+
+					"behind even though the data was fsynced.", key, w.why)
+			case renameAt >= 0 && dirSyncAt < renameAt:
 				t.Errorf("%s fsyncs the directory BEFORE the rename, which does not cover the new "+
 					"directory entry", key)
+			case renameAt < 0 && fileSyncAt >= 0 && dirSyncAt < fileSyncAt:
+				t.Errorf("%s fsyncs the directory before the file's own data; the entry would be "+
+					"durable while the bytes it points at are not", key)
 			}
 		})
 	}
 
-	// The four note writers are the ones this pass fixed. Naming them is redundant
-	// with the discovery above and that is deliberate: if a refactor moves or renames
-	// one so the scanner stops seeing it, this list says so out loud instead of the
-	// suite going quietly green on three.
+	// The durable note writers. Naming them is redundant with the discovery above and
+	// that is deliberate: if a refactor moves or renames one so the scanner stops seeing
+	// it, this list says so out loud instead of the suite going quietly green on five.
 	for _, key := range []string{
 		"pkg/meshclient/vault.go:writeFileAtomic",
 		"internal/hub/repo.go:writeFileAtomic",
 		"cmd/mesh/conflicts.go:writeFileAtomic",
 		"internal/curator/merge_note.go:writeAtomic",
+		"internal/vault/migrate.go:WriteNoteAtomic",
+		"internal/vault/scaffold.go:CreateNote",
 	} {
 		if !seen[key] {
 			t.Errorf("known note writer %s was not discovered; it moved, was renamed, or no longer "+
-				"uses temp+rename. Update this list in the same change, do not delete the entry.", key)
+				"writes note bytes. Update this list in the same change, do not delete the entry.", key)
 		}
 	}
 
@@ -161,22 +224,22 @@ func TestEveryTempRenameWriterFsyncs(t *testing.T) {
 	}
 }
 
-// findTempRenameWriters parses every non-test .go file under root WITHOUT comments
-// and returns each function that both creates a temp file and renames it.
+// findNoteByteWriters parses every non-test .go file under root WITHOUT comments and
+// returns each function that writes bytes into a vault.
 //
-// Parsing without parser.ParseComments is load-bearing, not tidiness. A body that
-// merely MENTIONS tmp.Sync() in a comment while the call itself is gone contains no
-// fsync at all, and a text scan that reads comments reports it as guarded. That
-// exact false negative was produced deliberately during the last round's ablation:
-// both calls deleted, "// tmp.Sync() removed, see history" left behind, guard green.
-// Comments never enter the AST here, so printing a body yields code only.
+// Parsing without parser.ParseComments is load-bearing, not tidiness. A body that merely
+// MENTIONS tmp.Sync() in a comment while the call itself is gone contains no fsync at all,
+// and a text scan that reads comments reports it as guarded. That exact false negative was
+// produced deliberately by an earlier round while checking this guard: both calls deleted,
+// "tmp.Sync() removed, see history" left behind as a comment, guard green. Comments never
+// enter the AST here, so printing a body yields code only.
 //
-// It reads files off disk rather than through the build system on purpose: build
-// tags would hide the pro-only hub writer from the default-tag test run, and that
-// twin is one of the four this exists to cover.
-func findTempRenameWriters(t *testing.T, root string) []tempRenameWriter {
+// It reads files off disk rather than through the build system on purpose: build tags
+// would hide the pro-only hub writer from the default-tag test run, and that twin is one
+// of the writers this exists to cover.
+func findNoteByteWriters(t *testing.T, root string) []noteByteWriter {
 	t.Helper()
-	var out []tempRenameWriter
+	var out []noteByteWriter
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -206,34 +269,102 @@ func findTempRenameWriters(t *testing.T, root string) []tempRenameWriter {
 			if !ok || fd.Body == nil {
 				continue
 			}
+			w := noteByteWriter{rel: rel, fn: fd.Name.Name}
+			var ierr error
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				pkg, ok := sel.X.(*ast.Ident)
+				if !ok || pkg.Name != "os" {
+					return true
+				}
+				switch sel.Sel.Name {
+				// The three ways this module spells "put these bytes on disk". Requiring
+				// os.CreateTemp specifically was the old shape and it missed the other two
+				// outright, which is how three note writers stayed invisible.
+				case "WriteFile", "OpenFile", "CreateTemp":
+					if len(call.Args) > 0 {
+						txt, err := exprText(fset, call.Args[0])
+						if err != nil {
+							ierr = err
+							return false
+						}
+						w.dests = append(w.dests, txt)
+					}
+				case "Rename":
+					w.renames = true
+				}
+				return true
+			})
+			if ierr != nil {
+				return ierr
+			}
+			if len(w.dests) == 0 {
+				continue
+			}
 			var buf bytes.Buffer
 			if err := printer.Fprint(&buf, fset, fd.Body); err != nil {
 				return err
 			}
-			body := buf.String()
-			// The shape being guarded is "write bytes somewhere, then rename them into
-			// place", so the rename is the anchor and the byte write is any of the three
-			// ways Go spells it. Requiring os.CreateTemp specifically was too narrow and
-			// missed the other common idiom outright: a writer that does
-			// os.WriteFile(path+".tmp", b) then os.Rename passed this guard green with no
-			// fsync anywhere in it, verified by planting one. Checked with a probe again
-			// after widening.
-			if !strings.Contains(body, "os.Rename(") {
+			w.body = buf.String()
+			w.why = vaultWriteSignal(w)
+			if w.why == "" {
 				continue
 			}
-			if !strings.Contains(body, "os.CreateTemp(") &&
-				!strings.Contains(body, "os.WriteFile(") &&
-				!strings.Contains(body, "os.OpenFile(") {
-				continue
-			}
-			out = append(out, tempRenameWriter{rel: rel, fn: fd.Name.Name, body: body})
+			out = append(out, w)
 		}
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("scan module for temp+rename writers: %v", err)
+		t.Fatalf("scan module for note-byte writers: %v", err)
 	}
 	return out
+}
+
+// vaultWriteSignal reports why a byte writer counts as writing into a vault, or "" when
+// it does not. Four independent signals, so no single one of them can be the hole:
+//
+//   - it renames a temp file into place. In this module that shape exists only for vault
+//     files and the config, and it is the generic helper shape (writeFileAtomic takes a
+//     path, so the destination expression says nothing about what it holds).
+//   - it names a .md path in its own code, which is how a function that builds a note
+//     filename itself gives itself away.
+//   - it handles frontmatter, which nothing but a note has.
+//   - it writes to a destination built from a vault root.
+//
+// Deliberately NOT in scope: Claude Code hook config files, the extraction log, and
+// .gitattributes. None of them is inside a note tree and none of them holds knowledge.
+func vaultWriteSignal(w noteByteWriter) string {
+	if w.renames {
+		return "temp file renamed into place"
+	}
+	if mdPathLiteral.MatchString(w.body) {
+		return "names a .md path"
+	}
+	if frontmatterCode.MatchString(w.body) {
+		return "handles note frontmatter"
+	}
+	for _, d := range w.dests {
+		if vaultDest.MatchString(d) {
+			return "writes to a vault path (" + d + ")"
+		}
+	}
+	return ""
+}
+
+// exprText renders one AST expression back to source text.
+func exprText(fset *token.FileSet, e ast.Expr) (string, error) {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, e); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
 }
 
 // moduleRoot walks up from the test's working directory to the directory holding

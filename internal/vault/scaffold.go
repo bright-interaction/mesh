@@ -224,11 +224,36 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		}
 		if _, err := f.Write([]byte(content)); err != nil {
 			f.Close()
+			os.Remove(path)
+			return nil, err
+		}
+		// Flush the note's bytes to the device before this returns a CreateResult naming
+		// it. Everything downstream treats that receipt as "the note exists": the index
+		// records its hash, sync.json records it as the base for the next round, and the
+		// agent that wrote it moves on. Without the fsync a power cut leaves the receipt's
+		// path holding a short or empty file, and the next sync round pushes THAT as the
+		// note's content. This is the primary authoring path for the whole flywheel
+		// (`mesh new`, MCP mesh_append_note and mesh_write_entity, the hub's /mcp,
+		// internal/web/pending_api), so it is the one that must not be lossy.
+		//
+		// The temp+rename shape used elsewhere is deliberately NOT used here: the O_EXCL
+		// open is what makes claiming the id atomic, and a rename would hand the race back
+		// (two writers rendering the same id, the second overwriting the first, both
+		// getting a success receipt). Durability is added around that claim, not instead
+		// of it. A failed write or fsync releases the claim rather than leaving a
+		// half-written note behind at an id the caller was told nothing about.
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(path)
 			return nil, err
 		}
 		if err := f.Close(); err != nil {
+			os.Remove(path)
 			return nil, err
 		}
+		// The note is a NEW directory entry, so the data fsync alone does not make it
+		// reachable after a power cut. Fsync the directory too, after the file.
+		syncDir(dir)
 		return &CreateResult{Path: path, ID: id, When: date, TODOs: fm.Validate()}, nil
 	}
 	return nil, fmt.Errorf("could not claim a free id for %q after %d attempts", base, maxIDAttempts)

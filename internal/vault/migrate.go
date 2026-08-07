@@ -5,6 +5,7 @@ package vault
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -308,7 +309,100 @@ func writeNoteChecked(path, content string) error {
 	if _, _, err := ParseFrontmatter([]byte(fmStr)); err != nil {
 		return fmt.Errorf("%s: rewritten frontmatter is invalid YAML (the index would drop this note, invisible to search and the graph): %w", path, err)
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return WriteNoteAtomic(path, []byte(content))
+}
+
+// WriteNoteAtomic replaces a note's bytes durably: the content goes to a temp file in
+// the same directory, is fsynced, and is then renamed over the note, after which the
+// directory entry is fsynced too.
+//
+// It replaces a plain os.WriteFile, which was neither atomic nor durable here. WriteFile
+// opens with O_TRUNC, so the note is EMPTY from the truncate until the write lands: a
+// crash in that window leaves nothing behind, and a concurrent reader (the indexer, the
+// sync daemon, an editor) can observe the empty or half-written file even with no crash
+// at all. That is the write path behind every bulk in-place rewrite of a whole vault
+// (`mesh migrate --apply`, `mesh scope backfill --apply`, `mesh structure --fill-bodies
+// --apply` and `--wire-orphans --apply`), none of which takes a backup first.
+//
+// The rename gives crash-atomicity and the two fsyncs give durability, in that order:
+// the data must reach the device BEFORE the rename publishes the name, or the rename can
+// point at blocks that were never written; the directory must be fsynced AFTER, or the
+// new entry itself can be lost. Exported because internal/ingest lands imported notes
+// through it too, so the whole module has ONE durable note writer instead of a sixth
+// hand-rolled copy that the next durability pass has to find again.
+//
+// The destination's current permission bits are preserved when it already exists, since
+// a rename installs the temp file's mode: without this a note the author chmod'd 0600
+// would come back 0644.
+func WriteNoteAtomic(path string, content []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	perm := os.FileMode(0o644)
+	if fi, err := os.Stat(path); err == nil {
+		perm = fi.Mode().Perm()
+		// A rename replaces the destination without ever opening it, so temp+rename would
+		// cheerfully overwrite a note the author chmod'd read-only, which the os.WriteFile
+		// this replaced refused with EACCES. That refusal is the only protection an author
+		// has against a bulk `--apply` pass touching a note they locked, and losing it
+		// silently would be a durability fix that costs data control. Ask the destination
+		// the same question a direct write would, before anything is created.
+		w, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		w.Close()
+	}
+	tmp, err := os.CreateTemp(dir, ".mesh-note-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	// CreateTemp makes the file 0600; match the mode the note is meant to land with.
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	// Flush the data to the device BEFORE the rename publishes the name.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	syncDir(dir)
+	return nil
+}
+
+// syncDir fsyncs a directory so a rename (or a freshly created note) that just landed in
+// it survives a power cut. Best effort on purpose: opening or fsyncing a directory handle
+// is a no-op or an error on some platforms and network filesystems (Windows cannot open
+// one at all), and that is not a failed write, so the bytes still count as written and
+// the refusal is only logged. The data itself is already fsynced by the caller.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		slog.Debug("vault: cannot open the note directory to fsync it", "dir", dir, "err", err)
+		return
+	}
+	if err := d.Sync(); err != nil {
+		slog.Debug("vault: directory fsync not supported here", "dir", dir, "err", err)
+	}
+	d.Close()
 }
 
 func fileMtimeDate(path string) string {
