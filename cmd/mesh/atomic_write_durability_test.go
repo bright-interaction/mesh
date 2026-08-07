@@ -110,13 +110,16 @@ var unguardedWriters = map[string]string{
 	"internal/meshcfg/config.go:SaveConfig": "writes .mesh/config.toml, not note bytes. " +
 		"Every field is re-derivable from env or defaults and a lost config costs a re-run " +
 		"of `mesh init`, so it is not in the same class as the note writers.",
-	"cmd/mesh/main.go:initCmd": "writes the starter index.md into an EMPTY vault, and only " +
-		"when the walk found no files at all. It holds no authored content (a heading and a " +
-		"pointer to `mesh new`), and `mesh init` re-creates it verbatim on the next run.",
-	"internal/hub/init.go:Bootstrap": "writes the hub's mesh.toml and the same trivially " +
-		"re-creatable starter index.md, once, into a fresh repo. Bootstrap commits the " +
-		"worktree immediately afterwards, so git's own durability covers the content that " +
-		"matters and a lost file is re-created by re-running bootstrap.",
+	// internal/hub/init.go:Bootstrap used to sit here, exempted because commitWorktree
+	// runs immediately after it, so git was said to carry the bytes into the object
+	// store. The entry itself asked for that argument to be re-checked, and it does not
+	// survive: git's default is `core.fsync=committed,-loose-object` (git 2.39's manual
+	// says so, and adds that it "risks losing recent work in the event of an unclean
+	// system shutdown"), and a fresh bootstrap commit is nothing but loose objects, so
+	// the file and the objects made from it are unhardened together. Bootstrap now lands
+	// both starter files through internal/hub/repo.go:writeFileAtomic and no longer
+	// writes bytes itself, which is why it is neither in this map nor in the discovered
+	// set. Do not re-add it.
 	"internal/ingest/state.go:saveState": "writes .mesh/ingest-state.json, the per-connector " +
 		"high-water mark. Losing it re-pulls a window that has already been pulled, and every " +
 		"import is a deterministic upsert onto the same path, so the cost is a slower run and " +
@@ -142,10 +145,10 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 	root := moduleRoot(t)
 	writers := findNoteByteWriters(t, root)
 	// A discovery guard that discovers nothing passes vacuously, which is the exact
-	// failure mode that let the twins survive. Pin a floor: the six durable note writers
-	// plus the five exempted non-note writers are all known to be findable.
+	// failure mode that let the twins survive. Pin a floor: the seven durable note writers
+	// plus the three exempted non-note writers are all known to be findable.
 	if len(writers) < 9 {
-		t.Fatalf("found only %d note-byte writer(s) in the module; at least the six note writers "+
+		t.Fatalf("found only %d note-byte writer(s) in the module; at least the seven note writers "+
 			"and the exempted non-note writers should be found, so the scanner is broken, not the code", len(writers))
 	}
 
@@ -207,6 +210,7 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 		"pkg/meshclient/vault.go:writeFileAtomic",
 		"internal/hub/repo.go:writeFileAtomic",
 		"cmd/mesh/conflicts.go:writeFileAtomic",
+		"cmd/mesh/main.go:writeStarterIndex",
 		"internal/curator/merge_note.go:writeAtomic",
 		"internal/vault/migrate.go:WriteNoteAtomic",
 		"internal/vault/scaffold.go:CreateNote",

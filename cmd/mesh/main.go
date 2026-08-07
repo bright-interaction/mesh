@@ -134,7 +134,7 @@ func initCmd() *cobra.Command {
 				date := vault.Now().Format("2006-01-02")
 				starter := "---\nid: index\ntype: map\ntitle: Vault index\nwhen: \"" + date + "\"\n---\n\n" +
 					"# Vault index\n\nA Mesh vault. Add notes with `mesh new <type> \"<title>\"`, then `mesh index`.\n"
-				if err := os.WriteFile(filepath.Join(root, "index.md"), []byte(starter), 0o644); err != nil {
+				if err := writeStarterIndex(root, starter); err != nil {
 					return err
 				}
 			}
@@ -158,6 +158,51 @@ func initCmd() *cobra.Command {
 		},
 	}
 	return c
+}
+
+// writeStarterIndex writes the starter index.md `mesh init` drops into an empty vault,
+// and fsyncs both the file and the vault directory before returning.
+//
+// It takes the vault root and names index.md itself rather than taking a finished path,
+// which is load-bearing for the census in atomic_write_durability_test.go: that guard
+// decides scope from what a writer's own code says it writes, and a helper whose
+// destination is a bare `path` parameter tells it nothing. Written the other way round
+// this function was invisible to the guard, which is exactly the failure mode the census
+// exists to prevent.
+//
+// It used to be a plain os.WriteFile, exempted from the fsync census as trivially
+// re-creatable. That exemption did not survive the failure the fsync prevents. An
+// unsynced write can leave a ZERO-LENGTH index.md after a power cut, and vault.Walk
+// counts any .md file whatever its contents, so `len(files) == 0` in initCmd is false
+// forever after and `mesh init` never re-creates it. The operator is left with an empty
+// note holding the vault's index id, in a vault that reported a successful init. The
+// other exempted writers really are re-creatable, because losing one leaves NOTHING at
+// the path they guard; this one leaves a file.
+//
+// No temp+rename: the branch that calls this runs only when the vault holds no notes at
+// all, so there is no previous content for a rename to protect and no concurrent reader
+// to protect it from. Creating the final name directly also keeps the 0644 the note
+// wants, which os.CreateTemp's 0600 would have silently changed. The census guard
+// accepts either shape and checks the ordering that matters: the data is fsynced before
+// the directory entry it is reached through.
+func writeStarterIndex(root, body string) error {
+	f, err := os.OpenFile(filepath.Join(root, "index.md"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte(body)); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	syncDir(root)
+	return nil
 }
 
 func doctorCmd() *cobra.Command {
