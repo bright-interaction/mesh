@@ -62,17 +62,31 @@ func (c *Client) Sync(req syncproto.SyncRequest) (syncproto.SyncResponse, error)
 }
 
 func (c *Client) rpc(method, path string, body any, authed bool, out any) error {
+	_, err := c.rpcHeaders(method, path, body, authed, out)
+	return err
+}
+
+// rpcHeaders is rpc plus the response headers, for the one contract that puts part of
+// its answer in a header: the curation activity trail returns its paging position in
+// one, because the response BODY type is shared with the pending-jobs route and adding
+// a field there would change what every existing client decodes. A caller that cannot
+// see the headers cannot page, which is exactly how the client ended up able to read
+// only the newest page of an endpoint that had a cursor.
+//
+// The headers come back only on success; every error path returns nil, so a caller can
+// never read a paging position off a response the hub refused.
+func (c *Client) rpcHeaders(method, path string, body any, authed bool, out any) (http.Header, error) {
 	var rdr io.Reader
 	if body != nil {
 		var buf bytes.Buffer
 		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			return err
+			return nil, err
 		}
 		rdr = &buf
 	}
 	req, err := http.NewRequest(method, c.HubURL+path, rdr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -85,15 +99,17 @@ func (c *Client) rpc(method, path string, body any, authed bool, out any) error 
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("hub %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return nil, fmt.Errorf("hub %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
 	if out != nil {
-		return json.Unmarshal(data, out)
+		if err := json.Unmarshal(data, out); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return resp.Header, nil
 }

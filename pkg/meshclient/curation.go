@@ -5,6 +5,9 @@ package meshclient
 
 import (
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/bright-interaction/mesh/internal/syncproto"
 )
@@ -29,19 +32,53 @@ func (c *Client) CurationJobs() ([]syncproto.CurationJob, error) {
 	return resp.Jobs, nil
 }
 
-// CurationActivity lists the hub's recent terminal curation jobs (resolved +
-// failed), most-recent first, for the team-wide "what did the curator do" view.
-// limit <= 0 uses the hub default.
-func (c *Client) CurationActivity(limit int) ([]syncproto.CurationJob, error) {
-	path := "/v1/curation/activity"
+// CurationActivityPageSize is the largest page /v1/curation/activity will serve: the
+// hub clamps ?limit to 1..200. Asking for more is not an error, it silently yields 200
+// rows, so history below the newest page is reached by PAGING with the cursor and never
+// by raising the limit.
+const CurationActivityPageSize = 200
+
+// curationActivityCursorHeader carries the position the hub's activity read stopped at;
+// it is sent back as ?cursor= to get the page below.
+//
+// This name must match internal/hub's constant of the same name exactly. Reading the
+// wrong header yields "" on every response, which this client cannot tell apart from
+// "the history ended here", so it would quietly go back to seeing only the newest page:
+// the precise defect the hub-side cursor was added to close.
+// TestCurationActivityCursorHeaderMatchesTheHub parses the hub source and pins the two
+// names together so they cannot drift.
+const curationActivityCursorHeader = "X-Mesh-Curation-Cursor"
+
+// CurationActivityPage lists ONE page of the hub's terminal curation jobs (resolved +
+// failed), most-recent first, for the team-wide "what did the curator do" view, and
+// returns the cursor for the page below it.
+//
+// cursor is "" for the newest page, otherwise a cursor a previous call handed back.
+// limit is the size of THIS page; the hub clamps it to 1..200 and uses its own default
+// (50) when limit <= 0. Reaching further back is paging, not a bigger limit.
+//
+// The returned cursor is empty ONLY when the hub says the history ended inside this
+// page. A page may come back short, or even empty, and still carry a cursor: the hub
+// omits rows in folders this token may not read, so a walk that stops on a short page
+// never reaches the readable rows sitting below a fenced run. Stop on the empty cursor.
+func (c *Client) CurationActivityPage(cursor string, limit int) ([]syncproto.CurationJob, string, error) {
+	q := url.Values{}
 	if limit > 0 {
-		path = fmt.Sprintf("%s?limit=%d", path, limit)
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	path := "/v1/curation/activity"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
 	}
 	var resp syncproto.CurationJobsResponse
-	if err := c.rpc("GET", path, nil, true, &resp); err != nil {
-		return nil, err
+	hdr, err := c.rpcHeaders("GET", path, nil, true, &resp)
+	if err != nil {
+		return nil, "", err
 	}
-	return resp.Jobs, nil
+	return resp.Jobs, strings.TrimSpace(hdr.Get(curationActivityCursorHeader)), nil
 }
 
 // CurationJob fetches one job including its IncomingB64 (the losing version).
