@@ -112,8 +112,12 @@ func TestEveryTempRenameWriterRestoresTheMode(t *testing.T) {
 	root := moduleRoot(t)
 	writers := findTempRenameWriters(t, root)
 	// A discovery guard that discovers nothing passes vacuously, which is how the twins
-	// survived last time. Pin a floor at the five known temp+rename writers.
-	if len(writers) < 5 {
+	// survived last time. Pin the floor at the temp+rename writers findable in the OPEN
+	// core, not in this monorepo checkout: the same test runs against the filtered public
+	// mirror, where one of the five lives in a stripped pro path. See the equivalent note
+	// in atomic_write_durability_test.go. The monorepo is a superset, so one number serves
+	// both trees and a broken scanner still finds ~0.
+	if len(writers) < 4 {
 		t.Fatalf("found only %d temp+rename writer(s); the module has at least five, so the "+
 			"scanner is broken rather than the code", len(writers))
 	}

@@ -154,10 +154,18 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 	root := moduleRoot(t)
 	writers := findNoteByteWriters(t, root)
 	// A discovery guard that discovers nothing passes vacuously, which is the exact
-	// failure mode that let the twins survive. Pin a floor: the seven durable note
-	// writers, the durable config writer, and the two exempted non-note writers are all
-	// known to be findable.
-	if len(writers) < 9 {
+	// failure mode that let the twins survive. Pin a floor at the writers that are
+	// findable in the OPEN core, not in this monorepo checkout.
+	//
+	// The distinction is load-bearing: this test also runs against the filtered
+	// public mirror, where split-public-repo.sh has stripped the pro paths and one
+	// of the writers counted here goes with them. A floor set from the monorepo's
+	// census therefore fails in the mirror for a reason that has nothing to do with
+	// durability, and it fails AFTER the publish transform, where it reads as
+	// "publishing would hand contributors a red suite". The monorepo satisfies this
+	// floor with room to spare (it is a superset of the open core), so one number
+	// serves both trees, and a genuinely broken scanner still finds ~0 and trips it.
+	if len(writers) < 8 {
 		t.Fatalf("found only %d note-byte writer(s) in the module; at least the seven note writers "+
 			"and the exempted non-note writers should be found, so the scanner is broken, not the code", len(writers))
 	}
