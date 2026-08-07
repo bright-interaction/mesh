@@ -233,29 +233,31 @@ func conflictsResolveCmd() *cobra.Command {
 				fmt.Printf("your parked version is KEPT at %s; re-run resolve --take-mine when the hub is reachable.\n", args[0])
 				return serr
 			}
-			if sum.Conflicts > 0 {
-				// Our push lost a race: the engine re-parked the loser. On a same-day
-				// re-conflict the re-parked sibling is byte-identical to the original
-				// (same path/user/content), so we just report where it now lives; on a
-				// different day there may be a second sibling. Either way nothing is lost.
-				// Same renderer as `mesh sync` and its watch loop. This site used to
-				// hand-roll the headline, which is why it never learned to mention a
-				// deferred remainder: a bounded round here reported a complete push.
-				for _, line := range syncHeadlineLines(sum) {
-					fmt.Println(line)
-				}
-				fmt.Println("the note advanced again, so your version was re-parked (no data lost):")
-				for _, s := range sum.ConflictSiblings {
-					fmt.Printf("  %s  (review: mesh conflicts diff %s)\n", textdiff.Sanitize(s), s)
-				}
-				reindexBestEffort(vaultDir)
-				return nil
-			}
-			// The hub can also REFUSE this path outright (viewer role, folder ACL, note
-			// scope, or oversize/binary content). A refusal is not a conflict, so
-			// sum.Conflicts is 0 and control used to fall straight through to the delete
-			// below: the parked sibling, which is the operator's only evidence of the
-			// divergence, was destroyed and the receipt said the team could see the
+			// Both branches below ask about the SAME round, and both must ask about the
+			// note the operator is rescuing, never about the vault:
+			//
+			//	takeMineRejected      = the hub refused OUR path
+			//	takeMineReConflicted  = the round re-parked OUR path
+			//
+			// ORDER MATTERS because a round can answer yes to both (our note refused by
+			// an ACL while it also loses a race), so whichever branch is tested first
+			// decides the receipt and the exit code. Conflicts-first re-opened the defect
+			// the rejection check was added to close: control took the conflicts branch,
+			// printed "your version was re-parked" naming a sibling belonging to a
+			// DIFFERENT note, and exited 0 on a push that never landed. So the refusal is
+			// asked first, and the round's other conflicts are reported inside whichever
+			// receipt owns the round instead of replacing it.
+			//
+			// The second branch used to read `sum.Conflicts > 0`, which is a counter for
+			// the whole round rather than a fact about this note, and that was the same
+			// defect wearing the other hat: a landed push reported as re-parked. See
+			// takeMineReConflicted.
+			//
+			// The hub REFUSES a path outright for viewer role, folder ACL, note scope,
+			// or oversize/binary content. A refusal is not a conflict, so sum.Conflicts
+			// is 0 in the plain case and control used to fall straight through to the
+			// delete below: the parked sibling, which is the operator's only evidence of
+			// the divergence, was destroyed and the receipt said the team could see the
 			// rescued version. The bytes themselves survive at the note's own path and
 			// SyncVault keeps them dirty for the next round, so this is a false receipt
 			// rather than byte loss, but it breaks the invariant above: drop the sibling
@@ -266,6 +268,13 @@ func conflictsResolveCmd() *cobra.Command {
 				}
 				reindexBestEffort(vaultDir)
 				return fmt.Errorf("the hub refused %s, so nothing was pushed and your parked version was kept", textdiff.Sanitize(baseRel))
+			}
+			if takeMineReConflicted(baseRel, sum) {
+				for _, line := range takeMineReConflictedReceipt(baseRel, sum) {
+					fmt.Println(line)
+				}
+				reindexBestEffort(vaultDir)
+				return nil
 			}
 			if err := os.Remove(sibAbs); err != nil && !os.IsNotExist(err) {
 				return err
@@ -292,12 +301,108 @@ func conflictsResolveCmd() *cobra.Command {
 // Nothing is lost (the bytes are at the note's own path and stay dirty until a later
 // round sends them) but the receipt has to say so, or the user stops here believing
 // the team can see it.
+//
+// It is only reached when OUR note neither conflicted nor was refused, so every conflict
+// the round reports belongs to someone else's note and is named as such. Saying nothing
+// about them would leave a sibling on disk that no receipt explains, right after telling
+// the operator this note is settled.
 func takeMineReceipt(baseRel string, sum meshclient.Summary) []string {
 	lines := []string{fmt.Sprintf("resolved %s: took your version and pushed it (HEAD %s).",
 		textdiff.Sanitize(baseRel), short8(sum.Head))}
 	if sum.Remaining > 0 {
 		lines = append(lines, fmt.Sprintf("  the round was bounded: %d changed note(s) are still queued and "+
 			"NOT on the hub yet, and this note may be one of them; run `mesh sync` again.", sum.Remaining))
+	}
+	return append(lines, otherConflictLines(sum.Conflicts, sum.ConflictSiblings)...)
+}
+
+// takeMineReConflicted reports whether the round re-parked THE NOTE the operator is
+// rescuing, as opposed to some other note that lost its own race in the same round.
+//
+// sum.Conflicts is a counter for the whole ROUND, so reading it bare answers a question
+// about the vault with a sentence about one note. A round where our push LANDED while an
+// unrelated note conflicted took this branch: it printed "your version was re-parked" over
+// a push that had in fact reached the hub, handed the operator a sibling path belonging to
+// that other note, and skipped the delete, so the resolved note's own stale sibling stayed
+// on disk and `mesh conflicts list` kept reporting it as unresolved. The offered path is
+// the dangerous part: `resolve --keep-base` on it drops the OTHER note's parked version,
+// which is that note's only copy of its divergence.
+//
+// Attribution is per sibling, the same way internal/curator/curator.go:pushOutcome does it
+// for the same Summary, and it fails SAFE in both unclear cases, because keeping a sibling
+// costs the operator one command while dropping one wrongly costs a version: a Conflicts
+// count larger than the sibling list that explains it, and a sibling whose base path
+// cannot be recovered, are both treated as ours.
+func takeMineReConflicted(baseRel string, sum meshclient.Summary) bool {
+	_, _, ours := roundConflicts(baseRel, sum)
+	return ours
+}
+
+// roundConflicts splits the round's re-parked siblings into the ones that belong to the
+// resolved note and the ones that belong to other notes, and reports whether the resolved
+// note is among them. It is the ONE place the attribution is decided, so the predicate
+// above and the receipt below cannot drift into two different answers.
+//
+// Both unclear shapes resolve toward "ours": a Conflicts count larger than the sibling
+// list that explains it (the list cannot say which one we are), and a sibling whose base
+// path merge.BasePath cannot recover. Over-reporting costs the operator a second look;
+// under-reporting invites them to drop another note's only parked copy with --keep-base.
+func roundConflicts(baseRel string, sum meshclient.Summary) (mine, others []string, ours bool) {
+	if sum.Conflicts == 0 {
+		return nil, nil, false
+	}
+	if sum.Conflicts > len(sum.ConflictSiblings) {
+		return sum.ConflictSiblings, nil, true
+	}
+	want := path.Clean(filepath.ToSlash(baseRel))
+	for _, sib := range sum.ConflictSiblings {
+		base, ok := merge.BasePath(path.Clean(filepath.ToSlash(sib)))
+		if !ok || path.Clean(base) == want {
+			mine = append(mine, sib)
+			continue
+		}
+		others = append(others, sib)
+	}
+	return mine, others, len(mine) > 0
+}
+
+// takeMineReConflictedReceipt renders the branch where OUR push lost a race and the
+// engine re-parked our version again.
+//
+// On a same-day re-conflict the re-parked sibling is byte-identical to the original
+// (same path, user and content), so this reports where our version now lives; on a
+// different day there may be a second sibling. Either way nothing is lost.
+//
+// The headline comes from the SAME renderer `mesh sync` and its watch loop use. This
+// site used to hand-roll it, which is why it never learned to mention a deferred
+// remainder: a bounded round here reported a complete push. It also used to print every
+// sibling in the round under "your version", including notes the operator had never
+// touched, so `resolve --keep-base` on one of those offered paths dropped that note's
+// only parked copy. Ours and theirs are named separately now.
+func takeMineReConflictedReceipt(baseRel string, sum meshclient.Summary) []string {
+	mine, others, _ := roundConflicts(baseRel, sum)
+	lines := syncHeadlineLines(sum)
+	lines = append(lines, "the note advanced again, so your version was re-parked (no data lost):")
+	for _, s := range mine {
+		lines = append(lines, fmt.Sprintf("  %s  (review: mesh conflicts diff %s)", textdiff.Sanitize(s), s))
+	}
+	return append(lines, otherConflictLines(len(others), others)...)
+}
+
+// otherConflictLines names the notes OTHER than the resolved one that the same round
+// re-parked. Both receipts that can own a round without our note conflicting need it (the
+// hub refused us, or our push landed): the round still created a sibling on disk, and a
+// *.sync-conflict file that no receipt ever mentioned reads as this note's unfinished
+// business. Callers pass the round's count and siblings, which are all other notes' by
+// construction at both call sites.
+func otherConflictLines(n int, sibs []string) []string {
+	if n <= 0 {
+		return nil
+	}
+	lines := []string{fmt.Sprintf("  separately, %d OTHER note(s) conflicted in the same round and were re-parked "+
+		"(this is not your note and does not change the outcome above); review them with `mesh conflicts list`:", n)}
+	for _, s := range sibs {
+		lines = append(lines, fmt.Sprintf("    %s", textdiff.Sanitize(s)))
 	}
 	return lines
 }
@@ -329,8 +434,14 @@ func takeMineRejected(baseRel string, sum meshclient.Summary) bool {
 // resolved path. It has to carry three facts, because the operator stops reading here:
 // the push did NOT land, the parked sibling was kept (so the evidence of the divergence
 // is still there), and the local bytes stay queued so a later sync retries them.
+//
+// A refusal and a conflict are independent outcomes of the same round, so a round that
+// refused OUR path can also have re-parked some OTHER note. That is reported here as a
+// trailing line rather than in its own branch: the refusal is what the operator asked
+// about and it owns the receipt, but the round still changed the vault and saying nothing
+// would leave a fresh sibling on disk that no receipt ever mentioned.
 func takeMineRejectedReceipt(baseRel, sibling string, sum meshclient.Summary) []string {
-	return []string{
+	lines := []string{
 		fmt.Sprintf("the hub REFUSED %s: your version was NOT pushed and the team cannot see it (HEAD %s).",
 			textdiff.Sanitize(baseRel), short8(sum.Head)),
 		"  a refusal means write access, not a merge: a viewer role, a folder ACL, the note's scope, " +
@@ -340,6 +451,7 @@ func takeMineRejectedReceipt(baseRel, sibling string, sum meshclient.Summary) []
 		"  the note stays queued as a local change, so every later `mesh sync` retries the push; " +
 			"re-run resolve --take-mine once the refusal is lifted to drop the sibling.",
 	}
+	return append(lines, otherConflictLines(sum.Conflicts, sum.ConflictSiblings)...)
 }
 
 // validateSibling enforces that arg is a real conflict sibling inside vaultDir and

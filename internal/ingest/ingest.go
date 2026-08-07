@@ -11,13 +11,17 @@ package ingest
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bright-interaction/mesh/internal/vault"
 	"gopkg.in/yaml.v3"
@@ -81,8 +85,13 @@ func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (R
 		_, serr := os.Stat(filepath.Join(vaultRoot, filepath.FromSlash(rel)))
 		return serr == nil
 	}
+	// Resolve through a Batch, not doc-by-doc: two upstream ids that transliterate onto
+	// one slug would otherwise both land on one path and the pull would report both as
+	// written while only the last one survived.
+	OrderForResolution(docs)
+	batch := NewBatch(c.Name(), onDisk)
 	for _, d := range docs {
-		rel, content, err := RenderDocResolved(c.Name(), d, onDisk)
+		rel, content, err := batch.Render(d)
 		if err != nil {
 			return Result{}, err
 		}
@@ -132,6 +141,9 @@ func RenderDoc(connectorName string, d Doc) (relPath string, content []byte, err
 // exists reports whether a vault-relative slash path is already present. Run passes
 // an os.Stat over the vault; a caller that writes through a repo instead of the
 // filesystem (the hub commits imports as a Change) passes its own lookup.
+//
+// This resolves ONE doc and therefore cannot see two docs of the same pull colliding
+// on one path. A caller that renders a whole pull must go through Batch, which does.
 func RenderDocResolved(connectorName string, d Doc, exists func(relPath string) bool) (relPath string, content []byte, err error) {
 	id := importedID(connectorName, vault.Slugify(d.ExternalID))
 	if exists == nil {
@@ -149,6 +161,140 @@ func RenderDocResolved(connectorName string, d Doc, exists func(relPath string) 
 		return renderDocAs(connectorName, d, legacyID)
 	}
 	return renderDocAs(connectorName, d, id)
+}
+
+// Batch resolves a run of docs from ONE connector into note paths, keeping two
+// documents that slug onto the SAME note distinct.
+//
+// The collision is a direct consequence of folding diacritics: two distinct upstream
+// ids can now transliterate to one slug, where the old letter-dropping rule kept them
+// apart ("cafe-1" and the e-acute spelling of it both slug to "cafe-1" now; before,
+// the second one slugged to "caf-1"). The two spellings of a Swedish word, an a-ring
+// and an a-diaeresis, do the same.
+//
+// Nothing downstream notices on its own. The CLI writes both notes to one path, and
+// the hub keys its Change.Upserts by path in a MAP, so the second document silently
+// REPLACES the first, one upstream item is missing from the vault, and the run reports
+// both as written.
+//
+// RenderDocResolved cannot see this: it is handed one doc at a time plus an existence
+// predicate that cannot tell "the note I wrote a moment ago" from "a different
+// document's note". Batch carries the one piece of state that makes the collision
+// visible, which ExternalID has claimed which path, and moves the loser to a
+// deterministic fingerprinted path instead of dropping it.
+//
+// Which of the two keeps the plain name is decided ONCE, by the first batch that sees
+// them together, and is stable from then on regardless of the order the connector
+// returns docs in: Render pins a doc that already sits at its fingerprinted path
+// before it looks at the contested one.
+type Batch struct {
+	connector string
+	exists    func(relPath string) bool
+	// claimed maps a vault-relative note path to the ExternalID that owns it in THIS
+	// batch. The same ExternalID twice is one document pulled twice, so it keeps its
+	// path (the import is a deterministic upsert); a different one is the collision.
+	claimed map[string]string
+}
+
+// NewBatch starts a resolution batch for one connector. exists reports whether a
+// vault-relative slash path is already present, exactly as for RenderDocResolved (nil
+// means "assume nothing is there", which disables the legacy-path fallback too).
+func NewBatch(connectorName string, exists func(relPath string) bool) *Batch {
+	return &Batch{connector: connectorName, exists: exists, claimed: map[string]string{}}
+}
+
+// Render resolves one doc within the batch and returns its vault-relative path and
+// provenance-stamped markdown, WITHOUT touching disk.
+func (b *Batch) Render(d Doc) (relPath string, content []byte, err error) {
+	// Pin a doc a previous run already moved off a contested slug BEFORE anything looks
+	// at the plain path. Without this the winner is whichever of the two the connector
+	// happened to return first, so a flipped order on the next pull would swap their
+	// files and leave a third, stale copy behind.
+	altID := disambiguatedID(b.connector, d.ExternalID)
+	if b.exists != nil && b.exists(importedPath(b.connector, altID)) {
+		return b.claim(altID, d)
+	}
+	rel, content, err := RenderDocResolved(b.connector, d, b.exists)
+	if err != nil {
+		return "", nil, err
+	}
+	if owner, taken := b.claimed[rel]; !taken || owner == d.ExternalID {
+		b.claimed[rel] = d.ExternalID
+		return rel, content, nil
+	}
+	return b.claim(altID, d)
+}
+
+// claim renders d under id and records the claim, refusing rather than overwriting if
+// some other ExternalID already holds that path.
+func (b *Batch) claim(id string, d Doc) (string, []byte, error) {
+	rel, content, err := renderDocAs(b.connector, d, id)
+	if err != nil {
+		return "", nil, err
+	}
+	if owner, taken := b.claimed[rel]; taken && owner != d.ExternalID {
+		// Only reachable through a SHA-256 prefix collision on two ExternalIDs. Refusing
+		// keeps the guarantee ("no import is silently replaced by another") true even
+		// there, and the error names the pair so the operator can see what happened.
+		return "", nil, fmt.Errorf("ingest: %q and %q both resolve to %s; refusing to overwrite one import with the other", owner, d.ExternalID, rel)
+	}
+	b.claimed[rel] = d.ExternalID
+	return rel, content, nil
+}
+
+// OrderForResolution reorders docs IN PLACE so the ids whose slug is a faithful spelling
+// of themselves come first. It is a stable sort, so nothing else about the pull order
+// moves. Every caller that renders a whole pull through a Batch must apply it first.
+//
+// It decides which side of a collision keeps the readable path. Without it, an item that
+// has been imported for months under an all-ASCII id ("cafe-1") loses its note the day a
+// diacritic spelling of the same id ("cafe-1" with an e-acute) shows up EARLIER in the
+// same pull: the diacritic doc resolves onto the existing note, claims it, and the ASCII
+// doc is the one that gets moved. The ambiguous spelling must always be the one that
+// moves, and which spelling is ambiguous does not depend on arrival order.
+func OrderForResolution(docs []Doc) {
+	sort.SliceStable(docs, func(i, j int) bool {
+		return !ambiguousSlug(docs[i].ExternalID) && ambiguousSlug(docs[j].ExternalID)
+	})
+}
+
+// ambiguousSlug reports whether externalID contains a rune Slugify cannot carry through
+// verbatim. Every non-ASCII rune either folds onto an ASCII letter (a-ring -> "a") or is
+// dropped, so two different ids can produce one slug; that is exactly the class the
+// diacritic fold made collidable.
+//
+// Two pure-ASCII ids can still collide with each other ("ENG__123!!" and "eng-123" both
+// slug to "eng-123"). Batch keeps both of those, it just has no principled way to say
+// which one should move, so arrival order decides. Nothing is ever lost either way.
+func ambiguousSlug(externalID string) bool {
+	for _, r := range externalID {
+		if r > unicode.MaxASCII {
+			return true
+		}
+	}
+	return false
+}
+
+// fingerprintBytes is how much of the ExternalID digest goes into a disambiguating
+// suffix: 6 bytes = 12 hex characters = 48 bits, which puts a birthday collision past
+// 16 million distinct ids sharing one connector and one slug. Wide enough that the
+// refusal in claim stays theoretical, short enough to keep the filename readable.
+const fingerprintBytes = 6
+
+// disambiguatedID is the collision-free id for a doc: its normal slug plus a short
+// deterministic fingerprint of the RAW ExternalID. It is a function of the ExternalID
+// alone, so a doc that lost a collision lands on the same path on every later pull.
+//
+// It is only ever used for the LOSER of an observed collision, never as the default,
+// because the default path is what a person reads in their vault and what every
+// already-imported note is sitting at.
+func disambiguatedID(connectorName, externalID string) string {
+	sum := sha256.Sum256([]byte(externalID))
+	fp := hex.EncodeToString(sum[:fingerprintBytes])
+	if slug := vault.Slugify(externalID); slug != "" {
+		return importedID(connectorName, slug+"-"+fp)
+	}
+	return importedID(connectorName, fp)
 }
 
 func importedID(connectorName, slug string) string { return connectorName + "-" + slug }
