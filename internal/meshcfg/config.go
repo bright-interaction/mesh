@@ -12,6 +12,7 @@ package meshcfg
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -214,7 +215,28 @@ func Save(meshDir string, e Embedding) error {
 	return SaveConfig(meshDir, cfg)
 }
 
-// SaveConfig writes the full <meshDir>/config.toml atomically (temp + rename), 0644.
+// SaveConfig writes the full <meshDir>/config.toml durably: temp + rename at 0644, with
+// the data fsynced before the rename publishes the name and the directory fsynced after,
+// exactly like the note writers.
+//
+// It used to skip both fsyncs, exempted from the census guard in
+// cmd/mesh/atomic_write_durability_test.go on the grounds that "every field is
+// re-derivable from env or defaults and a lost config costs a re-run of `mesh init`".
+// Neither half of that was true. `mesh init` does not write this file at all (the only
+// two writers are `mesh embed` and the web Settings PUT), and the fields that matter are
+// exactly the ones the operator TYPED and that no default can reproduce: the embedding
+// endpoint/model/dim, the code roots, the secret-bridge base URL, the tuned fusion
+// weights and the rerank stage. The whole point of the file is that the env vars do NOT
+// have to be re-exported, so "re-derivable from env" describes the case where the file
+// is not needed in the first place.
+//
+// The failure it leaves is also worse than "lost". An unsynced rename can publish a
+// ZERO-LENGTH config.toml, and this parser reads a truncated file as a valid empty
+// config with no error, so semantic search, rerank, freshness decay, the code index and
+// the secret bridge all switch themselves off silently. Both writers then do
+// load-modify-write (Save and the web handler each LoadConfig, mutate, SaveConfig), so
+// the next single-field edit persists the zeroes and the operator's setup is gone for
+// good with nothing having reported an error.
 func SaveConfig(meshDir string, c Config) error {
 	// key_env vars are NAMES of env vars, never secrets, and the set of names they may
 	// point at is closed (see keyenv.go). Anything outside the allow-list is reset to the
@@ -251,15 +273,50 @@ func SaveConfig(meshDir string, c Config) error {
 		os.Remove(tmpName)
 		return err
 	}
+	// os.CreateTemp makes its file 0600 and a rename installs that mode over the
+	// destination, so the chmod is what keeps config.toml at the 0644 it has always
+	// landed with. It runs BEFORE the fsync so the mode is part of what gets flushed,
+	// and the mode itself is deliberately unchanged by this durability fix: a fix that
+	// quietly narrows a file is worse than the gap it closes.
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	// Flush the data to the device BEFORE the rename publishes the name; a rename can
+	// otherwise publish blocks that were never written.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Rename(tmpName, filepath.Join(meshDir, configName)); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, filepath.Join(meshDir, configName))
+	syncDir(meshDir)
+	return nil
+}
+
+// syncDir fsyncs a directory so the rename that just landed in it survives a power cut.
+// Best effort on purpose, matching every other writer in the tree: opening or fsyncing a
+// directory handle is a no-op or an error on some platforms and network filesystems
+// (Windows cannot open one at all), and that is not a failed write, so the bytes still
+// count as written and the refusal is only logged. The data itself is already fsynced.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		slog.Debug("meshcfg: cannot open the config directory to fsync it", "dir", dir, "err", err)
+		return
+	}
+	if err := d.Sync(); err != nil {
+		slog.Debug("meshcfg: cannot fsync the config directory", "dir", dir, "err", err)
+	}
+	d.Close()
 }
 
 // validEnvName reports whether s is a plain environment-variable identifier

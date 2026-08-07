@@ -39,6 +39,7 @@ func curatorCmd() *cobra.Command {
 
 func curatorLogCmd() *cobra.Command {
 	var limit int
+	var maxScan int
 	var statusFilter string
 	var asJSON bool
 	c := &cobra.Command{
@@ -46,6 +47,9 @@ func curatorLogCmd() *cobra.Command {
 		Short: "List recent curator activity (resolved merges and failed jobs)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if maxScan < 1 {
+				return fmt.Errorf("--max-scan must be at least 1")
+			}
 			cl, err := meshclient.ClientForVault(vaultArg(args))
 			if err != nil {
 				return err
@@ -54,13 +58,19 @@ func curatorLogCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			jobs, scan, err := collectCuratorLog(cl.CurationActivity, limit, want)
+			jobs, scan, err := collectCuratorLog(cl.CurationActivityPage, limit, maxScan, want)
 			if err != nil {
 				return err
 			}
 			if asJSON {
 				b, _ := json.MarshalIndent(jobs, "", "  ")
 				fmt.Println(string(b))
+				// stdout stays parseable, so the truncation note goes to stderr. A
+				// machine reader handed a silently short list would draw the same wrong
+				// conclusion the empty state below exists to prevent.
+				if scan.Capped {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: the scan stopped at its %d-row ceiling after %d row(s); older jobs may exist below it (raise it with --max-scan).\n", scan.Cap, scan.Scanned)
+				}
 				return nil
 			}
 			if len(jobs) == 0 {
@@ -91,83 +101,123 @@ func curatorLogCmd() *cobra.Command {
 				fmt.Printf("        %s -> %s   review: mesh curator show %d\n", short8(j.BaseSHA), short8(j.ResolvedHead), j.ID)
 			}
 			if scan.Capped {
-				fmt.Printf("  the scan stopped at the hub's %d-row ceiling for one read, so older jobs may exist below it.\n", curatorLogScanCap)
+				fmt.Printf("  the scan stopped at its %d-row ceiling after %d row(s), so older jobs may exist below it (raise it with --max-scan).\n", scan.Cap, scan.Scanned)
 			}
 			return nil
 		},
 	}
-	c.Flags().IntVar(&limit, "limit", 50, "max MATCHING jobs to list (the hub caps one read at 200 rows)")
+	c.Flags().IntVar(&limit, "limit", 50, "max MATCHING jobs to list (walked from the hub in pages of at most 200)")
+	c.Flags().IntVar(&maxScan, "max-scan", curatorLogScanCap, "max raw activity rows to walk before stopping and saying so")
 	c.Flags().StringVar(&statusFilter, "status", "", "comma-separated filter: resolved,failed")
 	c.Flags().BoolVar(&asJSON, "json", false, "emit jobs as JSON")
 	return c
 }
 
 const (
-	// curatorLogScanCap bounds how many raw activity rows one `curator log` may pull.
-	// The hub clamps ?limit to 200 and its activity endpoint exposes no cursor, so 200
-	// rows is everything a single client read can reach: this is the hub's own ceiling,
-	// not a second softer one invented here.
-	curatorLogScanCap = 200
+	// curatorLogScanCap is the DEFAULT ceiling on how many raw activity rows one
+	// `curator log` walks. The hub clamps one page to 200 rows but its activity endpoint
+	// takes a cursor, so the whole history is now reachable and the ceiling has to come
+	// from this side: "page until something matches" would let one `--status failed` read
+	// the team's entire audit trail. 2000 rows is ten pages at the hub's page clamp, and
+	// is the same number of raw rows the hub itself is willing to examine for ONE read
+	// (its curationActivityScanCap), so the default walk costs the hub about what a
+	// handful of ordinary reads cost it. Nothing widens it on its own: only an operator
+	// typing --max-scan does, so an expensive read is always a deliberate one.
+	curatorLogScanCap = 2000
 	// curatorLogFirstPage is the smallest page a FILTERED scan asks for. An unfiltered
-	// read still asks for exactly what the user requested.
+	// read still asks for exactly the rows it still needs.
 	curatorLogFirstPage = 50
-	// curatorLogGrowth multiplies the page each round. With the two constants above a
-	// filtered scan costs at most two requests (50 then 200), which is what keeps this
-	// bounded rather than "page until you find something".
-	curatorLogGrowth = 4
 )
 
 // curatorLogScan records how far a scan actually got, so the caller can be honest about
 // what an empty result does and does not prove.
 type curatorLogScan struct {
-	Scanned int  // raw rows examined
-	Capped  bool // stopped short with rows possibly still below the last page
+	Scanned   int  // raw rows examined
+	Cap       int  // the row ceiling this walk ran under (--max-scan)
+	Capped    bool // stopped at that ceiling with rows the hub says still sit below it
+	Exhausted bool // reached the end of the hub's history, so an empty result is definitive
 }
 
-// collectCuratorLog fetches curator activity and applies the --status filter, paging
-// until it holds `limit` MATCHING rows.
+// curatorActivityFetch is the single hub call `curator log` makes: one page of terminal
+// jobs starting at `cursor` ("" = the newest page), plus the cursor for the page below
+// it. An empty next cursor is the hub saying its history ended inside this page. A short
+// or empty page does NOT mean that, because the hub omits rows in folders this token may
+// not read, so a walk that stops on a short page misses the readable rows below a fenced
+// run. meshclient.Client.CurationActivityPage is the real implementation.
+type curatorActivityFetch func(cursor string, limit int) ([]syncproto.CurationJob, string, error)
+
+// collectCuratorLog walks the hub's curator activity with the cursor and applies the
+// --status filter, stopping once it holds `limit` MATCHING rows.
 //
-// The endpoint returns the N most recent terminal jobs and takes no status parameter,
-// so filtering the response of one fixed fetch repeats the LIMIT-before-filter mistake
-// the hub store just fixed one layer down: `mesh curator log --status failed` printed
-// "no curator activity yet." whenever the newest N jobs had all merged cleanly, while
-// the failed jobs the operator came for sat one row below the page. Failures are the
-// rarer status by design, so they are exactly the ones that fall off it.
+// The endpoint takes no status parameter, so filtering the response of one fixed fetch
+// repeats the LIMIT-before-filter mistake the hub store fixed one layer down: `mesh
+// curator log --status failed` printed "no curator activity yet." whenever the newest N
+// jobs had all merged cleanly, while the failed jobs the operator came for sat one row
+// below the page. Failures are the rarer status by design, so they are exactly the ones
+// that fall off it. Paging one fixed page deeper was not enough either: the hub clamps a
+// page to 200 rows, so before it grew a cursor the 201st-newest job was unreachable from
+// any client and this command could only ever pretend to have looked.
 //
-// Growth is bounded by curatorLogScanCap (the hub's own clamp), so a filtered read
-// costs at most two requests and 200 metadata rows no matter how long the history is.
-func collectCuratorLog(fetch func(int) ([]syncproto.CurationJob, error), limit int, want map[string]bool) ([]syncproto.CurationJob, curatorLogScan, error) {
+// The walk is BOUNDED twice, so `curator log` can never become a full read of the team's
+// audit trail. It examines at most maxScan raw rows, and it issues at most
+// ceil(maxScan/CurationActivityPageSize)+1 requests. The request bound is not redundant:
+// the hub returns a cursor with an EMPTY page when every row on it is fenced from this
+// token, so a row-only budget would never be spent and the walk would page forever. Both
+// bounds come from maxScan (--max-scan), which nothing raises on its own, so an operator
+// cannot pull an unbounded history by accident: the default stops after
+// curatorLogScanCap rows and SAYS it stopped.
+func collectCuratorLog(fetch curatorActivityFetch, limit, maxScan int, want map[string]bool) ([]syncproto.CurationJob, curatorLogScan, error) {
 	if limit < 1 {
 		limit = 1
 	}
-	size := limit
-	if len(want) > 0 && size < curatorLogFirstPage {
-		size = curatorLogFirstPage
+	if maxScan < 1 {
+		maxScan = curatorLogScanCap
 	}
-	for {
-		size = min(size, curatorLogScanCap)
-		raw, err := fetch(size)
+	scan := curatorLogScan{Cap: maxScan}
+	maxRequests := (maxScan+meshclient.CurationActivityPageSize-1)/meshclient.CurationActivityPageSize + 1
+	matched := make([]syncproto.CurationJob, 0, min(limit, curatorLogFirstPage))
+	cursor := ""
+	for req := 0; req < maxRequests && scan.Scanned < maxScan; req++ {
+		// An unfiltered read asks for exactly the rows it still needs; a filtered one
+		// cannot know how deep the matches are, so it starts small and then asks for
+		// full pages.
+		size := limit - len(matched)
+		if len(want) > 0 {
+			size = curatorLogFirstPage
+			if req > 0 {
+				size = meshclient.CurationActivityPageSize
+			}
+		}
+		size = min(size, meshclient.CurationActivityPageSize, maxScan-scan.Scanned)
+		raw, next, err := fetch(cursor, size)
 		if err != nil {
 			return nil, curatorLogScan{}, err
 		}
-		matched := make([]syncproto.CurationJob, 0, min(len(raw), limit))
+		scan.Scanned += len(raw)
 		for _, j := range raw {
-			if len(matched) == limit {
-				break
-			}
 			if len(want) > 0 && !want[j.Status] {
 				continue
 			}
 			matched = append(matched, j)
+			if len(matched) == limit {
+				return matched, scan, nil
+			}
 		}
-		// A short page means the history ended inside it, so there is nothing below to
-		// find and a bigger request would return the same rows.
-		full := len(raw) >= size
-		if len(matched) == limit || !full || size == curatorLogScanCap {
-			return matched, curatorLogScan{Scanned: len(raw), Capped: full && len(matched) < limit}, nil
+		if next == "" {
+			// The hub says the history ended inside this page: nothing below to find, so
+			// an empty result here is a fact and not a truncation.
+			scan.Exhausted = true
+			return matched, scan, nil
 		}
-		size *= curatorLogGrowth
+		if next == cursor {
+			// A hub that hands back the cursor it was given cannot advance. Stop and
+			// report a short scan rather than spin against it.
+			break
+		}
+		cursor = next
 	}
+	scan.Capped = true
+	return matched, scan, nil
 }
 
 // curatorTerminalStatuses are the only statuses the activity endpoint can return; it
@@ -199,14 +249,24 @@ func parseCuratorStatusFilter(raw string) (map[string]bool, error) {
 // printed for two different facts: an empty history, and a filter that matched nothing
 // in the rows that were scanned. The second one reads as "the curator has never failed",
 // which is the opposite of what a scan that fell short actually establishes.
+//
+// There are three facts now, because a cursor walk can finish. A walk that ran out of
+// history proves the absence and may say so; one that stopped at its own row ceiling
+// proves nothing about what sits below and must not sound like it does.
 func curatorLogEmptyLines(want map[string]bool, scan curatorLogScan) []string {
-	if len(want) == 0 || scan.Scanned == 0 {
+	if scan.Scanned == 0 && !scan.Capped {
 		return []string{"no curator activity yet."}
 	}
-	lines := []string{fmt.Sprintf("no curator job with status %s in the %d most recent job(s) scanned; that is not the same as no such job.",
-		strings.Join(slices.Sorted(maps.Keys(want)), ","), scan.Scanned)}
+	subject := "curator job"
+	if len(want) > 0 {
+		subject = fmt.Sprintf("curator job with status %s", strings.Join(slices.Sorted(maps.Keys(want)), ","))
+	}
+	if scan.Exhausted {
+		return []string{fmt.Sprintf("no %s: the walk reached the end of the hub's history (%d job(s) scanned).", subject, scan.Scanned)}
+	}
+	lines := []string{fmt.Sprintf("no %s in the %d most recent job(s) scanned; that is not the same as no such job.", subject, scan.Scanned)}
 	if scan.Capped {
-		lines = append(lines, fmt.Sprintf("  the scan stopped at the hub's %d-row ceiling for one read, so older matching jobs may exist below it.", curatorLogScanCap))
+		lines = append(lines, fmt.Sprintf("  the scan stopped at its %d-row ceiling, so older matching jobs may exist below it (raise it with --max-scan).", scan.Cap))
 	}
 	return lines
 }

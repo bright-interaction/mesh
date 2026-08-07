@@ -64,7 +64,12 @@ func writeState(vaultDir string, s syncState) error {
 	// state file whose unmarshal error readState then swallowed, silently resetting the
 	// base to empty: the drop gates become no-ops and the next sync is a noisy full
 	// re-push with mass conflict siblings. Recoverable, but avoidable for one line.
-	return writeFileAtomic(statePath(vaultDir), b)
+	//
+	// 0600, the mode this call site used when it was an os.WriteFile, and not the note
+	// default: sync.json is a full listing of every note path in the vault plus a content
+	// hash for each, it sits next to the 0600 credentials file, and .mesh is only 0700
+	// when meshclient created it (internal/ingest/state.go makes it 0755).
+	return writeFileAtomic(statePath(vaultDir), b, 0o600)
 }
 
 func readState(vaultDir string) syncState {
@@ -219,13 +224,13 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 			if perr != nil {
 				return parked, perr
 			}
-			if err := writeFileAtomic(sibAbs, b); err != nil {
+			if err := writeFileAtomic(sibAbs, b, 0o644); err != nil {
 				return parked, err
 			}
 			parked = append(parked, park{note: d.Path, sibling: sib})
 			continue
 		}
-		if err := writeFileAtomic(abs, b); err != nil {
+		if err := writeFileAtomic(abs, b, 0o644); err != nil {
 			return parked, err
 		}
 	}
@@ -472,7 +477,7 @@ func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]s
 			// bytes at risk.
 			continue
 		}
-		if err := writeFileAtomic(sibAbs, local); err != nil {
+		if err := writeFileAtomic(sibAbs, local, 0o644); err != nil {
 			return unparked, err
 		}
 	}
@@ -505,10 +510,34 @@ func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]s
 // comment cannot fail a build. cmd/mesh/atomic_write_durability_test.go DISCOVERS
 // every temp-create + rename writer in the tree from the AST and fails on any one
 // that does not fsync, so a fifth copy is caught the day it is written.
-func writeFileAtomic(path string, b []byte) error {
+//
+// The destination's current permission bits are preserved when it already exists. A
+// rename INSTALLS the temp file, mode and all, and os.CreateTemp makes its file 0600,
+// so without this the durability fix silently narrowed every note it touched to
+// owner-only: nothing fails visibly, it just surfaces later as the indexer, a backup
+// agent, an editor or a container on another uid no longer being able to read a note
+// it could read yesterday. Same three lines as internal/vault/migrate.go
+// WriteNoteAtomic, on purpose; there is one pattern for this, not two.
+// TestEveryTempRenameWriterRestoresTheMode in cmd/mesh/conflicts_mode_test.go is the
+// discovery guard for it, built like the fsync one: it names no file, so a sixth copy
+// is caught the day it is written rather than three rounds later.
+//
+// newPerm is the mode a file that does not exist yet lands with, and it is a parameter
+// rather than a constant 0644 because not every caller writes a note. Notes pass 0644,
+// the mode every other note writer in the estate uses. writeState passes 0600, the mode
+// its os.WriteFile used before it became atomic: .mesh/sync.json lists every note path
+// in the vault with a content hash for each, .mesh is 0755 whenever internal/ingest
+// created it first, and a default of 0644 here would have published that listing to
+// every uid on the box on the next fresh join. A durability fix that widens a file
+// somebody deliberately made private is worse than the gap it closes.
+func writeFileAtomic(path string, b []byte, newPerm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+	perm := newPerm
+	if fi, err := os.Stat(path); err == nil {
+		perm = fi.Mode().Perm()
 	}
 	tmp, err := os.CreateTemp(dir, ".mesh-tmp-*")
 	if err != nil {
@@ -516,12 +545,19 @@ func writeFileAtomic(path string, b []byte) error {
 	}
 	tmpName := tmp.Name()
 	_, werr := tmp.Write(b)
+	// CreateTemp makes the file 0600; match the mode the note is meant to land with,
+	// BEFORE the rename publishes it.
+	perr := tmp.Chmod(perm)
 	// Flush the data to the device BEFORE the rename publishes the name.
 	serr := tmp.Sync()
 	cerr := tmp.Close()
 	if werr != nil {
 		os.Remove(tmpName)
 		return werr
+	}
+	if perr != nil {
+		os.Remove(tmpName)
+		return perr
 	}
 	if serr != nil {
 		os.Remove(tmpName)

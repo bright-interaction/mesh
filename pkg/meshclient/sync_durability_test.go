@@ -221,7 +221,7 @@ func TestWriteFileAtomicSurvivesAndCleansUp(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := writeFileAtomic(path, []byte(tc.body)); err != nil {
+			if err := writeFileAtomic(path, []byte(tc.body), 0o644); err != nil {
 				t.Fatalf("writeFileAtomic: %v", err)
 			}
 			got, err := os.ReadFile(path)

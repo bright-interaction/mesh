@@ -107,9 +107,18 @@ var frontmatterCode = regexp.MustCompile(`(?i)frontmatter`)
 // A note is the one thing in a vault that cannot be regenerated from anything else, which
 // is the whole reason the fsync rule exists and the only reason these are out of it.
 var unguardedWriters = map[string]string{
-	"internal/meshcfg/config.go:SaveConfig": "writes .mesh/config.toml, not note bytes. " +
-		"Every field is re-derivable from env or defaults and a lost config costs a re-run " +
-		"of `mesh init`, so it is not in the same class as the note writers.",
+	// internal/meshcfg/config.go:SaveConfig used to sit here, exempted because "every
+	// field is re-derivable from env or defaults and a lost config costs a re-run of
+	// `mesh init`". Both halves were false. `mesh init` never writes config.toml (it
+	// writes index.md and nothing else; the only writers are `mesh embed` and the web
+	// Settings PUT), and the fields that matter are the ones the operator typed, which no
+	// default reproduces: embedding endpoint/model/dim, code roots, the secret-bridge base
+	// URL, the tuned weights. The file exists precisely so those do NOT live in env.
+	// The failure was not "lost" either: LoadConfig reads a truncated file as a valid
+	// EMPTY config, so semantic search, rerank, freshness decay, the code index and the
+	// secret bridge all switch off silently, and both writers load-modify-write, so the
+	// next single-field edit persists the zeroes for good. SaveConfig now fsyncs, so it is
+	// covered by the checks below rather than excused here. Do not re-add it.
 	// internal/hub/init.go:Bootstrap used to sit here, exempted because commitWorktree
 	// runs immediately after it, so git was said to carry the bytes into the object
 	// store. The entry itself asked for that argument to be re-checked, and it does not
@@ -145,8 +154,9 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 	root := moduleRoot(t)
 	writers := findNoteByteWriters(t, root)
 	// A discovery guard that discovers nothing passes vacuously, which is the exact
-	// failure mode that let the twins survive. Pin a floor: the seven durable note writers
-	// plus the three exempted non-note writers are all known to be findable.
+	// failure mode that let the twins survive. Pin a floor: the seven durable note
+	// writers, the durable config writer, and the two exempted non-note writers are all
+	// known to be findable.
 	if len(writers) < 9 {
 		t.Fatalf("found only %d note-byte writer(s) in the module; at least the seven note writers "+
 			"and the exempted non-note writers should be found, so the scanner is broken, not the code", len(writers))
@@ -203,9 +213,19 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 		})
 	}
 
-	// The durable note writers. Naming them is redundant with the discovery above and
-	// that is deliberate: if a refactor moves or renames one so the scanner stops seeing
-	// it, this list says so out loud instead of the suite going quietly green on five.
+	// The durable writers. Naming them is redundant with the discovery above and that is
+	// deliberate: if a refactor moves or renames one so the scanner stops seeing it, this
+	// list says so out loud instead of the suite going quietly green on five.
+	//
+	// The last entry is the config writer, not a note writer. It is here because every
+	// other writer in the module is pinned by name either in this list or in
+	// unguardedWriters, and SaveConfig just left unguardedWriters, so without an entry it
+	// would be the one writer nothing names. The gap is not hypothetical for this one:
+	// its ONLY discovery signal is the temp+rename shape (its destination expression says
+	// meshDir, and it carries no .md literal and no frontmatter), so a refactor back to a
+	// plain os.WriteFile drops it out of the census entirely. Measured: rewritten that
+	// way, the census found 9 writers, the floor above tolerates 9, and every check
+	// passed on a config writer that fsynced nothing.
 	for _, key := range []string{
 		"pkg/meshclient/vault.go:writeFileAtomic",
 		"internal/hub/repo.go:writeFileAtomic",
@@ -214,10 +234,12 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 		"internal/curator/merge_note.go:writeAtomic",
 		"internal/vault/migrate.go:WriteNoteAtomic",
 		"internal/vault/scaffold.go:CreateNote",
+		"internal/meshcfg/config.go:SaveConfig",
 	} {
 		if !seen[key] {
-			t.Errorf("known note writer %s was not discovered; it moved, was renamed, or no longer "+
-				"writes note bytes. Update this list in the same change, do not delete the entry.", key)
+			t.Errorf("known durable writer %s was not discovered; it moved, was renamed, or no longer "+
+				"writes bytes the scanner can see. Update this list in the same change, do not delete "+
+				"the entry.", key)
 		}
 	}
 

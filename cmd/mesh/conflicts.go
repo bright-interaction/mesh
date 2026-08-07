@@ -519,10 +519,23 @@ func reindexBestEffort(vaultDir string) {
 // pkg/meshclient/vault.go writeFileAtomic for the full list, and
 // TestEveryTempRenameWriterFsyncs in atomic_write_durability_test.go for the guard
 // that finds any new one.
+//
+// The destination's current permission bits are preserved when it already exists, and a
+// new note lands 0644, the mode every other note writer in the estate uses. This one was
+// never an os.WriteFile, so 0644 for a new file is a chosen default and not a restoration:
+// it exists so a resolved note is not the odd 0600 file in a 0644 vault. A rename installs
+// the TEMP file's mode over the destination and os.CreateTemp makes its file 0600. This
+// writer lands on a note the user has been editing by hand, which is the file most likely
+// to carry permissions somebody chose on purpose, so narrowing it here is the least
+// acceptable place in the tree to do it.
 func writeFileAtomic(path string, b []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+	perm := os.FileMode(0o644)
+	if fi, err := os.Stat(path); err == nil {
+		perm = fi.Mode().Perm()
 	}
 	tmp, err := os.CreateTemp(dir, ".mesh-resolve-*")
 	if err != nil {
@@ -530,6 +543,13 @@ func writeFileAtomic(path string, b []byte) error {
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	// CreateTemp makes the file 0600; match the mode the note is meant to land with,
+	// BEFORE the rename publishes it.
+	if err := tmp.Chmod(perm); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
 		return err
