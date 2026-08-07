@@ -587,30 +587,63 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	if sf := scopeFromCtx(ctx); sf != nil {
 		allowed = sf.AllowedRead // nil-safe: nil => retriever does not filter
 	}
-	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: allowed})
+	// Retrieve UNPACKED and pack below instead. labelCard rewrites the snippet of every
+	// connector-ingested card AFTER retrieval, so packing inside Retrieve prices bytes
+	// this tool does not send: measured on a 300-note imported vault, the default budget
+	// of 8000 shipped 11284 tokens (+41%) while reporting 7988, and 1000/2000/3000 were
+	// each ~40% over. The budget exists so an agent can bound what one call costs its
+	// context, so it has to be measured on the FINAL form. Budget 0 here is not the
+	// /api/search defect (internal/web/search_cap_test.go): limit is already clamped
+	// above, so the unpacked set is bounded, and searchCardTokens packs it below.
+	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: limit, AllowedScopes: allowed})
 	if err != nil {
 		return nil, internalErr(err)
 	}
+	cards = retrieve.PackToBudget(cards, budget, searchCardTokens)
 	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)
-	return textResult(map[string]any{"cards": labelCards(cards), "tokens": retrieve.TotalTokens(cards)}), nil
+	return textResult(map[string]any{
+		"cards": labelCards(cards),
+		// Reported with the SAME cost function the packer used, so the number the agent
+		// reads is the number that was packed to.
+		"tokens": retrieve.TotalTokensFunc(cards, searchCardTokens),
+	}), nil
 }
 
-// labelCards marks the cards whose note came from a connector import: it stamps the
-// source and wraps the snippet in the data envelope, so third-party text can never
-// reach the agent as an unlabelled instruction-shaped span (the instruction boundary
-// the HTML and TTY sinks already have). Cards from the team's own notes pass through
-// untouched.
+// labelCard marks a card whose note came from a connector import: it stamps the source
+// and wraps the snippet in the data envelope, so third-party text can never reach the
+// agent as an unlabelled instruction-shaped span (the instruction boundary the HTML and
+// TTY sinks already have). A card from the team's own notes passes through untouched.
+func labelCard(c retrieve.Card) searchCard {
+	sc := searchCard{Card: c}
+	if src, ok := importedSource(c.Path); ok {
+		sc.Source = src
+		sc.Snippet = wrapUntrusted(src, "", c.Snippet)
+	}
+	return sc
+}
+
 func labelCards(cards []retrieve.Card) []searchCard {
 	out := make([]searchCard, 0, len(cards))
 	for _, c := range cards {
-		sc := searchCard{Card: c}
-		if src, ok := importedSource(c.Path); ok {
-			sc.Source = src
-			sc.Snippet = wrapUntrusted(src, "", c.Snippet)
-		}
-		out = append(out, sc)
+		out = append(out, labelCard(c))
 	}
 	return out
+}
+
+// searchCardTokens prices a card as mesh_search actually sends it: the LABELLED card,
+// envelope and Source field included. This is the retrieve.CardCost the packer runs on,
+// which is what keeps the bytes sent equal to the bytes budgeted. It must stay in sync
+// with labelCard by construction, so it calls it rather than re-deriving the shape.
+func searchCardTokens(c retrieve.Card) int {
+	sc := labelCard(c)
+	b, err := json.Marshal(sc)
+	if err != nil {
+		// A card that cannot be marshaled cannot be sent either. Price the wrapped card
+		// with the retriever's own counter so the packer keeps making progress instead
+		// of treating it as free.
+		return retrieve.TotalTokens([]retrieve.Card{sc.Card}) + retrieve.EstimateTokens(sc.Source)
+	}
+	return retrieve.EstimateTokens(string(b))
 }
 
 func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcError) {

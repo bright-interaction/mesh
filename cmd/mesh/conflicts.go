@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -250,6 +251,22 @@ func conflictsResolveCmd() *cobra.Command {
 				reindexBestEffort(vaultDir)
 				return nil
 			}
+			// The hub can also REFUSE this path outright (viewer role, folder ACL, note
+			// scope, or oversize/binary content). A refusal is not a conflict, so
+			// sum.Conflicts is 0 and control used to fall straight through to the delete
+			// below: the parked sibling, which is the operator's only evidence of the
+			// divergence, was destroyed and the receipt said the team could see the
+			// rescued version. The bytes themselves survive at the note's own path and
+			// SyncVault keeps them dirty for the next round, so this is a false receipt
+			// rather than byte loss, but it breaks the invariant above: drop the sibling
+			// only if the push LANDS.
+			if takeMineRejected(baseRel, sum) {
+				for _, line := range takeMineRejectedReceipt(baseRel, args[0], sum) {
+					fmt.Println(line)
+				}
+				reindexBestEffort(vaultDir)
+				return fmt.Errorf("the hub refused %s, so nothing was pushed and your parked version was kept", textdiff.Sanitize(baseRel))
+			}
 			if err := os.Remove(sibAbs); err != nil && !os.IsNotExist(err) {
 				return err
 			}
@@ -283,6 +300,46 @@ func takeMineReceipt(baseRel string, sum meshclient.Summary) []string {
 			"NOT on the hub yet, and this note may be one of them; run `mesh sync` again.", sum.Remaining))
 	}
 	return lines
+}
+
+// takeMineRejected reports whether the round the resolve just ran REFUSED the note
+// the operator was rescuing. Summary.Rejected carries the paths the hub would not
+// accept (viewer role, folder ACL, note scope, oversize or non-text content); the
+// note's bytes stay on disk and stay dirty, but they are not on the hub and will not
+// be until the refusal is lifted.
+//
+// Only THIS path counts. A rejection somewhere else in the same round says nothing
+// about the resolved note, and treating it as one would strand a sibling forever on
+// any vault that holds one permanently unwritable folder.
+//
+// Both sides are cleaned to slash form before comparing: baseRel is reconstructed
+// locally by validateSibling while the entries come back from the hub, so the same
+// note can arrive spelled slightly differently on Windows or after a "./" prefix.
+func takeMineRejected(baseRel string, sum meshclient.Summary) bool {
+	want := path.Clean(filepath.ToSlash(baseRel))
+	for _, rel := range sum.Rejected {
+		if path.Clean(filepath.ToSlash(rel)) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// takeMineRejectedReceipt renders what the operator is told when the hub refused the
+// resolved path. It has to carry three facts, because the operator stops reading here:
+// the push did NOT land, the parked sibling was kept (so the evidence of the divergence
+// is still there), and the local bytes stay queued so a later sync retries them.
+func takeMineRejectedReceipt(baseRel, sibling string, sum meshclient.Summary) []string {
+	return []string{
+		fmt.Sprintf("the hub REFUSED %s: your version was NOT pushed and the team cannot see it (HEAD %s).",
+			textdiff.Sanitize(baseRel), short8(sum.Head)),
+		"  a refusal means write access, not a merge: a viewer role, a folder ACL, the note's scope, " +
+			"or a note that is too large or not text. Ask an admin for write access on this path.",
+		fmt.Sprintf("  your version is KEPT in both places: at %s locally and in the parked sibling %s. Nothing was deleted.",
+			textdiff.Sanitize(baseRel), textdiff.Sanitize(sibling)),
+		"  the note stays queued as a local change, so every later `mesh sync` retries the push; " +
+			"re-run resolve --take-mine once the refusal is lifted to drop the sibling.",
+	}
 }
 
 // validateSibling enforces that arg is a real conflict sibling inside vaultDir and

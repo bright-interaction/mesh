@@ -4,6 +4,7 @@
 package retrieve
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,10 +44,17 @@ func tier0AtTheBottom(n int) []Card {
 // tokens, so a fifth of any budget under 635 could not hold one and the reserve
 // silently held nothing: budget 200 gave 1 card and 0 tier-0, budget 300 gave 2 cards
 // and 0 tier-0, budget 400 gave 3 cards and 0 tier-0, on a set with two tier-0
-// candidates. (An earlier version of this comment claimed 73-76 tokens per card and a
-// ~380 threshold; nothing in the package reproduces those, and every derived number
-// was wrong with them.) Only a budget <= 0 gets the 8000 default, so caller-supplied
-// small budgets pass straight through.
+// candidates. Only a budget <= 0 gets a default (8000 at the two search surfaces, 3000
+// at ask and curator), so caller-supplied small budgets pass straight through.
+//
+// An earlier version of this comment claimed 73-76 tokens per card and a ~380
+// threshold, and a later one said nothing in the package reproduced those. Both were
+// wrong. Measured here (TestCountersAgreeOnWhatACardCosts pins them): the marshaled
+// card is 127 tokens and the compact form 81, while the field-sum counter that used to
+// live in cardTokens' marshal-failure path returned 75 and 29 for the same two cards.
+// 75 is where the 73-76 came from. The package really did carry two counters that
+// disagreed by 41% on a full card and 64% on a compact one, and the derived numbers
+// were wrong only because the wrong one of the two was quoted. There is one counter now.
 func TestTier0ReserveHoldsACardAtSmallBudgets(t *testing.T) {
 	cards := tier0AtTheBottom(12)
 	tests := []struct {
@@ -128,6 +136,66 @@ func TestFallbackCardPrefersTheCompactForm(t *testing.T) {
 			}
 			if got := TotalTokens(packed); got >= full {
 				t.Errorf("fallback cost %d tokens, no cheaper than the full card's %d", got, full)
+			}
+		})
+	}
+}
+
+// TestCountersAgreeOnWhatACardCosts is the regression for the package holding TWO
+// counters. cardTokens prices the marshaled card, but its marshal-failure path priced
+// title+path+snippet+reason+8, and the packer trusts whichever one answers: on this
+// fixture that was 75 against 127 for a full card and 29 against 81 for a compact one,
+// so a single malformed card re-opened the exact overrun cardTokens exists to close.
+//
+// Two things are pinned. The fallback must agree with the marshaled count (over is
+// safe, under is not: an under-priced card looks free and the packer takes it plus
+// everything after it). And a card whose Score cannot be encoded must be priced at what
+// the SAME card costs with a finite score, because a non-finite score is a ranking bug,
+// not a discount.
+func TestCountersAgreeOnWhatACardCosts(t *testing.T) {
+	full := tier0AtTheBottom(3)[0]
+	tests := []struct {
+		name string
+		card Card
+	}{
+		{name: "full production-shaped card", card: full},
+		{name: "compact card with no snippet", card: compact(full)},
+		{name: "empty card is all structure", card: Card{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want := cardTokens(tc.card)
+			got := cardTokensNoMarshal(tc.card)
+			if got < want-2 {
+				t.Errorf("the no-marshal counter prices this card at %d, understating the %d "+
+					"the marshaled form really costs: the packer over-fills by that ratio "+
+					"whenever it takes that path", got, want)
+			}
+			if got > want+want/5+16 {
+				t.Errorf("the no-marshal counter prices this card at %d against a real %d, "+
+					"so far over that it would starve the budget", got, want)
+			}
+		})
+	}
+
+	scores := []struct {
+		name  string
+		score float64
+	}{
+		{name: "NaN score", score: math.NaN()},
+		{name: "+Inf score", score: math.Inf(1)},
+		{name: "-Inf score", score: math.Inf(-1)},
+	}
+	for _, tc := range scores {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := full
+			bad.Score = tc.score
+			zero := full
+			zero.Score = 0
+			if got, want := cardTokens(bad), cardTokens(zero); got != want {
+				t.Errorf("a card with a %s is priced at %d, but the same card with a finite "+
+					"score costs %d: an unencodable score must not change the accounting",
+					tc.name, got, want)
 			}
 		})
 	}

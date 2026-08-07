@@ -86,7 +86,13 @@ func Run(ctx context.Context, vaultRoot string, c Connector, since time.Time) (R
 		if err != nil {
 			return Result{}, err
 		}
-		if err := os.WriteFile(filepath.Join(vaultRoot, rel), content, 0o644); err != nil {
+		// Land the note through the vault's durable writer (temp file, fsync, rename,
+		// directory fsync) rather than os.WriteFile, which truncates the existing note
+		// first and fsyncs nothing. A re-pull upserts over a note that is already in the
+		// index and already synced to the team, so the truncate window is a window where
+		// the note reads as empty, and an un-fsynced import is content the hub can be
+		// told about before it is on the device.
+		if err := vault.WriteNoteAtomic(filepath.Join(vaultRoot, rel), content); err != nil {
 			return Result{}, err
 		}
 		written++
