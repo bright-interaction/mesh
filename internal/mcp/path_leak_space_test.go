@@ -43,7 +43,15 @@ func spacedRootServer(t *testing.T) *Server {
 // interesting half of the layout shipped anyway. The known-root pass fixes that by
 // matching the root as a substring and scanning on from its END.
 func TestScrubPathsWithARootThatContainsASpace(t *testing.T) {
-	const root = "~/Desktop/Automation HQ/vault"
+	// Deliberately NOT a home-shaped path. This file ships to the public mirror,
+	// whose blob-sanity gate refuses anything matching /(Users|home)/<name>/ in
+	// published blob content, and it refuses on the SHAPE, not on the name, so
+	// swapping the maintainer's real home for a neutral placeholder under
+	// /Users/ trips it just the same. Naming a concrete offending path here
+	// would re-trip the gate from inside the comment explaining it. The property
+	// under test is only "the root contains a space", so a path with a space and
+	// no home prefix satisfies both the test and the gate.
+	const root = "/srv/data/Automation HQ/vault"
 	cases := []struct {
 		name, in, want string
 		roots          []string
