@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1703,14 +1704,25 @@ func syncCmd() *cobra.Command {
 			// targeted updates after); the one-shot path just does that single full pass.
 			live := index.NewLiveIndexer(store, vaultDir)
 			syncOnce := func(authoritative bool) (meshclient.Summary, error) {
-				sum, err := meshclient.SyncVault(vaultDir)
-				if err != nil {
-					return sum, err
+				sum, serr := meshclient.SyncVault(vaultDir)
+				// Reconcile the LOCAL index whether or not the hub round worked. The
+				// index is derived from the markdown on disk and owes the hub nothing,
+				// so a DNS failure, an outage or a rejected token must never stop a
+				// locally written note from becoming searchable. This used to return on
+				// serr, which meant that for the whole of a hub outage the --watch daemon
+				// skipped EVERY reconcile (startup, the debounced file-change one and the
+				// 60s safety tick) while staying up and logging "reindex failed" once a
+				// minute. Observed on the live vault for hours at a time; it is the real
+				// cause of "the indexer stops picking up newly written notes".
+				_, rerr := live.Reconcile(authoritative)
+				switch {
+				case serr != nil && rerr != nil:
+					return sum, errors.Join(serr, rerr)
+				case serr != nil:
+					return sum, serr // still surfaced, so the outage is not silent
+				default:
+					return sum, rerr
 				}
-				if _, err := live.Reconcile(authoritative); err != nil {
-					return sum, err
-				}
-				return sum, nil
 			}
 
 			if !doWatch {
