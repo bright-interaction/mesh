@@ -113,10 +113,27 @@ const (
 	telemetryFlushInterval = 2 * time.Second
 )
 
-func dsn(path string) string {
+const (
+	// busyTimeoutMS is how long any mesh connection waits for another mesh process's
+	// write lock before giving up. It has to be generous: a sibling watcher's reconcile
+	// is a whole-vault write transaction (nodes + edges + note_code_links are rewritten
+	// wholesale even for one edited note), so seconds of waiting is normal and correct.
+	busyTimeoutMS = 30000
+	// checkpointBusyTimeoutMS is the patience of the best-effort TRUNCATE checkpoint,
+	// and of nothing else. Short on purpose so a contended vault costs one skipped tick
+	// instead of stalling the writer. It is applied on the checkpoint's OWN connection;
+	// see checkpointTruncateBestEffort for why it must never touch a pool.
+	checkpointBusyTimeoutMS = 2000
+)
+
+func dsn(path string) string { return dsnBusy(path, busyTimeoutMS) }
+
+// dsnBusy is dsn with an explicit busy_timeout, so a connection that wants a different
+// patience gets it in its DSN rather than by running a PRAGMA on a shared pool.
+func dsnBusy(path string, busyMS int) string {
 	return fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(on)&_pragma=journal_size_limit(%d)",
-		path, walSizeLimit,
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(on)&_pragma=journal_size_limit(%d)",
+		path, busyMS, walSizeLimit,
 	)
 }
 
@@ -719,13 +736,22 @@ func (s *Store) walBytes() int64 {
 }
 
 func (s *Store) checkpointTruncateBestEffort() {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	conn, err := s.writeDB.Conn(ctx)
+	// Its OWN connection, never one out of writeDB. writeDB is capped at a single
+	// connection, so `PRAGMA busy_timeout=2000` executed on it did not end with this
+	// function: the connection went back to the pool carrying 2000 and every later write
+	// transaction in the process inherited it, silently replacing the DSN's 30s. The
+	// trigger is a WAL over walSizeLimit, which is itself a symptom of write contention,
+	// so the daemon lost 28 seconds of patience exactly when a sibling watcher was
+	// holding the lock. Reconciles then returned SQLITE_BUSY, the drift stayed, and the
+	// next tick failed the same way, which is how the index stops picking up new notes.
+	// The short timeout belongs in this connection's DSN instead.
+	db, err := sql.Open("sqlite", dsnBusy(s.dbPath, checkpointBusyTimeoutMS))
 	if err != nil {
 		return
 	}
-	defer conn.Close()
-	_, _ = conn.ExecContext(ctx, "PRAGMA busy_timeout=2000")
-	_, _ = conn.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, _ = db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 }
