@@ -252,6 +252,17 @@ func TestWireOrphansSplitsBenignSkipsFromWriteFailures(t *testing.T) {
 				t.Fatalf("mesh index: %v", err)
 			}
 			if tc.readOnly {
+				// Root ignores the mode bits below, so the write this case exists to
+				// FAIL simply succeeds and the assertions read as a real regression in
+				// wire-orphans. That is not hypothetical: the public-mirror publish runs
+				// `go test` inside mesh-publish.Dockerfile, which declares no USER and
+				// therefore runs as root, so this case failed there while passing for
+				// every developer. Skip rather than weaken it: as an unprivileged user
+				// it still guards the benign-skip vs write-failure split.
+				if os.Geteuid() == 0 {
+					t.Skip("running as root: a 0444 file is still writable, so the write " +
+						"failure this case needs cannot be provoked")
+				}
 				// Readable so it still indexes as an orphan and retrieval still runs;
 				// unwritable so BackfillRelatedFile's os.WriteFile is what fails.
 				if err := os.Chmod(orphanPath, 0o444); err != nil {
