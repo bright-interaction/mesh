@@ -26,6 +26,10 @@ func TestLocalBackend(t *testing.T) {
 	write("alpha.md", "---\nid: alpha\ntype: note\nwhen: 2026-01-01\n---\n# Alpha\nsee [[beta]]\n")
 	write("beta.md", "---\nid: beta\ntype: note\nwhen: 2026-01-01\n---\n# Beta\nleaf\n")
 
+	// The owning writer indexes; the TUI reads. The backend used to index for itself,
+	// which made every browser a second writer against a vault that already has one.
+	seedIndex(t, dir)
+
 	be, closeFn, err := NewLocalBackend(dir)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)

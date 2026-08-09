@@ -55,14 +55,22 @@ type LocalBackend struct {
 	rtr       *retrieve.Retriever
 }
 
-// NewLocalBackend opens the vault index, builds the graph once, and returns the
-// backend plus a close func the caller defers.
+// NewLocalBackend opens the vault index READ-ONLY, loads the graph the owning writer
+// persisted, and returns the backend plus a close func the caller defers.
+//
+// A browser does not index. This used to open a writable store and run a full reindex of
+// the whole vault at startup, which made every `mesh tui` a second writer against a vault
+// that already has one: it took the write lock for the length of a full reindex, and held
+// a writable store open for as long as someone left the window up. That is the same
+// contention the read-only MCP split exists to remove, in a tool whose entire job is to
+// read. `mesh search` has always worked this way (open, LoadGraph, show what is indexed),
+// so this is the established contract for a reader, not a new one.
 func NewLocalBackend(vaultRoot string) (*LocalBackend, func() error, error) {
-	store, err := index.Open(vaultRoot)
+	store, err := index.OpenReadOnly(vaultRoot)
 	if err != nil {
 		return nil, nil, err
 	}
-	g, err := index.Reindex(store, vaultRoot)
+	g, err := store.LoadGraph()
 	if err != nil {
 		store.Close()
 		return nil, nil, err

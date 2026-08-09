@@ -290,7 +290,12 @@ func searchCmd() *cobra.Command {
 			if _, err := os.Stat(dbPath); err != nil {
 				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, vaultDir)
 			}
-			store, err := index.Open(vaultDir)
+			// Read-only: this command only ever LoadGraphs and retrieves, but opening
+			// writable runs ensureSchema, which takes the write lock. That is the whole of
+			// the documented "mesh search fails SQLITE_BUSY at apply schema while the index
+			// is perfectly fresh" symptom: a pure reader queueing behind the owner's
+			// reindex for no reason at all.
+			store, err := index.OpenReadOnly(vaultDir)
 			if err != nil {
 				return err
 			}
