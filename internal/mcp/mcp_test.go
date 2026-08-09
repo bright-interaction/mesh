@@ -20,17 +20,7 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "decisions"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	write := func(rel, body string) {
-		if err := os.WriteFile(filepath.Join(dir, rel), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("decisions/sqlite.md", "---\nid: sqlite\ntype: decision\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: use modernc sqlite for storage\n---\n# Storage\n")
-	write("note.md", "---\nid: note\ntype: note\nwhen: 2026-01-01\n---\n# Note\nmarketing copy\n")
-
+	seedVaultFiles(t, dir)
 	seedIndex(t, dir)
 	srv, err := NewServer(dir)
 	if err != nil {
@@ -41,6 +31,21 @@ func newTestServer(t *testing.T) *Server {
 	}
 	t.Cleanup(func() { srv.Close() })
 	return srv
+}
+
+// seedVaultFiles lays out the standard two-note fixture vault (markdown only, no index).
+func seedVaultFiles(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "decisions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(rel, body string) {
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("decisions/sqlite.md", "---\nid: sqlite\ntype: decision\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: use modernc sqlite for storage\n---\n# Storage\n")
+	write("note.md", "---\nid: note\ntype: note\nwhen: 2026-01-01\n---\n# Note\nmarketing copy\n")
 }
 
 // seedIndex plays the part of the single owning writer: it builds the index once and

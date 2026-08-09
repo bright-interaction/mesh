@@ -4,6 +4,7 @@
 package index
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 
@@ -86,10 +87,23 @@ type LiveIndexer struct {
 	store *Store
 	root  string
 
-	mu     sync.Mutex
-	cache  *NoteCache
-	seeded bool
+	mu         sync.Mutex
+	cache      *NoteCache
+	seeded     bool
+	lastHealth time.Time // when this owner last refreshed the persisted health findings
 }
+
+// healthRefreshInterval is how often the owning writer recomputes the lifecycle health
+// findings (dead refs, overdue reviews, contradictions) into note_health.
+//
+// Someone has to, and it can only be a writer. The pass is a write, so a read-only
+// `mesh mcp` window computes its answer in memory and persists nothing; before the
+// single-writer split those windows wrote the rows as a side effect of an agent calling
+// mesh_health, and the web dashboard read them. Nothing else refreshes them, so the
+// dashboard would sit on whatever the last `mesh health` run left behind. Derived state
+// belongs to the process that owns the index, on a cadence slow enough that a whole-vault
+// walk is nowhere near a per-tick cost.
+const healthRefreshInterval = 5 * time.Minute
 
 // NewLiveIndexer returns a LiveIndexer for the given store + vault root.
 func NewLiveIndexer(store *Store, root string) *LiveIndexer {
@@ -126,6 +140,7 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 		}
 		li.cache.Seed(notes)
 		li.seeded = true
+		li.refreshHealthIfDue()
 		return Reconciliation{
 			Added:     len(notes),
 			Reindexed: true,
@@ -134,5 +149,29 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 			Dur:       time.Since(start),
 		}, nil
 	}
-	return ReconcileIncremental(li.store, li.root, li.cache, !authoritative)
+	rec, err := ReconcileIncremental(li.store, li.root, li.cache, !authoritative)
+	if err == nil {
+		li.refreshHealthIfDue()
+	}
+	return rec, err
+}
+
+// refreshHealthIfDue recomputes the persisted health findings when they are older than
+// healthRefreshInterval. Called with li.mu held, from the one goroutine that reconciles,
+// so the passes can never overlap. Best effort: a health pass that fails must never fail
+// the reindex it rode in on, because the index is what retrieval depends on and the
+// findings are a lifecycle report about it.
+func (li *LiveIndexer) refreshHealthIfDue() {
+	if !li.lastHealth.IsZero() && time.Since(li.lastHealth) < healthRefreshInterval {
+		return
+	}
+	now := time.Now()
+	li.lastHealth = now
+	if _, err := li.store.ComputeHealth(li.root, now); err != nil {
+		slog.Warn("mesh: could not refresh the health findings", "err", err)
+		return
+	}
+	if _, err := li.store.ComputeContradictions(now); err != nil {
+		slog.Warn("mesh: could not refresh the contradiction findings", "err", err)
+	}
 }
