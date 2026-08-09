@@ -29,6 +29,7 @@ func scopedServer(t *testing.T) *Server {
 	}
 	write("a.md", "---\nid: note-a\ntype: note\nscope: team-a\nreview_by: 2020-01-01\n---\n# A\nalpha\n")
 	write("b.md", "---\nid: note-b\ntype: note\nscope: team-b\nreview_by: 2020-01-01\n---\n# B\nbravo\n")
+	seedIndex(t, dir)
 	srv, err := NewServer(dir)
 	if err != nil {
 		t.Fatal(err)

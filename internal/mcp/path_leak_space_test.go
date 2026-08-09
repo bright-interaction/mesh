@@ -26,6 +26,7 @@ func spacedRootServer(t *testing.T) *Server {
 		[]byte("---\nid: seed\ntype: decision\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: seed the index\n---\n# Seed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	seedIndex(t, dir)
 	srv, err := NewServer(dir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)

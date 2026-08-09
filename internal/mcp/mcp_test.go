@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -29,6 +31,7 @@ func newTestServer(t *testing.T) *Server {
 	write("decisions/sqlite.md", "---\nid: sqlite\ntype: decision\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: use modernc sqlite for storage\n---\n# Storage\n")
 	write("note.md", "---\nid: note\ntype: note\nwhen: 2026-01-01\n---\n# Note\nmarketing copy\n")
 
+	seedIndex(t, dir)
 	srv, err := NewServer(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -38,6 +41,23 @@ func newTestServer(t *testing.T) *Server {
 	}
 	t.Cleanup(func() { srv.Close() })
 	return srv
+}
+
+// seedIndex plays the part of the single owning writer: it builds the index once and
+// closes, so a read-only NewServer has something to read. Production has the same
+// ordering (`mesh watch` / `mesh sync --watch` owns the index; every `mesh mcp` window
+// reads it), which is why the tests do it this way rather than handing the server a
+// writable store it would never get in production.
+func seedIndex(t *testing.T, dir string) {
+	t.Helper()
+	owner, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if _, _, err := index.ReindexFull(owner, dir); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // call dispatches as the LOCAL STDIO transport does (ServeStdio marks its context with

@@ -428,7 +428,17 @@ func codeFileKnown(codeFiles map[string]bool, ref string) bool {
 }
 
 // setCodeRoots records the directories the code index was built from.
+//
+// The read-only check is not redundant with Write's: this is one of the few places that
+// reaches s.writeDB DIRECTLY instead of going through Write, and on a read-only store
+// writeDB is nil, so without this the call is a nil-pointer panic inside database/sql
+// rather than an error. A panic here would take down a long-running `mesh mcp` server,
+// and it would do it on a path (mesh_code_search) that looks purely read-only from the
+// outside. Any future direct writeDB use needs the same guard.
 func (s *Store) setCodeRoots(roots []string) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
 	_, err := s.writeDB.Exec(
 		`INSERT OR REPLACE INTO meta(key, value) VALUES('code_roots', ?)`,
 		strings.Join(roots, "\n"))

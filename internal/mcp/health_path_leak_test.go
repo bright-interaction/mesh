@@ -68,6 +68,7 @@ func TestHealthFindingsDoNotLeakTheVaultRoot(t *testing.T) {
 			writeNote(t, filepath.Join(dir, "decisions", "seed.md"), "seed")
 			keep := tc.setup(t, dir)
 
+			seedIndex(t, dir)
 			srv, err := NewServer(dir)
 			if err != nil {
 				t.Fatalf("NewServer: %v", err)

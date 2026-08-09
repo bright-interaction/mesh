@@ -26,6 +26,7 @@ func serverWithNotes(t *testing.T, notes map[string]string) *Server {
 			t.Fatal(err)
 		}
 	}
+	seedIndex(t, dir)
 	srv, err := NewServer(dir)
 	if err != nil {
 		t.Fatal(err)

@@ -60,9 +60,16 @@ type Server struct {
 	agent string // calling client's name from initialize (provenance default), guarded by mu
 }
 
-// NewServer opens the vault's index (at <vaultRoot>/.mesh) and loads it into memory.
+// NewServer opens the vault's index (at <vaultRoot>/.mesh) READ-ONLY and loads it into
+// memory. This is the per-window server a coding agent spawns, and there can be many of
+// them at once against one vault, so none of them may hold the SQLite write lock: only
+// the single owning writer (`mesh watch` / `mesh sync --watch`) indexes. Write-back still
+// works, because creating a note is a filesystem write the owner picks up; see toolWrite.
+//
+// NewServerAt (the hub) deliberately does NOT go through here: the hub owns the index it
+// serves, so it keeps a writable store.
 func NewServer(vaultRoot string) (*Server, error) {
-	store, err := index.Open(vaultRoot)
+	store, err := index.OpenReadOnly(vaultRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -91,13 +98,24 @@ func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
 	// gating on awaitReady waits ~1s, not for the enrichment passes below it.
 	go func() {
 		defer close(s.bg)
-		if err := s.reload(); err != nil {
+		// A read-only store cannot reindex: ReindexFull rewrites notes / search_index /
+		// nodes / edges, so on this path the owning writer has already done that work and
+		// all this server has to do is read the result into memory. LoadGraph is pure SQL
+		// over readDB and was written for exactly this split.
+		if err := s.load(); err != nil {
 			s.readyErr = fmt.Errorf("initial index load: %w", err)
 			fmt.Fprintf(os.Stderr, "mesh mcp: %v\n", s.readyErr)
 			close(s.ready)
 			return
 		}
 		close(s.ready)
+		if store.ReadOnly() {
+			// Both enrichment passes below are writes. They belong to the owning writer
+			// now, not to every window that connects; doing them here would just be N
+			// servers taking the write lock at startup, which is the contention this
+			// whole split exists to remove.
+			return
+		}
 		// Seed the flywheel measurement from the existing agent-authored corpus once, so
 		// the reuse number reflects accumulated knowledge from day one (idempotent).
 		_, _ = store.BackfillWritebacks()
@@ -169,6 +187,34 @@ func (s *Server) swap(g *graph.Graph) {
 	s.mu.Unlock()
 }
 
+// load puts the vault's graph in memory by whichever route this store allows: a writable
+// store re-indexes (and seeds the parsed-note cache so later reconciles are incremental),
+// a read-only one reads the owning writer's persisted result. Startup calls this.
+func (s *Server) load() error {
+	if s.store.ReadOnly() {
+		return s.refresh()
+	}
+	return s.reload()
+}
+
+// refresh rebuilds the in-memory graph + retriever from the PERSISTED tables, without
+// touching the vault or the write lock. It is how a read-only server picks up whatever
+// the owning writer has indexed since. It takes reloadMu like reload does, so a refresh
+// and a rebuild can never swap under each other.
+//
+// The parsed-note cache is deliberately left unseeded: it exists to make a REINDEX
+// incremental, and this server never reindexes.
+func (s *Server) refresh() error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	g, err := s.store.LoadGraph()
+	if err != nil {
+		return err
+	}
+	s.swap(g)
+	return nil
+}
+
 // reload fully re-indexes the vault and rebuilds the in-memory graph +
 // retriever, seeding the parsed-note cache so later reconciles can be incremental.
 // Run at startup and after a write-back so new notes are immediately retrievable.
@@ -188,6 +234,22 @@ func (s *Server) reload() error {
 // graph when it did. It is the watcher's reindex callback. Incremental: it parses
 // only changed files and rebuilds the graph in memory from the cache.
 func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error) {
+	// A read-only server has no reindex to run: the owning writer does that. The
+	// equivalent act here is picking up what the owner has already persisted, so the
+	// watcher, mesh_reindex and write-back all still refresh, none of them write, and
+	// none of them need to know which kind of store they are on. Branch BEFORE taking
+	// reloadMu: refresh takes it too, and it is not reentrant.
+	//
+	// Added/Changed/Removed stay zero because this pass genuinely did not classify any
+	// file; it is a snapshot swap, not a diff. Reindexed reports whether the in-memory
+	// graph was replaced, which is what every caller actually uses it for.
+	if s.store.ReadOnly() {
+		start := time.Now()
+		if err := s.refresh(); err != nil {
+			return index.Reconciliation{}, err
+		}
+		return index.Reconciliation{Reindexed: true, Dur: time.Since(start)}, nil
+	}
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 	rec, err := index.ReconcileIncremental(s.store, s.vaultRoot, s.cache, !authoritative)

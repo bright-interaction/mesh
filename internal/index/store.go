@@ -566,6 +566,13 @@ func (s *Store) Path() string { return s.dbPath }
 // config.toml live).
 func (s *Store) MeshDir() string { return s.dir }
 
+// ReadOnly reports whether this store was opened with OpenReadOnly, so a caller can
+// take the non-writing path instead of discovering it by failing. Callers must branch
+// on THIS, not on which constructor they think ran: the per-window `mesh mcp` server
+// and the hub's own indexing server share one setup function, and the hub owns its
+// index and must keep writing to it.
+func (s *Store) ReadOnly() bool { return s.readOnly }
+
 // NoteDate carries the lifecycle dates retrieval needs for freshness decay.
 type NoteDate struct {
 	Updated  string // frontmatter updated/when (YYYY-MM-DD)
