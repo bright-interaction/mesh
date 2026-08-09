@@ -206,6 +206,11 @@ func writeStarterIndex(root, body string) error {
 	return nil
 }
 
+// driftListLimit bounds the per-bucket file list doctor prints. Enough to diagnose,
+// short enough that a vault mid-bulk-edit does not bury the verdict under a thousand
+// paths.
+const driftListLimit = 8
+
 func doctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor [vault]",
@@ -238,6 +243,22 @@ func doctorCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("drift:  +%d new  ~%d changed  -%d removed\n", len(drift.Added), len(drift.Changed), len(drift.Removed))
+			// NAME the files. Counts alone say the index disagrees with the vault without
+			// saying where, and "+1 new" against a 1200-note vault is indistinguishable
+			// from a tool bug until you diff the two sets by hand, which is exactly the
+			// hour this cost on 2026-08-10. A handful of paths is the whole diagnosis.
+			for _, b := range []struct {
+				label string
+				paths []string
+			}{{"new", drift.Added}, {"changed", drift.Changed}, {"removed", drift.Removed}} {
+				for i, p := range b.paths {
+					if i == driftListLimit {
+						fmt.Printf("          ... and %d more %s\n", len(b.paths)-driftListLimit, b.label)
+						break
+					}
+					fmt.Printf("          %-7s %s\n", b.label, p)
+				}
+			}
 
 			files, err := vault.Walk(root)
 			if err != nil {

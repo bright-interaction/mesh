@@ -261,12 +261,31 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 		if Unfilled(v) {
 			continue // frontmatter itself has nothing real to offer yet
 		}
-		old := "## " + s.heading + "\n" + s.placeholder
-		if !strings.Contains(newBody, old) {
-			continue // not still the verbatim placeholder: authored already, or heading absent
+		heading := "## " + s.heading + "\n"
+		// A section can be in one of three states, and only the first two may be touched.
+		// Absent, so the note predates this heading existing (every gotcha and post-mortem
+		// written before Related was added to their templates). Present but still holding a
+		// placeholder, which includes placeholders this template used to emit and no longer
+		// does. Or present and authored, which is judgment and is never overwritten.
+		switch {
+		case !strings.Contains(newBody, heading):
+			newBody = appendSection(newBody, s.heading, v)
+			filled = append(filled, s.heading+" (added)")
+		default:
+			replaced := false
+			for _, ph := range append([]string{s.placeholder}, retiredPlaceholders[s.heading]...) {
+				old := heading + ph
+				if strings.Contains(newBody, old) {
+					newBody = strings.Replace(newBody, old, heading+v, 1)
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				continue // authored already; leave it exactly as written
+			}
+			filled = append(filled, s.heading)
 		}
-		newBody = strings.Replace(newBody, old, "## "+s.heading+"\n"+v, 1)
-		filled = append(filled, s.heading)
 	}
 	if len(filled) == 0 {
 		return res, nil // idempotent no-op
@@ -281,6 +300,29 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+// retiredPlaceholders are placeholder texts a template USED to emit for a heading. A note
+// scaffolded before the wording changed still carries the old string, and without this it
+// reads as authored prose and is skipped forever, so the backfill would quietly miss
+// exactly the notes that need it most: the oldest ones.
+var retiredPlaceholders = map[string][]string{
+	"Related": {"<!-- linked notes from the related: field render in the graph -->"},
+}
+
+// appendSection adds a heading the note never had. It goes at the end of the body but
+// BEFORE any trailing provenance comment (<!-- authored by ... -->), which every
+// scaffolded note carries as its last line; appending past the signature would read as an
+// afterthought bolted on rather than part of the note.
+func appendSection(body, heading, content string) string {
+	section := "## " + heading + "\n" + content + "\n"
+	trimmed := strings.TrimRight(body, "\n")
+	if i := strings.LastIndex(trimmed, "\n<!--"); i >= 0 && strings.HasSuffix(trimmed, "-->") {
+		head := strings.TrimRight(trimmed[:i], "\n")
+		tail := trimmed[i+1:]
+		return head + "\n\n" + section + "\n" + tail + "\n"
+	}
+	return trimmed + "\n\n" + section
 }
 
 // noFrontmatterErr names which of the two shapes a had=false file actually is. They need

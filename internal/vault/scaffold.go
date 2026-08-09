@@ -408,13 +408,14 @@ func bodySections(t NoteType) []bodySection {
 			{"Context", "<!-- TODO: what forced a decision; the situation and constraints -->", fieldWhy},
 			{"Decision", "<!-- TODO: what was decided, stated plainly -->", fieldDo},
 			{"Consequences", "<!-- TODO: trade-offs accepted; what this makes easy or hard -->", fieldDont},
-			{"Related", "<!-- linked notes from the related: field render in the graph -->", nil},
+			relatedSection,
 		}
 	case TypeGotcha:
 		return []bodySection{
 			{"Symptom", "<!-- TODO: how the problem shows up -->", fieldDont},
 			{"Cause", "<!-- TODO: the root cause -->", fieldWhy},
 			{"Fix", "<!-- TODO: the resolution or workaround -->", fieldDo},
+			relatedSection,
 		}
 	case TypePostMortem:
 		return []bodySection{
@@ -422,10 +423,46 @@ func bodySections(t NoteType) []bodySection {
 			{"Impact", "<!-- TODO: who or what was affected and for how long -->", fieldDont},
 			{"Root cause", "<!-- TODO: the underlying cause, not just the trigger -->", fieldWhy},
 			{"Follow-ups", "<!-- TODO: concrete actions, owners, dates -->", fieldDo},
+			relatedSection,
 		}
 	default:
 		return nil
 	}
+}
+
+// relatedSection closes every flywheel note with its links, RENDERED, not described.
+//
+// It used to be a comment saying the related: field renders in the graph, which is true
+// and useless to the two readers that matter. An agent reading the note through
+// mesh_fetch, and a human reading the raw markdown in an editor, both got a note whose
+// last line explained that its links exist somewhere else. Now the links are in the note.
+//
+// This creates no duplicate edges: the indexer already emits a "references" edge per
+// related: entry, Graph.AddEdge dedups on source+target+relation, and a body wikilink to
+// the same target lands on the same key. What it adds is the ability to FOLLOW the thread
+// from the text itself, which is the whole point of a linked corpus.
+var relatedSection = bodySection{"Related", relatedPlaceholder, fieldRelated}
+
+const relatedPlaceholder = "<!-- no related notes yet; add ids to the related: field and they render here -->"
+
+// fieldRelated renders the related: ids as a wikilink list. Unfilled (the empty list)
+// falls back to the placeholder like every other section.
+func fieldRelated(fm *Frontmatter) string {
+	if len(fm.Related) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(fm.Related))
+	for _, r := range fm.Related {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		lines = append(lines, "- [["+r+"]]")
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderSections fills each heading with its mapped frontmatter field when the author
