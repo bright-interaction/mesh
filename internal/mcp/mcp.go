@@ -9,7 +9,9 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -58,6 +60,11 @@ type Server struct {
 	bg       chan struct{} // closed when ALL background startup work is done (enrichment included)
 
 	agent string // calling client's name from initialize (provenance default), guarded by mu
+
+	// ownerIndexTimeout bounds the wait for the owning writer to index a just-written
+	// note. A field rather than a bare const so a test can shorten it without mutating
+	// global state (which would race across parallel tests); production never sets it.
+	ownerIndexTimeout time.Duration
 }
 
 // NewServer opens the vault's index (at <vaultRoot>/.mesh) READ-ONLY and loads it into
@@ -88,7 +95,7 @@ func NewServerAt(vaultRoot, indexDir string) (*Server, error) {
 }
 
 func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
-	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache(), ready: make(chan struct{}), bg: make(chan struct{})}
+	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache(), ready: make(chan struct{}), bg: make(chan struct{}), ownerIndexTimeout: ownerIndexTimeout}
 	// The initial load runs in the background so the MCP handshake answers
 	// immediately: a full reload of a grown vault plus the note<->code bridge
 	// exceeds a client's connect timeout (Claude Code kills the server at 30s
@@ -213,6 +220,85 @@ func (s *Server) refresh() error {
 	}
 	s.swap(g)
 	return nil
+}
+
+// ErrOwnerNotIndexing means the single owning writer did not index a just-written note
+// inside ownerIndexTimeout. The note IS durably on disk; only its indexing is missing,
+// which is a liveness failure of the owner (`mesh watch` / `mesh sync --watch` stopped),
+// not a durability failure of the write. Callers must say exactly that, because the one
+// thing that must never happen here is reporting a failed write for a note that exists:
+// the agent retries and Mesh mints a near-duplicate.
+var ErrOwnerNotIndexing = errors.New("the note was saved but the owning writer did not index it in time; it is NOT queryable yet")
+
+const (
+	// ownerIndexPollInterval is how often a read-only server checks whether the owner
+	// has landed a just-written note. Each check is one indexed point query on the read
+	// pool. WAL readers never block the writer, and QueryRow closes its rows, so this
+	// cannot pin a read snapshot the way a long-lived *sql.Rows would.
+	ownerIndexPollInterval = 50 * time.Millisecond
+	// ownerIndexTimeout bounds that wait. MEASURED, not guessed. Against a live owner at
+	// production cadence (300ms debounce, 30s periodic sweep), write-to-queryable over 12
+	// samples was p50 310ms, max 328ms across repeated runs: essentially the debounce,
+	// because fsnotify and not the sweep is what delivers the note. See
+	// TestWriteBackLatencyDistribution and TestWriteBackRidesFsnotifyNotThePeriodicSweep.
+	//
+	// Those samples are a tiny vault, where the reconcile itself is ~0. On the reference
+	// vault a reconcile has been measured at 1.2 to 2.3s, so the realistic worst case is
+	// debounce plus reindex, call it ~2.6s. 10s is roughly 4x that, which also absorbs an
+	// owner already mid-reindex of a larger change.
+	//
+	// Two measured ways a note misses its fsnotify event and falls through to the
+	// PERIODIC sweep instead, which at 30s is outside this bound:
+	//   - the moment right after the owner starts, before its watches are registered;
+	//   - a burst against a SHORT debounce, where the watcher is mid-reconcile. A
+	//     50ms-debounce owner put p50 at its 500ms sweep rather than at the 58ms its
+	//     fastest sample proved was possible. The 300ms production debounce showed none
+	//     of this over repeated runs.
+	// Such a note is still durable and does become queryable, just later than this bound,
+	// so it is reported as not-yet-queryable rather than silently accepted. That is also
+	// why the periodic sweep should stay well under this bound rather than far above it:
+	// today at 30s it is the one gap where a genuinely fine note reads as owner_down.
+	ownerIndexTimeout = 10 * time.Second
+)
+
+// awaitOwnerIndexed blocks until the single owning writer has indexed noteID, then
+// refreshes this server's in-memory graph from what the owner persisted.
+//
+// This is the whole of "write-back through the owner", and it needs no IPC:
+// vault.CreateNote already wrote the file, the owner's fsnotify sees it inside its
+// debounce, and its reconcile commits the note row, the FTS row and the graph tables in
+// ONE transaction (IndexVaultIncremental). That atomicity is what makes polling the note
+// row a valid readiness signal for the graph: if NotePath sees it, LoadGraph will too.
+func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID string) error {
+	deadline := time.Now().Add(s.ownerIndexTimeout)
+	for {
+		_, err := s.store.NotePath(noteID)
+		switch {
+		case err == nil:
+			return s.refresh()
+		case !errors.Is(err, sql.ErrNoRows):
+			return err // a real read error, not "not landed yet"
+		}
+		if time.Now().After(deadline) {
+			return ErrOwnerNotIndexing
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(ownerIndexPollInterval):
+		}
+	}
+}
+
+// publishWriteBack makes a just-created note queryable, by whichever route this server
+// is allowed to take: the owner of its index reindexes directly, a read-only server
+// waits for the owning writer to do it.
+func (s *Server) publishWriteBack(ctx context.Context, noteID string) error {
+	if s.store.ReadOnly() {
+		return s.awaitOwnerIndexed(ctx, noteID)
+	}
+	_, err := s.reconcileOnce(true)
+	return err
 }
 
 // reload fully re-indexes the vault and rebuilds the in-memory graph +

@@ -150,6 +150,7 @@ func TestToolSearchFused(t *testing.T) {
 
 func TestToolWriteBackReindexes(t *testing.T) {
 	s := newTestServer(t)
+	startOwner(t, s.vaultRoot) // the owning writer is what indexes a write-back now
 	res, rerr := s.dispatch(context.Background(), request{
 		JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "tools/call",
 		Params: mustJSON(map[string]any{"name": "mesh_append_note", "arguments": map[string]any{

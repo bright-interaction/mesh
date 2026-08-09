@@ -404,6 +404,7 @@ func TestReindexThrottlesRemoteCallers(t *testing.T) {
 // untouched rows keep their identity, and the new note is still immediately queryable.
 func TestWriteBackReconcilesIncrementally(t *testing.T) {
 	s := newTestServer(t) // decisions/sqlite.md, note.md
+	startOwner(t, s.vaultRoot)
 	before := noteRowID(t, s, "note")
 
 	// A gotcha lands in gotchas/, which sorts BEFORE note.md in the vault walk: under a
@@ -434,12 +435,18 @@ func TestWriteBackReconcilesIncrementally(t *testing.T) {
 
 // noteRowID reads a note row's sqlite rowid, the cheapest observable proof of whether
 // the row survived the write-back or was deleted and reinserted.
+// noteRowID reads a note's rowid straight from the index file. It opens its own
+// read-only connection rather than going through Store.Write: this is a READ, and on the
+// read-only server every window now runs, Write refuses outright.
 func noteRowID(t *testing.T, s *Server, id string) int64 {
 	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(s.store.MeshDir(), "mesh.db")+"?mode=ro")
+	if err != nil {
+		t.Fatalf("open index read-only: %v", err)
+	}
+	defer db.Close()
 	var rowid int64
-	if err := s.store.Write(func(tx *sql.Tx) error {
-		return tx.QueryRow(`SELECT rowid FROM notes WHERE id = ?`, id).Scan(&rowid)
-	}); err != nil {
+	if err := db.QueryRow(`SELECT rowid FROM notes WHERE id = ?`, id).Scan(&rowid); err != nil {
 		t.Fatalf("read rowid for %q: %v", id, err)
 	}
 	return rowid

@@ -16,7 +16,16 @@ import (
 // own vault lives under "Automation HQ". Every path-leak test in this file uses one,
 // because the whitespace-tokenizing scrubber passed every space-free fixture while
 // leaking most of the layout for a root like this one.
-func spacedRootServer(t *testing.T) *Server {
+func spacedRootServer(t *testing.T) *Server { return spacedRootServerMode(t, false) }
+
+// spacedRootServerWritable builds the server the way the HUB runs it: owning its own
+// index, so write-back still reconciles in-process and a broken vault walk still surfaces
+// a filesystem error through index_error. The scrub tests need that, because a read-only
+// server never walks the vault (its owner does), so the error they exist to scrub can no
+// longer arise there. Same coverage, pointed at where the code path now lives.
+func spacedRootServerWritable(t *testing.T) *Server { return spacedRootServerMode(t, true) }
+
+func spacedRootServerMode(t *testing.T, writable bool) *Server {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "Automation HQ", "vault")
 	if err := os.MkdirAll(filepath.Join(dir, "decisions"), 0o755); err != nil {
@@ -27,7 +36,11 @@ func spacedRootServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	seedIndex(t, dir)
-	srv, err := NewServer(dir)
+	newSrv := NewServer
+	if writable {
+		newSrv = func(root string) (*Server, error) { return NewServerAt(root, filepath.Join(root, ".mesh")) }
+	}
+	srv, err := newSrv(dir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -195,7 +208,7 @@ func TestAppendNoteDoesNotLeakTheVaultRootOnEitherFailure(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := spacedRootServer(t)
+			s := spacedRootServerWritable(t)
 			keep := tc.breakIt(t, s)
 			raw, _ := json.Marshal(map[string]any{
 				"type": "gotcha", "title": "Leak check", "do": "a", "dont": "b", "why": "c"})

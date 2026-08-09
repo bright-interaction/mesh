@@ -938,9 +938,11 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	// problem. So: succeed, and say the index is stale, so the caller knows to run
 	// mesh_reindex and knows not to retry the write.
 	var indexStale string
-	if _, err := s.reconcileOnce(true); err != nil {
+	var ownerDown bool
+	if err := s.publishWriteBack(ctx, res.ID); err != nil {
+		ownerDown = errors.Is(err, ErrOwnerNotIndexing)
 		slog.Error("mesh write: the note was saved but the index did not refresh",
-			"id", res.ID, "path", res.Path, "error", err)
+			"id", res.ID, "path", res.Path, "owner_down", ownerDown, "error", err)
 		// Scrubbed like every other message that leaves this process. This one is easy to
 		// miss because it sits right next to a "path" field that IS relativized, but the
 		// reconcile walks the vault, so its errors are filesystem errors: an unreadable
@@ -948,8 +950,17 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 		// shipped the whole server layout inside the staleness warning.
 		indexStale = ScrubPathsUnder(err.Error(), s.vaultRoot)
 	}
-	_ = s.store.IncrMetric("writes", 1)         // ROI telemetry (best-effort)
-	_ = s.store.RecordWriteback(res.ID, source) // flywheel: stamp authoring time for reuse measurement
+	// Both of these are writes, so on a read-only server they do nothing: IncrMetric
+	// drops the counter (recordTelemetry returns early, since no writer goroutine will
+	// ever flush it) and RecordWriteback returns ErrReadOnly. That is deliberate, and
+	// only the flywheel stamp is recovered: the owner's BackfillWritebacks is idempotent
+	// and re-derives it from the note's own `source: agent`, which CreateNote already
+	// set. The "writes" counter genuinely is lost on read-only windows, so
+	// FlywheelStats.WritesPer100Reads under-reports there; it is a telemetry number, not
+	// a correctness one, and paying a write lock per window to keep it exact is the
+	// contention this split exists to remove.
+	_ = s.store.IncrMetric("writes", 1)
+	_ = s.store.RecordWriteback(res.ID, source)
 	// Return a vault-relative path, never the server's absolute filesystem path:
 	// on a hosted hub the absolute path would leak the server's absolute vault path
 	// to the agent.
@@ -963,9 +974,28 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	if indexStale != "" {
 		out["index_stale"] = true
 		out["index_error"] = indexStale
-		out["warning"] = "The note IS saved at the path above. Only the index refresh failed, " +
-			"so it is not queryable yet. Do NOT call this tool again: a retry creates a " +
-			"duplicate note. Call mesh_reindex instead."
+		// Both messages start from the same fact (the note is saved, do not retry) and
+		// then diverge on the remedy, because giving the wrong one is worse than giving
+		// none. On a read-only server whose owner is down, mesh_reindex only re-reads
+		// what the owner already persisted, so it cannot make this note appear; saying
+		// "call mesh_reindex" there would send the agent in a loop against a tool that
+		// is structurally incapable of fixing it.
+		if ownerDown {
+			out["owner_down"] = true
+			out["warning"] = "The note IS saved at the path above, but it is NOT queryable yet: the " +
+				"single owning writer did not index it inside the wait. The usual cause is that " +
+				"`mesh watch` / `mesh sync --watch` is not running, so check that first; a busy " +
+				"owner can also miss its file-event window and pick the note up on its next " +
+				"periodic sweep instead, in which case it becomes queryable shortly on its own. " +
+				"Do NOT call this tool again: a retry creates a duplicate note. Do NOT call " +
+				"mesh_reindex either: this server is read-only, so a reindex only re-reads what " +
+				"the owner already wrote. If no owner is running, start one (or run `mesh index` " +
+				"once) and the note is indexed as soon as it does."
+		} else {
+			out["warning"] = "The note IS saved at the path above. Only the index refresh failed, " +
+				"so it is not queryable yet. Do NOT call this tool again: a retry creates a " +
+				"duplicate note. Call mesh_reindex instead."
+		}
 	}
 	return textResult(out), nil
 }
