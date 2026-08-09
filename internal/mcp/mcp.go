@@ -235,23 +235,29 @@ func (s *Server) refresh() (index.Reconciliation, error) {
 	// counts, never its correctness, so it must not fail the refresh: the graph is already
 	// good and the caller's notes are already queryable.
 	after, herr := s.store.NoteHashes()
-	rec := index.Reconciliation{Reindexed: true}
+	// Reindexed carries the same meaning it does on the writable path: something actually
+	// changed. A refresh always swaps a graph in, but saying so every time would make the
+	// watcher log a line on every idle tick (and mesh_reindex claim a pass it did not
+	// need), which is noise that hides the ticks that did bring something in. Unknown
+	// counts (the hash read failed) report true: we did swap, and under-reporting a real
+	// change is the worse error.
+	rec := index.Reconciliation{Reindexed: herr != nil}
 	if herr == nil {
-		if s.viewHashes != nil {
-			for p, h := range after {
-				switch prev, had := s.viewHashes[p]; {
-				case !had:
-					rec.Added++
-				case prev != h:
-					rec.Changed++
-				}
-			}
-			for p := range s.viewHashes {
-				if _, still := after[p]; !still {
-					rec.Removed++
-				}
+		first := s.viewHashes == nil
+		for p, h := range after {
+			switch prev, had := s.viewHashes[p]; {
+			case !had && !first:
+				rec.Added++
+			case had && prev != h:
+				rec.Changed++
 			}
 		}
+		for p := range s.viewHashes {
+			if _, still := after[p]; !still {
+				rec.Removed++
+			}
+		}
+		rec.Reindexed = first || rec.Any()
 		s.viewHashes = after
 	}
 	s.swap(g)

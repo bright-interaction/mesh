@@ -221,6 +221,46 @@ func TestReindexIsNotBlockedByAQuarantinedNote(t *testing.T) {
 	}
 }
 
+// TestRefreshReportsNothingWhenNothingChanged: a refresh always swaps a graph in, but it
+// must not claim a pass it did not need. The watcher logs a line whenever a reconcile
+// reports Reindexed, and on a read-only server every periodic tick is a refresh, so
+// reporting true unconditionally means a line every tick forever, which buries the ticks
+// that actually brought something in.
+func TestRefreshReportsNothingWhenNothingChanged(t *testing.T) {
+	s := newTestServer(t)
+
+	rec, err := s.reconcileOnce(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Reindexed || rec.Any() {
+		t.Fatalf("an idle tick reported a reindex: %+v", rec)
+	}
+
+	// A note the owner lands between two ticks IS a change, and must be reported.
+	seedNote(t, s.vaultRoot, "between-ticks")
+	rec, err = s.reconcileOnce(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.Reindexed || rec.Added != 1 {
+		t.Fatalf("a tick that picked up one new note reported %+v", rec)
+	}
+}
+
+// seedNote writes a note and has the owner-of-record (a one-shot writable store, like
+// `mesh index`) put it in the index, without a watcher: the point is what the read-only
+// server sees on its next refresh, not how fast the note got there.
+func seedNote(t *testing.T, vaultRoot, id string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(vaultRoot, "decisions", id+".md"),
+		[]byte("---\nid: "+id+"\ntype: decision\nwhen: 2026-02-02\ndo: x\ndont: y\nwhy: seeded between two watcher ticks\n---\n# "+id+"\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, vaultRoot)
+}
+
 func mustReindex(t *testing.T, s *Server) any {
 	t.Helper()
 	out, rerr := s.toolReindex(WithLocalOperator(context.Background()))
