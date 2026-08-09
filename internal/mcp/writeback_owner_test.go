@@ -65,17 +65,32 @@ func startOwnerWith(t *testing.T, dir string, debounce, reconcile time.Duration)
 func awaitWatcherLive(t *testing.T, owner *Server, dir string) {
 	t.Helper()
 	const probeID = "owner-watcher-probe"
-	if err := os.WriteFile(filepath.Join(dir, probeID+".md"),
+	probe := filepath.Join(dir, probeID+".md")
+	if err := os.WriteFile(probe,
 		[]byte("---\nid: "+probeID+"\ntype: note\nwhen: 2026-01-01\n---\n# Probe\nwatcher liveness probe\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	awaitProbe(t, owner, probeID, true, "the owner never indexed the watcher probe, so its watcher never came up")
+	// Take the probe out again and wait for THAT to land too, so it leaves no trace in the
+	// index. A test that counts what a refresh brought into view (mesh_reindex) would
+	// otherwise be measuring the harness: the probe is one more added note, indexed at
+	// exactly the moment the test is about to write the note it actually cares about.
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
+	awaitProbe(t, owner, probeID, false, "the owner never dropped the watcher probe from its index")
+}
+
+func awaitProbe(t *testing.T, owner *Server, probeID string, want bool, failure string) {
+	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		if _, err := owner.store.NotePath(probeID); err == nil {
+		_, err := owner.store.NotePath(probeID)
+		if (err == nil) == want {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the owner never indexed the watcher probe, so its watcher never came up")
+			t.Fatal(failure)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

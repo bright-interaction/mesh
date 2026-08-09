@@ -77,9 +77,11 @@ func TestHealthFindingsDoNotLeakTheVaultRoot(t *testing.T) {
 				t.Fatalf("WaitReady: %v", err)
 			}
 			t.Cleanup(func() { srv.Close() })
-			if _, err := srv.reconcileOnce(true); err != nil {
-				t.Fatalf("reconcile: %v", err)
-			}
+			// The owning writer is what finds these: the duplicate-id quarantine lives in
+			// the INCREMENTAL reconcile, and a read-only server runs neither pass. The drop
+			// reaches this server through the index, which is the whole reason drops are
+			// persisted rather than kept in the indexing process's memory.
+			startOwner(t, dir)
 
 			out, rerr := srv.toolHealth(WithLocalOperator(context.Background()), json.RawMessage(`{}`))
 			if rerr != nil {

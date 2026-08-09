@@ -298,22 +298,28 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 	}
 }
 
-// toolReindex forces an authoritative reconcile so an agent editing note files
-// directly (via the editor or CLI) can make its edits queryable on demand, instead
-// of waiting on the --watch debounce or restarting a no-watch server. Authoritative
-// = full content-hash check, so it also catches an edit that did not move the mtime.
+// toolReindex makes an agent's direct file edits (via the editor or CLI) queryable on
+// demand, instead of waiting on the --watch debounce or restarting a no-watch server.
+// Authoritative = full content-hash check, so it also catches an edit that did not move
+// the mtime.
+//
+// On a read-only server it does not reindex anything, because it cannot: it measures what
+// the vault has drifted by, waits for the single owning writer to absorb that, and
+// re-reads the result. Same observable contract ("after this returns, your edits are
+// queryable"), reached the only way a process without the write lock can reach it.
 func (s *Server) toolReindex(ctx context.Context) (any, *rpcError) {
-	// Role write gate: a reindex content-hashes the whole vault, re-indexes the code
-	// roots, and WRITES the result to the DB, so it is not a read even though what it
-	// returns is. A read-only hosted viewer must not be able to drive it.
+	// Role write gate: a reindex content-hashes the whole vault and re-indexes the code
+	// roots, so it is not a read even though what it returns is (and on a writable store
+	// it writes the result too). A read-only hosted viewer must not be able to drive it.
 	if can, set := writeAllowed(ctx); set && !can {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
 	}
 	// Throttle remote callers only (see reconcileThrottled): the hosted transports are
 	// where back-to-back passes contend with the hub's post-sync reconcile worker for
 	// reloadMu. The local operator's "reindex now" still means now.
-	rec, throttled, err := s.reconcileThrottled(!localOperator(ctx))
-	if err != nil {
+	rec, throttled, err := s.reconcileThrottled(ctx, !localOperator(ctx))
+	ownerDown := errors.Is(err, ErrOwnerNotIndexing)
+	if err != nil && !ownerDown {
 		return nil, internalErr(err)
 	}
 	// Count from the graph THIS reconcile produced, not a fresh snapshot() that a
@@ -332,6 +338,20 @@ func (s *Server) toolReindex(ctx context.Context) (any, *rpcError) {
 	if throttled {
 		out["throttled"] = true
 		out["note"] = "a reindex ran moments ago; this is that pass's result. Retry in a few seconds to force a fresh one."
+	}
+	// The one outcome mesh_reindex must never round up to success: this server does not
+	// index, it waits for the owning writer to, and the wait ran out. Same vocabulary as a
+	// write-back that could not be published, because it is the same failure and the same
+	// remedy, and the counts above describe what DID land, not what is still missing.
+	if ownerDown {
+		out["index_stale"] = true
+		out["owner_down"] = true
+		out["warning"] = "Your edits on disk are NOT queryable yet: the single owning writer did " +
+			"not index them inside the wait, and this server only re-reads what that writer " +
+			"persists. The usual cause is that `mesh watch` / `mesh sync --watch` is not " +
+			"running, so check that first. Calling this tool again will not help until one is: " +
+			"start an owner (or run `mesh index <vault>` once) and the edits are picked up as " +
+			"soon as it runs."
 	}
 	// A scope-confined caller must not learn out-of-scope volume: the global graph
 	// totals AND the reconcile deltas (added/changed/removed, which span every scope)
@@ -354,13 +374,92 @@ func (s *Server) toolReindex(ctx context.Context) (any, *rpcError) {
 	// a throttled replay: re-walking the code roots is the other half of the cost the
 	// cooldown exists to bound.
 	if !throttled {
-		if cs, ok, cerr := s.reindexCode(); ok && cerr == nil && !codeScopeDenied(ctx) {
-			out["code_files"] = cs.Files
-			out["code_symbols"] = cs.Symbols
-			out["code_edges"] = cs.Edges
+		if cr, cerr := s.refreshCode(); cerr == nil && cr.enabled && !codeScopeDenied(ctx) {
+			out["code_files"] = cr.stats.Files
+			out["code_symbols"] = cr.stats.Symbols
+			out["code_edges"] = cr.stats.Edges
+			if cr.note != "" {
+				out["code_index"] = cr.note
+			}
 		}
 	}
 	return textResult(out), nil
+}
+
+// computedHealthIssue are the issue kinds the health pass derives itself. Everything
+// else in note_health belongs to another writer (the curator), so a server that computes
+// its own findings still reads those back rather than dropping them.
+var computedHealthIssue = map[string]bool{"dead_ref": true, "overdue": true, "contradiction": true}
+
+// healthPass produces the current findings and their counts by whichever route this
+// server is allowed to take.
+//
+// A writable store runs the pass and PERSISTS it, which is what feeds the web dashboard
+// and the curator. A read-only store (every `mesh mcp` window) computes exactly the same
+// findings in memory and writes nothing: the analysis is a read over the vault plus this
+// index, and only recording it is the owning writer's privilege. Serving the persisted
+// rows instead would answer with whatever the owner last wrote, which on a vault whose
+// owner never runs the pass is nothing at all, and mesh_health would report a clean vault
+// by virtue of never having looked.
+func (s *Server) healthPass(now time.Time, issue string) ([]index.HealthFinding, map[string]int, *rpcError) {
+	if s.store.ReadOnly() {
+		findings, err := s.store.ScanHealth(s.vaultRoot, now)
+		if err != nil {
+			return nil, nil, internalErr(err)
+		}
+		contradictions, err := s.store.ScanContradictions()
+		if err != nil {
+			return nil, nil, internalErr(err)
+		}
+		findings = append(findings, contradictions...)
+		persisted, err := s.store.ListHealth("")
+		if err != nil {
+			return nil, nil, internalErr(err)
+		}
+		for _, f := range persisted {
+			if !computedHealthIssue[f.Issue] {
+				findings = append(findings, f)
+			}
+		}
+		// Counts are global (the caller's issue filter narrows the findings, not the
+		// counts), matching HealthCounts on the writable path. Ordering matches
+		// ListHealth's so the two routes are indistinguishable to a caller.
+		counts := make(map[string]int, len(findings))
+		for _, f := range findings {
+			counts[f.Issue]++
+		}
+		sort.Slice(findings, func(i, j int) bool {
+			if findings[i].Issue != findings[j].Issue {
+				return findings[i].Issue < findings[j].Issue
+			}
+			return findings[i].NoteID < findings[j].NoteID
+		})
+		if issue != "" {
+			kept := findings[:0]
+			for _, f := range findings {
+				if f.Issue == issue {
+					kept = append(kept, f)
+				}
+			}
+			findings = kept
+		}
+		return findings, counts, nil
+	}
+	if _, err := s.store.ComputeHealth(s.vaultRoot, now); err != nil {
+		return nil, nil, internalErr(err)
+	}
+	if _, err := s.store.ComputeContradictions(now); err != nil {
+		return nil, nil, internalErr(err)
+	}
+	findings, err := s.store.ListHealth(issue)
+	if err != nil {
+		return nil, nil, internalErr(err)
+	}
+	counts, _ := s.store.HealthCounts()
+	if counts == nil {
+		counts = map[string]int{}
+	}
+	return findings, counts, nil
 }
 
 // toolHealth runs the lifecycle health pass (dead refs + overdue reviews) and
@@ -371,27 +470,16 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		Issue string `json:"issue"`
 	}
 	_ = json.Unmarshal(raw, &a)
-	// Role write gate: the health pass reads EVERY note file in the vault and persists
-	// the findings + contradiction rows, so like mesh_reindex it is a state-mutating
-	// expensive operation wearing a read tool's clothes. A read-only hosted viewer must
-	// not be able to drive it repeatedly.
+	// Role write gate: the health pass reads EVERY note file in the vault (and on a
+	// writable store persists the findings + contradiction rows), so like mesh_reindex it
+	// is an expensive operation wearing a read tool's clothes. A read-only hosted viewer
+	// must not be able to drive it repeatedly.
 	if can, set := writeAllowed(ctx); set && !can {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
 	}
-	now := time.Now()
-	if _, err := s.store.ComputeHealth(s.vaultRoot, now); err != nil {
-		return nil, internalErr(err)
-	}
-	if _, err := s.store.ComputeContradictions(now); err != nil {
-		return nil, internalErr(err)
-	}
-	findings, err := s.store.ListHealth(strings.TrimSpace(a.Issue))
-	if err != nil {
-		return nil, internalErr(err)
-	}
-	counts, _ := s.store.HealthCounts()
-	if counts == nil {
-		counts = map[string]int{}
+	findings, counts, rerr := s.healthPass(time.Now(), strings.TrimSpace(a.Issue))
+	if rerr != nil {
+		return nil, rerr
 	}
 	// Unparseable notes never made it into the DB, which is exactly the bug: a note
 	// with broken frontmatter vanishes from search and the graph with no signal.

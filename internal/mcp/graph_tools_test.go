@@ -209,15 +209,24 @@ func TestStatsResourceActiveAndFresh(t *testing.T) {
 	t.Setenv("MESH_EMBED_ENDPOINT", "http://127.0.0.1:1/v1") // unreachable; Dim() probe -> 0 -> lenient
 	t.Setenv("MESH_EMBED_MODEL", "test-model")
 	s := newTestServer(t)
-	// Seed a live vector for note:sqlite with the matching note_hash, then reload so
-	// the retriever picks it up.
-	h, _ := s.store.NoteRetrievalHash("note:sqlite")
-	if err := s.store.ReplaceVectors("test-model", []index.VectorRow{
-		{NodeID: "note:sqlite", ChunkIx: 0, Vec: []float32{1, 0, 0, 0}, NoteHash: h},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.reload(); err != nil {
+	// Seed a live vector for note:sqlite with the matching note_hash, then refresh so the
+	// retriever picks it up. Embeddings are written by `mesh embed`, a different writer
+	// again, so they are seeded through a writable store exactly as production does; this
+	// server reads them.
+	func() {
+		owner, err := index.Open(s.vaultRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer owner.Close()
+		h, _ := owner.NoteRetrievalHash("note:sqlite")
+		if err := owner.ReplaceVectors("test-model", []index.VectorRow{
+			{NodeID: "note:sqlite", ChunkIx: 0, Vec: []float32{1, 0, 0, 0}, NoteHash: h},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if _, err := s.refresh(); err != nil {
 		t.Fatal(err)
 	}
 	res := call(t, s, "resources/read", map[string]any{"uri": "mesh://stats"})

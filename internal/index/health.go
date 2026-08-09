@@ -43,10 +43,45 @@ func isChangelogNote(id string) bool {
 	return id == "log" || strings.HasSuffix(id, "-log")
 }
 
-// ComputeHealth runs the dead-ref + overdue passes over the vault and replaces the
-// note_health rows for those two issue types (it leaves contradiction rows, which
-// the curator owns). Returns the findings it wrote. vaultRoot is the notes vault.
+// ComputeHealth runs ScanHealth and replaces the note_health rows for the two issue
+// types it owns (it leaves contradiction rows, which the curator owns). Returns the
+// findings it wrote. vaultRoot is the notes vault.
 func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding, error) {
+	findings, err := s.ScanHealth(vaultRoot, now)
+	if err != nil {
+		return nil, err
+	}
+	// Replace dead_ref + overdue rows atomically (keep contradiction rows).
+	at := now.Unix()
+	err = s.Write(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM note_health WHERE issue IN ('dead_ref','overdue')`); err != nil {
+			return err
+		}
+		ins, err := tx.Prepare(`INSERT INTO note_health(note_id,path,issue,detail,detected_at) VALUES(?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer ins.Close()
+		for _, f := range findings {
+			if _, err := ins.Exec(f.NoteID, f.Path, f.Issue, f.Detail, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return findings, err
+}
+
+// ScanHealth is the pass itself: the dead-ref + overdue analysis over the vault,
+// returning the findings and writing NOTHING.
+//
+// It is separate from ComputeHealth because computing health and persisting it are two
+// different rights. The analysis is a pure read (the vault's markdown plus this index's
+// read side), so a read-only server serves mesh_health straight from here; recording the
+// result for the dashboard stays with the single owning writer. Answering from the
+// persisted rows instead would serve whatever the owner last wrote, and on a vault whose
+// owner never runs the pass that is nothing at all.
+func (s *Store) ScanHealth(vaultRoot string, now time.Time) ([]HealthFinding, error) {
 	codeFiles, err := s.codeFilePaths()
 	if err != nil {
 		return nil, err
@@ -126,37 +161,28 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 			}
 		}
 	}
-	// Replace dead_ref + overdue rows atomically (keep contradiction rows).
-	at := now.Unix()
-	err = s.Write(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM note_health WHERE issue IN ('dead_ref','overdue')`); err != nil {
-			return err
-		}
-		ins, err := tx.Prepare(`INSERT INTO note_health(note_id,path,issue,detail,detected_at) VALUES(?,?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer ins.Close()
-		for _, f := range findings {
-			if _, err := ins.Exec(f.NoteID, f.Path, f.Issue, f.Detail, at); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	return findings, err
+	return findings, nil
 }
 
 // tier0Health are the institutional types whose do/dont guidance is worth checking
 // for contradictions.
 var tier0Health = map[string]bool{"decision": true, "gotcha": true, "post-mortem": true}
 
-// ComputeContradictions flags pairs of tier-0 notes that share a tag where one
+// ComputeContradictions runs ScanContradictions and replaces the contradiction rows.
+func (s *Store) ComputeContradictions(now time.Time) ([]HealthFinding, error) {
+	findings, err := s.ScanContradictions()
+	if err != nil {
+		return nil, err
+	}
+	return findings, s.RecordHealth("contradiction", findings, now)
+}
+
+// ScanContradictions flags pairs of tier-0 notes that share a tag where one
 // note's `do` strongly overlaps the other's `dont` (one recommends what the other
 // forbids). Dependency-free heuristic (token Jaccard, high threshold to stay
-// high-precision); the curator can later confirm with an LLM. Writes contradiction
-// rows. Returns the findings.
-func (s *Store) ComputeContradictions(now time.Time) ([]HealthFinding, error) {
+// high-precision); the curator can later confirm with an LLM. Pure computation over the
+// index's read side, writing nothing, for the same reason as ScanHealth.
+func (s *Store) ScanContradictions() ([]HealthFinding, error) {
 	notes, err := s.tier0Guidance()
 	if err != nil {
 		return nil, err
@@ -184,7 +210,7 @@ func (s *Store) ComputeContradictions(now time.Time) ([]HealthFinding, error) {
 			})
 		}
 	}
-	return findings, s.RecordHealth("contradiction", findings, now)
+	return findings, nil
 }
 
 type guidanceRow struct {

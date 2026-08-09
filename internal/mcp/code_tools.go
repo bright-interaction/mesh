@@ -180,14 +180,29 @@ func codeRefCards(refs []index.CodeRef) []map[string]any {
 	return out
 }
 
-// reindexCode refreshes the source-code index from the configured roots, used by
+// codeRefresh is what mesh_reindex reports about the source-code index: counts, whether
+// code indexing is enabled for this vault at all, and (when the counts describe the
+// index rather than a refresh this call performed) who owns that refresh.
+type codeRefresh struct {
+	stats   index.CodeStats
+	enabled bool
+	note    string
+}
+
+// refreshCode refreshes the source-code index from the configured roots, used by
 // mesh_reindex so an agent can force a code refresh the same way it forces a note
-// refresh. Returns ok=false (no error) when code indexing is not enabled. Env
+// refresh. enabled=false (no error) when code indexing is not enabled. Env
 // MESH_CODE_ROOTS / MESH_CODE_INDEX override the config file.
-func (s *Server) reindexCode() (stats index.CodeStats, ok bool, err error) {
+//
+// Indexing code is a WRITE, so a read-only server (every `mesh mcp` window) does not do
+// it: like the note index, the code index has one owner. It reports the size of the index
+// it is serving instead, and names what does refresh it. Silently returning nothing would
+// leave an agent believing one mesh_reindex covered code too, which is the same class of
+// quiet lie as a write-back that reports success without being queryable.
+func (s *Server) refreshCode() (codeRefresh, error) {
 	cfg, err := meshcfg.LoadConfig(s.store.MeshDir())
 	if err != nil {
-		return index.CodeStats{}, false, err
+		return codeRefresh{}, err
 	}
 	on := cfg.Code.Index || os.Getenv("MESH_CODE_INDEX") == "1"
 	roots := cfg.Code.Roots
@@ -196,14 +211,27 @@ func (s *Server) reindexCode() (stats index.CodeStats, ok bool, err error) {
 		on = true
 	}
 	if !on || len(roots) == 0 {
-		return index.CodeStats{}, false, nil
+		return codeRefresh{}, nil
 	}
-	stats, err = index.ReindexCode(s.store, roots, langSet(cfg.Code.Languages))
-	if err == nil {
-		_, _ = s.store.LinkNotesToCode(s.vaultRoot) // refresh the note<->code bridge (best-effort)
+	if s.store.ReadOnly() {
+		stats, err := s.store.CodeIndexSize()
+		if err != nil {
+			return codeRefresh{}, err
+		}
+		return codeRefresh{stats: stats, enabled: true, note: codeOwnedByWriter}, nil
 	}
-	return stats, true, err
+	stats, err := index.ReindexCode(s.store, roots, langSet(cfg.Code.Languages))
+	if err != nil {
+		return codeRefresh{}, err
+	}
+	_, _ = s.store.LinkNotesToCode(s.vaultRoot) // refresh the note<->code bridge (best-effort)
+	return codeRefresh{stats: stats, enabled: true}, nil
 }
+
+// codeOwnedByWriter is the message for the one thing mesh_reindex genuinely cannot do
+// from a read-only window. It names commands that CAN fix it, unlike the owner-down
+// write-back message that used to send agents back to mesh_reindex itself.
+const codeOwnedByWriter = "these are the current index totals, not a refresh: the source-code index is written by the single owning writer. Refresh it with `mesh code reindex <vault>` (the post-commit git hook already does)."
 
 func langSet(langs []string) map[string]bool {
 	if len(langs) == 0 {

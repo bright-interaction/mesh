@@ -50,10 +50,15 @@ type Server struct {
 
 	reloadMu sync.Mutex       // serializes rebuilds across dispatch + watcher
 	cache    *index.NoteCache // parsed-note cache for incremental reconcile; guarded by reloadMu
+	// viewHashes fingerprints the index the in-memory graph was last loaded from
+	// (path -> retrieval hash), so a read-only server can report what a refresh changed
+	// in its view. Guarded by reloadMu; nil until the first refresh.
+	viewHashes map[string]string
 
-	reindexMu     sync.Mutex // guards the mesh_reindex throttle state below
-	lastReindexAt time.Time
-	lastReindex   index.Reconciliation
+	reindexMu      sync.Mutex // guards the mesh_reindex throttle state below
+	lastReindexAt  time.Time
+	lastReindex    index.Reconciliation
+	lastReindexErr error // ErrOwnerNotIndexing when that pass left the index stale
 
 	ready    chan struct{} // closed when retrieval is servable (initial reload done)
 	readyErr error         // written once before ready closes
@@ -199,7 +204,8 @@ func (s *Server) swap(g *graph.Graph) {
 // a read-only one reads the owning writer's persisted result. Startup calls this.
 func (s *Server) load() error {
 	if s.store.ReadOnly() {
-		return s.refresh()
+		_, err := s.refresh() // the startup load has no previous view to report a delta against
+		return err
 	}
 	return s.reload()
 }
@@ -209,17 +215,47 @@ func (s *Server) load() error {
 // the owning writer has indexed since. It takes reloadMu like reload does, so a refresh
 // and a rebuild can never swap under each other.
 //
+// It reports what the swap changed in THIS server's view (notes it gained, lost, or whose
+// content moved), which is the only honest set of counts available to a process that did
+// not run the pass. That is a different question from the writable path's "what did the
+// vault drift by", and it is the one a caller of mesh_reindex here is actually asking:
+// the reindex may well have happened in the owner minutes ago, and what this call did was
+// bring it into view.
+//
 // The parsed-note cache is deliberately left unseeded: it exists to make a REINDEX
 // incremental, and this server never reindexes.
-func (s *Server) refresh() error {
+func (s *Server) refresh() (index.Reconciliation, error) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 	g, err := s.store.LoadGraph()
 	if err != nil {
-		return err
+		return index.Reconciliation{}, err
+	}
+	// Fingerprint the index we just loaded. A read error here costs the NEXT refresh its
+	// counts, never its correctness, so it must not fail the refresh: the graph is already
+	// good and the caller's notes are already queryable.
+	after, herr := s.store.NoteHashes()
+	rec := index.Reconciliation{Reindexed: true}
+	if herr == nil {
+		if s.viewHashes != nil {
+			for p, h := range after {
+				switch prev, had := s.viewHashes[p]; {
+				case !had:
+					rec.Added++
+				case prev != h:
+					rec.Changed++
+				}
+			}
+			for p := range s.viewHashes {
+				if _, still := after[p]; !still {
+					rec.Removed++
+				}
+			}
+		}
+		s.viewHashes = after
 	}
 	s.swap(g)
-	return nil
+	return rec, nil
 }
 
 // ErrOwnerNotIndexing means the single owning writer did not index a just-written note
@@ -261,6 +297,12 @@ const (
 	ownerIndexTimeout = 10 * time.Second
 )
 
+// OwnerIndexBound is ownerIndexTimeout, exported so the owning writer's own periodic
+// sweep can be pinned UNDER it (see cmd/mesh). A note that misses its fsnotify event is
+// picked up by that sweep, so a sweep interval above this bound is precisely the case
+// where a durable, perfectly fine note reads as owner_down.
+const OwnerIndexBound = ownerIndexTimeout
+
 // awaitOwnerIndexed blocks until the single owning writer has indexed noteID, then
 // refreshes this server's in-memory graph from what the owner persisted.
 //
@@ -275,7 +317,8 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID string) error {
 		_, err := s.store.NotePath(noteID)
 		switch {
 		case err == nil:
-			return s.refresh()
+			_, rerr := s.refresh() // the caller wants the note queryable, not the counts
+			return rerr
 		case !errors.Is(err, sql.ErrNoRows):
 			return err // a real read error, not "not landed yet"
 		}
@@ -288,6 +331,87 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID string) error {
 		case <-time.After(ownerIndexPollInterval):
 		}
 	}
+}
+
+// pendingDrift is the part of the vault the owning writer has not absorbed yet and still
+// can: notes added, changed or removed on disk that the index does not reflect.
+//
+// Files the owner recorded as DROPPED are excluded. A quarantined duplicate id parses
+// fine but is deliberately absent from the notes table, so DriftReport calls it Added
+// forever; counting it would make every mesh_reindex on a vault with one such note wait
+// out the whole bound and then report a perfectly healthy owner as down. (An unparseable
+// note never reaches the drift lists at all, so it needs no exclusion.) Both kinds are
+// still reported, by mesh_health, which is where a note that needs a human belongs.
+func (s *Server) pendingDrift() (index.Drift, error) {
+	d, err := s.store.DriftReport(s.vaultRoot)
+	if err != nil {
+		return index.Drift{}, err
+	}
+	dropped := map[string]bool{}
+	for _, fe := range s.store.DroppedNotes() {
+		dropped[fe.Path] = true
+	}
+	if len(dropped) == 0 {
+		return d, nil
+	}
+	keep := func(paths []string) []string {
+		out := paths[:0]
+		for _, p := range paths {
+			if !dropped[p] {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	d.Added, d.Changed, d.Removed = keep(d.Added), keep(d.Changed), keep(d.Removed)
+	return d, nil
+}
+
+// awaitOwnerCaughtUp is mesh_reindex's half of the contract awaitOwnerIndexed gives
+// write-back: it waits for the single owning writer to absorb whatever the vault has
+// drifted by, then refreshes this server's in-memory graph from what the owner
+// persisted. The counts it returns are what became queryable BECAUSE of this call.
+//
+// Without the wait, mesh_reindex on a read-only server is a lie in the one situation the
+// tool exists for. The contract an agent is handed says "if you edited note files
+// directly, call mesh_reindex to make those edits queryable now"; a bare snapshot swap
+// returns instantly with the owner still inside its debounce, so the tool reports success
+// and the edit is not there. The bound and the loud failure are the same as write-back's,
+// because it is the same failure: the owner is not running.
+func (s *Server) awaitOwnerCaughtUp(ctx context.Context) (index.Reconciliation, error) {
+	start := time.Now()
+	pending, err := s.pendingDrift()
+	if err != nil {
+		return index.Reconciliation{}, err
+	}
+	stale := false
+	deadline := start.Add(s.ownerIndexTimeout)
+	for pending.Any() {
+		if time.Now().After(deadline) {
+			stale = true
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return index.Reconciliation{}, ctx.Err()
+		case <-time.After(ownerIndexPollInterval):
+		}
+		if pending, err = s.pendingDrift(); err != nil {
+			return index.Reconciliation{}, err
+		}
+	}
+	// The counts come from the refresh, not from the drift we waited on: what a caller
+	// gets out of this call is what entered THIS server's view, and on the stale path
+	// that is whatever the owner did manage to index, never what is still missing.
+	rec, err := s.refresh()
+	if err != nil {
+		return index.Reconciliation{}, err
+	}
+	rec.Dur = time.Since(start)
+	if stale {
+		return rec, ErrOwnerNotIndexing
+	}
+	return rec, nil
 }
 
 // publishWriteBack makes a just-created note queryable, by whichever route this server
@@ -326,15 +450,17 @@ func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error)
 	// none of them need to know which kind of store they are on. Branch BEFORE taking
 	// reloadMu: refresh takes it too, and it is not reentrant.
 	//
-	// Added/Changed/Removed stay zero because this pass genuinely did not classify any
-	// file; it is a snapshot swap, not a diff. Reindexed reports whether the in-memory
-	// graph was replaced, which is what every caller actually uses it for.
+	// The counts describe this server's VIEW rather than the vault: a snapshot swap
+	// classifies nothing on disk, but it can say exactly which notes it gained, lost or
+	// saw change, which is what the watcher's log line and mesh_reindex both want.
 	if s.store.ReadOnly() {
 		start := time.Now()
-		if err := s.refresh(); err != nil {
+		rec, err := s.refresh()
+		if err != nil {
 			return index.Reconciliation{}, err
 		}
-		return index.Reconciliation{Reindexed: true, Dur: time.Since(start)}, nil
+		rec.Dur = time.Since(start)
+		return rec, nil
 	}
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
@@ -355,23 +481,41 @@ func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error)
 // a core on hashing and delay synced notes becoming visible for other members.
 const reindexThrottle = 5 * time.Second
 
-// reconcileThrottled is reconcileOnce(true) with a per-server cooldown for remote
-// callers. remote=false (the local stdio operator, who owns the box and expects
-// "reindex now" to mean now) always runs the real pass. It returns the pass result and
-// whether the cooldown replayed the previous one.
-func (s *Server) reconcileThrottled(remote bool) (index.Reconciliation, bool, error) {
+// reindexPass is one authoritative mesh_reindex pass by whichever route this server is
+// allowed to take: the owner of its index reindexes, a read-only server waits for the
+// owning writer to catch up and then re-reads the result. Note this is NOT what the
+// watcher calls (that is reconcileOnce): a watcher tick must never sit waiting on the
+// owner, it just picks up whatever has landed.
+func (s *Server) reindexPass(ctx context.Context) (index.Reconciliation, error) {
+	if s.store.ReadOnly() {
+		return s.awaitOwnerCaughtUp(ctx)
+	}
+	return s.reconcileOnce(true)
+}
+
+// reconcileThrottled is reindexPass with a per-server cooldown for remote callers.
+// remote=false (the local stdio operator, who owns the box and expects "reindex now" to
+// mean now) always runs the real pass. It returns the pass result, whether the cooldown
+// replayed the previous one, and the pass's staleness verdict.
+//
+// ErrOwnerNotIndexing is a RESULT, not a failure: the pass ran, and what it found is that
+// the owner has not caught up. It is cached and replayed with the rest of the pass, so a
+// throttled caller is told the index is stale instead of being handed the last healthy
+// pass as if nothing were wrong.
+func (s *Server) reconcileThrottled(ctx context.Context, remote bool) (index.Reconciliation, bool, error) {
 	s.reindexMu.Lock()
 	defer s.reindexMu.Unlock()
 	if remote && !s.lastReindexAt.IsZero() && time.Since(s.lastReindexAt) < reindexThrottle {
-		return s.lastReindex, true, nil
+		return s.lastReindex, true, s.lastReindexErr
 	}
-	rec, err := s.reconcileOnce(true)
-	if err != nil {
+	rec, err := s.reindexPass(ctx)
+	if err != nil && !errors.Is(err, ErrOwnerNotIndexing) {
 		return rec, false, err
 	}
 	s.lastReindexAt = time.Now()
 	s.lastReindex = rec
-	return rec, false, nil
+	s.lastReindexErr = err
+	return rec, false, err
 }
 
 // Watch live-reindexes the vault in the background until ctx is cancelled, so a

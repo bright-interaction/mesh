@@ -4,9 +4,12 @@
 package index
 
 import (
+	"database/sql"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/vault"
@@ -72,6 +75,8 @@ func (s *Store) recordDropped(root string, ferrs []FileError) {
 		prev[fe.Path] = errText(fe.Err)
 	}
 	s.dropped = rel
+	firstPass := !s.droppedSynced
+	s.droppedSynced = true
 	s.mu.Unlock()
 
 	fresh := 0
@@ -86,6 +91,96 @@ func (s *Store) recordDropped(root string, ferrs []FileError) {
 	if fresh > 0 {
 		slog.Warn("mesh reindex dropped notes", "new", fresh, "total", len(rel), "root", root)
 	}
+	// A shorter set with no new entries (someone fixed a note) is a change too, and it
+	// must reach the table or the fixed note stays flagged forever.
+	if firstPass || fresh > 0 || len(rel) != len(prev) {
+		s.persistDropped(rel)
+	}
+}
+
+// persistDropped mirrors the dropped set into the index so a reader in ANOTHER process
+// can surface it: every `mesh mcp` window is read-only now, so its own memory of what an
+// index pass dropped is permanently empty. Called only when the set actually changed (and
+// once per store on the first pass, since the table may hold a previous run's rows), so a
+// watcher sitting on a clean vault does not add a WAL frame every periodic tick.
+//
+// Best effort: a note that cannot be indexed is already the degraded case, and failing a
+// reindex over the bookkeeping about it would be a strictly worse outcome.
+func (s *Store) persistDropped(rel []FileError) {
+	if s.readOnly {
+		return // the owning writer records these; a read-only store only reads them back
+	}
+	at := time.Now().Unix()
+	err := s.Write(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM dropped_notes`); err != nil {
+			return err
+		}
+		ins, err := tx.Prepare(`INSERT OR REPLACE INTO dropped_notes(path,err,duplicate,detected_at) VALUES(?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer ins.Close()
+		for _, fe := range rel {
+			dup := 0
+			if errors.Is(fe.Err, ErrDuplicateNoteID) {
+				dup = 1
+			}
+			if _, err := ins.Exec(fe.Path, errText(fe.Err), dup, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		slog.Warn("mesh: could not record dropped notes in the index", "err", err, "dropped", len(rel))
+	}
+}
+
+// persistedDropErr rehydrates a dropped-note error read back out of the index. The
+// message is the original one; Unwrap restores the ErrDuplicateNoteID sentinel so
+// errors.Is keeps classifying a quarantined duplicate AFTER the finding crossed a process
+// boundary. mesh_health branches on exactly that to tell "fix the frontmatter" from "two
+// notes claim one id", and the two have different remedies.
+type persistedDropErr struct {
+	msg string
+	dup bool
+}
+
+func (e *persistedDropErr) Error() string { return e.msg }
+
+func (e *persistedDropErr) Unwrap() error {
+	if e.dup {
+		return ErrDuplicateNoteID
+	}
+	return nil
+}
+
+// droppedFromIndex reads the dropped set the owning writer recorded. A store opened
+// against an index an older mesh wrote has no such table; that is "nothing known", not an
+// error worth failing a health call over.
+func (s *Store) droppedFromIndex() []FileError {
+	rows, err := s.readDB.Query(`SELECT path, err, duplicate FROM dropped_notes ORDER BY path`)
+	if err != nil {
+		if !strings.Contains(err.Error(), "no such table") {
+			slog.Warn("mesh: could not read dropped notes from the index", "err", err)
+		}
+		return nil
+	}
+	defer rows.Close()
+	var out []FileError
+	for rows.Next() {
+		var path, msg string
+		var dup int
+		if err := rows.Scan(&path, &msg, &dup); err != nil {
+			return out
+		}
+		fe := FileError{Path: path}
+		if msg != "" || dup != 0 {
+			fe.Err = &persistedDropErr{msg: msg, dup: dup != 0}
+		}
+		out = append(out, fe)
+	}
+	return out
 }
 
 func errText(err error) string {
@@ -95,10 +190,17 @@ func errText(err error) string {
 	return err.Error()
 }
 
-// DroppedNotes returns the notes the last full reindex dropped as unparseable
-// (empty when the whole vault parsed cleanly). Feeds health/status surfaces so an
-// operator can find a note that vanished from the index.
+// DroppedNotes returns the notes the last index pass dropped as unparseable or
+// quarantined (empty when the whole vault parsed cleanly). Feeds health/status surfaces
+// so an operator can find a note that vanished from the index.
+//
+// A read-only store never runs a pass, so it has nothing of its own to report and reads
+// what the owning writer recorded instead. Without that, mesh_health in every `mesh mcp`
+// window would report a clean vault no matter how many notes were missing from it.
 func (s *Store) DroppedNotes() []FileError {
+	if s.readOnly {
+		return s.droppedFromIndex()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]FileError, len(s.dropped))

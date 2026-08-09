@@ -38,8 +38,12 @@ type Store struct {
 	closeOnce sync.Once // Close is idempotent: a second close(s.done) would panic
 	closeErr  error     // the first Close's result, replayed to later callers
 
-	mu      sync.Mutex  // guards dropped
+	mu      sync.Mutex  // guards dropped + droppedSynced
 	dropped []FileError // notes dropped as unparseable by the last full reindex
+	// droppedSynced records whether this store has mirrored its dropped set into the
+	// index yet. The first pass always writes (the table may hold a previous run's
+	// rows), later ones only when the set changed; see persistDropped.
+	droppedSynced bool
 
 	// Telemetry is accumulated in memory and flushed in one batched transaction by the
 	// writer goroutine (see flushTelemetry). It must never be written inline: the
@@ -267,7 +271,7 @@ func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 // It must be every table in schema.sql EXCEPT those in schemaKeep. A test asserts it
 // stays in sync with schema.sql so a newly-added table cannot silently leak stale
 // rows (or an orphaned renamed table) on a version bump.
-var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health", "note_code_links"}
+var dropOnVersionChange = []string{"notes", "nodes", "edges", "search_index", "corpus_stats", "meta", "code_files", "code_symbols", "code_edges", "code_search", "note_health", "note_code_links", "dropped_notes"}
 
 // schemaKeep are tables deliberately preserved across a schema-version rebuild:
 //   - metrics: accumulated usage counters, NOT re-derivable from the vault.

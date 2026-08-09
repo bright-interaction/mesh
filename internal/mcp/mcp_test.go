@@ -60,6 +60,24 @@ func seedIndex(t *testing.T, dir string) {
 	}
 }
 
+// seedCodeIndex plays the part of whatever owns the SOURCE-CODE index in production (the
+// post-commit git hook's `mesh code reindex`, or the owning writer): it opens the vault's
+// index writable, indexes the given code roots, and closes. Indexing code is a write, so
+// a read-only server can never do it for itself; it reads the result like any other
+// reader. Tests that used to call index.ReindexCode on the server's own store were
+// exercising a shape production no longer has.
+func seedCodeIndex(t *testing.T, vaultRoot string, codeRoots ...string) {
+	t.Helper()
+	owner, err := index.Open(vaultRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if _, err := index.ReindexCode(owner, codeRoots, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // call dispatches as the LOCAL STDIO transport does (ServeStdio marks its context with
 // WithLocalOperator), so these tests exercise the same trust level a `mesh mcp` session
 // has: local-only tools are reachable and the remote reindex cooldown does not apply.
@@ -266,6 +284,13 @@ func mustJSON(v any) json.RawMessage {
 // TestReindexPicksUpDirectFileEdit covers the IDE/CLI collaboration loop: an agent
 // edits a note file directly (not via mesh_append_note), so the running server is
 // stale until mesh_reindex forces a re-read. After reindex the new note is queryable.
+//
+// Under the single-writer split this is now an end-to-end test of the whole architecture,
+// because this server cannot index anything: the file must reach the index through the
+// owning writer, and mesh_reindex must wait for that rather than swapping in a snapshot
+// that does not have it yet. The owner is deliberately started AFTER the staleness check,
+// so "the server has not seen the file" is a fact about the index and not a race with the
+// owner's debounce.
 func TestReindexPicksUpDirectFileEdit(t *testing.T) {
 	s := newTestServer(t)
 	dir := s.vaultRoot
@@ -286,8 +311,14 @@ func TestReindexPicksUpDirectFileEdit(t *testing.T) {
 		}
 	}
 
+	// The owning writer comes up and takes the file, as `mesh watch` does in production.
+	startOwner(t, dir)
+
 	// Reindex, then it must be found.
 	r := toolText(t, call(t, s, "tools/call", map[string]any{"name": "mesh_reindex", "arguments": map[string]any{}}))
+	if r["index_stale"] == true {
+		t.Fatalf("reindex reported a stale index with the owner running: %v", r)
+	}
 	if r["reindexed"] != true || r["added"].(float64) != 1 {
 		t.Fatalf("reindex should report 1 added, got %v", r)
 	}

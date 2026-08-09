@@ -12,8 +12,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // bulkVault builds a vault of n notes whose bodies all match one query, so a test can
@@ -150,9 +148,7 @@ func TestCodeSearchClampsLimit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "x.go"), []byte(src.String()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := index.ReindexCode(s.store, []string{root}, nil); err != nil {
-		t.Fatal(err)
-	}
+	seedCodeIndex(t, s.vaultRoot, root)
 
 	cases := []struct {
 		name  string

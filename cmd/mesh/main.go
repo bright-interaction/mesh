@@ -1529,7 +1529,7 @@ func mcpCmd() *cobra.Command {
 	c.Flags().StringVar(&httpAddr, "http", "", "serve MCP over HTTP at host:port (POST /mcp) instead of stdio")
 	c.Flags().StringVar(&httpToken, "token", "", "bearer token for --http (or MESH_MCP_TOKEN); REQUIRED when binding beyond loopback")
 	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
-	c.Flags().DurationVar(&reconcile, "reconcile", 30*time.Second, "periodic full-reconcile safety net (0 to disable)")
+	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic full-reconcile safety net (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
 	return c
 }
 
@@ -1593,6 +1593,25 @@ func addrIsLoopback(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// defaultLocalReconcile is how often an owning writer re-checks the vault when no file
+// event told it to. It is the safety net under fsnotify, and it MUST stay under
+// mcp.OwnerIndexBound: a note that misses its event (the moment right after the owner
+// starts, before its watches are registered, or a burst caught mid-reconcile) becomes
+// queryable only on this tick, and every reader waiting on that note gives up at the
+// bound. It sat at 30s against a 10s bound, so that whole 20s window reported a durable,
+// perfectly fine note as owner_down.
+//
+// The tick is an authoritative content-hash pass over the vault, so this is not free; it
+// is the cost of the bound being true rather than aspirational. TestLocalSweepStaysUnder
+// TheWriteBackBound pins the relationship so it cannot drift apart again.
+const defaultLocalReconcile = 8 * time.Second
+
+// defaultHubSync is how often `mesh sync --watch` talks to the hub when nothing local
+// changed. Unlike the local reconcile this is a network round trip, and it answers a
+// different question (has a teammate pushed?), so it stays on its own slower cadence
+// instead of following the sweep down.
+const defaultHubSync = 60 * time.Second
+
 func watchCmd() *cobra.Command {
 	var debounce, reconcile time.Duration
 	c := &cobra.Command{
@@ -1644,7 +1663,7 @@ func watchCmd() *cobra.Command {
 		},
 	}
 	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
-	c.Flags().DurationVar(&reconcile, "reconcile", 30*time.Second, "periodic full-reconcile safety net (0 to disable)")
+	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic full-reconcile safety net (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
 	return c
 }
 func joinCmd() *cobra.Command {
@@ -1684,7 +1703,7 @@ func joinCmd() *cobra.Command {
 
 func syncCmd() *cobra.Command {
 	var doWatch bool
-	var debounce, reconcile time.Duration
+	var debounce, reconcile, hubInterval time.Duration
 	c := &cobra.Command{
 		Use:   "sync [vault]",
 		Short: "Reconcile the vault with the hub (push local edits, pull teammates', no git)",
@@ -1703,10 +1722,27 @@ func syncCmd() *cobra.Command {
 			// LiveIndexer makes the watch loop incremental (full seed on the first call,
 			// targeted updates after); the one-shot path just does that single full pass.
 			live := index.NewLiveIndexer(store, vaultDir)
+			// The periodic tick has two jobs with very different costs. Converging the
+			// LOCAL index is cheap and has to happen inside the write-back bound, because
+			// this daemon is the owning writer on a laptop and a note that missed its
+			// fsnotify event has nothing else to pick it up. Asking the hub for
+			// teammates' changes is a network round trip answering a different question,
+			// and SSE already delivers those in real time. So the tick now runs at the
+			// LOCAL cadence and the hub half keeps its own slower interval; anything
+			// driven by a real change (fsnotify, an SSE nudge, startup) still syncs
+			// immediately, which is every case where there is something to push.
+			var lastHub time.Time
 			syncOnce := func(authoritative bool) (meshclient.Summary, error) {
-				sum, serr := meshclient.SyncVault(vaultDir)
-				// Reconcile the LOCAL index whether or not the hub round worked. The
-				// index is derived from the markdown on disk and owes the hub nothing,
+				var sum meshclient.Summary
+				var serr error
+				// authoritative marks the startup pass and the periodic tick; only the
+				// latter is rate-limited, so a cold start still syncs at once.
+				if !authoritative || lastHub.IsZero() || time.Since(lastHub) >= hubInterval {
+					lastHub = time.Now()
+					sum, serr = meshclient.SyncVault(vaultDir)
+				}
+				// Reconcile the LOCAL index whether or not the hub round worked (or ran).
+				// The index is derived from the markdown on disk and owes the hub nothing,
 				// so a DNS failure, an outage or a rejected token must never stop a
 				// locally written note from becoming searchable. This used to return on
 				// serr, which meant that for the whole of a hub outage the --watch daemon
@@ -1792,7 +1828,8 @@ func syncCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&doWatch, "watch", false, "stay running: push local edits and pull hub changes in real time (SSE) plus a periodic safety reconcile")
 	c.Flags().DurationVar(&debounce, "debounce", 500*time.Millisecond, "quiet window to coalesce a burst of local saves before syncing")
-	c.Flags().DurationVar(&reconcile, "reconcile", 60*time.Second, "periodic safety-net sync interval (0 to disable)")
+	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic LOCAL reconcile interval (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
+	c.Flags().DurationVar(&hubInterval, "hub-interval", defaultHubSync, "how often the periodic tick also syncs with the hub (local edits and SSE nudges always sync immediately)")
 	return c
 }
 

@@ -124,6 +124,24 @@ CREATE TABLE IF NOT EXISTS note_health (
 CREATE INDEX IF NOT EXISTS idx_note_health_issue ON note_health(issue);
 CREATE INDEX IF NOT EXISTS idx_note_health_note ON note_health(note_id);
 
+-- dropped_notes: files an index pass could NOT index (unparseable frontmatter, or an
+-- effective id another file already claims). They are invisible to search and the graph
+-- until a human fixes them, which is the whole reason they are tracked: a broken note
+-- otherwise vanishes with zero signal.
+--
+-- Persisted because the process that INDEXES is no longer the process that REPORTS. The
+-- drops used to live only in the indexing process's memory, which was fine when every
+-- server indexed its own vault; now a read-only `mesh mcp` window has no memory of a drop
+-- the owning writer found, and mesh_health would call a vault clean while a note was
+-- missing from it. Derived + rebuildable: replaced wholesale by each pass that finds a
+-- different set.
+CREATE TABLE IF NOT EXISTS dropped_notes (
+  path        TEXT PRIMARY KEY,           -- vault-relative
+  err         TEXT NOT NULL DEFAULT '',
+  duplicate   INTEGER NOT NULL DEFAULT 0, -- 1 when the cause is a duplicate note id
+  detected_at INTEGER NOT NULL
+);
+
 -- metrics: monotonic usage counters for the ROI dashboard (queries served, notes
 -- fetched/written, plus per-note fetch counts keyed "fetch:<id>"). Derived usage
 -- telemetry, local only.

@@ -25,6 +25,29 @@ func (d Drift) Any() bool { return len(d.Added)+len(d.Changed)+len(d.Removed) > 
 // DriftReport compares the current vault files against the persisted notes using
 // the same retrieval_hash the indexer stores, so `mesh doctor` can tell the
 // operator exactly which files need a reindex instead of guessing.
+// NoteHashes maps every indexed note's path to its retrieval hash, i.e. a fingerprint of
+// what the index currently holds. DriftReport compares one of these against the vault on
+// disk; a read-only server compares two of them across a refresh to say what its own view
+// gained, lost or changed, which is the only honest way it can report counts for a pass
+// it did not run itself.
+func (s *Store) NoteHashes() (map[string]string, error) {
+	rows, err := s.readDB.Query(`SELECT path, retrieval_hash FROM notes`)
+	if err != nil {
+		return nil, err
+	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process; see below.
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var p, h string
+		if err := rows.Scan(&p, &h); err != nil {
+			return nil, err
+		}
+		out[p] = h
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) DriftReport(root string) (Drift, error) {
 	rows, err := s.readDB.Query(`SELECT path, retrieval_hash FROM notes`)
 	if err != nil {

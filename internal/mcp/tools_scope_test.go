@@ -9,8 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // scopedServer builds a server over a vault with two notes in distinct scopes, each
@@ -106,9 +104,7 @@ func seedCode(t *testing.T, s *Server) string {
 	if err := os.WriteFile(filepath.Join(root, "x.go"), []byte("package x\n\nfunc UniqueWidgetMaker() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := index.ReindexCode(s.store, []string{root}, nil); err != nil {
-		t.Fatal(err)
-	}
+	seedCodeIndex(t, s.vaultRoot, root)
 	return "UniqueWidgetMaker"
 }
 

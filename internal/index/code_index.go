@@ -341,6 +341,27 @@ func (s *Store) CodeIndexed() bool {
 	return n > 0
 }
 
+// CodeIndexSize is the CURRENT size of the persisted code index, as opposed to what a
+// run of the indexer just wrote. A read-only server cannot reindex code (that write
+// belongs to the owning writer), but it can still say how big the index it is serving
+// is, which is what a caller of mesh_reindex actually wants to know. Files/Symbols/Edges
+// carry the same meaning as in CodeStats; the run-specific fields stay zero because no
+// run happened.
+func (s *Store) CodeIndexSize() (CodeStats, error) {
+	var st CodeStats
+	var err error
+	if st.Files, err = s.Count("code_files"); err != nil {
+		return CodeStats{}, err
+	}
+	if st.Symbols, err = s.Count("code_symbols"); err != nil {
+		return CodeStats{}, err
+	}
+	if st.Edges, err = s.Count("code_edges"); err != nil {
+		return CodeStats{}, err
+	}
+	return st, nil
+}
+
 // retrievalHashCode is the drift fingerprint of a parsed file: a content change
 // that alters any symbol's identity, kind, position, or signature flips the hash.
 func retrievalHashCode(cf *code.CodeFile) string {
