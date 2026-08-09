@@ -42,7 +42,7 @@ The collaboration server and the AI layer, the monetized value:
 - `internal/curator`, `cmd/mesh-curator`: the BYOAI sync-curator (AI conflict merge). It imports the open `internal/llm` - pro importing open is fine.
 - `internal/hnsw` + `internal/retrieve/retrieve_ann_pro.go`: the HNSW ANN index, the "1000+ vectors" scale gate. The core has a build-tag seam (`annSearcher`/`buildANN`, nil in the open build) so it compiles brute-force-only; the pro build wires HNSW with `-tags pro`. This is gated by ABSENCE (the impl is stripped from the mirror), not a removable flag.
 - `cmd/mesh/ui_hubteam_pro.go`: the team-mode wiring for `mesh ui --hub-db`, which reads the pro hub store. Same build-tag seam as HNSW: the open core ships `cmd/mesh/ui_hubteam_stub.go` (an `openHubTeam` that refuses team mode with a "needs the pro build" error), and this pro file - the only `cmd/mesh` file importing `internal/hub` - is stripped from the mirror. Plain `mesh ui` (solo vault) stays fully open.
-- `cmd/mesh/conflicts_test.go` and the `pkg/meshclient` hub-harness tests (`e2e_test.go`, `events_test.go`, `tombstone_test.go`): integration tests that stand up a real hub to exercise the open sync client and conflicts command, so they need the pro hub and are stripped with it. The meshclient set strips together because `e2e_test.go` defines the `setupHub` helper the other two reuse. The production code they cover ships open; the private monorepo runs the full suite. (`pkg/meshclient/vault_test.go` is hub-free and stays in the mirror.)
+- The `cmd/mesh` hub-harness tests (`conflicts_test.go`, `cli_receipts_test.go`, `resolve_ordering_test.go`, `sync_local_reconcile_test.go`) and the `pkg/meshclient` ones (`e2e_test.go`, `events_test.go`, `tombstone_test.go`): integration tests that stand up a real hub to exercise the open sync client and conflicts command, so they need the pro hub and are stripped with it. Each set strips together, because within a set one file defines the harness the others reuse (`conflicts_test.go` provides `runSub`/`parkedConflict`; `e2e_test.go` provides `setupHub`), and removing the definition without its users leaves the mirror's own suite unable to compile. The production code they cover ships open; the private monorepo runs the full suite. (`pkg/meshclient/vault_test.go` is hub-free and stays in the mirror.)
 - Future: cross-vault federation, team-scale collaboration analytics, pro graph functions. These belong here, behind the service/license, not as a flag in the open binary.
 
 Authoritative exclude set: every path below is removed from the public mirror's entire
@@ -57,7 +57,8 @@ cmd/mesh/ui_hubteam_pro.go
 internal/flarereport
 
 # tests that need a running pro hub
-cmd/mesh/conflicts_test.go
+cmd/mesh/conflicts_test.go  cmd/mesh/cli_receipts_test.go
+cmd/mesh/resolve_ordering_test.go  cmd/mesh/sync_local_reconcile_test.go
 pkg/meshclient/e2e_test.go  pkg/meshclient/events_test.go  pkg/meshclient/tombstone_test.go
 
 # files that build or run the pro hub
