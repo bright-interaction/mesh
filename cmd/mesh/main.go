@@ -218,7 +218,11 @@ func doctorCmd() *cobra.Command {
 				fmt.Printf("no index at %s\n  fix: mesh index %s\n", dbPath, root)
 				return fmt.Errorf("no index")
 			}
-			store, err := index.Open(root)
+			// READ-ONLY: doctor only counts rows and reports drift, so taking the write
+			// lock to do it is how `mesh doctor` came to fail with SQLITE_BUSY at "apply
+			// schema" against a perfectly fresh index whenever the owning writer happened
+			// to be mid-reconcile. Reproduced 2026-08-10 on the live vault.
+			store, err := index.OpenReadOnly(root)
 			if err != nil {
 				return err
 			}
@@ -674,7 +678,8 @@ func statusCmd() *cobra.Command {
 			if _, err := os.Stat(dbPath); err != nil {
 				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, root)
 			}
-			store, err := index.Open(root)
+			// READ-ONLY: counts, the graph and the vector stats are all reads.
+			store, err := index.OpenReadOnly(root)
 			if err != nil {
 				return err
 			}

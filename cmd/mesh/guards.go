@@ -36,7 +36,8 @@ func guardsListCmd() *cobra.Command {
 		Short: "List gotchas that have an anti-pattern (guard candidates)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := index.Open(vaultArgOr(args, vaultRoot))
+			// READ-ONLY: these surface stored gotchas, nothing more.
+			store, err := index.OpenReadOnly(vaultArgOr(args, vaultRoot))
 			if err != nil {
 				return err
 			}
@@ -66,7 +67,8 @@ func guardsSuggestCmd() *cobra.Command {
 		Short: "Propose pre-commit guards for high-confidence gotchas (BYOAI; review before enabling)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := index.Open(vaultArgOr(args, vaultRoot))
+			// READ-ONLY: these surface stored gotchas, nothing more.
+			store, err := index.OpenReadOnly(vaultArgOr(args, vaultRoot))
 			if err != nil {
 				return err
 			}
