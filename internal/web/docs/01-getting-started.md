@@ -17,6 +17,15 @@ mesh ui /path/to/MyVault        # open this web app over it
 That is the whole import for local use. Obsidian `[[wikilinks]]` and tags become
 graph edges automatically. Re-run `mesh index` (or use `mesh watch`) after edits.
 
+The order matters: this app READS the index, it does not build it. One process owns
+the index and writes it (`mesh watch`, or `mesh sync --watch` if you sync with a
+team); everything else, this app and every `mesh mcp` window your agent opens, reads
+what that writer persisted. That is why several agent sessions and a browser tab can
+be open at once without fighting over the database. The write features here still
+work: Reindex waits for the owning writer to catch up, and promoting a review
+candidate writes the note and hands the bookkeeping to that writer. If it is not
+running, they say so rather than pretending.
+
 Nothing leaves your machine: the index is a `.mesh/` folder next to your notes, and
 `mesh ui` binds to `127.0.0.1`. No account, no upload, no service to sign up for.
 

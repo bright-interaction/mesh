@@ -21,6 +21,7 @@ func cfgServer(t *testing.T) (*Server, string) {
 	if err := os.WriteFile(filepath.Join(dir, "n.md"), []byte("---\nid: n\ntype: note\nwhen: 2026-01-01\n---\n# N\nbody\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	seedIndex(t, dir)
 	s, err := NewServer(dir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)

@@ -32,6 +32,7 @@ func bulkServer(t *testing.T, n int) *Server {
 			t.Fatal(err)
 		}
 	}
+	seedIndex(t, dir)
 	s, err := NewServer(dir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)

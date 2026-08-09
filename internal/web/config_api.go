@@ -5,6 +5,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -300,26 +301,59 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 	return nil
 }
 
-// handleReindex runs an authoritative reconcile and swaps in the fresh graph, the
-// browser equivalent of `mesh index`. Returns what changed.
+// handleReindex brings the served graph up to date with the vault, the browser
+// equivalent of `mesh index`. Returns what changed.
+//
+// A read-only viewer does not reindex anything, because it cannot: the owning writer
+// does that. It measures what the vault has drifted by, waits for the owner to absorb
+// it, and re-reads the result. Same observable contract ("after this returns, what is on
+// disk is queryable"), reached the only way a process without the write lock can reach
+// it, and with the same loud owner_down when the owner is not running. Rounding that up
+// to a plain success would make the button a lie in exactly the case it exists for.
 func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
-	g, err := index.Reindex(s.store, s.vaultRoot)
-	if err != nil {
-		http.Error(w, "reindex failed", http.StatusInternalServerError)
-		return
+	out := map[string]any{"reindexed": true}
+	if s.store.ReadOnly() {
+		werr := s.store.AwaitOwnerCaughtUp(r.Context(), s.vaultRoot, s.ownerWait)
+		stale := errors.Is(werr, index.ErrOwnerNotIndexing)
+		if werr != nil && !stale {
+			slog.Error("mesh ui: waiting for the owning writer failed", "error", werr)
+			http.Error(w, "reindex failed", http.StatusInternalServerError)
+			return
+		}
+		if err := s.refresh(); err != nil {
+			slog.Error("mesh ui: reloading the graph failed", "error", err)
+			http.Error(w, "reindex failed", http.StatusInternalServerError)
+			return
+		}
+		if stale {
+			out["index_stale"] = true
+			out["owner_down"] = true
+			out["warning"] = ownerDownNote
+		}
+	} else {
+		// This server owns the index: apply anything a reader queued, then reindex.
+		if _, err := s.store.DrainOps(); err != nil {
+			slog.Warn("mesh ui: could not drain the owner op queue", "error", err)
+		}
+		g, err := index.Reindex(s.store, s.vaultRoot)
+		if err != nil {
+			http.Error(w, "reindex failed", http.StatusInternalServerError)
+			return
+		}
+		// Swap the graph and drop the cached retriever in ONE exclusive critical section,
+		// so a retriever build that is in flight cannot publish a retriever over the old
+		// graph after we cleared the cache (see Server.retriever).
+		s.mu.Lock()
+		s.graph = g
+		s.cachedRetriever.Store(nil) // rebuild over the fresh graph on the next search
+		s.mu.Unlock()
 	}
-	// Swap the graph and drop the cached retriever in ONE exclusive critical section, so
-	// a retriever build that is in flight cannot publish a retriever over the old graph
-	// after we cleared the cache (see Server.retriever).
-	s.mu.Lock()
-	s.graph = g
-	s.cachedRetriever.Store(nil) // rebuild over the fresh graph on the next search
-	s.mu.Unlock()
 	notes, _ := s.store.Count("notes")
 	nodes, _ := s.store.Count("nodes")
 	edges, _ := s.store.Count("edges")
-	writeJSON(w, map[string]any{"reindexed": true, "counts": map[string]int{"notes": notes, "nodes": nodes, "edges": edges}})
+	out["counts"] = map[string]int{"notes": notes, "nodes": nodes, "edges": edges}
+	writeJSON(w, out)
 }

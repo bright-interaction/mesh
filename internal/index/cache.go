@@ -132,6 +132,7 @@ func (li *LiveIndexer) Full() (*graph.Graph, error) {
 func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 	li.mu.Lock()
 	defer li.mu.Unlock()
+	li.drainOps()
 	if !li.seeded {
 		start := time.Now()
 		g, notes, err := ReindexFull(li.store, li.root)
@@ -154,6 +155,24 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 		li.refreshHealthIfDue()
 	}
 	return rec, err
+}
+
+// drainOps applies whatever a read-only surface queued for this owner, before the
+// reindex rather than after: a promote enqueues its bookkeeping AND writes the note
+// file, and the caller is waiting on both, so making it wait an extra reconcile for
+// the half that costs nothing would be gratuitous. Called with li.mu held.
+//
+// Best effort in the same sense as the health pass: an op that cannot be applied must
+// not fail the reindex retrieval depends on. The op file survives a failure, so the
+// next pass retries it and the caller's own wait is what reports the delay.
+func (li *LiveIndexer) drainOps() {
+	n, err := li.store.DrainOps()
+	if err != nil {
+		slog.Warn("mesh: could not drain the owner op queue", "err", err)
+	}
+	if n > 0 {
+		slog.Debug("mesh: applied queued ops", "count", n)
+	}
 }
 
 // refreshHealthIfDue recomputes the persisted health findings when they are older than

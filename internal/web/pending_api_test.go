@@ -33,13 +33,20 @@ func TestPendingPromoteAndDiscard(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "seed.md"), []byte("---\nid: seed\ntype: note\nwhen: 2026-01-01\n---\n# Seed\nx\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	seedIndex(t, dir)
+	// The queue is filled by the extractor (a writer) and resolved through the owning
+	// writer, so this exercises the production shape: a read-only viewer in front of a
+	// live owner.
+	seedPending(t, dir,
+		index.PendingNote{Type: "gotcha", Title: "Keep me", Do: "do x", Dont: "dont y", Why: "because"},
+		index.PendingNote{Type: "decision", Title: "Toss me"},
+	)
+	runOwner(t, dir)
 	s, err := NewServer(dir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	defer s.Close()
-	_ = s.store.AddPending(index.PendingNote{Type: "gotcha", Title: "Keep me", Do: "do x", Dont: "dont y", Why: "because"})
-	_ = s.store.AddPending(index.PendingNote{Type: "decision", Title: "Toss me"})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 

@@ -4,9 +4,12 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -49,6 +52,12 @@ type Server struct {
 	buildMu         sync.Mutex // serializes retriever builds; NOT held while s.mu is held
 
 	configMu sync.Mutex // serializes config.toml read-modify-write (PUT /api/config)
+
+	// ownerWait bounds how long a read-only viewer waits for the owning writer to apply
+	// what it queued. A field rather than a bare const so a test can shorten it without
+	// mutating global state (which would race across parallel tests); production never
+	// sets it and gets index.OwnerIndexBound.
+	ownerWait time.Duration
 
 	logins   *rateLimiter  // per-peer token bucket in front of POST /api/login
 	asks     *rateLimiter  // per-caller token bucket in front of POST /api/ask
@@ -123,8 +132,39 @@ func (s *Server) baseHref() string {
 	return s.basePath + "/"
 }
 
-// NewServer opens the vault index and builds the in-memory graph once.
+// NewServer opens the vault's index READ-ONLY and loads the graph the owning writer has
+// already persisted. This is the viewer you run beside an owner (`mesh watch` /
+// `mesh sync --watch`), which is every laptop: the app stays open for hours, so a
+// writable store here is a second long-lived writer against one mesh.db, and the whole
+// point of the single-writer split is that there is exactly one.
+//
+// It does NOT reindex at startup. That used to be the first thing this constructor did,
+// which meant opening the dashboard ran a full reindex of the vault before it drew a
+// frame, against the same write lock the owner needs. Reading what the owner persisted
+// is the same graph, without the fight.
+//
+// The write features still work; they route through the owner. See handleReindex and the
+// pending queue in pending_api.go.
 func NewServer(vaultRoot string) (*Server, error) {
+	store, err := index.OpenReadOnly(vaultRoot)
+	if err != nil {
+		return nil, err
+	}
+	g, err := store.LoadGraph()
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	return newServer(vaultRoot, store, g), nil
+}
+
+// NewOwningServer opens the index WRITABLE and owns it: it reindexes at startup and
+// applies its own writes. Use it only where this process is the sole writer of that
+// index, which today is the mesh-ui container (`mesh ui --own-index`). There, no
+// `mesh watch` runs against the served vault, so a read-only viewer would serve an index
+// nobody ever updates. Same split as internal/mcp: NewServer is the per-window reader,
+// NewServerAt is the hub that owns what it serves.
+func NewOwningServer(vaultRoot string) (*Server, error) {
 	store, err := index.Open(vaultRoot)
 	if err != nil {
 		return nil, err
@@ -134,10 +174,19 @@ func NewServer(vaultRoot string) (*Server, error) {
 		store.Close()
 		return nil, err
 	}
+	// Apply anything a reader queued for an owner before this process started. Normally
+	// empty: it matters when a vault is served read-only for a while and then owned.
+	if _, err := store.DrainOps(); err != nil {
+		slog.Warn("mesh ui: could not drain the owner op queue at startup", "error", err)
+	}
 	// Seed the flywheel measurement from the existing agent-authored corpus once, so the
 	// Dashboard shows a real reuse number immediately even if no mesh mcp ran (idempotent).
 	_, _ = store.BackfillWritebacks()
 	_, _ = store.LinkNotesToCode(vaultRoot) // build the note<->code bridge if a code index exists
+	return newServer(vaultRoot, store, g), nil
+}
+
+func newServer(vaultRoot string, store *index.Store, g *graph.Graph) *Server {
 	return &Server{
 		vaultRoot: vaultRoot,
 		store:     store,
@@ -148,37 +197,111 @@ func NewServer(vaultRoot string) (*Server, error) {
 		logins: newRateLimiter(5.0/60.0, 5),
 		// POST /api/ask forks an LLM subprocess (or bills a BYOAI key) per call, so it is
 		// both rate limited (12/min, burst 4) and capped in flight.
-		asks:     newRateLimiter(12.0/60.0, 4),
-		askSlots: make(chan struct{}, askMaxInFlight),
-	}, nil
+		asks:      newRateLimiter(12.0/60.0, 4),
+		askSlots:  make(chan struct{}, askMaxInFlight),
+		ownerWait: index.OwnerIndexBound,
+	}
 }
 
 func (s *Server) Close() error { return s.store.Close() }
+
+// refresh rebuilds the in-memory graph from the PERSISTED tables, without touching the
+// vault or the write lock. It is how a read-only viewer picks up whatever the owning
+// writer has indexed since, and it is the read-only counterpart of the graph swap the
+// writable paths do after their own reindex.
+func (s *Server) refresh() error {
+	g, err := s.store.LoadGraph()
+	if err != nil {
+		return err
+	}
+	// One exclusive critical section for the swap + invalidation, so an in-flight
+	// retriever build cannot publish over the old graph (see Server.retriever).
+	s.mu.Lock()
+	s.graph = g
+	s.cachedRetriever.Store(nil)
+	s.mu.Unlock()
+	return nil
+}
+
+// ownerDownNote is what every surface here says when the owning writer did not apply a
+// change in time. The action itself succeeded and is durable; what is missing is the
+// indexing, and the remedy is always the same, so the wording is too.
+const ownerDownNote = "This took effect on disk but the index has NOT caught up: the single owning writer " +
+	"did not apply it inside the wait, and this viewer only reads what that writer persists. " +
+	"The usual cause is that `mesh watch` / `mesh sync --watch` is not running, so check that " +
+	"first; the change is picked up as soon as one runs."
+
+// resolveIndexWrites performs index mutations by whichever route this server is allowed
+// to take. When it owns the index it applies them directly. When it is a reader it
+// queues them for the owning writer and waits for the LAST one to land: ops are applied
+// oldest first, so the last one disappearing means all of them did, and one wait means
+// one bound rather than one per op.
+//
+// ownerDown=true means the change is queued and durable but not yet applied. It is never
+// an error: reporting a failure for something that WILL take effect is how a caller ends
+// up retrying and doing it twice.
+func (s *Server) resolveIndexWrites(ctx context.Context, direct func() error, ops ...index.Op) (ownerDown bool, err error) {
+	if !s.store.ReadOnly() {
+		return false, direct()
+	}
+	var last string
+	for _, op := range ops {
+		name, err := s.store.EnqueueOp(op)
+		if err != nil {
+			return false, err
+		}
+		last = name
+	}
+	if err := s.store.AwaitOpApplied(ctx, last, s.ownerWait); err != nil {
+		if errors.Is(err, index.ErrOwnerNotIndexing) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
+}
+
+// route is one served pattern. The routes live in a table rather than in a run of
+// mux.HandleFunc calls so a test can enumerate them: every one of them has to keep
+// working on a read-only viewer, and the only way to be sure a NEW one was considered is
+// to make the guard fail when it has no entry. See TestEveryRouteSurvivesReadOnly.
+type route struct {
+	pattern string
+	h       http.HandlerFunc
+}
+
+func (s *Server) routes() []route {
+	return []route{
+		{"GET /", s.handleIndex},
+		{"GET /graph.json", s.handleGraph},
+		{"GET /assets/", s.handleAsset},
+		{"POST /api/login", s.handleLogin},
+		{"POST /api/logout", s.handleLogout},
+		{"GET /api/status", s.handleStatus},
+		{"GET /api/config", s.handleGetConfig},
+		{"PUT /api/config", s.handlePutConfig},
+		{"POST /api/reindex", s.handleReindex},
+		{"GET /api/search", s.handleSearch},
+		{"GET /api/note/{id}", s.handleNote},
+		{"GET /api/docs", s.handleDocsList},
+		{"GET /api/docs/{slug}", s.handleDoc},
+		{"GET /api/mcp-tools", s.handleMCPTools},
+		{"GET /api/dashboard", s.handleDashboard},
+		{"POST /api/ask", s.handleAsk},
+		{"GET /api/pending", s.handlePendingList},
+		{"POST /api/pending/promote", s.handlePendingPromote},
+		{"POST /api/pending/discard", s.handlePendingDiscard},
+		{"GET /openapi.json", s.handleOpenAPI},
+	}
+}
 
 // Handler wires the routes: the SPA shell, the graph payload, embedded assets, and
 // the /api surface, all behind the auth guard (a no-op on a loopback bind).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", s.handleIndex)
-	mux.HandleFunc("GET /graph.json", s.handleGraph)
-	mux.HandleFunc("GET /assets/", s.handleAsset)
-	mux.HandleFunc("POST /api/login", s.handleLogin)
-	mux.HandleFunc("POST /api/logout", s.handleLogout)
-	mux.HandleFunc("GET /api/status", s.handleStatus)
-	mux.HandleFunc("GET /api/config", s.handleGetConfig)
-	mux.HandleFunc("PUT /api/config", s.handlePutConfig)
-	mux.HandleFunc("POST /api/reindex", s.handleReindex)
-	mux.HandleFunc("GET /api/search", s.handleSearch)
-	mux.HandleFunc("GET /api/note/{id}", s.handleNote)
-	mux.HandleFunc("GET /api/docs", s.handleDocsList)
-	mux.HandleFunc("GET /api/docs/{slug}", s.handleDoc)
-	mux.HandleFunc("GET /api/mcp-tools", s.handleMCPTools)
-	mux.HandleFunc("GET /api/dashboard", s.handleDashboard)
-	mux.HandleFunc("POST /api/ask", s.handleAsk)
-	mux.HandleFunc("GET /api/pending", s.handlePendingList)
-	mux.HandleFunc("POST /api/pending/promote", s.handlePendingPromote)
-	mux.HandleFunc("POST /api/pending/discard", s.handlePendingDiscard)
-	mux.HandleFunc("GET /openapi.json", s.handleOpenAPI)
+	for _, rt := range s.routes() {
+		mux.HandleFunc(rt.pattern, rt.h)
+	}
 	var h http.Handler
 	if s.member != nil {
 		h = s.memberGuard(mux) // per-member auth (mesh ui --hub-db)
@@ -376,7 +499,11 @@ func writeJSON(w http.ResponseWriter, v any) {
 // mode (each request authenticates as a hub client and is scoped to them); member auth
 // is then the fail-closed gate, so the single-token requirement is skipped. Otherwise
 // it is the standalone single-token viewer (loopback needs no token).
-func Serve(vaultRoot, addr, token, basePath string, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, int64, bool)) error {
+// ownIndex=true makes this process the OWNING WRITER of the vault's index instead of a
+// reader of it. Only correct where nothing else writes that index (the mesh-ui
+// container); beside a `mesh watch` / `mesh sync --watch` it reintroduces the second
+// long-lived writer this whole split removed.
+func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, int64, bool)) error {
 	memberMode := verify != nil
 	var auth authConfig
 	if !memberMode {
@@ -386,8 +513,20 @@ func Serve(vaultRoot, addr, token, basePath string, verify func(string) (int64, 
 		}
 		auth = a
 	}
-	s, err := NewServer(vaultRoot)
+	newSrv := NewServer
+	if ownIndex {
+		newSrv = NewOwningServer
+	}
+	s, err := newSrv(vaultRoot)
 	if err != nil {
+		// The read-only open refuses a vault with no index, which is right (an empty graph
+		// served as if it were the vault is worse), but its advice is written for the MCP.
+		// Say the part that is specific to being the viewer.
+		if !ownIndex && errors.Is(err, index.ErrNoIndexYet) {
+			return fmt.Errorf("%w\n\nmesh ui reads the index, it does not build it. Either start the owning "+
+				"writer (`mesh watch %s`), index once (`mesh index %s`), or pass --own-index if nothing "+
+				"else writes this vault", err, vaultRoot, vaultRoot)
+		}
 		return err
 	}
 	defer s.Close()
@@ -398,6 +537,11 @@ func Serve(vaultRoot, addr, token, basePath string, verify func(string) (int64, 
 	}
 	exp := BuildExport(s.graph, vaultRoot, nil)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))
+	if ownIndex {
+		fmt.Printf("index: OWNED by this process (it reindexes and writes)\n")
+	} else {
+		fmt.Printf("index: read-only; the owning writer (mesh watch / mesh sync --watch) indexes\n")
+	}
 	if memberMode {
 		fmt.Printf("auth: per-member (hub client token; views scoped per member)\n")
 	} else if auth.authRequired() {

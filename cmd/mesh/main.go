@@ -990,6 +990,16 @@ func indexCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("wrote:  %d notes to %s\n", n, store.Path())
+			// Apply whatever the read-only surfaces queued for an owning writer. This is
+			// the command every owner_down message points people at ("start an owner, or
+			// run `mesh index <vault>` once"), so it has to actually settle the queue: a
+			// review item the dashboard promoted while nothing owned the index stays in
+			// that queue forever otherwise, and the advice would be wrong.
+			if applied, err := store.DrainOps(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not apply the queued index ops: %v\n", err)
+			} else if applied > 0 {
+				fmt.Printf("applied: %d queued op(s) from read-only surfaces (review-queue changes, usage counters)\n", applied)
+			}
 			return nil
 		},
 	}
@@ -1948,6 +1958,7 @@ func tuiCmd() *cobra.Command {
 }
 func uiCmd() *cobra.Command {
 	var addr, token, basePath, hubDB string
+	var ownIndex bool
 	c := &cobra.Command{
 		Use:   "ui [vault]",
 		Short: "Serve the local web app: graph, search, settings, docs, API reference",
@@ -1963,9 +1974,12 @@ func uiCmd() *cobra.Command {
 			if hubDB == "" {
 				hubDB = os.Getenv("MESH_UI_HUB_DB")
 			}
+			if !ownIndex {
+				ownIndex = os.Getenv("MESH_UI_OWN_INDEX") == "1"
+			}
 			// Standalone single-token mode.
 			if hubDB == "" {
-				return web.Serve(vaultArg(args), addr, token, basePath, nil, nil, nil)
+				return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, nil, nil, nil)
 			}
 			// Per-member team mode: resolve each request against the hub's client
 			// store and scope reads to the signed-in member. The hub store is the
@@ -1978,12 +1992,17 @@ func uiCmd() *cobra.Command {
 				return err
 			}
 			defer closeHub()
-			return web.Serve(vaultArg(args), addr, token, basePath, verify, scopesFor, roleFor)
+			return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, verify, scopesFor, roleFor)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")
 	c.Flags().StringVar(&token, "token", "", "bearer token required for /api access (or MESH_UI_TOKEN); mandatory when binding beyond loopback")
 	c.Flags().StringVar(&basePath, "base-path", "", "serve the app under a path, e.g. /app (or MESH_UI_BASE_PATH), for a reverse proxy")
 	c.Flags().StringVar(&hubDB, "hub-db", "", "hub.db path (or MESH_UI_HUB_DB): serve a team with per-member login + scoped views")
+	// Off by default, because the common case is a laptop where `mesh sync --watch`
+	// already owns the index and this viewer is one of several readers of it. Turn it on
+	// ONLY where nothing else writes that index (the mesh-ui container), or you have two
+	// long-lived writers against one mesh.db again.
+	c.Flags().BoolVar(&ownIndex, "own-index", false, "own the vault's index: reindex at startup and write directly (or MESH_UI_OWN_INDEX=1). Only where no `mesh watch` / `mesh sync --watch` runs against this vault")
 	return c
 }

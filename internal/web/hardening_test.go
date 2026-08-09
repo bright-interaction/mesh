@@ -21,6 +21,7 @@ func memberServer(t *testing.T) *Server {
 	if err := os.WriteFile(filepath.Join(dir, "n.md"), []byte("---\nid: n\ntype: note\ntitle: N\n---\n# n\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	seedIndex(t, dir)
 	s, err := NewServer(dir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)

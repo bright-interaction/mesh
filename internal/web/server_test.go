@@ -12,9 +12,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testServer(t *testing.T) *httptest.Server {
+	ts, _ := testServerVault(t)
+	return ts
+}
+
+// testServerVault is testServer plus the vault path, for the tests that need to play
+// the owning writer as well as the viewer.
+func testServerVault(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	dir := t.TempDir()
 	write := func(rel, body string) {
@@ -26,13 +34,14 @@ func testServer(t *testing.T) *httptest.Server {
 	write("alpha.md", "---\nid: alpha\ntype: note\nwhen: 2026-01-01\n---\n# Alpha\n[[beta]]\n")
 	write("beta.md", "---\nid: beta\ntype: note\nwhen: 2026-01-01\n---\n# Beta\nleaf\n")
 
+	seedIndex(t, dir)
 	s, err := NewServer(dir)
 	if err != nil {
 		t.Fatalf("NewServer (is git/index ok?): %v", err)
 	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(func() { ts.Close(); s.Close() })
-	return ts
+	return ts, dir
 }
 
 func get(t *testing.T, ts *httptest.Server, path string) (int, string, http.Header) {
@@ -90,14 +99,30 @@ func TestServerRoutes(t *testing.T) {
 }
 
 func TestDashboardAPI(t *testing.T) {
-	ts := testServer(t)
+	ts, dir := testServerVault(t)
+	// The viewer is read-only, so its usage counters reach the index through the owning
+	// writer's op queue (see index.OpTelemetry). Without an owner they would sit in the
+	// queue, which is exactly what the dashboard would then be reporting: nothing.
+	runOwner(t, dir)
 	// A search bumps the queries counter the dashboard reports.
 	if code, _, _ := get(t, ts, "/api/search?q=alpha"); code != 200 {
 		t.Fatalf("search status %d", code)
 	}
-	code, body, _ := get(t, ts, "/api/dashboard")
-	if code != 200 {
-		t.Fatalf("dashboard status %d", code)
+	var code int
+	var body string
+	// The queue is drained by the owner's reconcile, so the counter lands within a tick
+	// rather than synchronously with the search.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code, body, _ = get(t, ts, "/api/dashboard")
+		if code != 200 {
+			t.Fatalf("dashboard status %d", code)
+		}
+		if strings.Contains(body, `"queries":0`) && time.Now().Before(deadline) {
+			time.Sleep(25 * time.Millisecond)
+			continue
+		}
+		break
 	}
 	var d struct {
 		Usage struct {

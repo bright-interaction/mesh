@@ -70,15 +70,25 @@ func TestWriteLockProbe(t *testing.T) {
 		before.cliMax.Round(time.Millisecond), after.cliMax.Round(time.Millisecond),
 		humanBytes(before.walBytes), humanBytes(after.walBytes))
 
-	// The structural claim, which does not depend on machine speed: the same agent-visible
-	// work goes through one writer instead of six, so it WRITES less. WAL bytes is that
-	// measurement (nothing checkpoints inside this window, so it is cumulative bytes
-	// written), and it is the quantity that reached 223MB in production and starved every
-	// other writer into SQLITE_BUSY.
-	if after.walBytes >= before.walBytes {
-		t.Errorf("the single-writer arm wrote %s against %s for identical work; the point of the split "+
-			"is that N windows stop each re-indexing the same vault", humanBytes(after.walBytes), humanBytes(before.walBytes))
-	}
+	// The WAL comparison is REPORTED, not asserted, and the reason is worth keeping: the
+	// figure does not mean what it was originally taken to mean. It was documented as
+	// "cumulative bytes written, because nothing checkpoints inside this window", but the
+	// DSN sets wal_autocheckpoint to 1000 pages (~4MB), so an arm that writes more
+	// checkpoints itself mid-run, and journal_size_limit then truncates the file. The
+	// size at the end is therefore a sample of where the checkpoint cycle happened to
+	// be, not a total. Observed both ways from that: it PASSED under an ablation that
+	// made the two arms identical (recorded in the single-writer decision note), and it
+	// FAILED on 2026-08-09 with the before arm reading 0B, on unchanged code, purely
+	// because the suite was running packages in parallel.
+	//
+	// An assertion that can go either way regardless of the code is worse than no
+	// assertion: it teaches people to re-run until green. The structural claim it was
+	// reaching for (windows do not each re-index the vault) is pinned deterministically
+	// by TestNewServerOpensReadOnly and TestEveryToolSurvivesOnAReadOnlyServer instead.
+	// What stays below are the absolutes on the AFTER arm, which do not depend on the
+	// before arm losing a race.
+	t.Logf("WAL at end of arm: before %s, after %s (a checkpoint-cycle sample, not a total; see the comment above)",
+		humanBytes(before.walBytes), humanBytes(after.walBytes))
 	// The accepted tradeoff, stated as a bound rather than left as a surprise: a write-back
 	// no longer indexes in-process, so it waits for the owner's debounce and its p50 goes
 	// UP. What it buys is a bounded tail. It must stay inside the bound step 2 measured.

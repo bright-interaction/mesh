@@ -32,6 +32,7 @@ func spacedMemberServer(t *testing.T) (*Server, string) {
 		[]byte("---\nid: seed\ntype: note\nwhen: 2026-01-01\n---\n# Seed\nx\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	seedIndex(t, dir)
 	s, err := NewServer(dir)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -102,10 +103,11 @@ func TestPromoteDoesNotLeakTheServerVaultPath(t *testing.T) {
 			if tc.breakIt != nil {
 				tc.breakIt(t, dir)
 			}
-			if err := s.store.AddPending(index.PendingNote{
-				Type: "gotcha", Title: "Keep me", Do: "do x", Dont: "dont y", Why: "because"}); err != nil {
-				t.Fatalf("seeding the queue: %v", err)
-			}
+			// The extractor fills the queue and the owner resolves it; the viewer only
+			// reads. Seeding through s.store would need a writable viewer, which is the
+			// shape the single-writer split removed.
+			seedPending(t, dir, index.PendingNote{
+				Type: "gotcha", Title: "Keep me", Do: "do x", Dont: "dont y", Why: "because"})
 			code, body := promoteAsAdmin(t, s, index.PendingID("gotcha", "Keep me"))
 			if code != tc.wantStatus {
 				t.Fatalf("promote = %d, want %d: %s", code, tc.wantStatus, body)

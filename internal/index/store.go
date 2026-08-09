@@ -222,6 +222,11 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 // must never look alike; see TestReadOnlyWriteFailsLoudly.
 var ErrReadOnly = errors.New("mesh: this index store is read-only; write-back routes through the single owning writer (mesh watch / mesh sync --watch)")
 
+// ErrNoIndexYet is returned by OpenReadOnly when the vault has no index at all. A
+// sentinel because it is the one startup failure a caller can give better advice about
+// than this package can: what to run instead depends on which surface you are.
+var ErrNoIndexYet = errors.New("no index yet")
+
 // OpenReadOnly opens <vaultRoot>/.mesh/mesh.db for READS ONLY: no writer goroutine, no
 // write connection, Write always fails with ErrReadOnly. This is what every per-window
 // `mesh mcp` server must use (see the mesh multi-writer decision note): only the single
@@ -240,7 +245,7 @@ func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 	dbPath := filepath.Join(meshDir, "mesh.db")
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("no index yet at %s: start the owning writer first (`mesh watch` or `mesh sync --watch`), or run `mesh index` once", dbPath)
+			return nil, fmt.Errorf("%w at %s: start the owning writer first (`mesh watch` or `mesh sync --watch`), or run `mesh index` once", ErrNoIndexYet, dbPath)
 		}
 		return nil, err
 	}
@@ -258,13 +263,21 @@ func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("open read-only index: %w", err)
 	}
-	return &Store{
+	s := &Store{
 		dir:      meshDir,
 		dbPath:   dbPath,
 		readDB:   readDB,
 		readOnly: true,
 		done:     make(chan struct{}),
-	}, nil
+	}
+	// Usage counters still have to reach the index. They are the flywheel measurement
+	// (queries, fetches, note reuse), and after the single-writer split the only
+	// processes that generate them are read-only: every `mesh mcp` window and the web
+	// viewer. Dropping them here would freeze the dashboard's reuse rate at whatever the
+	// last writable process left behind, while the app kept reporting it as current.
+	s.wg.Add(1)
+	go s.forwardTelemetry()
+	return s, nil
 }
 
 // dropOnVersionChange lists the tables wiped and rebuilt on a schema-version change.
@@ -701,9 +714,6 @@ func (s *Store) Write(fn func(*sql.Tx) error) error {
 // a read path (mesh_search, mesh_fetch, the web search API) must never wait on the
 // single writer just to bump a counter.
 func (s *Store) recordTelemetry(key string, n int64, reuse *reuseEvent) {
-	if s.readOnly {
-		return // no writer goroutine ever flushes this; dropping it beats growing it forever
-	}
 	s.telMu.Lock()
 	defer s.telMu.Unlock()
 	if key != "" {
@@ -737,6 +747,15 @@ func (s *Store) drainTelemetry() (func(*sql.Tx) error, bool) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	return telemetryTx(keys, counts, reuses), true
+}
+
+// telemetryTx is the transaction that applies one batch of counters. Factored out
+// because the batch now arrives by two routes: the writable store's own flush ticker,
+// and a read-only store's batch forwarded through the owner's op queue. The two must
+// apply identically, or the same fetch would count differently depending on which
+// process observed it.
+func telemetryTx(keys []string, counts map[string]int64, reuses []reuseEvent) func(*sql.Tx) error {
 	return func(tx *sql.Tx) error {
 		for _, k := range keys {
 			if _, err := tx.Exec(
@@ -757,13 +776,62 @@ func (s *Store) drainTelemetry() (func(*sql.Tx) error, bool) {
 			}
 		}
 		return nil
-	}, true
+	}
+}
+
+// forwardTelemetry is the read-only store's equivalent of the writer goroutine's flush
+// ticker: it drains the in-memory counters onto the owning writer's op queue on the same
+// cadence. One small file per interval per process, and only when something happened, so
+// an idle window writes nothing at all.
+func (s *Store) forwardTelemetry() {
+	defer s.wg.Done()
+	t := time.NewTicker(telemetryFlushInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			s.queueTelemetry() // land the last batch on the way out
+			return
+		case <-t.C:
+			s.queueTelemetry()
+		}
+	}
+}
+
+// queueTelemetry hands one batch of counters to the owning writer. Best effort by
+// design: counters are the one thing in this index that is genuinely lossy (see
+// walSizeLimit's neighbours), and a queue that is full means the owner is long gone,
+// which the surfaces report on their own paths with a great deal more context than a
+// counter could.
+func (s *Store) queueTelemetry() {
+	s.telMu.Lock()
+	counts, reuses := s.telCount, s.telReuse
+	s.telCount, s.telReuse = nil, nil
+	s.telMu.Unlock()
+	if len(counts) == 0 && len(reuses) == 0 {
+		return
+	}
+	op := Op{Kind: OpTelemetry, Counts: counts}
+	for _, r := range reuses {
+		op.Reuse = append(op.Reuse, ReuseEvent{NoteID: r.noteID, GapSec: r.gapSec, At: r.at})
+	}
+	if _, err := s.EnqueueOp(op); err != nil {
+		slog.Debug("mesh: could not queue usage counters for the owning writer", "err", err)
+	}
 }
 
 // flushTelemetry writes any pending counters now, from the CALLER's goroutine (via the
 // jobs channel). Read paths never call it; the reporting surfaces do, so a dashboard or
 // a test reads a consistent picture instead of one that lags the flush ticker.
 func (s *Store) flushTelemetry() {
+	if s.readOnly {
+		// Same intent, the only route available: hand the batch to the owning writer now
+		// rather than at the next tick. Going through Write here would fail with
+		// ErrReadOnly and log "this batch of counters is lost", which was true before the
+		// queue existed and is not any more.
+		s.queueTelemetry()
+		return
+	}
 	fn, ok := s.drainTelemetry()
 	if !ok {
 		return
@@ -796,12 +864,16 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) shutdown() error {
-	// A read-only store has no writer goroutine (s.wg was never Add(1)'d), no jobs
-	// channel, and no writeDB: closing readDB is the whole of its shutdown. It must
+	// A read-only store has no writer goroutine, no jobs channel and no writeDB. It must
 	// also never open its own writable connection to run checkpointTruncateBestEffort,
 	// which is exactly what the writable path below does: an OpenReadOnly caller (a
-	// per-window `mesh mcp`) is not allowed to become a writer even for one PRAGMA.
+	// per-window `mesh mcp`) is not allowed to become a writer even for one PRAGMA. What
+	// it does have is the telemetry forwarder, which lands its last batch on the op queue
+	// when done closes; waiting for it is why a window that is closed right after a
+	// search still contributes that search to the flywheel.
 	if s.readOnly {
+		close(s.done)
+		s.wg.Wait()
 		return s.readDB.Close()
 	}
 	// Land the last batch of in-memory telemetry while the writer is still serving:

@@ -22,6 +22,7 @@ func TestMemberRoleGateAndRevocation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "n.md"), []byte("---\nid: n\ntype: note\ntitle: N\n---\n# n\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	seedIndex(t, dir)
 	srv, err := NewServer(dir)
 	if err != nil {
 		t.Fatal(err)

@@ -26,6 +26,7 @@ func TestWebMemberScoping(t *testing.T) {
 	must("devsecret.md", "---\nid: devsecret\ntype: note\ntitle: DevSecret\nscope: dev\n---\n# dev only\n")
 	must("salesplan.md", "---\nid: salesplan\ntype: note\ntitle: SalesPlan\nscope: sales\n---\n# sales only\n")
 
+	seedIndex(t, dir)
 	srv, err := NewServer(dir)
 	if err != nil {
 		t.Fatal(err)
