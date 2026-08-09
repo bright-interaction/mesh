@@ -26,13 +26,14 @@ import (
 // concurrently with the writer. This is the foundation the fsnotify watcher
 // (later) needs: it can stream upserts while mesh_search reads, with no deadlock.
 type Store struct {
-	dir     string
-	dbPath  string
-	writeDB *sql.DB
-	readDB  *sql.DB
-	jobs    chan job
-	done    chan struct{}
-	wg      sync.WaitGroup // tracks the writer goroutine so Close can join it
+	dir      string
+	dbPath   string
+	writeDB  *sql.DB
+	readDB   *sql.DB
+	jobs     chan job
+	done     chan struct{}
+	wg       sync.WaitGroup // tracks the writer goroutine so Close can join it
+	readOnly bool           // true for OpenReadOnly: no writer goroutine, Write always fails
 
 	closeOnce sync.Once // Close is idempotent: a second close(s.done) would panic
 	closeErr  error     // the first Close's result, replayed to later callers
@@ -124,6 +125,15 @@ const (
 	// instead of stalling the writer. It is applied on the checkpoint's OWN connection;
 	// see checkpointTruncateBestEffort for why it must never touch a pool.
 	checkpointBusyTimeoutMS = 2000
+	// walAutocheckpointPages is SQLite's own default (1000 pages, ~4MB at the default
+	// 4096-byte page size), set EXPLICITLY on the DSN rather than left implicit. This is
+	// the outstanding rider from the multi-writer decision (journal_size_limit already
+	// shipped; wal_autocheckpoint did not). It changes nothing about the bound: at 1000
+	// pages it fires well under walSizeLimit's 16MB, so it is redundant with the writer's
+	// own PASSIVE-then-escalate-to-TRUNCATE loop below, not a replacement for it. Being
+	// explicit means a future SQLite default change can't silently move this threshold
+	// out from under the tuning the comments here already documented.
+	walAutocheckpointPages = 1000
 )
 
 func dsn(path string) string { return dsnBusy(path, busyTimeoutMS) }
@@ -132,8 +142,23 @@ func dsn(path string) string { return dsnBusy(path, busyTimeoutMS) }
 // patience gets it in its DSN rather than by running a PRAGMA on a shared pool.
 func dsnBusy(path string, busyMS int) string {
 	return fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(on)&_pragma=journal_size_limit(%d)",
-		path, busyMS, walSizeLimit,
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(on)&_pragma=journal_size_limit(%d)&_pragma=wal_autocheckpoint(%d)",
+		path, busyMS, walSizeLimit, walAutocheckpointPages,
+	)
+}
+
+// dsnReadOnly is the DSN for OpenReadOnly: mode=ro refuses the OS-level open flags SQLite
+// would need to write at all (SQLITE_READONLY on any write attempt, "attempt to write a
+// readonly database"), and query_only(true) is defense in depth on top of that at the SQL
+// layer. Deliberately does NOT set journal_mode(WAL): that pragma is a schema change, and
+// asking a read-only connection to (re-)declare it risks the exact write attempt mode=ro
+// exists to refuse, on a file already in WAL mode on disk from the owning writer. It also
+// does not set journal_size_limit or wal_autocheckpoint: both are checkpoint tuning, and
+// a connection that cannot write never checkpoints.
+func dsnReadOnly(path string) string {
+	return fmt.Sprintf(
+		"file:%s?mode=ro&_pragma=busy_timeout(%d)&_pragma=foreign_keys(on)&_pragma=query_only(true)",
+		path, busyTimeoutMS,
 	)
 }
 
@@ -184,6 +209,58 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 	s.wg.Add(1)
 	go s.writer()
 	return s, nil
+}
+
+// ErrReadOnly is returned by every write path on a Store opened with OpenReadOnly (Write
+// itself, and anything built on it: RecordWriteback, IncrMetric, ComputeHealth, ...). It
+// is a sentinel, not a message match, so a caller can branch on it (errors.Is) instead of
+// getting the generic "database is locked" a real contended write would produce; the two
+// must never look alike; see TestReadOnlyWriteFailsLoudly.
+var ErrReadOnly = errors.New("mesh: this index store is read-only; write-back routes through the single owning writer (mesh watch / mesh sync --watch)")
+
+// OpenReadOnly opens <vaultRoot>/.mesh/mesh.db for READS ONLY: no writer goroutine, no
+// write connection, Write always fails with ErrReadOnly. This is what every per-window
+// `mesh mcp` server must use (see the mesh multi-writer decision note): only the single
+// owning writer may hold a writable Store against a given mesh.db, so N concurrent MCP
+// servers never again fight each other (or the owner) for the SQLite write lock.
+//
+// Unlike Open, this does NOT create the database: a read-only store has nothing to apply
+// a schema with, so a vault with no index yet (or one whose owning writer has never run)
+// fails closed with a clear message instead of silently producing an empty graph.
+func OpenReadOnly(vaultRoot string) (*Store, error) {
+	return OpenReadOnlyAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"))
+}
+
+// OpenReadOnlyAt is OpenReadOnly with an explicit index directory, mirroring OpenAt.
+func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
+	dbPath := filepath.Join(meshDir, "mesh.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no index yet at %s: start the owning writer first (`mesh watch` or `mesh sync --watch`), or run `mesh index` once", dbPath)
+		}
+		return nil, err
+	}
+	readDB, err := sql.Open("sqlite", dsnReadOnly(dbPath))
+	if err != nil {
+		return nil, err
+	}
+	// Probe now, not on the first caller query: a corrupt or half-written file should
+	// fail at Open like the writable path does, not surface as a confusing query error
+	// deep inside the first mesh_search.
+	if err := readDB.Ping(); err != nil {
+		readDB.Close()
+		if isUnreadableDB(err) {
+			return nil, corruptIndexError(vaultRoot, dbPath, err)
+		}
+		return nil, fmt.Errorf("open read-only index: %w", err)
+	}
+	return &Store{
+		dir:      meshDir,
+		dbPath:   dbPath,
+		readDB:   readDB,
+		readOnly: true,
+		done:     make(chan struct{}),
+	}, nil
 }
 
 // dropOnVersionChange lists the tables wiped and rebuilt on a schema-version change.
@@ -590,8 +667,15 @@ func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
 	return tx.Commit()
 }
 
-// Write runs fn inside a transaction on the single writer goroutine.
+// Write runs fn inside a transaction on the single writer goroutine. On a Store opened
+// with OpenReadOnly this fails loudly with ErrReadOnly instead of blocking: s.jobs is
+// nil on a read-only store (there is no writer goroutine to receive from it), and
+// sending on a nil channel blocks forever, so this check must run BEFORE the select,
+// not be left to fall out of it.
 func (s *Store) Write(fn func(*sql.Tx) error) error {
+	if s.readOnly {
+		return ErrReadOnly
+	}
 	reply := make(chan error, 1)
 	select {
 	case s.jobs <- job{fn: fn, reply: reply}:
@@ -606,6 +690,9 @@ func (s *Store) Write(fn func(*sql.Tx) error) error {
 // a read path (mesh_search, mesh_fetch, the web search API) must never wait on the
 // single writer just to bump a counter.
 func (s *Store) recordTelemetry(key string, n int64, reuse *reuseEvent) {
+	if s.readOnly {
+		return // no writer goroutine ever flushes this; dropping it beats growing it forever
+	}
 	s.telMu.Lock()
 	defer s.telMu.Unlock()
 	if key != "" {
@@ -698,6 +785,14 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) shutdown() error {
+	// A read-only store has no writer goroutine (s.wg was never Add(1)'d), no jobs
+	// channel, and no writeDB: closing readDB is the whole of its shutdown. It must
+	// also never open its own writable connection to run checkpointTruncateBestEffort,
+	// which is exactly what the writable path below does: an OpenReadOnly caller (a
+	// per-window `mesh mcp`) is not allowed to become a writer even for one PRAGMA.
+	if s.readOnly {
+		return s.readDB.Close()
+	}
 	// Land the last batch of in-memory telemetry while the writer is still serving:
 	// after close(s.done) every Write returns "store is closed".
 	s.flushTelemetry()
