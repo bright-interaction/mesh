@@ -6,13 +6,18 @@
 // editor and it is searchable at once, no commit, no manual `mesh index`.
 //
 // The design mirrors Milestone S's "reconcile-first" principle at local scale.
-// The periodic reconcile is the primary consistency mechanism: it runs the same
-// authoritative content-hash drift check `mesh doctor` uses, so it always
+// The periodic reconcile is the primary consistency mechanism, so it always
 // converges and a missed or dropped file event never leaves lasting drift. The
 // fsnotify event stream is a best-effort speedup layered on top, debounced so a
 // burst of editor saves collapses into one reindex. The expensive reindex runs
 // single-flight on one goroutine and only rebuilds when retrieval-relevant
 // content actually changed, so an idle vault costs nothing but a cheap scan.
+//
+// That tick runs at two depths. Every fire takes the mtime fast path, which sees
+// added, removed and normally-edited notes for one stat each; only every
+// DefaultFullReconcile does it escalate to the authoritative content-hash check
+// `mesh doctor` uses. Both halves used to run on the short interval, which meant
+// re-parsing the entire vault seven times a minute forever on an idle machine.
 package watch
 
 import (
@@ -36,15 +41,35 @@ type Result struct {
 	Dur       time.Duration
 }
 
+// Pass reasons. A callback that needs to know WHY it is running must read Pass.Reason
+// rather than infer it from Pass.Authoritative: those two used to move together, and
+// `mesh sync` inferred "this is the periodic tick" from authoritative=true to rate-limit
+// its hub round. The moment the tick stopped being authoritative on every fire, that
+// inference flipped and the daemon started a full hub sync every 8 seconds instead of
+// every 60.
+const (
+	ReasonStartup = "startup" // first pass, before anything is known about the vault
+	ReasonChange  = "change"  // a debounced local edit, or an external Trigger nudge
+	ReasonTick    = "tick"    // the periodic safety net, with nothing observed to prompt it
+)
+
+// Pass describes one reconcile the watcher is asking the callback to run.
+type Pass struct {
+	Reason string // one of ReasonStartup / ReasonChange / ReasonTick
+	// Authoritative selects the content-hash drift check (parses every note) over the
+	// mtime fast path (one stat per note). True on startup and on the periodic FULL pass.
+	Authoritative bool
+}
+
 // Options configure a watch run.
 type Options struct {
-	Root          string                                   // vault root to watch
-	Debounce      time.Duration                            // quiet window to coalesce a save burst; <=0 uses the default
-	Reconcile     time.Duration                            // periodic safety-net interval; <=0 disables the tick
-	FullReconcile time.Duration                            // how often the periodic tick escalates to the authoritative full-hash pass; <=0 uses the default
-	OnReindex     func(authoritative bool) (Result, error) // drift-check + reindex, single-flight; authoritative=false on a debounced change and on a plain safety tick (mtime fast path), true on startup + the periodic FULL pass (hash check)
-	Logf          func(string, ...any)                     // progress sink; nil is silent
-	Trigger       <-chan struct{}                          // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
+	Root          string                     // vault root to watch
+	Debounce      time.Duration              // quiet window to coalesce a save burst; <=0 uses the default
+	Reconcile     time.Duration              // periodic safety-net interval; <=0 disables the tick
+	FullReconcile time.Duration              // how often the periodic tick escalates to the authoritative full-hash pass; <=0 uses the default
+	OnReindex     func(Pass) (Result, error) // drift-check + reindex, single-flight
+	Logf          func(string, ...any)       // progress sink; nil is silent
+	Trigger       <-chan struct{}            // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
 }
 
 const defaultDebounce = 300 * time.Millisecond
@@ -98,7 +123,7 @@ func Run(ctx context.Context, opt Options) error {
 
 	// Reflect disk from the moment we start (bootstraps an empty index too). Startup is
 	// always authoritative: nothing is known about what changed while we were not running.
-	reconcile(opt, logf, "startup", true)
+	reconcile(opt, logf, Pass{Reason: ReasonStartup, Authoritative: true})
 	lastFull := time.Now()
 
 	// Debounce timer, created stopped: armed only once an event arrives.
@@ -151,7 +176,7 @@ func Run(ctx context.Context, opt Options) error {
 			// unless a caller wired one in.
 			resetTimer(debounce, opt.Debounce)
 		case <-debounce.C:
-			reconcile(opt, logf, "change", false)
+			reconcile(opt, logf, Pass{Reason: ReasonChange, Authoritative: false})
 		case <-tick:
 			// Safety net: catches anything the event stream missed (a dropped event,
 			// a same-second rename, a note written before our watches were in place).
@@ -163,23 +188,22 @@ func Run(ctx context.Context, opt Options) error {
 			if full {
 				lastFull = time.Now()
 			}
-			reconcile(opt, logf, "reconcile", full)
+			reconcile(opt, logf, Pass{Reason: ReasonTick, Authoritative: full})
 		}
 	}
 }
 
-// reconcile runs one drift-check + reindex. authoritative selects the content-hash pass
-// (parses every note) over the mtime fast path (one stat per note); the caller decides,
-// because the choice is a cadence question, not a property of the reason.
-func reconcile(opt Options, logf func(string, ...any), reason string, authoritative bool) {
-	res, err := opt.OnReindex(authoritative)
+// reconcile runs one drift-check + reindex. The caller decides both halves of the Pass:
+// which reason this is, and whether it gets the content-hash check or the mtime fast path.
+func reconcile(opt Options, logf func(string, ...any), p Pass) {
+	res, err := opt.OnReindex(p)
 	if err != nil {
-		logf("reindex failed (%s): %v", reason, err)
+		logf("reindex failed (%s): %v", p.Reason, err)
 		return
 	}
 	if res.Reindexed {
 		logf("reindexed +%d ~%d -%d in %s (%s)",
-			res.Added, res.Changed, res.Removed, res.Dur.Round(time.Millisecond), reason)
+			res.Added, res.Changed, res.Removed, res.Dur.Round(time.Millisecond), p.Reason)
 	}
 }
 

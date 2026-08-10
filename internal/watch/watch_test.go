@@ -35,7 +35,7 @@ func TestRunReconcilesOnChange(t *testing.T) {
 			Root:      dir,
 			Debounce:  20 * time.Millisecond,
 			Reconcile: 0, // isolate the fsnotify path
-			OnReindex: func(authoritative bool) (Result, error) {
+			OnReindex: func(p Pass) (Result, error) {
 				calls <- struct{}{}
 				return Result{Reindexed: true, Added: 1}, nil
 			},
@@ -77,7 +77,7 @@ func TestRunPeriodicReconcile(t *testing.T) {
 		Root:      dir,
 		Debounce:  time.Hour, // make the event path irrelevant
 		Reconcile: 40 * time.Millisecond,
-		OnReindex: func(authoritative bool) (Result, error) {
+		OnReindex: func(p Pass) (Result, error) {
 			calls <- struct{}{}
 			return Result{}, nil // no drift: the safety tick still fires the check
 		},
@@ -98,7 +98,10 @@ func TestRunPeriodicReconcile(t *testing.T) {
 // ~12% of a core between them on a 1216-note vault, forever, with nothing changing.
 func TestPeriodicTickIsCheapUntilTheFullInterval(t *testing.T) {
 	dir := t.TempDir()
-	type call struct{ authoritative bool }
+	type call struct {
+		authoritative bool
+		reason        string
+	}
 	calls := make(chan call, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -107,8 +110,8 @@ func TestPeriodicTickIsCheapUntilTheFullInterval(t *testing.T) {
 		Debounce:      time.Hour, // isolate the tick from the event path
 		Reconcile:     20 * time.Millisecond,
 		FullReconcile: 400 * time.Millisecond,
-		OnReindex: func(authoritative bool) (Result, error) {
-			calls <- call{authoritative}
+		OnReindex: func(p Pass) (Result, error) {
+			calls <- call{p.Authoritative, p.Reason}
 			return Result{}, nil
 		},
 	})
@@ -119,6 +122,9 @@ func TestPeriodicTickIsCheapUntilTheFullInterval(t *testing.T) {
 	case c := <-calls:
 		if !c.authoritative {
 			t.Fatal("startup reconcile must be authoritative")
+		}
+		if c.reason != ReasonStartup {
+			t.Fatalf("startup pass carried reason %q, want %q", c.reason, ReasonStartup)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for the startup reconcile")
@@ -134,6 +140,12 @@ func TestPeriodicTickIsCheapUntilTheFullInterval(t *testing.T) {
 		case c := <-calls:
 			if c.authoritative {
 				t.Fatalf("tick %d inside the full-reconcile window was authoritative", cheap+1)
+			}
+			// The reason must stay ReasonTick even when the pass is cheap. A callback
+			// that needs to tell a tick from a real change reads this, and conflating
+			// the two is what turned mesh sync's 60s hub round into an 8s one.
+			if c.reason != ReasonTick {
+				t.Fatalf("periodic pass carried reason %q, want %q", c.reason, ReasonTick)
 			}
 			cheap++
 		case <-deadline:
@@ -165,7 +177,7 @@ func TestRunIgnoresNonMarkdown(t *testing.T) {
 	go Run(ctx, Options{
 		Root:     dir,
 		Debounce: 20 * time.Millisecond,
-		OnReindex: func(authoritative bool) (Result, error) {
+		OnReindex: func(p Pass) (Result, error) {
 			calls <- struct{}{}
 			return Result{}, nil
 		},

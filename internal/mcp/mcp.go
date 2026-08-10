@@ -449,8 +449,8 @@ func (s *Server) Watch(ctx context.Context, debounce, reconcile, fullReconcile t
 		Reconcile:     reconcile,
 		FullReconcile: fullReconcile,
 		Logf:          logf,
-		OnReindex: func(authoritative bool) (watch.Result, error) {
-			rec, err := s.reconcileOnce(authoritative)
+		OnReindex: func(p watch.Pass) (watch.Result, error) {
+			rec, err := s.reconcileOnce(p.Authoritative)
 			if err != nil {
 				return watch.Result{}, err
 			}

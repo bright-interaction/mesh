@@ -5,6 +5,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/watch"
@@ -80,6 +81,36 @@ func TestOwningWritersShareTheFullReconcileCadence(t *testing.T) {
 		t.Fatalf("the authoritative pass (%s) is no cheaper than the sweep (%s); the whole point of "+
 			"separating them is that parsing every note does not belong on the sweep's cadence",
 			watch.DefaultFullReconcile, defaultLocalReconcile)
+	}
+}
+
+// TestHubRoundIsRateLimitedOnlyOnTheTick is the regression guard for a defect the
+// cheap-sweep change introduced and that no existing test could see.
+//
+// `mesh sync --watch` gated its hub round on the pass being "authoritative", which was a
+// stand-in for "this is the periodic tick, so rate-limit it". Making the tick cheap broke
+// that stand-in: the tick stopped being authoritative, the gate read every tick as a real
+// change, and the daemon went from one hub round a minute to one every 8 seconds, each
+// re-hashing the whole vault to build its outbox. The fix reads Pass.Reason; this pins it.
+func TestHubRoundIsRateLimitedOnlyOnTheTick(t *testing.T) {
+	now := time.Now()
+	recent := now.Add(-time.Second)
+
+	for _, tc := range []struct {
+		name   string
+		reason string
+		last   time.Time
+		want   bool
+	}{
+		{"startup always syncs", watch.ReasonStartup, recent, true},
+		{"a real change always syncs", watch.ReasonChange, recent, true},
+		{"a tick inside the interval does not", watch.ReasonTick, recent, false},
+		{"a tick past the interval does", watch.ReasonTick, now.Add(-2 * defaultHubSync), true},
+		{"the very first tick does", watch.ReasonTick, time.Time{}, true},
+	} {
+		if got := hubDue(tc.reason, tc.last, defaultHubSync, now); got != tc.want {
+			t.Errorf("%s: hubDue = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

@@ -1658,6 +1658,22 @@ const defaultLocalReconcile = 8 * time.Second
 // instead of following the sweep down.
 const defaultHubSync = 60 * time.Second
 
+// hubDue decides whether this reconcile pass also does a hub round. Startup and any real
+// change (a local edit, an SSE nudge) always sync: those are the passes with something to
+// push. The bare periodic tick is rate-limited to interval, because a hub round is a
+// network trip plus a re-hash of every note to compute the outbox, and SSE already
+// delivers teammates' changes in real time.
+//
+// It is a named function with a test because it used to be an inline condition keyed off
+// "authoritative", which silently meant "is this the periodic tick" until the tick stopped
+// being authoritative on every fire. That kind of coupling is invisible in a closure.
+func hubDue(reason string, last time.Time, interval time.Duration, now time.Time) bool {
+	if reason != watch.ReasonTick {
+		return true
+	}
+	return last.IsZero() || now.Sub(last) >= interval
+}
+
 func watchCmd() *cobra.Command {
 	var debounce, reconcile, fullReconcile time.Duration
 	c := &cobra.Command{
@@ -1691,8 +1707,8 @@ func watchCmd() *cobra.Command {
 				Reconcile:     reconcile,
 				FullReconcile: fullReconcile,
 				Logf:          logf,
-				OnReindex: func(authoritative bool) (watch.Result, error) {
-					rec, err := live.Reconcile(authoritative)
+				OnReindex: func(p watch.Pass) (watch.Result, error) {
+					rec, err := live.Reconcile(p.Authoritative)
 					if err != nil {
 						return watch.Result{}, err
 					}
@@ -1780,12 +1796,15 @@ func syncCmd() *cobra.Command {
 			// driven by a real change (fsnotify, an SSE nudge, startup) still syncs
 			// immediately, which is every case where there is something to push.
 			var lastHub time.Time
-			syncOnce := func(authoritative bool) (meshclient.Summary, error) {
+			syncOnce := func(p watch.Pass) (meshclient.Summary, error) {
 				var sum meshclient.Summary
 				var serr error
-				// authoritative marks the startup pass and the periodic tick; only the
-				// latter is rate-limited, so a cold start still syncs at once.
-				if !authoritative || lastHub.IsZero() || time.Since(lastHub) >= hubInterval {
+				// Only the periodic tick is rate-limited, so a cold start and any real
+				// change still sync at once. This reads Pass.Reason and NOT
+				// Pass.Authoritative: the two used to be the same thing, and inferring
+				// "this is the tick" from authoritative=true broke the instant the tick
+				// stopped hashing on every fire, turning a 60s hub round into an 8s one.
+				if hubDue(p.Reason, lastHub, hubInterval, time.Now()) {
 					lastHub = time.Now()
 					sum, serr = meshclient.SyncVault(vaultDir)
 				}
@@ -1798,7 +1817,7 @@ func syncCmd() *cobra.Command {
 				// 60s safety tick) while staying up and logging "reindex failed" once a
 				// minute. Observed on the live vault for hours at a time; it is the real
 				// cause of "the indexer stops picking up newly written notes".
-				_, rerr := live.Reconcile(authoritative)
+				_, rerr := live.Reconcile(p.Authoritative)
 				switch {
 				case serr != nil && rerr != nil:
 					return sum, errors.Join(serr, rerr)
@@ -1810,7 +1829,8 @@ func syncCmd() *cobra.Command {
 			}
 
 			if !doWatch {
-				sum, err := syncOnce(true) // one-shot: full authoritative reconcile
+				// one-shot: a full authoritative reconcile, and always a hub round
+				sum, err := syncOnce(watch.Pass{Reason: watch.ReasonStartup, Authoritative: true})
 				if err != nil {
 					return err
 				}
@@ -1845,7 +1865,7 @@ func syncCmd() *cobra.Command {
 				FullReconcile: fullReconcile,
 				Trigger:       nudge,
 				Logf:          logf,
-				OnReindex: func(authoritative bool) (watch.Result, error) {
+				OnReindex: func(p watch.Pass) (watch.Result, error) {
 					// Note: applying the hub's deltas writes .md files, which the
 					// watcher sees and debounces into one more reconcile. That follow-up
 					// is a guaranteed no-op (SyncVault re-hashes from disk and persists
@@ -1853,7 +1873,7 @@ func syncCmd() *cobra.Command {
 					// fast-forwards without a broadcast), so it converges in one extra
 					// idle round rather than looping. We accept that cheap round instead
 					// of threading self-written paths through the watcher.
-					sum, serr := syncOnce(authoritative)
+					sum, serr := syncOnce(p)
 					if serr != nil {
 						return watch.Result{}, serr
 					}
