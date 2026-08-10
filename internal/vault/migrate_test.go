@@ -249,9 +249,16 @@ func TestBackfillBodyFileRepairsReferencePages(t *testing.T) {
 		if !strings.Contains(body, "- [[other-note]]") {
 			t.Errorf("entity Related still describes its links instead of listing them:\n%s", body)
 		}
-		// The sections with no field behind them keep their prompt rather than a guess.
-		if !strings.Contains(body, "## Key facts\n<!-- TODO") {
-			t.Errorf("a section with no source field should keep its TODO prompt:\n%s", body)
+		// Sections with no field behind them are DROPPED on an authored page, not filled
+		// with a guess and not left as an empty prompt. (This assertion used to require the
+		// prompt to survive. It was changed deliberately: on an agent-written page nothing
+		// ever comes back to fill it, so the prompt is a permanently empty section rather
+		// than an invitation. A human's `mesh new` scaffold, which has no why, still keeps
+		// every prompt: see "leaves an unauthored scaffold completely alone".)
+		for _, gone := range []string{"## How it works", "## Key facts"} {
+			if strings.Contains(body, gone) {
+				t.Errorf("%q survived on an authored page with nothing to fill it:\n%s", gone, body)
+			}
 		}
 	})
 

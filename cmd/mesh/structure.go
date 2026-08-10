@@ -5,8 +5,10 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/relate"
@@ -20,7 +22,8 @@ import (
 // the vault structure standard. It complements `mesh lint` (frontmatter validity) and
 // `mesh health` (knowledge lifecycle): validity, organization, lifecycle.
 func structureCmd() *cobra.Command {
-	var verbose, wireOrphans, apply, fillBodies bool
+	var verbose, wireOrphans, apply, fillBodies, fillTimelines bool
+	var repoPath string
 	c := &cobra.Command{
 		Use:   "structure [vault]",
 		Short: "Grade the vault's organization: types, connectivity, tier-0, maps",
@@ -51,6 +54,9 @@ func structureCmd() *cobra.Command {
 			}
 			if fillBodies {
 				return fillNoteBodies(root, files, apply)
+			}
+			if fillTimelines {
+				return fillNoteTimelines(root, files, repoPath, apply)
 			}
 
 			fmt.Printf("structure: grade %s  (%d/100)\n", rep.Grade, rep.Score)
@@ -112,6 +118,8 @@ func structureCmd() *cobra.Command {
 	c.Flags().BoolVar(&verbose, "verbose", false, "list every finding with its note path")
 	c.Flags().BoolVar(&wireOrphans, "wire-orphans", false, "propose `related:` links for every orphan note (dry run unless --apply)")
 	c.Flags().BoolVar(&fillBodies, "fill-bodies", false, "fill a note's TODO-skeleton body sections from its already-authored do/dont/why (dry run unless --apply)")
+	c.Flags().BoolVar(&fillTimelines, "fill-timelines", false, "build a post-mortem's \"What happened\" from its own dates and the commit ids it names (dry run unless --apply)")
+	c.Flags().StringVar(&repoPath, "repo", "", "with --fill-timelines, a git repository to resolve commit ids against, so the timeline carries real committer times and subjects")
 	c.Flags().BoolVar(&apply, "apply", false, "with --wire-orphans or --fill-bodies, write the changes into the notes")
 	return c
 }
@@ -123,6 +131,106 @@ func structureCmd() *cobra.Command {
 //
 // BackfillBodyFile is idempotent (a filled section no longer matches its placeholder), so
 // running this twice is safe and the second run reports nothing to do.
+// fillNoteTimelines builds the "What happened" section of every post-mortem still holding
+// its placeholder, from the note's own recorded date, the commit ids it names, and the
+// dates in its prose (see vault.BackfillTimelineFile). Dry run unless --apply, like its
+// two siblings, because it rewrites the author's files.
+//
+// Without --repo it still runs, on dates alone. With one, each hex-looking word in the
+// note is resolved against that repository and only real commits survive, which is both
+// where the times and subjects come from and how the many hex-looking words in prose get
+// filtered out.
+func fillNoteTimelines(root string, files []string, repoPath string, apply bool) error {
+	if !apply {
+		fmt.Println("dry run (pass --apply to write); scanning post-mortems for an unfilled \"What happened\"")
+	}
+	var resolve vault.CommitResolver
+	if repoPath != "" {
+		r, err := gitCommitResolver(repoPath)
+		if err != nil {
+			return err
+		}
+		resolve = r
+	} else {
+		fmt.Println("no --repo given: timelines will carry dates only, no commit times or subjects")
+	}
+
+	var changed, failed int
+	for _, path := range files {
+		rel := path
+		if r, err := filepath.Rel(root, path); err == nil {
+			rel = r
+		}
+		res, err := vault.BackfillTimelineFile(path, resolve, !apply)
+		if err != nil {
+			fmt.Printf("  !! %s: %v\n", rel, err)
+			failed++
+			continue
+		}
+		if !res.Changed {
+			continue
+		}
+		changed++
+		fmt.Printf("  %s\n", rel)
+	}
+	verb := "would build"
+	if apply {
+		verb = "built"
+	}
+	fmt.Printf("\n%s %d timeline(s)", verb, changed)
+	if failed > 0 {
+		fmt.Printf(", failed on %d", failed)
+	}
+	fmt.Println()
+	if apply && changed > 0 {
+		fmt.Printf("run `mesh index %s` to pick the new bodies up\n", root)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d note(s) failed", failed, len(files))
+	}
+	return nil
+}
+
+// gitCommitResolver resolves commit ids against a real repository, memoising both hits and
+// misses: a vault's post-mortems name the same commits repeatedly, and the misses (every
+// hex-looking word in prose) outnumber the hits several times over.
+//
+// It verifies the path is a repository up front rather than letting every lookup fail
+// quietly, because a resolver that never resolves anything produces timelines with no
+// commits and looks exactly like a vault whose notes name none.
+func gitCommitResolver(repoPath string) (vault.CommitResolver, error) {
+	if out, err := exec.Command("git", "-C", repoPath, "rev-parse", "--git-dir").CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("--repo %s is not a git repository: %s", repoPath, strings.TrimSpace(string(out)))
+	}
+	cache := map[string]*vault.Commit{}
+	return func(id string) (vault.Commit, bool) {
+		if c, seen := cache[id]; seen {
+			if c == nil {
+				return vault.Commit{}, false
+			}
+			return *c, true
+		}
+		out, err := exec.Command("git", "-C", repoPath, "show", "-s", "--format=%cI%x09%s", id+"^{commit}").Output()
+		if err != nil {
+			cache[id] = nil
+			return vault.Commit{}, false
+		}
+		parts := strings.SplitN(strings.TrimRight(string(out), "\n"), "\t", 2)
+		if len(parts) != 2 {
+			cache[id] = nil
+			return vault.Commit{}, false
+		}
+		when, perr := time.Parse(time.RFC3339, parts[0])
+		if perr != nil {
+			cache[id] = nil
+			return vault.Commit{}, false
+		}
+		c := vault.Commit{ID: id, When: when, Subject: parts[1]}
+		cache[id] = &c
+		return c, true
+	}, nil
+}
+
 func fillNoteBodies(root string, files []string, apply bool) error {
 	if !apply {
 		fmt.Println("dry run (pass --apply to write); scanning for TODO-skeleton bodies with filled frontmatter")

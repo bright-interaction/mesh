@@ -351,6 +351,13 @@ func renderBody(fm *Frontmatter) string {
 	if sections := referenceSections(fm.Type); sections != nil {
 		body, _ = fillBodySections(body, fm, sections)
 	}
+	// Same entity repair the backfill applies, so a page written today and a page repaired
+	// later are byte-identical. Without this an agent-written entity was born with a lead
+	// prompt it would never fill and two sections nothing feeds, which is precisely the
+	// state 11 live pages were in.
+	if fm.Type == TypeEntity {
+		body, _ = repairEntityPage(body, fm)
+	}
 	return body
 }
 
@@ -467,6 +474,84 @@ func referenceSections(t NoteType) []bodySection {
 	default:
 		return nil
 	}
+}
+
+// entityLeadPlaceholder is the "**One-liner.**" prompt tmplEntity opens with. It is a
+// lead line rather than a heading, so the section machinery cannot reach it.
+const entityLeadPlaceholder = "**One-liner.** <!-- TODO: what this is and why it matters, in one sentence -->"
+
+// unsourcedEntityHeadings are the entity sections no frontmatter field can fill. On a page
+// an agent wrote through mesh_write_entity they are dead weight forever: the whole payload
+// is `why`, nothing else is ever supplied, and a heading followed by a TODO comment renders
+// as an empty section. Writing architecture prose on the page's behalf is the fabrication
+// the 65-stub post-mortem forbids, so the repair drops them instead. `mesh new entity`
+// still emits them, because a human scaffolding a page IS going to fill them in and the
+// prompt is the point there.
+var unsourcedEntityHeadings = []string{"How it works", "Key facts"}
+
+// FirstSentence returns the first sentence of s, or "" when there is not a clean one. It
+// is deliberately conservative: it stops at ". ", "! " or "? " followed by a capital or a
+// digit, refuses a result under 20 or over 400 characters, and refuses one that ends on a
+// common abbreviation, so a page gets a real one-line summary or none at all.
+func FirstSentence(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// Only consider the first paragraph: a lead sentence never spans a blank line.
+	if i := strings.Index(s, "\n\n"); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] != '.' && s[i] != '!' && s[i] != '?' {
+			continue
+		}
+		if s[i+1] != ' ' {
+			continue
+		}
+		rest := strings.TrimLeft(s[i+1:], " ")
+		if rest == "" {
+			break
+		}
+		c := rest[0]
+		if !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
+			continue
+		}
+		cand := strings.TrimSpace(s[:i+1])
+		if endsOnAbbreviation(cand) {
+			continue
+		}
+		if len(cand) < 20 || len(cand) > 400 {
+			return ""
+		}
+		return cand
+	}
+	// No sentence break at all: the whole first paragraph counts if it is short enough.
+	if len(s) >= 20 && len(s) <= 400 {
+		return s
+	}
+	return ""
+}
+
+// endsOnAbbreviation reports whether cand ends on something that looks like an
+// abbreviation rather than a sentence, so "runs on host, port 8080, etc." does not
+// become a one-liner ending mid-thought.
+func endsOnAbbreviation(cand string) bool {
+	low := strings.ToLower(cand)
+	for _, a := range []string{" e.g.", " i.e.", " etc.", " vs.", " no.", " approx.", " cf."} {
+		if strings.HasSuffix(low, a) {
+			return true
+		}
+	}
+	// A single letter before the dot is an initial, not a sentence end.
+	if n := len(cand); n >= 2 && cand[n-1] == '.' {
+		c := cand[n-2]
+		if (c >= 'A' && c <= 'Z') && (n == 2 || cand[n-3] == ' ') {
+			return true
+		}
+	}
+	return false
 }
 
 // relatedSection closes every flywheel note with its links, RENDERED, not described.

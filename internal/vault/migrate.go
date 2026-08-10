@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // MigrateResult records what a migration pass did to one file.
@@ -263,6 +265,11 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 	}
 
 	newBody, filled := fillBodySections(body, fm, sections)
+	if fm.Type == TypeEntity {
+		var extra []string
+		newBody, extra = repairEntityPage(newBody, fm)
+		filled = append(filled, extra...)
+	}
 	if len(filled) == 0 {
 		return res, nil // idempotent no-op
 	}
@@ -321,6 +328,257 @@ func fillBodySections(body string, fm *Frontmatter, sections []bodySection) (str
 		}
 	}
 	return newBody, filled
+}
+
+// Commit is one resolved commit behind an id a note mentions. Times and subjects come
+// from the repository, never from the note, so a wrong id in the prose cannot invent a
+// timeline entry: it simply does not resolve.
+type Commit struct {
+	ID      string
+	When    time.Time
+	Subject string
+}
+
+// CommitResolver looks an id up in a repository. It returns ok=false for anything that is
+// not a real commit, which is also what filters the many hex-looking words in prose
+// ("deadbeef", "0e5f4a1 in the log", a truncated hash that no longer exists).
+type CommitResolver func(id string) (Commit, bool)
+
+var (
+	shaLike  = regexp.MustCompile(`\b[0-9a-f]{7,40}\b`)
+	isoDate  = regexp.MustCompile(`\b20[0-9]{2}-[01][0-9]-[0-3][0-9]\b`)
+	whatHapp = "## What happened\n" + whatHappenedPlaceholder
+)
+
+const whatHappenedPlaceholder = "<!-- TODO: the incident, plainly -->"
+
+// BackfillTimelineFile fills a post-mortem's "What happened" section from evidence the
+// note already carries, and from nothing else.
+//
+// That section is the one part of a post-mortem no frontmatter field feeds, so it stayed a
+// TODO on 88 notes: do/dont/why carry judgments (a recommendation, a warning, a reason),
+// not a chronology. Reconstructing the narrative from those three would be invention. What
+// IS reconstructible, and verifiable, is when things happened: the note's own recorded
+// date, the commit ids it names resolved against the repository for their real committer
+// time and subject, and the other dates its prose refers to. That is what goes in.
+//
+// Only a section still holding its exact placeholder is touched, so an authored "What
+// happened" is never overwritten, and the result no longer matches the placeholder, so
+// re-running is a no-op. resolve may be nil, in which case the section is built from dates
+// alone.
+func BackfillTimelineFile(path string, resolve CommitResolver, dryRun bool) (*MigrateResult, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	fmText, body, had := SplitFrontmatter(string(data))
+	if !had {
+		return nil, noFrontmatterErr(path, string(data))
+	}
+	fm, _, err := ParseFrontmatter([]byte(fmText))
+	if err != nil {
+		return nil, err
+	}
+	res := &MigrateResult{Path: path}
+	if fm.Type != TypePostMortem || !strings.Contains(body, whatHapp) {
+		return res, nil
+	}
+
+	section := buildTimeline(string(data), fm, resolve)
+	if section == "" {
+		return res, nil
+	}
+	newBody := strings.Replace(body, whatHapp, "## What happened\n"+section, 1)
+	res.Changed = true
+	res.Actions = append(res.Actions, "built What happened from the note's own dates and commit ids")
+	if dryRun {
+		return res, nil
+	}
+	if err := writeNoteChecked(path, "---\n"+fmText+"\n---\n"+newBody); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// buildTimeline renders the section. Everything in it is either quoted from the note's
+// frontmatter or read out of the repository; there is no sentence here that asserts
+// anything the sources do not.
+func buildTimeline(whole string, fm *Frontmatter, resolve CommitResolver) string {
+	var commits []Commit
+	if resolve != nil {
+		seen := map[string]bool{}
+		for _, id := range shaLike.FindAllString(whole, -1) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			if c, ok := resolve(id); ok {
+				commits = append(commits, c)
+			}
+		}
+		sort.Slice(commits, func(i, j int) bool { return commits[i].When.Before(commits[j].When) })
+	}
+
+	// Dedupe commits that resolve to the same object through a short and a long id.
+	var uniq []Commit
+	byFull := map[string]bool{}
+	for _, c := range commits {
+		if byFull[c.ID] {
+			continue
+		}
+		byFull[c.ID] = true
+		uniq = append(uniq, c)
+	}
+	commits = uniq
+
+	recorded := strings.TrimSpace(fm.When)
+	created := strings.TrimSpace(fm.Created)
+	if recorded == "" {
+		recorded = created
+	}
+
+	// A date is only worth listing if it is not already on screen: not the date this note
+	// records, and not one a commit row already carries. Without this the thinnest notes
+	// came out saying "Recorded 2026-07-28" and then "Other dates this note refers to:
+	// 2026-07-28", which reads like a bug.
+	covered := map[string]bool{recorded: true, created: true}
+	for _, c := range commits {
+		covered[c.When.Format("2006-01-02")] = true
+	}
+	var others []string
+	seenDate := map[string]bool{}
+	for _, d := range isoDate.FindAllString(whole, -1) {
+		if seenDate[d] || covered[d] {
+			continue
+		}
+		seenDate[d] = true
+		others = append(others, d)
+	}
+	sort.Strings(others)
+
+	var b strings.Builder
+	if recorded != "" {
+		b.WriteString("Recorded " + recorded)
+		if created != "" && created != recorded {
+			b.WriteString(" (note created " + created + ")")
+		}
+		if a := strings.TrimSpace(fm.Agent); a != "" {
+			b.WriteString(" by " + a)
+		}
+		b.WriteString(".\n")
+	}
+	if len(commits) > 0 {
+		b.WriteString("\nThe commits this note names, with the times and subjects git has for them:\n\n")
+		b.WriteString("| committed | commit | subject |\n|---|---|---|\n")
+		for _, c := range commits {
+			b.WriteString("| " + c.When.Format("2006-01-02 15:04 -07:00") + " | `" + c.ID + "` | " + escapePipes(c.Subject) + " |\n")
+		}
+	}
+	if len(others) > 0 {
+		b.WriteString("\nOther dates this note refers to: " + strings.Join(others, ", ") + ".\n")
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	if len(commits) == 0 && len(others) == 0 {
+		b.WriteString("\nThis note names no commit ids and no other dates, so that one timestamp is the " +
+			"whole of the recoverable chronology. The incident narrative was never written down here, " +
+			"and it is not reconstructible from the note's own fields, so it is absent rather than " +
+			"reconstructed.\n")
+		return b.String()
+	}
+	b.WriteString("\nAssembled from this note's frontmatter, the commit ids in its own text resolved " +
+		"against the repository, and the dates in its prose. The incident narrative is not " +
+		"recoverable from those sources and is deliberately absent rather than reconstructed.\n")
+	return b.String()
+}
+
+// escapePipes keeps a commit subject from breaking the markdown table it sits in.
+func escapePipes(s string) string { return strings.ReplaceAll(s, "|", `\|`) }
+
+// repairEntityPage finishes what fillBodySections starts on an entity page, for the two
+// parts of tmplEntity the section machinery cannot reach.
+//
+// The lead gets the first sentence of `why`, which is extraction and not authoring: an
+// entity's why opens by saying what the thing is, which is exactly what the one-liner
+// asks for, and FirstSentence refuses anything that does not look like a clean sentence.
+//
+// "How it works" and "Key facts" are DROPPED when they still hold their prompt, because
+// no field feeds them and nothing ever will on an agent-written page. Keeping a heading
+// whose body is a TODO comment renders an empty section forever; writing one from
+// inference would be worse. The template still emits both for `mesh new`.
+func repairEntityPage(body string, fm *Frontmatter) (string, []string) {
+	// Both repairs are for a page that HAS content: an agent wrote it, its substance is in
+	// why, and nothing will ever revisit it. A page with no why is a fresh `mesh new`
+	// scaffold a human is about to fill, and every prompt on it is still doing its job.
+	if Unfilled(strings.TrimSpace(fm.Why)) {
+		return body, nil
+	}
+	var did []string
+	if strings.Contains(body, entityLeadPlaceholder) {
+		if lead := FirstSentence(fm.Why); lead != "" {
+			body = strings.Replace(body, entityLeadPlaceholder, "**One-liner.** "+lead, 1)
+			did = append(did, "One-liner (from why)")
+		}
+	}
+	for _, h := range unsourcedEntityHeadings {
+		if trimmed, ok := dropPlaceholderSection(body, h); ok {
+			body = trimmed
+			did = append(did, h+" (dropped, nothing sources it)")
+		}
+	}
+	return body, did
+}
+
+// dropPlaceholderSection removes a "## <heading>" section whose entire content is a single
+// TODO comment. It refuses anything else, so a section a human has written is never
+// touched, and it never removes a heading that has real prose or nested content under it.
+func dropPlaceholderSection(body, heading string) (string, bool) {
+	start := sectionStart(body, heading)
+	if start < 0 {
+		return body, false
+	}
+	rest := body[start:]
+	nl := strings.Index(rest, "\n")
+	if nl < 0 {
+		return body, false
+	}
+	inner := rest[nl+1:]
+	end := strings.Index(inner, "\n## ")
+	tail := ""
+	if end >= 0 {
+		tail = inner[end+1:]
+		inner = inner[:end]
+	}
+	if strings.TrimSpace(inner) == "" {
+		return body, false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(inner), "\n") {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		if !strings.HasPrefix(l, "<!--") || !strings.HasSuffix(l, "-->") {
+			return body, false // authored content: leave the whole section alone
+		}
+	}
+	head := strings.TrimRight(body[:start], "\n")
+	if tail == "" {
+		return head + "\n", true
+	}
+	return head + "\n\n" + tail, true
+}
+
+// sectionStart returns the offset of a "## <heading>" line, or -1.
+func sectionStart(body, heading string) int {
+	h := "## " + heading + "\n"
+	if strings.HasPrefix(body, h) {
+		return 0
+	}
+	if i := strings.Index(body, "\n"+h); i >= 0 {
+		return i + 1
+	}
+	return -1
 }
 
 // retiredPlaceholders are placeholder texts a template USED to emit for a heading. A note
