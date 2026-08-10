@@ -129,10 +129,17 @@ var unguardedWriters = map[string]string{
 	// both starter files through internal/hub/repo.go:writeFileAtomic and no longer
 	// writes bytes itself, which is why it is neither in this map nor in the discovered
 	// set. Do not re-add it.
-	"internal/ingest/state.go:saveState": "writes .mesh/ingest-state.json, the per-connector " +
-		"high-water mark. Losing it re-pulls a window that has already been pulled, and every " +
-		"import is a deterministic upsert onto the same path, so the cost is a slower run and " +
-		"never a lost or duplicated note.",
+	// internal/ingest/state.go:saveState used to sit here, exempted because losing the
+	// per-connector high-water mark only re-pulls a window that has already been pulled,
+	// and every import is a deterministic upsert onto the same path, so the cost was said
+	// to be a slower run and never a lost or duplicated note. That reasoning still holds
+	// and is no longer the deciding factor: the same write had to become temp+rename
+	// anyway to repair the file's MODE (it was 0644, beside .mesh/credentials, naming the
+	// source systems this vault pulls from, and os.WriteFile's perm applies only on
+	// create so an existing file would have stayed 0644 forever). Once a write is an
+	// atomic rename, the fsync is one more line, and this map's own rule is that an
+	// exemption cannot outlive its reason. saveState now fsyncs, so it is covered by the
+	// checks below rather than excused here. Do not re-add it.
 	"pkg/meshclient/vault.go:writeCredentials": "writes .mesh/credentials.json (the hub URL " +
 		"and token), not note bytes, at 0600. A lost credential file is re-obtained by " +
 		"running `mesh join` again; no knowledge is in it.",
