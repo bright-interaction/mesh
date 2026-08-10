@@ -227,6 +227,42 @@ land). A standalone `mesh-curator` worker can reconcile non-trivial conflicts wi
 the team's own BYOAI model, committing the merged note back through the normal sync
 path (the hub itself stays AI-free).
 
+## Upgrading: behaviour changes you will notice
+
+An audit pass changed how several commands behave. Each of these is deliberate, and each
+one is the kind of change that is confusing if you meet it without warning.
+
+**`mesh migrate` and `mesh scope backfill` are dry runs by default.** They rewrite every
+note in the vault in place with no backup, so writing is now opt-in via `--apply`. This is
+the one most likely to catch you: a script that calls either of them bare no longer
+rewrites anything, and it exits 0, so it looks like it worked. Add `--apply`.
+
+**`mesh doctor` exits 1 when a note does not parse.** It used to report `status: healthy`
+while holding zero indexed notes, because it counted only what had made it into the index
+and an unparseable note never gets there. It now reports `status: BROKEN` and names how
+many notes are invisible to search. If you gate CI on `mesh doctor`, it can now fail.
+
+**`mesh index` can delete a corrupt index.** A `.mesh/mesh.db` that SQLite refuses to open
+used to dead-end every command including the one that rebuilds it. `mesh index` now
+removes and rebuilds it, strictly when the failure is a corrupt database and never for any
+other open error, such as a busy lock. Your notes are the source of truth; the index is
+derived (see Recovery above).
+
+**`mesh conflicts resolve --take-mine` exits non-zero when the hub refuses your push.** It
+used to delete your parked conflict sibling and print that it had pushed, even when the
+hub had rejected the path for a role, ACL, scope or size reason. It now keeps the sibling,
+names the refusal, and fails. Wrappers treating exit 0 as "resolved" should be rechecked.
+
+**`mesh curator log --status` rejects unknown values** rather than silently matching
+nothing. Valid values are `failed` and `resolved`.
+
+**`GET /api/search` defaults changed** to `limit=20` and `budget=8000`, matching the MCP
+tool. Results are token-packed now; previously `budget=0` skipped packing entirely and
+`limit` had no ceiling. `limit` is capped at 100.
+
+**The hub's curation activity endpoint takes `?cursor`**, so failed jobs older than the
+newest page are reachable. A malformed cursor returns 400 rather than being ignored.
+
 ## Commands
 
 Set up and capture:
