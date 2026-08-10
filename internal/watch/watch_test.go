@@ -90,6 +90,73 @@ func TestRunPeriodicReconcile(t *testing.T) {
 	waitCall(t, calls, "second periodic reconcile")
 }
 
+// TestPeriodicTickIsCheapUntilTheFullInterval pins the split that keeps an idle laptop
+// cool. The safety tick has to stay frequent (a note that missed its file event must be
+// indexed before a reader gives up at the write-back bound), but only the occasional pass
+// may be authoritative, because that one parses and content-hashes every note in the
+// vault. Before the split, every tick did the expensive half: three idle daemons held
+// ~12% of a core between them on a 1216-note vault, forever, with nothing changing.
+func TestPeriodicTickIsCheapUntilTheFullInterval(t *testing.T) {
+	dir := t.TempDir()
+	type call struct{ authoritative bool }
+	calls := make(chan call, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, Options{
+		Root:          dir,
+		Debounce:      time.Hour, // isolate the tick from the event path
+		Reconcile:     20 * time.Millisecond,
+		FullReconcile: 400 * time.Millisecond,
+		OnReindex: func(authoritative bool) (Result, error) {
+			calls <- call{authoritative}
+			return Result{}, nil
+		},
+	})
+
+	// Startup is always authoritative: nothing is known about what changed while the
+	// watcher was not running.
+	select {
+	case c := <-calls:
+		if !c.authoritative {
+			t.Fatal("startup reconcile must be authoritative")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the startup reconcile")
+	}
+
+	// Every tick inside the full-reconcile window takes the cheap path. With a 20ms tick
+	// against a 400ms window there are many of them, so a single authoritative pass here
+	// would mean the expensive half is still running on the tick's cadence.
+	deadline := time.After(300 * time.Millisecond)
+	cheap := 0
+	for done := false; !done; {
+		select {
+		case c := <-calls:
+			if c.authoritative {
+				t.Fatalf("tick %d inside the full-reconcile window was authoritative", cheap+1)
+			}
+			cheap++
+		case <-deadline:
+			done = true
+		}
+	}
+	if cheap < 3 {
+		t.Fatalf("expected the safety tick to keep firing cheaply, got %d calls", cheap)
+	}
+
+	// Once the window elapses, exactly one pass escalates.
+	for {
+		select {
+		case c := <-calls:
+			if c.authoritative {
+				return // the escalation happened
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("the authoritative pass never ran after the full-reconcile interval")
+		}
+	}
+}
+
 func TestRunIgnoresNonMarkdown(t *testing.T) {
 	dir := t.TempDir()
 	calls := make(chan struct{}, 64)

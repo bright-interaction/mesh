@@ -442,12 +442,13 @@ func (s *Server) reconcileThrottled(ctx context.Context, remote bool) (index.Rec
 // Watch live-reindexes the vault in the background until ctx is cancelled, so a
 // long-running agent session sees notes a human edits in their editor without a
 // restart. logf must write to stderr: stdout carries the JSON-RPC stream.
-func (s *Server) Watch(ctx context.Context, debounce, reconcile time.Duration, logf func(string, ...any)) error {
+func (s *Server) Watch(ctx context.Context, debounce, reconcile, fullReconcile time.Duration, logf func(string, ...any)) error {
 	return watch.Run(ctx, watch.Options{
-		Root:      s.vaultRoot,
-		Debounce:  debounce,
-		Reconcile: reconcile,
-		Logf:      logf,
+		Root:          s.vaultRoot,
+		Debounce:      debounce,
+		Reconcile:     reconcile,
+		FullReconcile: fullReconcile,
+		Logf:          logf,
 		OnReindex: func(authoritative bool) (watch.Result, error) {
 			rec, err := s.reconcileOnce(authoritative)
 			if err != nil {

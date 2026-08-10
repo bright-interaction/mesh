@@ -38,15 +38,35 @@ type Result struct {
 
 // Options configure a watch run.
 type Options struct {
-	Root      string                                   // vault root to watch
-	Debounce  time.Duration                            // quiet window to coalesce a save burst; <=0 uses the default
-	Reconcile time.Duration                            // periodic safety-net interval; <=0 disables the tick
-	OnReindex func(authoritative bool) (Result, error) // drift-check + reindex, single-flight; authoritative=false on a debounced change (mtime fast path ok), true on startup + the periodic safety tick (full hash check)
-	Logf      func(string, ...any)                     // progress sink; nil is silent
-	Trigger   <-chan struct{}                          // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
+	Root          string                                   // vault root to watch
+	Debounce      time.Duration                            // quiet window to coalesce a save burst; <=0 uses the default
+	Reconcile     time.Duration                            // periodic safety-net interval; <=0 disables the tick
+	FullReconcile time.Duration                            // how often the periodic tick escalates to the authoritative full-hash pass; <=0 uses the default
+	OnReindex     func(authoritative bool) (Result, error) // drift-check + reindex, single-flight; authoritative=false on a debounced change and on a plain safety tick (mtime fast path), true on startup + the periodic FULL pass (hash check)
+	Logf          func(string, ...any)                     // progress sink; nil is silent
+	Trigger       <-chan struct{}                          // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
 }
 
 const defaultDebounce = 300 * time.Millisecond
+
+// DefaultFullReconcile is how often the safety tick runs the AUTHORITATIVE pass, which
+// parses and content-hashes every note in the vault. The tick itself has to stay frequent
+// (a note that missed its file event must be indexed before a reader gives up at
+// mcp.OwnerIndexBound), but the expensive half does not: the cheap mtime pass already
+// catches every added, removed and normally-edited file, and it costs one stat per note
+// instead of a parse.
+//
+// Running BOTH halves on the same short interval is what made an idle laptop hot. Measured
+// 2026-08-10 on a 1216-note vault: `mesh sync --watch` burned 5.6% of a core doing nothing
+// but re-parsing an unchanged vault every 8s, and each `mesh mcp --watch` (one per open
+// agent session) another ~2.8%, so three idle daemons held ~12% of a core between them
+// around the clock.
+//
+// What the longer interval actually costs: the ONLY drift the mtime pass cannot see is a
+// content change that leaves mtime untouched (a mtime-preserving write, or a second edit
+// inside the same one-second mtime granularity). That case now converges within
+// defaultFullReconcile instead of within Reconcile. Everything else is unchanged.
+const DefaultFullReconcile = 5 * time.Minute
 
 // Run watches opt.Root until ctx is cancelled, calling opt.OnReindex whenever
 // the vault changes (debounced) and on a periodic safety tick. It reconciles
@@ -58,6 +78,9 @@ func Run(ctx context.Context, opt Options) error {
 	}
 	if opt.Debounce <= 0 {
 		opt.Debounce = defaultDebounce
+	}
+	if opt.FullReconcile <= 0 {
+		opt.FullReconcile = DefaultFullReconcile
 	}
 	logf := opt.Logf
 	if logf == nil {
@@ -73,8 +96,10 @@ func Run(ctx context.Context, opt Options) error {
 		return err
 	}
 
-	// Reflect disk from the moment we start (bootstraps an empty index too).
-	reconcile(opt, logf, "startup")
+	// Reflect disk from the moment we start (bootstraps an empty index too). Startup is
+	// always authoritative: nothing is known about what changed while we were not running.
+	reconcile(opt, logf, "startup", true)
+	lastFull := time.Now()
 
 	// Debounce timer, created stopped: armed only once an event arrives.
 	debounce := time.NewTimer(opt.Debounce)
@@ -126,22 +151,27 @@ func Run(ctx context.Context, opt Options) error {
 			// unless a caller wired one in.
 			resetTimer(debounce, opt.Debounce)
 		case <-debounce.C:
-			reconcile(opt, logf, "change")
+			reconcile(opt, logf, "change", false)
 		case <-tick:
-			// Safety net: the authoritative content-hash reconcile catches
-			// anything the event stream missed (a dropped event, a same-second
-			// rename). With no real edits it is a fast drift check that finds
-			// nothing and rebuilds nothing.
-			reconcile(opt, logf, "reconcile")
+			// Safety net: catches anything the event stream missed (a dropped event,
+			// a same-second rename, a note written before our watches were in place).
+			// The cheap mtime pass sees all of those, so it runs on every tick; the
+			// authoritative content-hash pass, which parses the whole vault, runs only
+			// once per FullReconcile. See DefaultFullReconcile for why the two cadences
+			// are separate.
+			full := time.Since(lastFull) >= opt.FullReconcile
+			if full {
+				lastFull = time.Now()
+			}
+			reconcile(opt, logf, "reconcile", full)
 		}
 	}
 }
 
-func reconcile(opt Options, logf func(string, ...any), reason string) {
-	// A debounced local change can use the mtime fast path; startup and the periodic
-	// safety tick run an authoritative full hash check so a mtime-preserving edit (or
-	// any missed event) is always caught.
-	authoritative := reason != "change"
+// reconcile runs one drift-check + reindex. authoritative selects the content-hash pass
+// (parses every note) over the mtime fast path (one stat per note); the caller decides,
+// because the choice is a cadence question, not a property of the reason.
+func reconcile(opt Options, logf func(string, ...any), reason string, authoritative bool) {
 	res, err := opt.OnReindex(authoritative)
 	if err != nil {
 		logf("reindex failed (%s): %v", reason, err)

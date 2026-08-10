@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/mcp"
+	"github.com/bright-interaction/mesh/internal/watch"
 	"github.com/spf13/cobra"
 )
 
@@ -48,6 +49,37 @@ func TestOwningWritersUseTheLocalSweepDefault(t *testing.T) {
 		if f.DefValue != want {
 			t.Errorf("%s --reconcile defaults to %s, want %s (the sweep under the write-back bound)", tc.name, f.DefValue, want)
 		}
+	}
+}
+
+// TestOwningWritersShareTheFullReconcileCadence: the cheap sweep and the authoritative
+// content-hash pass are two different cadences on one ticker, and the expensive one is
+// what heats an idle laptop. All three owning writers must expose it and default it the
+// same way, for the same reason the sweep default is pinned above: `mesh mcp --watch`
+// runs once per open agent session, so a command that quietly kept the old
+// every-tick-is-authoritative behaviour would put the cost straight back.
+func TestOwningWritersShareTheFullReconcileCadence(t *testing.T) {
+	want := watch.DefaultFullReconcile.String()
+	for _, tc := range []struct {
+		name string
+		cmd  func() *cobra.Command
+	}{
+		{"mesh watch", watchCmd},
+		{"mesh mcp", mcpCmd},
+		{"mesh sync", syncCmd},
+	} {
+		f := tc.cmd().Flags().Lookup("full-reconcile")
+		if f == nil {
+			t.Fatalf("%s has no --full-reconcile flag, so its authoritative pass is not tunable", tc.name)
+		}
+		if f.DefValue != want {
+			t.Errorf("%s --full-reconcile defaults to %s, want %s", tc.name, f.DefValue, want)
+		}
+	}
+	if watch.DefaultFullReconcile <= defaultLocalReconcile {
+		t.Fatalf("the authoritative pass (%s) is no cheaper than the sweep (%s); the whole point of "+
+			"separating them is that parsing every note does not belong on the sweep's cadence",
+			watch.DefaultFullReconcile, defaultLocalReconcile)
 	}
 }
 

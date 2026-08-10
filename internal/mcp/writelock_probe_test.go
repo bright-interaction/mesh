@@ -151,7 +151,7 @@ func runProbeArm(t *testing.T, arm string, windowsWritable bool) probeResult {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				_ = srv.Watch(ctx, 50*time.Millisecond, 150*time.Millisecond, func(string, ...any) {})
+				_ = srv.Watch(ctx, 50*time.Millisecond, 150*time.Millisecond, 300*time.Millisecond, func(string, ...any) {})
 			}()
 			t.Cleanup(func() { cancel(); <-done; srv.Close() })
 			windows = append(windows, srv)

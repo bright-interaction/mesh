@@ -39,7 +39,11 @@ func startOwnerWith(t *testing.T, dir string, debounce, reconcile time.Duration)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = owner.Watch(ctx, debounce, reconcile, func(string, ...any) {})
+		// A full-reconcile interval far longer than the test proves the point the
+		// write-back bound actually rests on: the CHEAP mtime sweep is what has to pick
+		// up a note that missed its file event. If indexing here depended on the
+		// authoritative content-hash pass, this would hang.
+		_ = owner.Watch(ctx, debounce, reconcile, time.Hour, func(string, ...any) {})
 	}()
 	t.Cleanup(func() {
 		cancel()

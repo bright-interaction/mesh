@@ -1527,7 +1527,7 @@ func mcpCmd() *cobra.Command {
 	var vaultDir string
 	var doWatch bool
 	var httpAddr, httpToken string
-	var debounce, reconcile time.Duration
+	var debounce, reconcile, fullReconcile time.Duration
 	c := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve the agent retrieval contract over MCP (JSON-RPC on stdio, or HTTP with --http)",
@@ -1539,7 +1539,7 @@ func mcpCmd() *cobra.Command {
 			}
 			defer srv.Close()
 			if httpAddr != "" {
-				return serveMCPHTTP(srv, httpAddr, httpToken, doWatch, debounce, reconcile)
+				return serveMCPHTTP(srv, httpAddr, httpToken, doWatch, debounce, reconcile, fullReconcile)
 			}
 			if !doWatch {
 				return srv.ServeStdio()
@@ -1555,7 +1555,7 @@ func mcpCmd() *cobra.Command {
 				logf := func(format string, a ...any) {
 					fmt.Fprintf(os.Stderr, "mesh watch: "+format+"\n", a...)
 				}
-				if err := srv.Watch(ctx, debounce, reconcile, logf); err != nil {
+				if err := srv.Watch(ctx, debounce, reconcile, fullReconcile, logf); err != nil {
 					fmt.Fprintf(os.Stderr, "mesh watch: %v\n", err)
 				}
 			}()
@@ -1570,13 +1570,14 @@ func mcpCmd() *cobra.Command {
 	c.Flags().StringVar(&httpAddr, "http", "", "serve MCP over HTTP at host:port (POST /mcp) instead of stdio")
 	c.Flags().StringVar(&httpToken, "token", "", "bearer token for --http (or MESH_MCP_TOKEN); REQUIRED when binding beyond loopback")
 	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
-	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic full-reconcile safety net (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
+	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic reconcile safety net (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
+	c.Flags().DurationVar(&fullReconcile, "full-reconcile", watch.DefaultFullReconcile, "how often the safety net escalates to the authoritative content-hash pass over every note")
 	return c
 }
 
 // serveMCPHTTP serves the MCP server over HTTP (POST /mcp). Fail-closed: a
 // non-loopback bind REQUIRES a bearer token. Optionally runs the background watcher.
-func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, reconcile time.Duration) error {
+func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, reconcile, fullReconcile time.Duration) error {
 	if token == "" {
 		token = os.Getenv("MESH_MCP_TOKEN")
 	}
@@ -1588,7 +1589,7 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 		defer cancel()
 		go func() {
 			logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, "mesh watch: "+format+"\n", a...) }
-			_ = srv.Watch(ctx, debounce, reconcile, logf)
+			_ = srv.Watch(ctx, debounce, reconcile, fullReconcile, logf)
 		}()
 	}
 	mux := http.NewServeMux()
@@ -1642,9 +1643,13 @@ func addrIsLoopback(addr string) bool {
 // bound. It sat at 30s against a 10s bound, so that whole 20s window reported a durable,
 // perfectly fine note as owner_down.
 //
-// The tick is an authoritative content-hash pass over the vault, so this is not free; it
-// is the cost of the bound being true rather than aspirational. TestLocalSweepStaysUnder
-// TheWriteBackBound pins the relationship so it cannot drift apart again.
+// The tick used to be an authoritative content-hash pass over the whole vault, which made
+// the bound honest but cost 5.6% of a core on an idle 1216-note vault, times one daemon
+// per open agent session. It is now the mtime pass (one stat per note), which still sees
+// every added, removed and normally-edited file, so the bound holds for the cases that
+// motivated it; the content-hash pass moved to watch.DefaultFullReconcile.
+// TestLocalSweepStaysUnderTheWriteBackBound pins the relationship so it cannot drift apart
+// again.
 const defaultLocalReconcile = 8 * time.Second
 
 // defaultHubSync is how often `mesh sync --watch` talks to the hub when nothing local
@@ -1654,7 +1659,7 @@ const defaultLocalReconcile = 8 * time.Second
 const defaultHubSync = 60 * time.Second
 
 func watchCmd() *cobra.Command {
-	var debounce, reconcile time.Duration
+	var debounce, reconcile, fullReconcile time.Duration
 	c := &cobra.Command{
 		Use:   "watch [vault]",
 		Short: "Watch the vault and live-reindex on every change (local-first immediacy)",
@@ -1681,10 +1686,11 @@ func watchCmd() *cobra.Command {
 			// only changed files and rebuild the graph in memory.
 			live := index.NewLiveIndexer(store, root)
 			err = watch.Run(ctx, watch.Options{
-				Root:      root,
-				Debounce:  debounce,
-				Reconcile: reconcile,
-				Logf:      logf,
+				Root:          root,
+				Debounce:      debounce,
+				Reconcile:     reconcile,
+				FullReconcile: fullReconcile,
+				Logf:          logf,
 				OnReindex: func(authoritative bool) (watch.Result, error) {
 					rec, err := live.Reconcile(authoritative)
 					if err != nil {
@@ -1704,7 +1710,8 @@ func watchCmd() *cobra.Command {
 		},
 	}
 	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
-	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic full-reconcile safety net (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
+	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic reconcile safety net (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
+	c.Flags().DurationVar(&fullReconcile, "full-reconcile", watch.DefaultFullReconcile, "how often the safety net escalates to the authoritative content-hash pass over every note")
 	return c
 }
 func joinCmd() *cobra.Command {
@@ -1744,7 +1751,7 @@ func joinCmd() *cobra.Command {
 
 func syncCmd() *cobra.Command {
 	var doWatch bool
-	var debounce, reconcile, hubInterval time.Duration
+	var debounce, reconcile, fullReconcile, hubInterval time.Duration
 	c := &cobra.Command{
 		Use:   "sync [vault]",
 		Short: "Reconcile the vault with the hub (push local edits, pull teammates', no git)",
@@ -1832,11 +1839,12 @@ func syncCmd() *cobra.Command {
 				}
 			}()
 			err = watch.Run(ctx, watch.Options{
-				Root:      vaultDir,
-				Debounce:  debounce,
-				Reconcile: reconcile,
-				Trigger:   nudge,
-				Logf:      logf,
+				Root:          vaultDir,
+				Debounce:      debounce,
+				Reconcile:     reconcile,
+				FullReconcile: fullReconcile,
+				Trigger:       nudge,
+				Logf:          logf,
 				OnReindex: func(authoritative bool) (watch.Result, error) {
 					// Note: applying the hub's deltas writes .md files, which the
 					// watcher sees and debounces into one more reconcile. That follow-up
@@ -1870,6 +1878,7 @@ func syncCmd() *cobra.Command {
 	c.Flags().BoolVar(&doWatch, "watch", false, "stay running: push local edits and pull hub changes in real time (SSE) plus a periodic safety reconcile")
 	c.Flags().DurationVar(&debounce, "debounce", 500*time.Millisecond, "quiet window to coalesce a burst of local saves before syncing")
 	c.Flags().DurationVar(&reconcile, "reconcile", defaultLocalReconcile, "periodic LOCAL reconcile interval (0 to disable); keep it under the write-back bound so a note that missed its file event is still indexed in time")
+	c.Flags().DurationVar(&fullReconcile, "full-reconcile", watch.DefaultFullReconcile, "how often the safety net escalates to the authoritative content-hash pass over every note")
 	c.Flags().DurationVar(&hubInterval, "hub-interval", defaultHubSync, "how often the periodic tick also syncs with the hub (local edits and SSE nudges always sync immediately)")
 	return c
 }
