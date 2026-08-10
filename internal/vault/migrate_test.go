@@ -225,3 +225,115 @@ func TestBackfillBodyFile(t *testing.T) {
 		}
 	})
 }
+
+// TestBackfillBodyFileRepairsReferencePages covers the shape that produced 18 dead bodies
+// in the live vault: an agent writes an entity through mesh_write_entity, the page's whole
+// substance lands in frontmatter `why`, and the body stays a TODO skeleton whose Related
+// section DESCRIBES the links instead of listing them. Nothing was empty, so lint stayed
+// at zero notices and nothing ever pointed at them.
+func TestBackfillBodyFileRepairsReferencePages(t *testing.T) {
+	entity := "---\nid: e\ntype: entity\ntitle: E\nrelated:\n  - other-note\nwhy: WHAT-THIS-IS\n---\n\n# E\n\n" + tmplEntity
+
+	t.Run("fills an entity from why and renders its links", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "e.md")
+		os.WriteFile(p, []byte(entity), 0o644)
+		res, err := BackfillBodyFile(p, false)
+		if err != nil || !res.Changed {
+			t.Fatalf("Changed=%v err=%v", res.Changed, err)
+		}
+		out, _ := os.ReadFile(p)
+		_, body, _ := SplitFrontmatter(string(out))
+		if !strings.Contains(body, "## What it does\nWHAT-THIS-IS") {
+			t.Errorf("entity body did not take its prose from why:\n%s", body)
+		}
+		if !strings.Contains(body, "- [[other-note]]") {
+			t.Errorf("entity Related still describes its links instead of listing them:\n%s", body)
+		}
+		// The sections with no field behind them keep their prompt rather than a guess.
+		if !strings.Contains(body, "## Key facts\n<!-- TODO") {
+			t.Errorf("a section with no source field should keep its TODO prompt:\n%s", body)
+		}
+	})
+
+	t.Run("create-time and repair-time agree", func(t *testing.T) {
+		// The two paths had no reason to produce the same bytes, and a projection that
+		// only ran at create time is why the live pages never healed.
+		fm := &Frontmatter{ID: "e", Type: TypeEntity, Title: "E", Why: "WHAT-THIS-IS", Related: StringList{"other-note"}}
+		created := renderBody(fm)
+
+		p := filepath.Join(t.TempDir(), "e.md")
+		os.WriteFile(p, []byte(entity), 0o644)
+		BackfillBodyFile(p, false)
+		out, _ := os.ReadFile(p)
+		_, withTitle, _ := SplitFrontmatter(string(out))
+		// SplitFrontmatter's body keeps the "# Title" heading; renderBody starts below it.
+		repaired := strings.TrimPrefix(strings.TrimSpace(withTitle), "# E")
+
+		if strings.TrimSpace(created) != strings.TrimSpace(repaired) {
+			t.Errorf("create-time and repair-time bodies differ:\ncreated:\n%s\nrepaired:\n%s", created, repaired)
+		}
+	})
+
+	t.Run("fills a plain note from why/do/dont", func(t *testing.T) {
+		note := "---\nid: n\ntype: note\ntitle: N\ndo: DO-THIS\ndont: NOT-THIS\nwhy: BECAUSE\n---\n\n# N\n\n" + tmplNote
+		p := filepath.Join(t.TempDir(), "n.md")
+		os.WriteFile(p, []byte(note), 0o644)
+		if _, err := BackfillBodyFile(p, false); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := os.ReadFile(p)
+		_, body, _ := SplitFrontmatter(string(out))
+		for _, want := range []string{"## Overview\nBECAUSE", "## Do\nDO-THIS", "## Don't\nNOT-THIS"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("note body missing %q:\n%s", want, body)
+			}
+		}
+	})
+
+	t.Run("added sections land before the closing Related list", func(t *testing.T) {
+		// tmplNote ends with Related, so a naive append put the note's own Do and Don't
+		// AFTER its link list: Overview, Related, Do, Don't.
+		note := "---\nid: n\ntype: note\ntitle: N\nrelated:\n  - other-note\ndo: DO-THIS\ndont: NOT-THIS\nwhy: BECAUSE\n---\n\n# N\n\n" + tmplNote
+		p := filepath.Join(t.TempDir(), "n.md")
+		os.WriteFile(p, []byte(note), 0o644)
+		if _, err := BackfillBodyFile(p, false); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := os.ReadFile(p)
+		var order []string
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.HasPrefix(line, "## ") {
+				order = append(order, strings.TrimPrefix(line, "## "))
+			}
+		}
+		want := []string{"Overview", "Do", "Don't", "Related"}
+		if strings.Join(order, ",") != strings.Join(want, ",") {
+			t.Errorf("section order is %v, want %v:\n%s", order, want, out)
+		}
+	})
+
+	t.Run("is idempotent on a reference page", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "e.md")
+		os.WriteFile(p, []byte(entity), 0o644)
+		BackfillBodyFile(p, false)
+		first, _ := os.ReadFile(p)
+		res, _ := BackfillBodyFile(p, false)
+		second, _ := os.ReadFile(p)
+		if res.Changed || string(first) != string(second) {
+			t.Errorf("second run changed the file (Changed=%v)", res.Changed)
+		}
+	})
+
+	t.Run("leaves an empty scaffold alone", func(t *testing.T) {
+		// `mesh new entity` writes no why at all. There is nothing to project, and
+		// inventing one is the failure this whole area exists to avoid.
+		empty := "---\nid: e\ntype: entity\ntitle: E\n---\n\n# E\n\n" + tmplEntity
+		p := filepath.Join(t.TempDir(), "e.md")
+		os.WriteFile(p, []byte(empty), 0o644)
+		res, _ := BackfillBodyFile(p, false)
+		out, _ := os.ReadFile(p)
+		if res.Changed || string(out) != empty {
+			t.Errorf("an unauthored scaffold must be left exactly as written (Changed=%v)", res.Changed)
+		}
+	})
+}

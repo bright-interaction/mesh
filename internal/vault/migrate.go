@@ -221,8 +221,12 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 // scaffold.go), so a repaired note converges on exactly the body CreateNote would have
 // written today instead of drifting into a second, hand-maintained mapping.
 //
-// Only decision/gotcha/post-mortem are fed by do/dont/why (bodySections returns nil for
-// every other type, so BackfillBodyFile is a no-op there). Within those, a section is only
+// Two mappings feed it. bodySections covers decision/gotcha/post-mortem, whose do/dont/why
+// come from the author. referenceSections covers entity and note, where a HUMAN scaffold
+// has no such fields but an AGENT write (mesh_write_entity, mesh_append_note) does: those
+// pages were a silent no-op here until 2026-08-10, so 18 of them in the live vault kept a
+// pure TODO skeleton with their whole substance sitting in frontmatter. Within either
+// mapping, a section is only
 // touched when its body content is STILL the placeholder comment verbatim AND the mapped
 // frontmatter field has real content (Unfilled decides "real" the same way lint and the
 // scaffold do). An author who already replaced a placeholder with their own prose keeps it
@@ -248,9 +252,38 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 	res := &MigrateResult{Path: path}
 	sections := bodySections(fm.Type)
 	if sections == nil {
-		return res, nil // not a flywheel type: body is not fed by do/dont/why
+		// Not a flywheel type. A reference page (entity, note) is not fed by do/dont/why
+		// when a HUMAN scaffolds it, but an agent writing one through mesh_write_entity /
+		// mesh_append_note does supply that prose, and it landed in frontmatter with the
+		// body left as a pure TODO skeleton on 18 pages in the live vault.
+		sections = referenceSections(fm.Type)
+	}
+	if sections == nil {
+		return res, nil // nothing in frontmatter maps to this type's body
 	}
 
+	newBody, filled := fillBodySections(body, fm, sections)
+	if len(filled) == 0 {
+		return res, nil // idempotent no-op
+	}
+	res.Changed = true
+	res.Actions = append(res.Actions, "filled body section(s): "+strings.Join(filled, ", "))
+	if dryRun {
+		return res, nil
+	}
+	out := "---\n" + fmText + "\n---\n" + newBody
+	if err := writeNoteChecked(path, out); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// fillBodySections projects each section's mapped frontmatter field into the body, and
+// reports which headings it touched. It is shared by the create path (renderBody) and the
+// backfill (BackfillBodyFile) so a page written today and a page repaired years later end
+// up byte-identical; they had no reason to agree before, and a projection that only ran at
+// create time is exactly how 18 live pages kept a skeleton body forever.
+func fillBodySections(body string, fm *Frontmatter, sections []bodySection) (string, []string) {
 	newBody := body
 	var filled []string
 	for _, s := range sections {
@@ -287,19 +320,7 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 			filled = append(filled, s.heading)
 		}
 	}
-	if len(filled) == 0 {
-		return res, nil // idempotent no-op
-	}
-	res.Changed = true
-	res.Actions = append(res.Actions, "filled body section(s): "+strings.Join(filled, ", "))
-	if dryRun {
-		return res, nil
-	}
-	out := "---\n" + fmText + "\n---\n" + newBody
-	if err := writeNoteChecked(path, out); err != nil {
-		return nil, err
-	}
-	return res, nil
+	return newBody, filled
 }
 
 // retiredPlaceholders are placeholder texts a template USED to emit for a heading. A note
@@ -307,22 +328,74 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 // reads as authored prose and is skipped forever, so the backfill would quietly miss
 // exactly the notes that need it most: the oldest ones.
 var retiredPlaceholders = map[string][]string{
-	"Related": {"<!-- linked notes from the related: field render in the graph -->"},
+	"Related": {
+		"<!-- linked notes from the related: field render in the graph -->",
+		// The entity/concept templates word their Related prompt differently, so without
+		// this every entity page kept the prompt instead of its links.
+		"<!-- link the concepts it uses and the decisions that shaped it: `[[note-id]]` (also fill related: above) -->",
+		"<!-- `[[note-id]]` -->",
+	},
 }
 
 // appendSection adds a heading the note never had. It goes at the end of the body but
 // BEFORE any trailing provenance comment (<!-- authored by ... -->), which every
 // scaffolded note carries as its last line; appending past the signature would read as an
 // afterthought bolted on rather than part of the note.
+//
+// It also lands before a trailing "## Related", because Related is the note's closing
+// link list in every template and a section bolted on after it reads as an appendix to the
+// links rather than part of the note. Without this a repaired plain note came out
+// Overview, Related, Do, Don't.
 func appendSection(body, heading, content string) string {
 	section := "## " + heading + "\n" + content + "\n"
 	trimmed := strings.TrimRight(body, "\n")
-	if i := strings.LastIndex(trimmed, "\n<!--"); i >= 0 && strings.HasSuffix(trimmed, "-->") {
-		head := strings.TrimRight(trimmed[:i], "\n")
-		tail := trimmed[i+1:]
-		return head + "\n\n" + section + "\n" + tail + "\n"
+
+	// Match the provenance line specifically, not any trailing comment: a template's last
+	// line is often a placeholder comment (tmplNote closes on the Related prompt), and
+	// treating that as the signature tore the Related section in half.
+	tail := ""
+	if i := strings.LastIndex(trimmed, "\n"+provenancePrefix); i >= 0 && strings.HasSuffix(trimmed, "-->") {
+		tail = trimmed[i+1:]
+		trimmed = strings.TrimRight(trimmed[:i], "\n")
 	}
-	return trimmed + "\n\n" + section
+	if i := lastTrailingRelated(trimmed); i >= 0 {
+		head := strings.TrimRight(trimmed[:i], "\n")
+		rel := strings.TrimRight(trimmed[i:], "\n")
+		trimmed = head + "\n\n" + strings.TrimRight(section, "\n") + "\n\n" + rel
+		section = ""
+	}
+	out := trimmed
+	if section != "" {
+		out = trimmed + "\n\n" + strings.TrimRight(section, "\n")
+	}
+	if tail != "" {
+		return out + "\n\n" + tail + "\n"
+	}
+	return out + "\n"
+}
+
+// provenancePrefix opens the "<!-- authored by X -->" line renderNote closes every
+// scaffolded note with.
+const provenancePrefix = "<!-- authored by "
+
+// lastTrailingRelated returns the byte offset of a "## Related" heading that is the LAST
+// section of body, or -1. A Related section with other headings after it is not the
+// closing link list, so it is left alone.
+func lastTrailingRelated(body string) int {
+	i := strings.LastIndex(body, "\n## Related\n")
+	if i < 0 {
+		if strings.HasPrefix(body, "## Related\n") {
+			i = 0
+		} else {
+			return -1
+		}
+	} else {
+		i++ // skip the leading newline
+	}
+	if strings.Contains(body[i+len("## Related\n"):], "\n## ") {
+		return -1
+	}
+	return i
 }
 
 // noFrontmatterErr names which of the two shapes a had=false file actually is. They need

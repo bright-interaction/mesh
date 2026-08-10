@@ -344,7 +344,14 @@ func renderBody(fm *Frontmatter) string {
 	if sections := bodySections(fm.Type); sections != nil {
 		return renderSections(fm, sections)
 	}
-	return bodyTemplate(fm.Type)
+	body := bodyTemplate(fm.Type)
+	// A reference page keeps its full skeleton (its extra prompts are the point), but any
+	// heading that DOES have a frontmatter field behind it gets the prose instead of the
+	// prompt. Same helper the backfill uses, so create-time and repair-time agree.
+	if sections := referenceSections(fm.Type); sections != nil {
+		body, _ = fillBodySections(body, fm, sections)
+	}
+	return body
 }
 
 func bodyTemplate(t NoteType) string {
@@ -423,6 +430,38 @@ func bodySections(t NoteType) []bodySection {
 			{"Impact", "<!-- TODO: who or what was affected and for how long -->", fieldDont},
 			{"Root cause", "<!-- TODO: the underlying cause, not just the trigger -->", fieldWhy},
 			{"Follow-ups", "<!-- TODO: concrete actions, owners, dates -->", fieldDo},
+			relatedSection,
+		}
+	default:
+		return nil
+	}
+}
+
+// referenceSections maps frontmatter onto the body of a REFERENCE page (entity, note).
+// These types are not fed by do/dont/why when a human scaffolds one with `mesh new`, which
+// is why they are absent from bodySections and keep their type-specific skeleton. But an
+// agent writing one through mesh_write_entity supplies the page's substance as `why`, and
+// mesh_append_note carries do/dont/why on a plain note, so for those the prose exists and
+// simply never reached the body: 18 pages in the live vault (11 entities, 7 notes) held
+// full frontmatter and a body of nothing but TODO comments, with their related: links
+// described rather than rendered.
+//
+// Only headings with a field to source them from appear here. The rest of each template
+// (an entity's "How it works" and "Key facts", the "**One-liner.**" lead) has no
+// corresponding field and keeps its TODO prompt, the same honest gap post-mortem's
+// "What happened" keeps: a prompt for a human beats a heading filled with a guess.
+func referenceSections(t NoteType) []bodySection {
+	switch t {
+	case TypeEntity:
+		return []bodySection{
+			{"What it does", "<!-- TODO: the core function, plainly -->", fieldWhy},
+			relatedSection,
+		}
+	case TypeNote:
+		return []bodySection{
+			{"Overview", "<!-- TODO: the substance of this note -->", fieldWhy},
+			{"Do", "<!-- TODO: what to do, concretely -->", fieldDo},
+			{"Don't", "<!-- TODO: what to avoid, and why -->", fieldDont},
 			relatedSection,
 		}
 	default:
