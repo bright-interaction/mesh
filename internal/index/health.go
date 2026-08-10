@@ -130,6 +130,11 @@ func (s *Store) ScanHealth(vaultRoot string, now time.Time) ([]HealthFinding, er
 				if seen[ref] || ref == n.path {
 					continue
 				}
+				// A path the author declared synthetic. Per-ref rather than per-note, so
+				// the rest of this note's references stay checked.
+				if vault.ExemptsDeadRef(n.expectDeadRefPaths, ref) {
+					continue
+				}
 				seen[ref] = true
 				if !codeFileKnown(codeFiles, ref) {
 					// Candidate only. The index may simply be behind the tree, so this is
@@ -365,6 +370,7 @@ func (s *Store) HealthCounts() (map[string]int, error) {
 type noteRow struct {
 	id, path, reviewBy string
 	expectDeadRefs     bool
+	expectDeadRefPaths []string
 }
 
 func (s *Store) noteList() ([]noteRow, error) {
@@ -383,12 +389,14 @@ func (s *Store) noteList() ([]noteRow, error) {
 		// Frontmatter is stored as JSON, so read the one flag rather than unmarshalling
 		// the whole struct for every note on every health run.
 		var fmFlags struct {
-			ExpectDeadRefs bool `json:"ExpectDeadRefs"`
+			ExpectDeadRefs     bool     `json:"ExpectDeadRefs"`
+			ExpectDeadRefPaths []string `json:"ExpectDeadRefPaths"`
 		}
 		if fmJSON != "" {
 			_ = json.Unmarshal([]byte(fmJSON), &fmFlags)
 		}
 		n.expectDeadRefs = fmFlags.ExpectDeadRefs
+		n.expectDeadRefPaths = fmFlags.ExpectDeadRefPaths
 		out = append(out, n)
 	}
 	return out, rows.Err()

@@ -60,6 +60,19 @@ func (s *StringList) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// ExemptsDeadRef reports whether ref is one of the paths a note declared synthetic in
+// `expect_dead_ref_paths`. Both sides get the same "./" trim the dead-ref scanner applies to
+// what it finds, so an author can paste a reported path straight back into the list.
+func ExemptsDeadRef(paths []string, ref string) bool {
+	ref = strings.TrimLeft(strings.TrimSpace(ref), "./")
+	for _, p := range paths {
+		if strings.TrimLeft(strings.TrimSpace(p), "./") == ref {
+			return true
+		}
+	}
+	return false
+}
+
 // Frontmatter is the whitelisted view of a note's YAML header. Raw YAML is
 // never spread into storage; only known keys are kept (the JSONB house rule).
 type Frontmatter struct {
@@ -79,7 +92,24 @@ type Frontmatter struct {
 	// are meant to be gone, so dead_ref would flag it forever and correctly. Six such
 	// notes (retired services, an old audit) were permanently red, and a health check
 	// with permanent known-good findings is one people learn to skim past.
-	ExpectDeadRefs bool       `yaml:"expect_dead_refs,omitempty"`
+	ExpectDeadRefs bool `yaml:"expect_dead_refs,omitempty"`
+	// ExpectDeadRefPaths exempts individual paths instead of the whole note, for a note that
+	// merely QUOTES a path that never existed: a fabricated stack frame inside a test
+	// narrative, an illustrative filename in an example. Nothing in such a path tells it
+	// apart from a real file that got deleted, so the author is the only one who can say.
+	// Both live cases were a single synthetic frame in prose on a page citing dozens of real
+	// files, so ExpectDeadRefs would have switched the check off exactly where it earns the
+	// most, while leaving them meant the count could never read zero and a genuine new dead
+	// ref had to be spotted against a permanently non-zero baseline.
+	//
+	// This is a SEPARATE key rather than a list shape on expect_dead_refs, and that is the
+	// whole point: frontmatter is read by long-running daemons and a synced hub that are
+	// routinely a binary behind, and yaml.v3 ignores a key it does not know but REFUSES a
+	// known key of the wrong type. Overloading expect_dead_refs was tried first and made
+	// both notes unparseable to every reader still on the old binary, which drops a note
+	// from search and the graph entirely: `[[flare]]` stopped resolving across 88 links
+	// until the shape was moved here. An unknown key degrades to a stale finding instead.
+	ExpectDeadRefPaths StringList `yaml:"expect_dead_ref_paths,omitempty"`
 	Supersedes     StringList `yaml:"supersedes,omitempty"`
 	Severity       string     `yaml:"severity,omitempty"`
 	Role           string     `yaml:"role,omitempty"`

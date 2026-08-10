@@ -6,6 +6,7 @@ package vault
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -97,11 +98,12 @@ func TestMigrateReportsFlywheelTODOs(t *testing.T) {
 
 func TestBackfillRelatedFile(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		content    string
-		related    []string
-		wantChange bool
-		wantHas    []string
+		name        string
+		content     string
+		related     []string
+		wantChange  bool
+		wantHas     []string
+		wantRelated []string // what the note's related: must decode to after the rewrite
 	}{
 		{
 			name:       "adds links to a note with none",
@@ -116,6 +118,35 @@ func TestBackfillRelatedFile(t *testing.T) {
 			related:    []string{"derived"},
 			wantChange: false,
 			wantHas:    []string{"- mine"},
+		},
+		{
+			// The shape 1098 of the live vault's 1227 notes are in. A bare key parses to
+			// nil, not to an empty list, and reading it as "the author declared related"
+			// skipped every one of them: --wire-orphans reported "already declaring
+			// related" for notes whose related list did not exist.
+			name:        "a bare related: key is an empty scaffold, not a declaration",
+			content:     "---\nid: alpha\ntype: gotcha\nrelated:\ntags:\n    - mesh\n---\n# Alpha\nbody\n",
+			related:     []string{"beta", "gamma"},
+			wantChange:  true,
+			wantHas:     []string{"- beta", "- gamma"},
+			wantRelated: []string{"beta", "gamma"},
+		},
+		{
+			// The inverse, and the one the old condition got backwards: an explicit empty
+			// list IS a decision ("I looked, there are none") and must survive.
+			name:       "an explicit empty list is a decision and is left alone",
+			content:    "---\nid: alpha\ntype: gotcha\nrelated: []\n---\n# Alpha\n",
+			related:    []string{"derived"},
+			wantChange: false,
+			wantHas:    []string{"related: []"},
+		},
+		{
+			// A scalar we cannot interpret is still the author having written something.
+			name:       "a non-list related is left alone",
+			content:    "---\nid: alpha\ntype: gotcha\nrelated: mine\n---\n# Alpha\n",
+			related:    []string{"derived"},
+			wantChange: false,
+			wantHas:    []string{"related: mine"},
 		},
 		{
 			name:       "deduplicates and drops blanks",
@@ -154,8 +185,20 @@ func TestBackfillRelatedFile(t *testing.T) {
 			if !had {
 				t.Fatal("rewritten note lost its frontmatter block")
 			}
-			if _, _, err := ParseFrontmatter([]byte(fmStr)); err != nil {
+			fm, _, err := ParseFrontmatter([]byte(fmStr))
+			if err != nil {
 				t.Fatalf("rewritten frontmatter does not parse (index would drop the note): %v", err)
+			}
+			// Prepending a related: block to frontmatter that already carries a bare
+			// related: line yields two of them. YAML resolves that silently, so the note
+			// keeps parsing while the graph reads whichever copy the decoder kept.
+			if n := strings.Count("\n"+fmStr, "\nrelated:"); n > 1 {
+				t.Errorf("frontmatter declares related: %d times, want at most 1:\n%s", n, fmStr)
+			}
+			if tc.wantRelated != nil {
+				if got := []string(fm.Related); !slices.Equal(got, tc.wantRelated) {
+					t.Errorf("related = %v, want %v\n%s", got, tc.wantRelated, out)
+				}
 			}
 		})
 	}

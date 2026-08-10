@@ -181,12 +181,25 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 		return nil, err
 	}
 	res := &MigrateResult{Path: path}
+	// Anything the author actually wrote under `related` is the ground truth and a derived
+	// list must never overwrite it. That INCLUDES `related: []`, which is how a note records
+	// that its links were considered and there are none.
+	//
+	// A bare `related:` with nothing under it is not that. It parses to nil rather than to
+	// an empty list, so reading "declared" as "the key is present" got the two exactly
+	// backwards: the accidental empty key was treated as a deliberate decision, while the
+	// deliberate `related: []` was the one thing this would overwrite. 1098 of the live
+	// vault's 1227 notes carry the bare key, so the inversion did not skip a handful of
+	// notes, it skipped nearly every note `mesh structure --wire-orphans` exists to reach,
+	// and reported "already declaring related" about each one. Same nil-versus-empty trap as
+	// a zero-value pgtype.Text: absent and empty are different answers, and only one of
+	// them is a claim.
+	bareKey := false
 	if v, ok := raw["related"]; ok {
-		// Present but empty counts as "already handled": an empty list is how a note
-		// records that its links were considered and there are none.
-		if l, isList := v.([]any); !isList || len(l) > 0 {
+		if v != nil {
 			return res, nil
 		}
+		bareKey = true
 	}
 	var clean []string
 	seen := map[string]bool{}
@@ -209,11 +222,40 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 	for _, r := range clean {
 		b.WriteString("    - " + r + "\n")
 	}
-	out := "---\n" + b.String() + fmText + "\n---\n" + body
+	// The new block is PREPENDED, so the bare key it replaces has to go or the note ends up
+	// declaring `related` twice. That is not cosmetic: yaml.v3 rejects a duplicate mapping
+	// key outright, so writeNoteChecked refuses the write and the note is reported as a
+	// failure instead of being wired. Every note reachable by the fix above is in exactly
+	// this shape, so the two changes are one change.
+	if bareKey {
+		fmText = dropBareTopLevelKey(fmText, "related")
+	}
+	if fmText != "" {
+		fmText += "\n"
+	}
+	out := "---\n" + b.String() + fmText + "---\n" + body
 	if err := writeNoteChecked(path, out); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// dropBareTopLevelKey removes a top-level `key:` line that carries no value (nothing
+// after the colon but whitespace or a comment). Anchored at column 0 so an indented key
+// of the same name nested under another mapping is left alone, and value-carrying lines
+// are never touched: this only ever deletes a line YAML already read as nil.
+func dropBareTopLevelKey(fmText, key string) string {
+	lines := strings.Split(fmText, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if rest, found := strings.CutPrefix(ln, key+":"); found {
+			if rest = strings.TrimSpace(rest); rest == "" || strings.HasPrefix(rest, "#") {
+				continue
+			}
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
 }
 
 // BackfillBodyFile repairs a note whose body is still the TODO skeleton an older Mesh
