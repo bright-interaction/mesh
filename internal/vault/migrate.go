@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // MigrateResult records what a migration pass did to one file.
@@ -53,32 +55,36 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 		return nil, err
 	}
 	res := &MigrateResult{Path: path}
-	var add []string
+	add := &yaml.Node{Kind: yaml.MappingNode}
 
-	if _, ok := raw["id"]; !ok || strings.TrimSpace(fm.ID) == "" {
+	if !declaredKey(raw, "id") {
 		id := Slugify(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
-		add = append(add, "id: "+id)
+		if err := addKey(add, "id", id); err != nil {
+			return nil, err
+		}
 		res.Actions = append(res.Actions, "added id "+id)
 	}
-	if _, ok := raw["type"]; !ok {
-		add = append(add, "type: note")
+	if !declaredKey(raw, "type") {
+		if err := addKey(add, "type", string(TypeNote)); err != nil {
+			return nil, err
+		}
 		res.Actions = append(res.Actions, "added type note")
 	}
-	if _, ok := raw["when"]; !ok {
-		when, src := fm.Updated, "updated"
+	if !declaredKey(raw, "when") {
+		when, src := strings.TrimSpace(fm.Updated), "updated"
 		if when == "" {
 			when, src = fileMtimeDate(path), "file mtime"
 		}
-		add = append(add, `when: "`+when+`"`)
+		if err := addKey(add, "when", when); err != nil {
+			return nil, err
+		}
 		res.Actions = append(res.Actions, "set when from "+src)
 	}
-	if _, ok := raw["related"]; !ok {
+	if !declaredKey(raw, "related") {
 		if links := relatedLinks(body); len(links) > 0 {
-			block := "related:"
-			for _, l := range links {
-				block += "\n  - " + l
+			if err := addKey(add, "related", links); err != nil {
+				return nil, err
 			}
-			add = append(add, block)
 			res.Actions = append(res.Actions, "lifted "+strconv.Itoa(len(links))+" related links")
 		}
 	}
@@ -91,7 +97,7 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 		}
 	}
 
-	if len(add) == 0 {
+	if len(add.Content) == 0 {
 		return res, nil // already clean: idempotent no-op
 	}
 	res.Changed = true
@@ -99,9 +105,9 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 		return res, nil
 	}
 
-	newFM := strings.Join(add, "\n")
-	if fmText != "" {
-		newFM += "\n" + fmText
+	newFM, err := mergeFrontmatter(add, fmText)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	out := "---\n" + newFM + "\n---\n" + body
 	if !had {
@@ -134,7 +140,10 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 		return nil, err
 	}
 	res := &MigrateResult{Path: path}
-	if _, ok := raw["scope"]; ok {
+	// declaredKey, not key presence: a bare `scope:` (or any null spelling, or `scope: ""`)
+	// counted as labeled, so the backfill reported an idempotent no-op on a note that never
+	// carried a scope at all and EffectiveScopes stayed on the dev fail-safe forever.
+	if declaredKey(raw, "scope") {
 		return res, nil // already labeled: idempotent no-op
 	}
 	if strings.TrimSpace(scope) == "" {
@@ -145,9 +154,13 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 	if dryRun {
 		return res, nil
 	}
-	newFM := "scope: " + scope
-	if fmText != "" {
-		newFM += "\n" + fmText
+	add := &yaml.Node{Kind: yaml.MappingNode}
+	if err := addKey(add, "scope", scope); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	newFM, err := mergeFrontmatter(add, fmText)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	out := "---\n" + newFM + "\n---\n" + body
 	if !had {
@@ -183,23 +196,12 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 	res := &MigrateResult{Path: path}
 	// Anything the author actually wrote under `related` is the ground truth and a derived
 	// list must never overwrite it. That INCLUDES `related: []`, which is how a note records
-	// that its links were considered and there are none.
-	//
-	// A bare `related:` with nothing under it is not that. It parses to nil rather than to
-	// an empty list, so reading "declared" as "the key is present" got the two exactly
-	// backwards: the accidental empty key was treated as a deliberate decision, while the
-	// deliberate `related: []` was the one thing this would overwrite. 1098 of the live
-	// vault's 1227 notes carry the bare key, so the inversion did not skip a handful of
-	// notes, it skipped nearly every note `mesh structure --wire-orphans` exists to reach,
-	// and reported "already declaring related" about each one. Same nil-versus-empty trap as
-	// a zero-value pgtype.Text: absent and empty are different answers, and only one of
-	// them is a claim.
-	bareKey := false
-	if v, ok := raw["related"]; ok {
-		if v != nil {
-			return res, nil
-		}
-		bareKey = true
+	// that its links were considered and there are none. A bare `related:` is not that, and
+	// declaredKey is where the two are told apart; 1105 of the live vault's 1366 notes carry
+	// the bare key, so this is nearly every note `mesh structure --wire-orphans` exists to
+	// reach.
+	if declaredKey(raw, "related") {
+		return res, nil
 	}
 	var clean []string
 	seen := map[string]bool{}
@@ -217,45 +219,139 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 	if dryRun {
 		return res, nil
 	}
-	var b strings.Builder
-	b.WriteString("related:\n")
-	for _, r := range clean {
-		b.WriteString("    - " + r + "\n")
+	add := &yaml.Node{Kind: yaml.MappingNode}
+	if err := addKey(add, "related", clean); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	// The new block is PREPENDED, so the bare key it replaces has to go or the note ends up
-	// declaring `related` twice. That is not cosmetic: yaml.v3 rejects a duplicate mapping
-	// key outright, so writeNoteChecked refuses the write and the note is reported as a
-	// failure instead of being wired. Every note reachable by the fix above is in exactly
-	// this shape, so the two changes are one change.
-	if bareKey {
-		fmText = dropBareTopLevelKey(fmText, "related")
+	newFM, err := mergeFrontmatter(add, fmText)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if fmText != "" {
-		fmText += "\n"
-	}
-	out := "---\n" + b.String() + fmText + "---\n" + body
+	out := "---\n" + newFM + "\n---\n" + body
 	if err := writeNoteChecked(path, out); err != nil {
 		return nil, err
 	}
 	return res, nil
 }
 
-// dropBareTopLevelKey removes a top-level `key:` line that carries no value (nothing
-// after the colon but whitespace or a comment). Anchored at column 0 so an indented key
-// of the same name nested under another mapping is left alone, and value-carrying lines
-// are never touched: this only ever deletes a line YAML already read as nil.
-func dropBareTopLevelKey(fmText, key string) string {
-	lines := strings.Split(fmText, "\n")
-	out := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		if rest, found := strings.CutPrefix(ln, key+":"); found {
-			if rest = strings.TrimSpace(rest); rest == "" || strings.HasPrefix(rest, "#") {
-				continue
-			}
-		}
-		out = append(out, ln)
+// declaredKey reports whether a note actually declares a value under key. Key PRESENCE is
+// not a declaration: a bare `related:` parses to nil, and so does every null spelling (~,
+// null, Null, NULL), while `id: ""` parses to a blank string. Each of those is an empty
+// scaffold line rather than the author saying something, and reading presence as a value got
+// it backwards on four keys of MigrateFile, on BackfillScopeFile and on BackfillRelatedFile:
+// the accidental empty key counted as a deliberate decision, while the deliberate
+// `related: []` ("I looked, there are none") was the one shape a backfill would overwrite.
+// An empty list or map IS a claim and stays declared, which is the whole distinction. Same
+// nil-versus-empty trap as a zero-value pgtype.Text: absent and empty are different answers
+// and only one of them is an answer.
+//
+// Every writer here goes through this one predicate. Four keys got the same question wrong
+// independently and a fifth was fixed on its own, which is the shape of a rule that lives in
+// five copies instead of one.
+func declaredKey(raw map[string]any, key string) bool {
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return false
 	}
-	return strings.Join(out, "\n")
+	s, isString := v.(string)
+	return !isString || strings.TrimSpace(s) != ""
+}
+
+// addKey queues a key/value pair for a frontmatter block, encoding the value through yaml
+// instead of formatting it into a line. A hand-built line is an injection point: a
+// "## Related" wikilink lifted verbatim turned `- [[Deploy: staging]]` into a nested mapping,
+// `- [[*star]]` into an unknown alias and `- [[&amp]]` into an anchor whose value silently
+// vanished, and a synthesized `when: "<value>"` closed early on any value carrying a quote.
+// Every one of those made the whole block unparseable, so writeNoteChecked could only refuse
+// the write and the note was reported as a migration failure on every run. The encoder quotes
+// whatever needs quoting.
+func addKey(m *yaml.Node, key string, value any) error {
+	v := &yaml.Node{}
+	if err := v.Encode(value); err != nil {
+		return fmt.Errorf("frontmatter %s: %w", key, err)
+	}
+	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, v)
+	return nil
+}
+
+// mergeFrontmatter renders the keys a writer is adding and puts them in front of the block
+// the note already has, after DELETING any entry those keys already occupy.
+//
+// The delete goes through the mapping rather than through a line match, because a
+// line-editing dropper and the nil test that decides to edit are two readers of the same
+// YAML and they drifted: the test fired on `related: ~` while the dropper only ever removed
+// a line with nothing after the colon, so the note came out declaring `related` twice,
+// yaml.v3 refuses a duplicate mapping key outright, and the note could never be wired. There
+// is only one reader now, so the two cannot disagree again.
+func mergeFrontmatter(add *yaml.Node, fmText string) (string, error) {
+	keys := make([]string, 0, len(add.Content)/2)
+	for i := 0; i < len(add.Content); i += 2 {
+		keys = append(keys, add.Content[i].Value)
+	}
+	rest, err := dropTopLevelKeys(fmText, keys...)
+	if err != nil {
+		return "", err
+	}
+	block, err := encodeFrontmatter(add)
+	if err != nil {
+		return "", err
+	}
+	if rest != "" {
+		block += "\n" + rest
+	}
+	return block, nil
+}
+
+// dropTopLevelKeys removes each key from a frontmatter block's top-level mapping, whatever
+// value shape it carries, and returns the block re-encoded. It returns the input untouched
+// when it removes nothing, so a note that only GAINS keys keeps the author's own bytes,
+// comments and formatting exactly as written.
+func dropTopLevelKeys(fmText string, keys ...string) (string, error) {
+	if strings.TrimSpace(fmText) == "" {
+		return fmText, nil
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(fmText), &doc); err != nil {
+		return "", fmt.Errorf("frontmatter: %w", err)
+	}
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmText, nil
+	}
+	m := doc.Content[0]
+	drop := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		drop[k] = true
+	}
+	kept := make([]*yaml.Node, 0, len(m.Content))
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if drop[m.Content[i].Value] {
+			continue
+		}
+		kept = append(kept, m.Content[i], m.Content[i+1])
+	}
+	if len(kept) == len(m.Content) {
+		return fmText, nil
+	}
+	if len(kept) == 0 {
+		return "", nil
+	}
+	m.Content = kept
+	return encodeFrontmatter(m)
+}
+
+// encodeFrontmatter renders a mapping node as a frontmatter block, at the four-space indent
+// the vault's notes already use.
+func encodeFrontmatter(m *yaml.Node) (string, error) {
+	var b strings.Builder
+	enc := yaml.NewEncoder(&b)
+	enc.SetIndent(4)
+	if err := enc.Encode(m); err != nil {
+		return "", fmt.Errorf("frontmatter: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return "", fmt.Errorf("frontmatter: %w", err)
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
 }
 
 // BackfillBodyFile repairs a note whose body is still the TODO skeleton an older Mesh
