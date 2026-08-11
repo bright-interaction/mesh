@@ -48,6 +48,7 @@ func spacedMemberServer(t *testing.T) (*Server, string) {
 			return 0, "", false
 		},
 		func(id int64) map[string]bool { return nil },
+		func(id int64) func(string) bool { return nil },
 		func(id int64) (string, int64, bool) { return "admin", 1000, true },
 	)
 	return s, dir

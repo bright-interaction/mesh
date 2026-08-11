@@ -41,7 +41,8 @@ func TestMemberRoleGateAndRevocation(t *testing.T) {
 			}
 			return 0, "", false
 		},
-		func(id int64) map[string]bool { return nil }, // unrestricted reads
+		func(id int64) map[string]bool { return nil },   // unrestricted reads
+		func(id int64) func(string) bool { return nil }, // no folder ACLs
 		func(id int64) (string, int64, bool) {
 			switch id {
 			case 1:

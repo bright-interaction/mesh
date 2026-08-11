@@ -27,6 +27,10 @@ type memberAuth struct {
 	verify func(token string) (clientID int64, user string, ok bool)
 	// scopesFor returns the member's readable scopes; nil = unrestricted (no scoping configured).
 	scopesFor func(clientID int64) map[string]bool
+	// pathsFor returns the member's per-path folder-ACL read predicate; nil = unrestricted
+	// (no folder ACL configured). Folder ACLs and scopes are independent partitions, so
+	// this is not derivable from scopesFor.
+	pathsFor func(clientID int64) func(path string) bool
 	// roleFor returns the member's role, their immutable created_at, and whether the
 	// client still exists. ok=false means the client was removed/revoked, so a
 	// still-valid cookie must stop working immediately instead of at cookie expiry.
@@ -38,8 +42,8 @@ type memberAuth struct {
 
 const memberCookie = "mesh_member"
 
-func newMemberAuth(verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, int64, bool)) *memberAuth {
-	return &memberAuth{verify: verify, scopesFor: scopesFor, roleFor: roleFor, key: stableMemberKey()}
+func newMemberAuth(verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool)) *memberAuth {
+	return &memberAuth{verify: verify, scopesFor: scopesFor, pathsFor: pathsFor, roleFor: roleFor, key: stableMemberKey()}
 }
 
 // hub role order (owner > admin > member > viewer). Duplicated minimally here because
@@ -196,17 +200,28 @@ func (m *memberAuth) clientFromRequest(r *http.Request) (int64, bool) {
 // SetMemberAuth puts the web app in per-member mode: requests authenticate as a hub
 // client and the graph/search/note surfaces are scoped to that member. verify checks a
 // client token; scopesFor returns a member's readable scopes (nil = unrestricted);
-// roleFor returns the member's role, their immutable created_at (bound into the session
-// cookie so a reused client rowid cannot revive a revoked member's cookie), and whether
-// the client still exists.
-func (s *Server) SetMemberAuth(verify func(token string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, int64, bool)) {
-	s.member = newMemberAuth(verify, scopesFor, roleFor)
+// pathsFor returns their folder-ACL read predicate (nil = unrestricted); roleFor returns
+// the member's role, their immutable created_at (bound into the session cookie so a
+// reused client rowid cannot revive a revoked member's cookie), and whether the client
+// still exists.
+func (s *Server) SetMemberAuth(verify func(token string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool)) {
+	s.member = newMemberAuth(verify, scopesFor, pathsFor, roleFor)
 	s.scopeResolver = func(r *http.Request) map[string]bool {
 		id, ok := s.member.clientFromRequest(r)
 		if !ok {
 			return map[string]bool{} // deny-all for an unresolved request (the guard blocks these anyway)
 		}
 		return s.member.scopesFor(id) // nil here = unrestricted (scoping not configured)
+	}
+	s.pathResolver = func(r *http.Request) func(string) bool {
+		if s.member.pathsFor == nil {
+			return nil // no folder ACLs wired (standalone-shaped host)
+		}
+		id, ok := s.member.clientFromRequest(r)
+		if !ok {
+			return func(string) bool { return false } // deny-all, same as the scope resolver
+		}
+		return s.member.pathsFor(id) // nil here = unrestricted (no folder ACL configured)
 	}
 }
 

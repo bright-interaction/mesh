@@ -13,6 +13,6 @@ import "errors"
 // the call returns a clear error instead. Plain `mesh ui` (no --hub-db) serves a solo
 // vault and is fully covered by this repository. See LICENSING.md for what the
 // commercial hub build adds.
-func openHubTeam(_, _ string) (func(string) (int64, string, bool), func(int64) map[string]bool, func(int64) (string, int64, bool), func() error, error) {
-	return nil, nil, nil, nil, errors.New("team mode (mesh ui --hub-db) needs the commercial Mesh hub build, which is not part of this open-core repository (see LICENSING.md); plain `mesh ui` serves a solo vault")
+func openHubTeam(_, _ string) (func(string) (int64, string, bool), func(int64) map[string]bool, func(int64) func(string) bool, func(int64) (string, int64, bool), func() error, error) {
+	return nil, nil, nil, nil, nil, errors.New("team mode (mesh ui --hub-db) needs the commercial Mesh hub build, which is not part of this open-core repository (see LICENSING.md); plain `mesh ui` serves a solo vault")
 }

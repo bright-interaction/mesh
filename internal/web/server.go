@@ -39,6 +39,12 @@ type Server struct {
 	// graph/search/note surfaces are filtered per member. nil (standalone `mesh ui`) =
 	// unrestricted, so the loopback single-user viewer is unchanged.
 	scopeResolver func(*http.Request) map[string]bool
+	// pathResolver is the folder-ACL twin of scopeResolver: it maps a request to the
+	// caller's per-path read predicate (nil = unrestricted). The two are independent
+	// partitions and BOTH gate every read surface, because a team can fence folders with
+	// ACLs and never define a scope, and then scopeResolver returns nil and filters
+	// nothing whatsoever.
+	pathResolver func(*http.Request) func(string) bool
 	// member, when set (mesh ui --hub-db), puts the app in per-member auth mode: each
 	// request authenticates as a hub client instead of the single shared token.
 	member *memberAuth
@@ -114,6 +120,20 @@ func (s *Server) allowedScopes(r *http.Request) map[string]bool {
 		return nil
 	}
 	return s.scopeResolver(r)
+}
+
+// allowedPath returns the caller's per-path read predicate (nil = unrestricted).
+func (s *Server) allowedPath(r *http.Request) func(string) bool {
+	if s.pathResolver == nil {
+		return nil
+	}
+	return s.pathResolver(r)
+}
+
+// canReadPath reports whether the caller may read a vault-relative note path.
+func (s *Server) canReadPath(r *http.Request, path string) bool {
+	allow := s.allowedPath(r)
+	return allow == nil || allow(path)
 }
 
 // SetScopeResolver installs the per-request scope resolver (used by the hub to serve
@@ -364,7 +384,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	g := s.graph
 	s.mu.RUnlock()
-	exp := BuildExport(g, s.exposedVaultRoot(), s.allowedScopes(r))
+	exp := BuildExport(g, s.exposedVaultRoot(), s.allowedScopes(r), s.allowedPath(r))
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
 	_ = json.NewEncoder(w).Encode(exp)
@@ -429,13 +449,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// grow. The same aggregate is deliberately scoped in internal/mcp/tools.go ("A
 	// scope-confined caller must not learn out-of-scope volume") and admin-gated on
 	// /api/dashboard; this route was the one surface that reported it raw.
+	// A folder ACL confines volume exactly as a scope does, and it is the only boundary
+	// a team that fenced folders without defining a scope has, so it gates this branch too.
 	var notes, nodes, edges, vectors int
-	if allowed := s.allowedScopes(r); allowed != nil {
+	allowed, allowPath := s.allowedScopes(r), s.allowedPath(r)
+	if allowed != nil || allowPath != nil {
 		g := s.graph
 		if g != nil {
+			visible := func(n *graph.Node) bool { return scopeVisible(n, allowed) && pathVisible(n, allowPath) }
 			seen := map[string]bool{}
 			for _, n := range g.Nodes() {
-				if !scopeVisible(n, allowed) {
+				if !visible(n) {
 					continue
 				}
 				nodes++
@@ -444,13 +468,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 					notes++
 				}
 				for _, e := range g.Neighbors(n.ID) {
-					if tn, ok := g.Node(e.Target); ok && scopeVisible(tn, allowed) {
+					if tn, ok := g.Node(e.Target); ok && visible(tn) {
 						edges++
 					}
 				}
 			}
 		}
-		vectors = 0 // per-scope vector counts are not tracked; do not leak the global
+		vectors = 0 // per-partition vector counts are not tracked; do not leak the global
 	} else {
 		// An unrestricted caller (owner/admin, or the standalone single-token viewer)
 		// still needs the note count: the web app reads counts.notes to decide whether
@@ -503,7 +527,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // reader of it. Only correct where nothing else writes that index (the mesh-ui
 // container); beside a `mesh watch` / `mesh sync --watch` it reintroduces the second
 // long-lived writer this whole split removed.
-func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, roleFor func(int64) (string, int64, bool)) error {
+func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool)) error {
 	memberMode := verify != nil
 	var auth authConfig
 	if !memberMode {
@@ -533,9 +557,9 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 	s.auth = auth
 	s.basePath = normalizeBasePath(basePath)
 	if memberMode {
-		s.SetMemberAuth(verify, scopesFor, roleFor)
+		s.SetMemberAuth(verify, scopesFor, pathsFor, roleFor)
 	}
-	exp := BuildExport(s.graph, vaultRoot, nil)
+	exp := BuildExport(s.graph, vaultRoot, nil, nil)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))
 	if ownIndex {
 		fmt.Printf("index: OWNED by this process (it reindexes and writes)\n")

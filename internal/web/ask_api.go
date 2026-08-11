@@ -83,7 +83,7 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), askMaxDuration)
 	defer cancel()
-	res, err := ask.Answer(ctx, s.retriever(), s.store, client, req.Question, req.Budget, s.allowedScopes(r))
+	res, err := ask.Answer(ctx, s.retriever(), s.store, client, req.Question, req.Budget, s.allowedScopes(r), s.allowedPath(r))
 	if err != nil {
 		// A runtime LLM failure (e.g. no claude on this host) degrades to a message, not a 500.
 		writeJSON(w, map[string]any{"answer": "Could not answer right now: " + err.Error(), "citations": nil})

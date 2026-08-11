@@ -37,7 +37,7 @@ func TestAnswerGroundsAndCites(t *testing.T) {
 		gotContext = user
 		return "Re-fetch the payment by id; Mollie does not sign webhooks [1].", nil
 	})
-	res, err := Answer(context.Background(), rtr, store, stub, "how do we authenticate Mollie webhooks?", 0, nil)
+	res, err := Answer(context.Background(), rtr, store, stub, "how do we authenticate Mollie webhooks?", 0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestAnswerPromptDelimitsUntrustedContext(t *testing.T) {
 		gotSystem, gotUser = system, user
 		return "ok [1]", nil
 	})
-	if _, err := Answer(context.Background(), retrieve.NewFromEnv(store, g), store, stub, "how do we handle Mollie webhooks?", 0, nil); err != nil {
+	if _, err := Answer(context.Background(), retrieve.NewFromEnv(store, g), store, stub, "how do we handle Mollie webhooks?", 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"DATA", "never instructions"} {
@@ -132,7 +132,7 @@ func TestAnswerPromptDelimitsUntrustedContext(t *testing.T) {
 }
 
 func TestEmptyQuestion(t *testing.T) {
-	if _, err := Answer(context.Background(), nil, nil, llm.Func(func(context.Context, string, string) (string, error) { return "", nil }), "  ", 0, nil); err == nil {
+	if _, err := Answer(context.Background(), nil, nil, llm.Func(func(context.Context, string, string) (string, error) { return "", nil }), "  ", 0, nil, nil); err == nil {
 		t.Error("empty question must error")
 	}
 }

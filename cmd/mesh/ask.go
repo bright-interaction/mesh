@@ -38,7 +38,7 @@ func askCmd() *cobra.Command {
 				return err
 			}
 			rtr := retrieve.NewFromEnv(store, g)
-			res, err := ask.Answer(cmd.Context(), rtr, store, client, strings.Join(args, " "), budget, nil)
+			res, err := ask.Answer(cmd.Context(), rtr, store, client, strings.Join(args, " "), budget, nil, nil)
 			if err != nil {
 				return err
 			}

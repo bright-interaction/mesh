@@ -49,6 +49,7 @@ func TestWebMemberScoping(t *testing.T) {
 			}
 			return nil // dev: unrestricted
 		},
+		func(id int64) func(string) bool { return nil }, // no folder ACLs in this fixture
 		func(id int64) (string, int64, bool) {
 			switch id {
 			case 1:

@@ -2034,7 +2034,7 @@ func uiCmd() *cobra.Command {
 			}
 			// Standalone single-token mode.
 			if hubDB == "" {
-				return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, nil, nil, nil)
+				return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, nil, nil, nil, nil)
 			}
 			// Per-member team mode: resolve each request against the hub's client
 			// store and scope reads to the signed-in member. The hub store is the
@@ -2042,12 +2042,12 @@ func uiCmd() *cobra.Command {
 			// the open core returns a clear "needs the pro build" error here. Break-glass
 			// (the shared MESH_UI_TOKEN as an unrestricted admin login) is preserved by
 			// the pro impl so flipping a live app to member mode never locks anyone out.
-			verify, scopesFor, roleFor, closeHub, err := openHubTeam(hubDB, token)
+			verify, scopesFor, pathsFor, roleFor, closeHub, err := openHubTeam(hubDB, token)
 			if err != nil {
 				return err
 			}
 			defer closeHub()
-			return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, verify, scopesFor, roleFor)
+			return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, verify, scopesFor, pathsFor, roleFor)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")

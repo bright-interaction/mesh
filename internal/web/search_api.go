@@ -39,7 +39,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	budget := atoiOr(r.URL.Query().Get("budget"), mcp.SearchBudgetDefault)
 	rt := s.retriever()
-	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r)})
+	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r), AllowPath: s.allowedPath(r)})
 	if err != nil {
 		http.Error(w, "search failed", http.StatusInternalServerError)
 		return
@@ -55,6 +55,13 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	rel, err := s.store.NotePath(id)
 	if err != nil {
+		http.Error(w, "unknown note id", http.StatusNotFound)
+		return
+	}
+	// Folder read check, before the scope one: the path is already resolved and a team
+	// can fence folders without defining a single scope, in which case the scope set is
+	// nil and this is the only boundary there is.
+	if !s.canReadPath(r, rel) {
 		http.Error(w, "unknown note id", http.StatusNotFound)
 		return
 	}

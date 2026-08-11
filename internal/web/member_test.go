@@ -20,10 +20,10 @@ func TestMemberCookieSurvivesRestart(t *testing.T) {
 	t.Setenv("MESH_UI_COOKIE_SECRET", "")
 	t.Setenv("MESH_UI_TOKEN", "stable-shared-secret")
 
-	before := newMemberAuth(nil, nil, nil)
+	before := newMemberAuth(nil, nil, nil, nil)
 	cookie := before.sign(7, 1700000000) // issued to the member
 
-	after := newMemberAuth(nil, nil, nil) // simulates a server restart / redeploy
+	after := newMemberAuth(nil, nil, nil, nil) // simulates a server restart / redeploy
 	if id, ok := after.clientFromCookie(cookie, 1700000000); !ok || id != 7 {
 		t.Fatalf("cookie issued before restart did not validate after (ok=%v id=%d)", ok, id)
 	}
@@ -38,9 +38,9 @@ func TestMemberCookieSurvivesRestart(t *testing.T) {
 func TestCookieSecretPriority(t *testing.T) {
 	t.Setenv("MESH_UI_COOKIE_SECRET", "explicit-secret")
 	t.Setenv("MESH_UI_TOKEN", "other")
-	a := newMemberAuth(nil, nil, nil)
+	a := newMemberAuth(nil, nil, nil, nil)
 	t.Setenv("MESH_UI_TOKEN", "changed") // token rotates, but the explicit secret pins the key
-	b := newMemberAuth(nil, nil, nil)
+	b := newMemberAuth(nil, nil, nil, nil)
 	if a.signAt(1, 1700000000, 1800000000) != b.signAt(1, 1700000000, 1800000000) {
 		t.Fatal("MESH_UI_COOKIE_SECRET should pin the key regardless of MESH_UI_TOKEN")
 	}
@@ -60,7 +60,7 @@ func signV1(m *memberAuth, id int64) string {
 // old unexpiring v1 format must be dead.
 func TestMemberCookieExpiry(t *testing.T) {
 	t.Setenv("MESH_UI_COOKIE_SECRET", "pinned-for-the-test")
-	m := newMemberAuth(nil, nil, nil)
+	m := newMemberAuth(nil, nil, nil, nil)
 	now := time.Now().Unix()
 
 	const created = int64(1700000000)
@@ -103,7 +103,7 @@ func TestMemberCookieExpiry(t *testing.T) {
 // as whoever now holds that id. Binding created_at is what kills it.
 func TestMemberCookieDoesNotSurviveARowidReuse(t *testing.T) {
 	t.Setenv("MESH_UI_COOKIE_SECRET", "pinned-for-the-test")
-	m := newMemberAuth(nil, nil, nil)
+	m := newMemberAuth(nil, nil, nil, nil)
 
 	const revokedCreated = int64(1700000000)
 	const successorCreated = int64(1700009999) // same rowid, different member, later join
@@ -127,6 +127,7 @@ func TestMemberRejectsCookieAfterRowidReuse(t *testing.T) {
 	m := newMemberAuth(
 		func(string) (int64, string, bool) { return 0, "", false },
 		func(int64) map[string]bool { return nil },
+		func(int64) func(string) bool { return nil },
 		func(id int64) (string, int64, bool) {
 			if id == 42 {
 				return "member", createdAt, true

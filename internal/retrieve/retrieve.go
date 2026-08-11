@@ -82,6 +82,12 @@ type Options struct {
 	// loop (the catch-all for the vector arm and expanded neighbours), which is still
 	// before the reranker reads any doc.
 	AllowedScopes map[string]bool
+	// AllowPath, when non-nil, is the FOLDER read boundary: it reports whether the
+	// caller may read the note at that vault-relative path. nil = unrestricted (no
+	// folder ACL configured). It is a SEPARATE partition from AllowedScopes and a
+	// caller must clear both: a team can fence folders with ACLs while never defining
+	// a scope, in which case AllowedScopes is nil and filters nothing at all.
+	AllowPath func(path string) bool
 }
 
 type Retriever struct {
@@ -471,7 +477,7 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 			break
 		}
 		seedCard, seedOK := r.card(seed.id)
-		if !seedOK || !scopeAllowed(seedCard.Scope, opt.AllowedScopes) {
+		if !seedOK || !scopeAllowed(seedCard.Scope, opt.AllowedScopes) || !pathAllowed(seedCard.Path, opt.AllowPath) {
 			continue
 		}
 		seeded++
@@ -497,9 +503,10 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		if !ok {
 			continue
 		}
-		// Scope read boundary: drop notes the caller may not read BEFORE they reach
-		// the head, the reranker, or the budget packer. Covers every signal at once.
-		if !scopeAllowed(c.Scope, opt.AllowedScopes) {
+		// Read boundary: drop notes the caller may not read BEFORE they reach the head,
+		// the reranker, or the budget packer. Covers every signal at once, and both
+		// partitions, because a folder ACL can fence a note whose scope is allowed.
+		if !scopeAllowed(c.Scope, opt.AllowedScopes) || !pathAllowed(c.Path, opt.AllowPath) {
 			continue
 		}
 		c.Snippet = snippet[id]
@@ -760,6 +767,15 @@ func (r *Retriever) card(id string) (Card, bool) {
 // predicate so this surface cannot drift from the MCP/web scope checks.
 func scopeAllowed(cardScope string, allowed map[string]bool) bool {
 	return vault.ScopeAllowsCSV(cardScope, allowed)
+}
+
+// pathAllowed reports whether a card's note path clears the folder read boundary.
+// allow==nil means unrestricted (no folder ACL configured). Unlike the scope filter this
+// cannot be pushed into candidate generation (the store indexes scope, not ACL prefixes),
+// so a folder-fenced caller trades some recall for the boundary: their fetch limit is
+// spent partly on rows that are then dropped.
+func pathAllowed(path string, allow func(string) bool) bool {
+	return allow == nil || allow(path)
 }
 
 // freshnessTypes are NON-institutional notes that decay with age. Decisions,

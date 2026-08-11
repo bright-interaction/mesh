@@ -38,6 +38,7 @@ func memberServer(t *testing.T) *Server {
 			return 0, "", false
 		},
 		func(id int64) map[string]bool { return nil },
+		func(id int64) func(string) bool { return nil },
 		func(id int64) (string, int64, bool) {
 			switch id {
 			case 1:

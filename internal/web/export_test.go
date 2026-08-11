@@ -29,7 +29,7 @@ func linkedGraph() *graph.Graph {
 }
 
 func TestBuildExport(t *testing.T) {
-	exp := BuildExport(linkedGraph(), "/vault", nil)
+	exp := BuildExport(linkedGraph(), "/vault", nil, nil)
 
 	// Notes only (the tag node is excluded), index = highest degree.
 	if exp.Meta.NodeCount != 3 || len(exp.Nodes) != 3 {
@@ -87,7 +87,7 @@ func TestBuildExport(t *testing.T) {
 }
 
 func TestBuildExportEmpty(t *testing.T) {
-	exp := BuildExport(graph.New(), "/vault", nil)
+	exp := BuildExport(graph.New(), "/vault", nil, nil)
 	if exp.Meta.NodeCount != 0 || len(exp.Nodes) != 0 || exp.Meta.IndexID != "" {
 		t.Fatalf("empty graph should export nothing, got %+v", exp.Meta)
 	}

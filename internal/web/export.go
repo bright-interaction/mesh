@@ -75,17 +75,29 @@ func scopeVisible(n *graph.Node, allowed map[string]bool) bool {
 	return vault.ScopeAllowsCSV(sc, allowed)
 }
 
+// pathVisible reports whether a note node is visible under the caller's folder ACLs.
+// allowPath==nil means unrestricted. A node with no recorded path is refused under an
+// active fence: an unnameable path cannot be evaluated, and the payload carries the
+// note's title either way.
+func pathVisible(n *graph.Node, allowPath func(string) bool) bool {
+	if allowPath == nil {
+		return true
+	}
+	return n.NotePath != "" && allowPath(n.NotePath)
+}
+
 // BuildExport projects the in-memory graph into the SPA payload. allowed (nil =
-// unrestricted) filters notes to the caller's readable scopes; an excluded note drops
-// out of nodes, so its edges and orbit fall away with it.
-func BuildExport(g *graph.Graph, vaultRoot string, allowed map[string]bool) Export {
+// unrestricted) filters notes to the caller's readable scopes and allowPath (nil =
+// unrestricted) to their readable folders; an excluded note drops out of nodes, so its
+// edges and orbit fall away with it.
+func BuildExport(g *graph.Graph, vaultRoot string, allowed map[string]bool, allowPath func(string) bool) Export {
 	all := g.Nodes()
 
 	// Note nodes only, and a quick membership set for filtering edges/adjacency.
 	notes := make([]*graph.Node, 0, len(all))
 	isNote := make(map[string]bool)
 	for _, n := range all {
-		if n.Kind == "note" && scopeVisible(n, allowed) {
+		if n.Kind == "note" && scopeVisible(n, allowed) && pathVisible(n, allowPath) {
 			notes = append(notes, n)
 			isNote[n.ID] = true
 		}

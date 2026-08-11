@@ -80,8 +80,11 @@ func codeReadable(allowedScopes map[string]bool) bool {
 
 // Answer retrieves notes + code for the question, asks the LLM grounded on them, and
 // returns the answer with the cited sources. allowedScopes (nil = unrestricted) keeps
-// a scoped caller's answer within their readable notes.
-func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, client llm.Client, question string, budget int, allowedScopes map[string]bool) (Result, error) {
+// a scoped caller's answer within their readable notes, and allowPath (nil =
+// unrestricted) does the same for folder ACLs. Both have to be applied at retrieval:
+// filtering the citations afterwards would still have fed the fenced note's body to the
+// model, and the answer text is what the caller reads.
+func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, client llm.Client, question string, budget int, allowedScopes map[string]bool, allowPath func(string) bool) (Result, error) {
 	if strings.TrimSpace(question) == "" {
 		return Result{}, fmt.Errorf("empty question")
 	}
@@ -93,7 +96,7 @@ func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, cl
 	n := 0
 
 	if rtr != nil {
-		cards, _ := rtr.Retrieve(ctx, question, retrieve.Options{Budget: budget, AllowedScopes: allowedScopes})
+		cards, _ := rtr.Retrieve(ctx, question, retrieve.Options{Budget: budget, AllowedScopes: allowedScopes, AllowPath: allowPath})
 		for _, c := range cards {
 			n++
 			// %q on the title already escapes newlines; the snippet is raw note body,
