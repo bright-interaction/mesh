@@ -113,10 +113,27 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 	if !had {
 		out = "---\n" + newFM + "\n---\n\n" + body
 	}
-	if err := writeNoteChecked(path, out); err != nil {
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// matchEOL rewrites out's line endings to the ones src is written with. Every block this
+// file encodes is built with \n while the body keeps the author's bytes, so a CRLF note came
+// back with LF markers and an LF frontmatter block glued onto CRLF prose: line endings no
+// author wrote, on a shape the repo deliberately preserves (SPEC 6.5, internal/merge). It is
+// also what fed the section bug below, since a half-converted note has some CRLF headings
+// and some LF ones.
+//
+// An LF note is returned byte for byte, so a lone \r a note carries as content is never
+// promoted into a line ending.
+func matchEOL(out, src string) string {
+	crlf := strings.Count(src, "\r\n")
+	if crlf == 0 || crlf <= strings.Count(src, "\n")-crlf {
+		return out
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(out, "\r\n", "\n"), "\n", "\r\n")
 }
 
 // BackfillScopeFile stamps `scope: <scope>` onto a note that declares no scope yet,
@@ -166,7 +183,7 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 	if !had {
 		out = "---\n" + newFM + "\n---\n\n" + body
 	}
-	if err := writeNoteChecked(path, out); err != nil {
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -228,7 +245,7 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	out := "---\n" + newFM + "\n---\n" + body
-	if err := writeNoteChecked(path, out); err != nil {
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -417,7 +434,7 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 		return res, nil
 	}
 	out := "---\n" + fmText + "\n---\n" + newBody
-	if err := writeNoteChecked(path, out); err != nil {
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -439,30 +456,26 @@ func fillBodySections(body string, fm *Frontmatter, sections []bodySection) (str
 		if Unfilled(v) {
 			continue // frontmatter itself has nothing real to offer yet
 		}
-		heading := "## " + s.heading + "\n"
 		// A section can be in one of three states, and only the first two may be touched.
 		// Absent, so the note predates this heading existing (every gotcha and post-mortem
 		// written before Related was added to their templates). Present but still holding a
 		// placeholder, which includes placeholders this template used to emit and no longer
 		// does. Or present and authored, which is judgment and is never overwritten.
-		switch {
-		case !strings.Contains(newBody, heading):
+		h, end, ok := findSection(newBody, s.heading)
+		if !ok {
 			newBody = appendSection(newBody, s.heading, v)
 			filled = append(filled, s.heading+" (added)")
-		default:
-			replaced := false
-			for _, ph := range append([]string{s.placeholder}, retiredPlaceholders[s.heading]...) {
-				old := heading + ph
-				if strings.Contains(newBody, old) {
-					newBody = strings.Replace(newBody, old, heading+v, 1)
-					replaced = true
-					break
-				}
+			continue
+		}
+		// A section holding none of its placeholders is authored, and authored is judgment:
+		// it is left exactly as written, even where it disagrees with the frontmatter field.
+		for _, ph := range append([]string{s.placeholder}, retiredPlaceholders[s.heading]...) {
+			if !opensWithPlaceholder(newBody[h.content:end], ph) {
+				continue
 			}
-			if !replaced {
-				continue // authored already; leave it exactly as written
-			}
+			newBody = newBody[:h.content] + v + newBody[h.content+len(ph):]
 			filled = append(filled, s.heading)
+			break
 		}
 	}
 	return newBody, filled
@@ -532,7 +545,7 @@ func BackfillTimelineFile(path string, resolve CommitResolver, dryRun bool) (*Mi
 	if dryRun {
 		return res, nil
 	}
-	if err := writeNoteChecked(path, "---\n"+fmText+"\n---\n"+newBody); err != nil {
+	if err := writeNoteChecked(path, matchEOL("---\n"+fmText+"\n---\n"+newBody, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -672,22 +685,11 @@ func repairEntityPage(body string, fm *Frontmatter) (string, []string) {
 // TODO comment. It refuses anything else, so a section a human has written is never
 // touched, and it never removes a heading that has real prose or nested content under it.
 func dropPlaceholderSection(body, heading string) (string, bool) {
-	start := sectionStart(body, heading)
-	if start < 0 {
+	h, end, ok := findSection(body, heading)
+	if !ok {
 		return body, false
 	}
-	rest := body[start:]
-	nl := strings.Index(rest, "\n")
-	if nl < 0 {
-		return body, false
-	}
-	inner := rest[nl+1:]
-	end := strings.Index(inner, "\n## ")
-	tail := ""
-	if end >= 0 {
-		tail = inner[end+1:]
-		inner = inner[:end]
-	}
+	inner, tail := body[h.content:end], body[end:]
 	if strings.TrimSpace(inner) == "" {
 		return body, false
 	}
@@ -700,23 +702,84 @@ func dropPlaceholderSection(body, heading string) (string, bool) {
 			return body, false // authored content: leave the whole section alone
 		}
 	}
-	head := strings.TrimRight(body[:start], "\n")
+	head := strings.TrimRight(body[:h.off], "\n")
 	if tail == "" {
 		return head + "\n", true
 	}
 	return head + "\n\n" + tail, true
 }
 
-// sectionStart returns the offset of a "## <heading>" line, or -1.
-func sectionStart(body, heading string) int {
-	h := "## " + heading + "\n"
-	if strings.HasPrefix(body, h) {
-		return 0
+// bodyHeading is one level-2 heading of a note body: where its line starts, its text, and
+// where its content starts (the first byte past the heading line).
+type bodyHeading struct {
+	off     int
+	text    string
+	content int
+}
+
+// bodyHeadings returns every level-2 heading LINE of body, in reading order. It is the one
+// section locator in this file: fillBodySections, dropPlaceholderSection and
+// lastTrailingRelated all ask it where a section is.
+//
+// They used to ask strings.Contains for "## "+heading+"\n" instead, and that needle is
+// wrong three ways at once. A CRLF note ends the line "\r\n", so EVERY section read as
+// absent and the backfill bolted a second copy of each one onto a note that already had
+// them, silently, reporting success; CRLF is a shape this repo deliberately preserves
+// (SPEC 6.5). "### Cause" CONTAINS "## Cause", so an h3 satisfied the h2 test and the
+// mapped field was never projected, on exactly the older hand-edited notes the backfill
+// exists to reach. And the needle matched inside a fence, so a gotcha DOCUMENTING the
+// scaffold had the example in its code block rewritten while its real section stayed
+// missing. relatedLinks has always read the stripped body for that last reason.
+func bodyHeadings(body string) []bodyHeading {
+	// Fences and comments are blanked, not removed: the stripped copy has the same bytes
+	// and lines as the input, so an offset found here indexes the raw body.
+	clean, _ := StripFencesAndComments(body)
+	var out []bodyHeading
+	for off := 0; off < len(clean); {
+		line, next := clean[off:], len(clean)
+		if i := strings.IndexByte(line, '\n'); i >= 0 {
+			line, next = line[:i], off+i+1
+		}
+		// Trailing whitespace and the \r of a CRLF note are not part of the heading; a
+		// deeper level is a different heading, and "## " is a prefix no h3 can carry.
+		if t := strings.TrimRight(line, " \t\r"); strings.HasPrefix(t, "## ") {
+			out = append(out, bodyHeading{off: off, text: strings.TrimSpace(t[len("## "):]), content: next})
+		}
+		off = next
 	}
-	if i := strings.Index(body, "\n"+h); i >= 0 {
-		return i + 1
+	return out
+}
+
+// findSection locates the "## <heading>" section: its heading line, and the offset where
+// the section ends (the next level-2 heading, or the end of the body).
+func findSection(body, heading string) (h bodyHeading, end int, ok bool) {
+	headings := bodyHeadings(body)
+	for i, cur := range headings {
+		if cur.text != heading {
+			continue
+		}
+		end = len(body)
+		if i+1 < len(headings) {
+			end = headings[i+1].off
+		}
+		return cur, end, true
 	}
-	return -1
+	return bodyHeading{}, 0, false
+}
+
+// opensWithPlaceholder reports whether a section's content opens with exactly the
+// placeholder LINE. The placeholder has to be the whole first line, so prose an author
+// wrote next to it is never mistaken for the prompt, and the trailing bytes of the line
+// (a CRLF note's \r) stay where they are when the caller splices the field in.
+func opensWithPlaceholder(content, ph string) bool {
+	if ph == "" || !strings.HasPrefix(content, ph) {
+		return false
+	}
+	rest := content[len(ph):]
+	if i := strings.IndexByte(rest, '\n'); i >= 0 {
+		rest = rest[:i]
+	}
+	return strings.TrimRight(rest, " \t\r") == ""
 }
 
 // retiredPlaceholders are placeholder texts a template USED to emit for a heading. A note
@@ -778,20 +841,15 @@ const provenancePrefix = "<!-- authored by "
 // section of body, or -1. A Related section with other headings after it is not the
 // closing link list, so it is left alone.
 func lastTrailingRelated(body string) int {
-	i := strings.LastIndex(body, "\n## Related\n")
-	if i < 0 {
-		if strings.HasPrefix(body, "## Related\n") {
-			i = 0
-		} else {
-			return -1
-		}
-	} else {
-		i++ // skip the leading newline
-	}
-	if strings.Contains(body[i+len("## Related\n"):], "\n## ") {
+	headings := bodyHeadings(body)
+	if len(headings) == 0 {
 		return -1
 	}
-	return i
+	last := headings[len(headings)-1]
+	if last.text != "Related" {
+		return -1
+	}
+	return last.off
 }
 
 // noFrontmatterErr names which of the two shapes a had=false file actually is. They need
