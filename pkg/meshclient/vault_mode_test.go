@@ -127,7 +127,7 @@ func TestSyncStateStaysPrivate(t *testing.T) {
 			why:     "a new sync.json must land at the mode its os.WriteFile used, not the note default",
 		},
 		{
-			name:    "vault already indexed, so .mesh is the 0755 internal/ingest made it",
+			name:    "vault already indexed, so .mesh is the 0755 internal/index made it",
 			dirPerm: 0o755,
 			want:    0o600,
 			why:     "with a world-traversable .mesh, 0644 here publishes every note path in the vault",

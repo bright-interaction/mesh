@@ -41,9 +41,13 @@ func loadState(vaultRoot string) (ingestState, error) {
 // ran first decided the mode for every other writer's files.
 const stateFileMode = 0o600
 
-// stateDirMode agrees with pkg/meshclient, which creates the same .mesh directory at
-// 0700. Two writers of one directory disagreeing about its mode is how a private file
-// ends up in a world-traversable directory: the loser's intent is discarded silently.
+// stateDirMode agrees with pkg/meshclient and internal/index, the other two creators of
+// this directory. THREE packages create .mesh and MkdirAll is a no-op on an existing one,
+// so the first to run decides the mode for all of them and the losers' intent is discarded
+// silently. Fixing this constant alone did nothing on a real vault: internal/index runs
+// first on essentially every command and still made it 0755 for another day. If you change
+// this, change all three, and keep internal/index's repair, because a mode constant cannot
+// reach a directory that already exists.
 const stateDirMode = 0o700
 
 func saveState(vaultRoot string, st ingestState) error {

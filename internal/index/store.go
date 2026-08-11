@@ -166,10 +166,49 @@ func dsnReadOnly(path string) string {
 	)
 }
 
+// vaultMeshDirMode keeps <vault>/.mesh owner-only. It agrees with pkg/meshclient and
+// internal/ingest, which create the same directory. Three packages create it and
+// MkdirAll is a NO-OP on an existing directory, so the FIRST one to run silently
+// decides the mode for every other one's files, and this package is almost always
+// first: every mesh command opens the index. That is how a vault ends up with a
+// correctly 0600 .mesh/credentials sitting in a world-traversable directory, next to
+// a 0644 mesh.db holding the full text of every note.
+const vaultMeshDirMode = 0o700
+
 // Open creates (or opens) <vaultRoot>/.mesh/mesh.db, applies the schema, and
 // starts the writer goroutine.
 func Open(vaultRoot string) (*Store, error) {
-	return OpenAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"))
+	dir := filepath.Join(vaultRoot, ".mesh")
+	if err := ensureVaultMeshDir(dir); err != nil {
+		return nil, err
+	}
+	return OpenAt(vaultRoot, dir)
+}
+
+// ensureVaultMeshDir creates <vault>/.mesh at vaultMeshDirMode and, when it already
+// exists wider than that, narrows it. The repair is the point: MkdirAll's mode applies
+// only when it CREATES the directory, exactly like os.WriteFile's perm argument, so
+// tightening the constant alone would leave every vault created by an older mesh at
+// 0755 forever. Only the group and other bits are touched, and only downward, so an
+// operator who deliberately narrowed further is not widened back.
+func ensureVaultMeshDir(dir string) error {
+	if err := os.MkdirAll(dir, vaultMeshDirMode); err != nil {
+		return err
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		if err := os.Chmod(dir, perm&^0o077); err != nil {
+			// Best effort: a vault on a filesystem that refuses chmod (or one owned by
+			// another uid) must still be indexable. Log it rather than fail the command,
+			// but log it at WARN, because the credentials beside it are exposed.
+			slog.Warn("index: cannot narrow world-readable vault .mesh",
+				"dir", dir, "mode", perm.String(), "err", err)
+		}
+	}
+	return nil
 }
 
 // OpenAt is like Open but stores the index in an explicit directory instead of

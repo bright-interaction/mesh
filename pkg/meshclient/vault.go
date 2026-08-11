@@ -67,8 +67,11 @@ func writeState(vaultDir string, s syncState) error {
 	//
 	// 0600, the mode this call site used when it was an os.WriteFile, and not the note
 	// default: sync.json is a full listing of every note path in the vault plus a content
-	// hash for each, it sits next to the 0600 credentials file, and .mesh is only 0700
-	// when meshclient created it (internal/ingest/state.go makes it 0755).
+	// hash for each, and it sits next to the 0600 credentials file. Do not weaken this on
+	// the assumption that the directory protects it. Three packages create .mesh and the
+	// first one to run wins; internal/index is almost always first (every mesh command
+	// opens the index) and it created the directory at 0755 until 2026-08-11. This file's
+	// own mode is the only part of its privacy this package controls.
 	return writeFileAtomic(statePath(vaultDir), b, 0o600)
 }
 
