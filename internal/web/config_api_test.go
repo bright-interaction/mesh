@@ -6,6 +6,7 @@ package web
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -48,17 +49,18 @@ func doJSON(t *testing.T, h http.Handler, method, path, body string) (int, map[s
 }
 
 func TestConfigRoundTrip(t *testing.T) {
+	t.Setenv("MESH_ALLOWED_ENDPOINT_HOSTS", "e.example.com")
 	s, dir := cfgServer(t)
 	h := s.Handler()
 
 	// PUT a weight + endpoint.
-	code, _ := doJSON(t, h, "PUT", "/api/config", `{"updates":{"retrieval.weight_fts":"0.5","embedding.endpoint":"http://e/v1"}}`)
+	code, _ := doJSON(t, h, "PUT", "/api/config", `{"updates":{"retrieval.weight_fts":"0.5","embedding.endpoint":"https://e.example.com/v1"}}`)
 	if code != 200 {
 		t.Fatalf("PUT config = %d, want 200", code)
 	}
 	// It must land in config.toml on disk.
 	b, err := os.ReadFile(filepath.Join(dir, ".mesh", "config.toml"))
-	if err != nil || !strings.Contains(string(b), "weight_fts = 0.5") || !strings.Contains(string(b), "http://e/v1") {
+	if err != nil || !strings.Contains(string(b), "weight_fts = 0.5") || !strings.Contains(string(b), "https://e.example.com/v1") {
 		t.Fatalf("config.toml did not persist the update: %v\n%s", err, b)
 	}
 	// GET reflects it with source=file.
@@ -123,5 +125,53 @@ func TestConfigValidationAndReindex(t *testing.T) {
 	code, got := doJSON(t, h, "POST", "/api/reindex", "")
 	if code != 200 || got["reindexed"] != true {
 		t.Errorf("reindex = %d %+v", code, got)
+	}
+}
+
+// TestConfigEndpointURLsMustBeHTTPSAndAllowListed pins the three operator-settable URLs
+// that are DESTINATIONS FOR CREDENTIALED TRAFFIC. secret_bridge.base_url receives the
+// Dockyard API key in X-API-Key (the long-lived credential the whole capability design
+// exists to keep out of Mesh), and rerank/embedding endpoints receive candidate note
+// BODIES plus an Authorization bearer. All three are writable by a team admin over
+// PUT /api/config and go live immediately, so an unvalidated write is credential
+// exfiltration and vault-content egress in one request. They must be https, must name a
+// host on the operator allow-list (which no HTTP surface can write, same shape as the
+// key_env allow-list), and an unparseable URL must fail closed.
+func TestConfigEndpointURLsMustBeHTTPSAndAllowListed(t *testing.T) {
+	keys := []string{"embedding.endpoint", "rerank.endpoint", "secret_bridge.base_url"}
+	cases := []struct {
+		name     string
+		allow    string
+		value    string
+		wantCode int
+	}{
+		{"plain http is refused", "llm.example.com", "http://llm.example.com/v1", http.StatusBadRequest},
+		{"a host off the allow-list is refused", "llm.example.com", "https://evil.tld/v1", http.StatusBadRequest},
+		{"an unparseable url fails closed", "llm.example.com", "https://exa mple.com/v1", http.StatusBadRequest},
+		{"an empty allow-list refuses every host", "", "https://llm.example.com/v1", http.StatusBadRequest},
+		{"an allow-listed https endpoint is accepted", "llm.example.com", "https://llm.example.com/v1", http.StatusOK},
+	}
+	for _, key := range keys {
+		for _, tc := range cases {
+			t.Run(key+"/"+tc.name, func(t *testing.T) {
+				t.Setenv("MESH_ALLOWED_ENDPOINT_HOSTS", tc.allow)
+				s, dir := cfgServer(t)
+				body := fmt.Sprintf(`{"updates":{%q:%q}}`, key, tc.value)
+				code, _ := doJSON(t, s.Handler(), "PUT", "/api/config", body)
+				if code != tc.wantCode {
+					t.Fatalf("PUT %s=%q = %d, want %d", key, tc.value, code, tc.wantCode)
+				}
+				// A refusal leaves config.toml unwritten entirely, so a missing file is
+				// simply "not persisted".
+				b, err := os.ReadFile(filepath.Join(dir, ".mesh", "config.toml"))
+				if err != nil && !os.IsNotExist(err) {
+					t.Fatalf("read config.toml: %v", err)
+				}
+				want := tc.wantCode == http.StatusOK
+				if got := strings.Contains(string(b), tc.value); got != want {
+					t.Fatalf("config.toml persisted %q = %v, want %v\n%s", tc.value, got, want, b)
+				}
+			})
+		}
 	}
 }

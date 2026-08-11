@@ -139,6 +139,23 @@ func scrubKeyEnv(c *meshcfg.Config) {
 	drop("secret_bridge.key_env", &c.SecretBridge.KeyEnv)
 }
 
+// scrubEndpoints is the same treatment for the three endpoint URLs (see
+// meshcfg.CheckEndpointURL). Input filtering alone would leave a redirect that landed
+// before the allow-list existed live forever, because the config row survives the write
+// and outlives the admin role that made it; refusing to re-persist it means the next
+// config write takes it back out.
+func scrubEndpoints(c *meshcfg.Config) {
+	drop := func(field string, v *string) {
+		if err := meshcfg.CheckEndpointURL(field, *v); err != nil {
+			slog.Warn("mesh ui: dropping a disallowed endpoint URL from config.toml", "field", field, "url", *v, "error", err)
+			*v = ""
+		}
+	}
+	drop("embedding.endpoint", &c.Embedding.Endpoint)
+	drop("rerank.endpoint", &c.Retrieval.RerankEndpoint)
+	drop("secret_bridge.base_url", &c.SecretBridge.BaseURL)
+}
+
 // handleGetConfig returns the effective settings. Admin-gated: the values include the
 // internal embedding/rerank endpoints and the Dockyard secret-bridge URL plus agent id,
 // which is reconnaissance a read-only viewer has no reason to hold. A no-op in
@@ -173,11 +190,12 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		editable[f.Key] = f.Editable
 	}
 	cfg, _ := meshcfg.LoadConfig(s.store.MeshDir())
-	// Defence in depth on the READ side: the file on disk may predate the allow-list or
+	// Defence in depth on the READ side: the file on disk may predate the allow-lists or
 	// have been hand-edited, and this handler is about to rewrite the whole struct back
-	// out. Drop any key_env that names something outside allowedKeyEnv rather than
-	// re-persisting it, so the allow-list is not just an input filter.
+	// out. Drop any key_env or endpoint URL outside its allow-list rather than
+	// re-persisting it, so the allow-lists are not just an input filter.
 	scrubKeyEnv(&cfg)
+	scrubEndpoints(&cfg)
 	for k, v := range req.Updates {
 		if _, known := envFor[k]; !known {
 			http.Error(w, "unknown field: "+k, http.StatusBadRequest)
@@ -226,6 +244,9 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 	}
 	switch key {
 	case "embedding.endpoint":
+		if err := meshcfg.CheckEndpointURL(key, v); err != nil {
+			return err
+		}
 		c.Embedding.Endpoint = v
 	case "embedding.model":
 		c.Embedding.Model = v
@@ -263,6 +284,9 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 		}
 		c.Retrieval.WeightVec = f
 	case "rerank.endpoint":
+		if err := meshcfg.CheckEndpointURL(key, v); err != nil {
+			return err
+		}
 		c.Retrieval.RerankEndpoint = v
 	case "rerank.model":
 		c.Retrieval.RerankModel = v
@@ -287,6 +311,9 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 		}
 		c.Retrieval.HNSWThreshold = i
 	case "secret_bridge.base_url":
+		if err := meshcfg.CheckEndpointURL(key, v); err != nil {
+			return err
+		}
 		c.SecretBridge.BaseURL = v
 	case "secret_bridge.key_env":
 		if err := checkKeyEnv(key, v); err != nil {
