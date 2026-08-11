@@ -189,7 +189,19 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	for _, f := range s.effectiveConfig() {
 		editable[f.Key] = f.Editable
 	}
-	cfg, _ := meshcfg.LoadConfig(s.store.MeshDir())
+	// This is a read-modify-WRITE of the whole file: the load supplies every field the
+	// caller did not send, and SaveConfig rewrites all of them. A swallowed error left a
+	// zero Config here, so one PUT of one field silently wiped both endpoint URLs, the
+	// secret-bridge URL and every weight, and the temp-file rename landed it even though
+	// the file could not be read. A missing file is not an error (LoadConfig returns the
+	// zero Config for it), so anything that does come back here means the base is unknown
+	// and the write has to be refused.
+	cfg, err := meshcfg.LoadConfig(s.store.MeshDir())
+	if err != nil {
+		slog.Error("mesh ui: refusing a config write, the current config could not be read", "dir", s.store.MeshDir(), "error", err)
+		http.Error(w, "config unreadable, refusing to overwrite it", http.StatusInternalServerError)
+		return
+	}
 	// Defence in depth on the READ side: the file on disk may predate the allow-lists or
 	// have been hand-edited, and this handler is about to rewrite the whole struct back
 	// out. Drop any key_env or endpoint URL outside its allow-list rather than

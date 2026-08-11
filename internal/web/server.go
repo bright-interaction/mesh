@@ -454,26 +454,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	var notes, nodes, edges, vectors int
 	allowed, allowPath := s.allowedScopes(r), s.allowedPath(r)
 	if allowed != nil || allowPath != nil {
-		g := s.graph
-		if g != nil {
-			visible := func(n *graph.Node) bool { return scopeVisible(n, allowed) && pathVisible(n, allowPath) }
-			seen := map[string]bool{}
-			for _, n := range g.Nodes() {
-				if !visible(n) {
-					continue
-				}
-				nodes++
-				if n.Kind == "note" && !seen[n.NoteID] {
-					seen[n.NoteID] = true
-					notes++
-				}
-				for _, e := range g.Neighbors(n.ID) {
-					if tn, ok := g.Node(e.Target); ok && visible(tn) {
-						edges++
-					}
-				}
-			}
-		}
+		notes, nodes, edges = s.visibleCounts(func(n *graph.Node) bool {
+			return scopeVisible(n, allowed) && pathVisible(n, allowPath)
+		})
 		vectors = 0 // per-partition vector counts are not tracked; do not leak the global
 	} else {
 		// An unrestricted caller (owner/admin, or the standalone single-token viewer)
@@ -498,6 +481,36 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		},
 		"authRequired": s.auth.authRequired() || s.member != nil,
 	})
+}
+
+// visibleCounts walks the graph under the read lock and counts what visible admits.
+// The lock is the same one handleGraph takes for s.graph and the same one refresh, the
+// reindex route and the pending promote take to swap it; this walk is the only reader
+// that used to skip it, which made an ordinary /api/status poll race a promote.
+func (s *Server) visibleCounts(visible func(*graph.Node) bool) (notes, nodes, edges int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	g := s.graph
+	if g == nil {
+		return 0, 0, 0
+	}
+	seen := map[string]bool{}
+	for _, n := range g.Nodes() {
+		if !visible(n) {
+			continue
+		}
+		nodes++
+		if n.Kind == "note" && !seen[n.NoteID] {
+			seen[n.NoteID] = true
+			notes++
+		}
+		for _, e := range g.Neighbors(n.ID) {
+			if tn, ok := g.Node(e.Target); ok && visible(tn) {
+				edges++
+			}
+		}
+	}
+	return notes, nodes, edges
 }
 
 // normalizeBasePath returns "" for root, or a clean "/seg" with a leading slash and

@@ -175,3 +175,44 @@ func TestConfigEndpointURLsMustBeHTTPSAndAllowListed(t *testing.T) {
 		}
 	}
 }
+
+// PUT /api/config is a read-modify-write of the whole file: it loads config.toml, sets
+// the one field the caller sent, and writes the entire struct back. It used to discard
+// the load error, so any read failure other than "file does not exist" handed the
+// handler a ZERO Config and the save then persisted that: one PUT of one weight wiped
+// both endpoint URLs, the secret-bridge URL and every other weight, and answered 200.
+// The save writes a temp file and renames it, so it lands even when the file at that
+// path cannot be read, which is what made the loss total rather than a failed write.
+func TestConfigPutRefusesWhenLoadFails(t *testing.T) {
+	t.Setenv("MESH_ALLOWED_ENDPOINT_HOSTS", "e.example.com")
+	s, dir := cfgServer(t)
+	h := s.Handler()
+
+	seed := `{"updates":{"embedding.endpoint":"https://e.example.com/v1","retrieval.weight_fts":"0.5"}}`
+	if code, _ := doJSON(t, h, "PUT", "/api/config", seed); code != http.StatusOK {
+		t.Fatalf("seed PUT = %d, want 200", code)
+	}
+	// Make the read fail with something that is not os.IsNotExist. A self-referential
+	// symlink does it portably (ELOOP) and without depending on file modes, which root
+	// ignores.
+	path := filepath.Join(dir, ".mesh", "config.toml")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(path, path); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _ := doJSON(t, h, "PUT", "/api/config", `{"updates":{"retrieval.weight_graph":"0.3"}}`)
+	if code != http.StatusInternalServerError {
+		t.Errorf("PUT over an unreadable config.toml = %d, want 500", code)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		b, _ := os.ReadFile(path)
+		t.Fatalf("the handler rewrote config.toml from a Config it never managed to read:\n%s", b)
+	}
+}

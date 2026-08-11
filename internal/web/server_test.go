@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -173,5 +174,56 @@ func TestStatusCountsNotesUnrestricted(t *testing.T) {
 	}
 	if st.Counts["nodes"] < 3 {
 		t.Errorf("counts.nodes = %d, want >= 3", st.Counts["nodes"])
+	}
+}
+
+// handleStatus read s.graph with no lock at all while handleGraph took s.mu.RLock for
+// the same field and refresh / reindex / pending-promote took s.mu.Lock to swap it. Only
+// the scope- or folder-confined branch of handleStatus walks the graph, so a scope
+// resolver is what makes the read reachable. The SPA polls /api/status on a timer to
+// drive its empty-state overlay, so this raced a promote or a reindex in ordinary use.
+// Fails under -race before the fix.
+func TestStatusGraphReadTakesTheLock(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "dev.md"),
+		[]byte("---\nid: dev\ntype: note\nwhen: 2026-01-01\nscope: dev\n---\n# Dev\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, dir)
+	s, err := NewServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Registered before the stopper below so it runs after it (cleanups are LIFO):
+	// closing the store under a live refresh loop is not what this test measures.
+	t.Cleanup(func() { s.Close() })
+	s.SetScopeResolver(func(*http.Request) map[string]bool { return map[string]bool{"dev": true} })
+	h := s.Handler()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := s.refresh(); err != nil {
+				t.Errorf("refresh: %v", err)
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() { close(stop); wg.Wait() })
+
+	for i := 0; i < 200; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/status", nil))
+		if rec.Code != 200 {
+			t.Fatalf("/api/status = %d, want 200", rec.Code)
+		}
 	}
 }
