@@ -1974,7 +1974,19 @@ func joinCmd() *cobra.Command {
 				return err
 			}
 			abs, _ := filepath.Abs(vaultDir)
-			fmt.Printf("joined and cloned %s (HEAD %s, %d files pulled)\n", abs, short8(sum.Head), sum.Pulled)
+			fmt.Printf("joined and cloned %s\n", abs)
+			// A join ENDS in a sync round (JoinVault returns SyncVault's Summary), so it
+			// can conflict, be refused, or defer part of the push exactly like `mesh sync`.
+			// This site used to print Head and Pulled and nothing else, which is the worst
+			// place in the product to be silent: someone who ran `mesh init ~/notes`, wrote
+			// an index.md and then joined a hub had their file replaced by the hub's
+			// version, their bytes parked in a .sync-conflict sibling, and was told only
+			// "5 files pulled". A viewer-role join reported no refusals, and a join into a
+			// vault with more dirty notes than one batch never said work remained. Same
+			// renderer as every other round.
+			for _, line := range syncSummaryLines(sum) {
+				fmt.Println(line)
+			}
 			fmt.Println("next:")
 			fmt.Println("  mesh sync " + vaultDir + "                       # push your edits, pull teammates'")
 			fmt.Printf("  mesh mcp --vault %s --watch       # point your agent at the vault\n", vaultDir)
@@ -2133,46 +2145,30 @@ func syncCmd() *cobra.Command {
 }
 
 // syncSummaryLines renders one sync round for the operator: a headline, then one
-// indented line per thing that needs a decision. Shared by the one-shot path and the
-// --watch loop, which had drifted into two different wordings of the same four lines.
+// indented line per thing that needs a decision. Shared by `mesh join`, the one-shot
+// `mesh sync`, and its --watch loop, which had drifted into separate wordings of the
+// same four lines.
 //
-// The Remaining line is the operator half of the bounded-batch fix. SyncVault caps how
-// many dirty notes one round pushes and defers the rest (Summary.Remaining), but
-// Remaining was set and then read by nobody outside the tests, so a user with 12000
-// dirty notes saw "synced: pushed 4000, pulled 0, 0 conflict(s)" and had no way to
-// learn that 8000 edits were still local and invisible to the team. A number nobody
-// prints is the same as no fix at all, so it says what to do next, not just a count.
+// The renderer itself lives in pkg/meshclient next to Summary, because cmd/mesh is not
+// the only binary that runs a round: cmd/mesh-curator joins a hub too, could not reach
+// a renderer that lived here, and grew its own two-field receipt as a result. These
+// wrappers stay so the CLI keeps one local name for the thing it prints.
 func syncSummaryLines(sum meshclient.Summary) []string {
-	lines := syncHeadlineLines(sum)
-	for _, sib := range sum.ConflictSiblings {
-		lines = append(lines, fmt.Sprintf("  conflict: hub version kept; your version saved at %s (resolve, then sync)", sib))
-	}
-	for _, sib := range sum.Protected {
-		lines = append(lines, fmt.Sprintf("  protected your unsaved local edit; incoming hub version saved at %s", sib))
-	}
-	for _, rej := range sum.Rejected {
-		lines = append(lines, fmt.Sprintf("  rejected by hub (no write permission, scope, too large, or not a .md note): %s -- kept local, will retry", rej))
-	}
-	return lines
+	return sum.Lines()
 }
 
 // syncHeadlineLines renders the part of a sync round that is true wherever the round
 // was triggered from: what moved, and whether the push was complete.
 //
-// It is split out because there is a THIRD caller of SyncVault in the CLI besides
-// `mesh sync` and its --watch loop: `mesh conflicts resolve --take-mine` pushes the
-// version it just restored. That one had its own hand-rolled copy of the headline
-// format and therefore never grew the remainder line either, so resolving a conflict
-// on a vault with a deferred backlog printed a headline that read complete. One
-// format string, three callers; TestSyncHeadlineHasOneRenderer fails on a fourth copy.
+// It is split out because `mesh conflicts resolve --take-mine` owns its own receipt
+// wording for the note it just rescued, but still has to tell the truth about the
+// round that carried it. That site had its own hand-rolled copy of the headline
+// format and therefore never grew the remainder line, so resolving a conflict on a
+// vault with a deferred backlog printed a headline that read complete.
+// TestEveryCLISyncRoundRendersThroughTheSharedRenderer discovers the callers from the
+// AST, so a new one that hand-rolls a receipt fails the build instead of shipping.
 func syncHeadlineLines(sum meshclient.Summary) []string {
-	lines := []string{fmt.Sprintf("synced: pushed %d, pulled %d, %d conflict(s) (HEAD %s)",
-		sum.Pushed, sum.Pulled, sum.Conflicts, short8(sum.Head))}
-	if sum.Remaining > 0 {
-		lines = append(lines, fmt.Sprintf("  %d more changed note(s) are still queued and NOT on the hub yet "+
-			"(one round pushes a bounded batch); run `mesh sync` again to send them", sum.Remaining))
-	}
-	return lines
+	return sum.HeadlineLines()
 }
 
 // syncSummaryMoved reports whether a round is worth a log line under --watch, which
@@ -2180,8 +2176,7 @@ func syncHeadlineLines(sum meshclient.Summary) []string {
 // Remaining counts: a round that pushed a full batch and deferred the rest has moved,
 // and the deferred tail is exactly what the operator needs to be told about.
 func syncSummaryMoved(sum meshclient.Summary) bool {
-	return sum.Pushed > 0 || sum.Pulled > 0 || sum.Conflicts > 0 ||
-		sum.Remaining > 0 || len(sum.Protected) > 0 || len(sum.Rejected) > 0
+	return sum.Moved()
 }
 
 func short8(s string) string {

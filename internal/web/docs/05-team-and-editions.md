@@ -15,6 +15,12 @@ to a `*.sync-conflict-*.md` sibling to resolve by hand. Deletes and renames
 propagate, and the hub authors git history attributed to each user. Add
 `mesh sync --watch` for real-time push.
 
+`mesh join` ends in that same reconcile, so joining a directory that already holds
+notes can conflict, can have a note refused, and can leave part of your push queued.
+It reports all three the way `mesh sync` does; read the lines it prints before you
+carry on. Joining a DIFFERENT hub from the same directory resets the sync baseline,
+so your notes are pushed to the new hub in full rather than treated as already sent.
+
 ## Trust and access (team hub)
 
 A team hub is fail-closed and built for regulated teams:

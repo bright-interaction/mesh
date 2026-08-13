@@ -480,21 +480,213 @@ const syncHeadlineFormat = `synced: pushed %d, pulled %d, %d conflict(s) (HEAD %
 
 // TestSyncHeadlineHasOneRenderer pins the sync headline to a single function.
 //
-// Three CLI paths call SyncVault and report the round: `mesh sync`, its --watch loop,
-// and `mesh conflicts resolve --take-mine`. All three had their own copy of this
-// format string, and the copies drifted, which is how the deferred-remainder line
+// Several CLI paths run a sync round and report it, and they each had their own copy
+// of this format string. The copies drifted, which is how the deferred-remainder line
 // (Summary.Remaining) reached one of them and none of the others: a bounded round
 // looked complete everywhere except the one path that had been updated. The count is
-// pinned at exactly one so a fourth path cannot start a fourth copy.
+// pinned at exactly one so the next path cannot start another copy.
+//
+// The renderer lives in pkg/meshclient, next to Summary, because cmd/mesh-curator
+// runs rounds too and cannot import a cmd/mesh function.
+//
+// This test on its own is NOT enough, and that is worth stating here because it was
+// believed to be: it pins where the string lives, not who uses it. `mesh join` was the
+// uncounted caller that printed a two-field receipt of its own and never touched this
+// string at all, so nothing here could see it. That is what the test below covers.
 func TestSyncHeadlineHasOneRenderer(t *testing.T) {
 	root := moduleRoot(t)
 	owners := functionsContaining(t, root, syncHeadlineFormat)
-	want := []string{"cmd/mesh/main.go:syncHeadlineLines"}
+	want := []string{"pkg/meshclient/summary.go:HeadlineLines"}
 	if len(owners) != 1 || owners[0] != want[0] {
 		t.Errorf("the sync headline is rendered by %v, want exactly %v. Every caller must go "+
 			"through the shared renderer, or the next line added to one copy silently misses "+
 			"the others (that is how Summary.Remaining stayed invisible).", owners, want)
 	}
+}
+
+// syncEntryPoints are the two calls that RUN a sync round and hand back a Summary
+// describing what needs a decision. A function that calls one of these owes the
+// operator a report of what it got back.
+var syncEntryPoints = map[string]bool{"SyncVault": true, "JoinVault": true}
+
+// TestEveryCLISyncRoundRendersThroughTheSharedRenderer DISCOVERS, from the AST, every
+// function in the command-line binaries that runs a sync round, and fails on any one
+// that cannot reach the shared renderer.
+//
+// The subject list is discovered rather than written down, and that is the whole point.
+// The previous guard stated its subjects in a comment ("three CLI paths call SyncVault")
+// and asserted only that one format string had one owner. `mesh join` was a fourth
+// caller: JoinVault ends in SyncVault and returns the full Summary, and joinCmd read
+// Head and Pulled off it and printed nothing else. So a stranger who ran `mesh init`,
+// wrote an index.md and then joined a hub had their file replaced and their bytes parked
+// in a sibling, and the terminal said "5 files pulled". A viewer-role join reported no
+// refusals; a join with a deferred remainder reported none of it either. Every one of
+// those facts was in the Summary and every one was dropped, and the guard that existed
+// to catch exactly this was green over it, because a hand-written list cannot notice a
+// caller nobody added to it.
+//
+// Reachability rather than a direct call, because `mesh conflicts resolve --take-mine`
+// legitimately owns its own receipt wording for the note it just rescued; it must still
+// route the ROUND through the shared headline, which it does two calls down.
+func TestEveryCLISyncRoundRendersThroughTheSharedRenderer(t *testing.T) {
+	root := moduleRoot(t)
+	// cmd/ is where the operator-facing binaries live; pkg/meshclient is scanned too so
+	// the renderer and the entry points themselves resolve during the walk.
+	funcs := scanFuncs(t, root, []string{"cmd", filepath.Join("pkg", "meshclient")})
+
+	var renderers []string
+	for q, f := range funcs {
+		if strings.Contains(f.body, syncHeadlineFormat) {
+			renderers = append(renderers, q)
+		}
+	}
+	sort.Strings(renderers)
+	if len(renderers) != 1 {
+		t.Fatalf("expected exactly one function to own the sync headline, found %v", renderers)
+	}
+	renderer := renderers[0]
+
+	var callers, offenders []string
+	for q, f := range funcs {
+		if !strings.HasPrefix(q, "cmd/") {
+			continue // internal daemons report through their own logs, not a receipt
+		}
+		if !anyOf(f.calls, syncEntryPoints) {
+			continue
+		}
+		callers = append(callers, q)
+		if !reachesFunc(funcs, q, renderer) {
+			offenders = append(offenders, q)
+		}
+	}
+	sort.Strings(callers)
+	sort.Strings(offenders)
+	if len(callers) == 0 {
+		t.Fatal("found no CLI function that calls SyncVault or JoinVault; the discovery is " +
+			"broken, and a broken discovery is a guard that passes over anything")
+	}
+	if len(offenders) > 0 {
+		t.Errorf("these CLI functions run a sync round but never reach %s: %v\n"+
+			"Each one gets a Summary carrying Conflicts, ConflictSiblings, Protected, Rejected "+
+			"and Remaining, and a receipt that omits them tells the user their notes are on the "+
+			"hub when they are not. Render through Summary.Lines (cmd/mesh: syncSummaryLines) "+
+			"instead of hand-rolling a headline.", renderer, offenders)
+	}
+	t.Logf("sync-round callers checked: %v", callers)
+}
+
+// scannedFunc is one function body plus the plain names of everything it calls, which
+// is enough to walk the call graph inside the packages we scanned.
+type scannedFunc struct {
+	body  string
+	calls map[string]bool
+}
+
+// scanFuncs parses every non-test .go file under the given module-relative directories
+// and returns "<rel>:<func>" -> its body and call set. Methods are keyed by their own
+// name (there is no receiver in the key), which is enough resolution here and keeps the
+// call-graph walk name-based.
+func scanFuncs(t *testing.T, root string, dirs []string) map[string]scannedFunc {
+	t.Helper()
+	out := map[string]scannedFunc{}
+	for _, d := range dirs {
+		err := filepath.WalkDir(filepath.Join(root, d), func(path string, de fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if de.IsDir() {
+				switch de.Name() {
+				case ".git", "node_modules", "testdata", "vendor":
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			fset := token.NewFileSet()
+			parsed, perr := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+			if perr != nil {
+				return perr
+			}
+			rel, rerr := filepath.Rel(root, path)
+			if rerr != nil {
+				rel = path
+			}
+			rel = filepath.ToSlash(rel)
+			for _, decl := range parsed.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Body == nil {
+					continue
+				}
+				var buf bytes.Buffer
+				if err := printer.Fprint(&buf, fset, fd.Body); err != nil {
+					return err
+				}
+				calls := map[string]bool{}
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					switch fn := call.Fun.(type) {
+					case *ast.Ident:
+						calls[fn.Name] = true
+					case *ast.SelectorExpr:
+						calls[fn.Sel.Name] = true
+					}
+					return true
+				})
+				out[rel+":"+fd.Name.Name] = scannedFunc{body: buf.String(), calls: calls}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("scan %s: %v", d, err)
+		}
+	}
+	return out
+}
+
+func anyOf(have map[string]bool, want map[string]bool) bool {
+	for n := range want {
+		if have[n] {
+			return true
+		}
+	}
+	return false
+}
+
+// reachesFunc walks the call graph from start and reports whether target is reachable.
+// The sync entry points are dead ends on purpose: SyncVault BUILDS the Summary (its body
+// mentions every field), so traversing into it would make every caller trivially
+// "reach" any renderer and the guard would pass over the exact thing it is watching for.
+func reachesFunc(funcs map[string]scannedFunc, start, target string) bool {
+	byName := map[string][]string{}
+	for q := range funcs {
+		byName[q[strings.LastIndex(q, ":")+1:]] = append(byName[q[strings.LastIndex(q, ":")+1:]], q)
+	}
+	seen := map[string]bool{start: true}
+	queue := []string{start}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur == target {
+			return true
+		}
+		for name := range funcs[cur].calls {
+			if syncEntryPoints[name] {
+				continue
+			}
+			for _, next := range byName[name] {
+				if !seen[next] {
+					seen[next] = true
+					queue = append(queue, next)
+				}
+			}
+		}
+	}
+	return false
 }
 
 // functionsContaining returns "<rel>:<func>" for every function whose CODE contains

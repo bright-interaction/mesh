@@ -31,6 +31,15 @@ type syncState struct {
 	HeadSHA string            `json:"head_sha"`
 	Hashes  map[string]string `json:"hashes"`             // vault-relative path -> content sha
 	TombSeq int64             `json:"tomb_seq,omitempty"` // last delete high-water mark seen from the hub
+	// VaultID and HubURL record WHICH hub this base describes. Everything else in this
+	// file is meaningless without them: HeadSHA is a commit in one hub's history, Hashes
+	// is "what that hub already has", and TombSeq is a position in that hub's delete
+	// ledger. A join into an already-joined directory rewrites .mesh/credentials and
+	// used to leave all three pointing at the previous hub, so hub A's hash map became
+	// the push baseline for hub B and every note not edited since was skipped by
+	// computeOutbox forever (see JoinVault).
+	VaultID string `json:"vault_id,omitempty"`
+	HubURL  string `json:"hub_url,omitempty"`
 }
 
 func credPath(vaultDir string) string  { return filepath.Join(vaultDir, ".mesh", "credentials") }
@@ -717,7 +726,22 @@ func SyncVault(vaultDir string) (Summary, error) {
 			delete(current, rel)
 		}
 	}
-	if err := writeState(vaultDir, syncState{HeadSHA: resp.HeadSHA, Hashes: current, TombSeq: resp.TombstoneSeq}); err != nil {
+	// Carry the vault identity forward. It is what makes a later `mesh join` able to
+	// tell "same hub, keep the base" from "different hub, this base is a lie", so a
+	// round that dropped it would re-open that hole on the next sync. HubURL is
+	// backfilled from the credentials when the state predates the field, which is how a
+	// vault joined before this shipped starts being protected without a re-join.
+	hubURL := state.HubURL
+	if hubURL == "" {
+		hubURL = creds.HubURL
+	}
+	if err := writeState(vaultDir, syncState{
+		HeadSHA: resp.HeadSHA,
+		Hashes:  current,
+		TombSeq: resp.TombstoneSeq,
+		VaultID: state.VaultID,
+		HubURL:  hubURL,
+	}); err != nil {
 		return Summary{}, err
 	}
 	sum := Summary{Pushed: len(outbox) - len(resp.Rejected), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped, Rejected: resp.Rejected}
@@ -739,12 +763,19 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 	if err := os.MkdirAll(vaultDir, 0o755); err != nil {
 		return Summary{}, err
 	}
+	// Read what this directory was joined to BEFORE writeCredentials overwrites it.
+	// The old hub URL is one of the two ways we can recognise a re-join that switches
+	// hubs, and it only exists until the next line runs.
+	prevCreds, _ := readCredentials(vaultDir) // missing file = never joined; zero value is right
+	prevState := readState(vaultDir)
+
 	c := New(hubURL, "")
 	jr, err := c.Join(invite)
 	if err != nil {
 		return Summary{}, err
 	}
-	if err := writeCredentials(vaultDir, credentials{HubURL: strings.TrimRight(hubURL, "/"), Token: jr.ClientToken}); err != nil {
+	hubBase := strings.TrimRight(hubURL, "/")
+	if err := writeCredentials(vaultDir, credentials{HubURL: hubBase, Token: jr.ClientToken}); err != nil {
 		return Summary{}, err
 	}
 	c.Token = jr.ClientToken
@@ -755,8 +786,59 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 	if err := checkHomogeneity(vi.MeshToml); err != nil {
 		return Summary{}, err
 	}
-	// No local state yet -> base "" -> the hub returns a full snapshot.
+	vaultID := jr.VaultID
+	if vaultID == "" {
+		vaultID = vi.VaultID
+	}
+	// Point the sync BASE at the hub we just joined, not the one we used to be joined
+	// to. Join rewrote .mesh/credentials and left .mesh/sync.json alone, so re-joining
+	// an already-joined directory made hub A's hash map the push baseline for hub B:
+	// computeOutbox diffs against it, so every note not edited since was seen as
+	// already synced and skipped, the full reconcile kept the local files, and the
+	// recompute wrote those same hashes back as the new base. Recorded as synced,
+	// never sent, and it does not self-heal, because nothing ever re-dirties a path
+	// that both sides believe is settled. TombSeq is the same shape and worse: the hub
+	// echoes the client's floor back (internal/hub/sync.go), so hub B's own deletes
+	// stay invisible until its sequence passes hub A's. Reachable by doing the
+	// documented thing on a rebuilt hub, a hub migration, or a hub.db re-bootstrap.
+	//
+	// A zero base is the safe answer: the hub replies with a full snapshot and the
+	// client pushes everything it holds, which is what "join and clone" already means.
+	// The identity is stamped either way, so a state file written before this existed
+	// starts carrying it after one join and the comparison gets sharper, not weaker.
+	if joinTargetsAnotherVault(prevState, prevCreds.HubURL, hubBase, vaultID) {
+		prevState = syncState{Hashes: map[string]string{}}
+	}
+	prevState.VaultID = vaultID
+	prevState.HubURL = hubBase
+	if err := writeState(vaultDir, prevState); err != nil {
+		return Summary{}, err
+	}
+	// Fresh directory: base "" -> the hub returns a full snapshot.
 	return SyncVault(vaultDir)
+}
+
+// joinTargetsAnotherVault reports whether a join is pointing an ALREADY-joined
+// directory at a different vault than the one .mesh/sync.json describes, which makes
+// the stored base (HeadSHA, Hashes, TombSeq) wrong rather than merely stale.
+//
+// The vault id is the authority when both sides have one: it survives a hub moving to
+// a new URL, and it changes when a hub is rebuilt at the same URL. The URL is the
+// fallback for a state file written before the id was recorded, and for a hub that
+// reports no id at all. An empty stored base is nothing to invalidate, so a first join
+// into an empty directory is never treated as a switch.
+func joinTargetsAnotherVault(prev syncState, prevHubURL, hubURL, vaultID string) bool {
+	if prev.HeadSHA == "" && len(prev.Hashes) == 0 && prev.TombSeq == 0 {
+		return false
+	}
+	if prev.VaultID != "" && vaultID != "" {
+		return prev.VaultID != vaultID
+	}
+	known := prev.HubURL
+	if known == "" {
+		known = strings.TrimRight(prevHubURL, "/")
+	}
+	return known != "" && known != hubURL
 }
 
 // checkHomogeneity fails closed if the vault's canonical embedding space (from the
