@@ -16,6 +16,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/llm"
+	"github.com/bright-interaction/mesh/internal/shellpath"
 )
 
 // Guard is a proposed enforcement for a gotcha.
@@ -100,15 +101,18 @@ func ShellSnippet(guards []Guard) string {
 		includes := ""
 		for _, gl := range strings.Split(g.Globs, ",") {
 			if gl = strings.TrimSpace(gl); gl != "" {
-				includes += fmt.Sprintf(" --include='%s'", gl)
+				// shellpath.Quote, not a hand-written ' + gl + ': a glob carrying an
+				// apostrophe closed the quote and the rest of the glob became shell syntax
+				// in a file the user is invited to run as a pre-commit hook. Globs still
+				// come out quoted (`*` is not in the safe set), so grep, not the shell,
+				// expands them.
+				includes += " --include=" + shellpath.Quote(gl)
 			}
 		}
 		msg := strings.ReplaceAll(g.Message, "'", "")
 		b.WriteString(fmt.Sprintf("\n# %s  [%s]\nif grep -rnE%s -- %s . >/dev/null 2>&1; then\n  echo 'GUARD: %s'; fail=1\nfi\n",
-			g.Title, g.Severity, includes, shellQuote(g.Pattern), msg))
+			g.Title, g.Severity, includes, shellpath.Quote(g.Pattern), msg))
 	}
 	b.WriteString("\nexit $fail\n")
 	return b.String()
 }
-
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }

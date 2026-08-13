@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/shellpath"
 )
 
 // The single owning writer, named on disk.
@@ -202,7 +204,7 @@ const NoOwnerIssue = "no-owner"
 func NoOwnerRemedy(vaultRoot string) string {
 	arg := " <vault>"
 	if vaultRoot != "" {
-		arg = " " + vaultRoot
+		arg = " " + shellpath.Quote(vaultRoot)
 	}
 	return "no owning writer detected: nothing is indexing this vault, so notes you write or edit " +
 		"stay invisible to search. Fix: point your agent at `mesh mcp --vault" + arg + " --watch`, which " +
