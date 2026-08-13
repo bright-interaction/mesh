@@ -204,10 +204,20 @@ Keep it short and friendly, then carry on with whatever they need.
 // OpenRebuild rather than Open, matching `mesh index`: install IS the first build, so a
 // corrupt index file is the thing being replaced, not an obstacle. It discards the file
 // only for that one error class (see recoverCorruptIndex), and says so out loud.
-func indexVault(vaultAbs string) error {
+//
+// It also returns how many notes the pass had to DROP, which is a different failure from
+// the ones above and was the half BLOCKER 6's first fix left open. A hard index failure
+// was made loud; a partial one stayed silent. A vault of eight files with one broken
+// frontmatter block and one duplicate id opens, reindexes and counts perfectly well, so
+// install printed "+ indexed the vault (6 notes)" and "Done." and exited 0 over the exact
+// vault `mesh index` and `mesh init` both exit 1 on. Six is not eight, and the count alone
+// never says so: the user has no other copy of that number to compare it against on their
+// first run. The census and the exit code are shared with init through reportDroppedNotes
+// so the two commands cannot answer the same vault differently again.
+func indexVault(vaultAbs string) (int, error) {
 	store, recovered, err := index.OpenRebuild(vaultAbs)
 	if err != nil {
-		return installIndexError(vaultAbs, err)
+		return 0, installIndexError(vaultAbs, err)
 	}
 	defer store.Close()
 	if recovered {
@@ -215,18 +225,30 @@ func indexVault(vaultAbs string) error {
 		fmt.Println("    your notes are intact; stored embeddings went with it, so re-run `mesh embed` if you use semantic search")
 	}
 	if _, err := index.Reindex(store, vaultAbs); err != nil {
-		return installIndexError(vaultAbs, err)
+		return 0, installIndexError(vaultAbs, err)
 	}
 	n, err := store.Count("notes")
 	if err != nil {
-		return installIndexError(vaultAbs, err)
+		return 0, installIndexError(vaultAbs, err)
 	}
-	if n == 0 {
+	// A failure to READ the census is an index failure like any other here, so it gets
+	// the same "do NOT restart your agent yet" wrapper: install cannot tell the user
+	// whether the mesh it just wired them to is complete.
+	nDropped, derr := reportDroppedNotes(store, vaultAbs)
+	if derr != nil {
+		return 0, installIndexError(vaultAbs, derr)
+	}
+	switch {
+	case nDropped > 0:
+		// Never the clean receipt, even when n is 0: an empty index over a vault full of
+		// broken notes is the loudest case, not the quietest.
+		fmt.Printf("  ! indexed the vault (%d notes, %d NOT indexed and invisible to the agent; see above)\n", n, nDropped)
+	case n == 0:
 		fmt.Printf("  + indexed the vault (no notes yet: add markdown under %s and run `mesh index %s`)\n", vaultAbs, shellpath.Quote(vaultAbs))
-		return nil
+	default:
+		fmt.Printf("  + indexed the vault (%d notes)\n", n)
 	}
-	fmt.Printf("  + indexed the vault (%d notes)\n", n)
-	return nil
+	return nDropped, nil
 }
 
 // installIndexError names the remedy for the one failure a stranger meets on their first
@@ -300,13 +322,25 @@ func installCmd() *cobra.Command {
 				}
 				// Before SetOnboardPending and before "Done.": a welcome armed over a
 				// vault with no working index fires into a session that has no mesh.
-				if err := indexVault(vaultAbs); err != nil {
+				nDropped, err := indexVault(vaultAbs)
+				if err != nil {
 					return err
 				}
 				if err := hooks.SetOnboardPending(vaultAbs); err != nil {
 					return err
 				}
 				fmt.Println("  + armed the first-run welcome")
+				// A dropped note is not a reason to leave the agent unwired, so the setup
+				// above stands and the welcome is armed. It IS a reason to withhold the
+				// word "Done.": what the agent will read is not what is in the folder, and
+				// the closing line is the only place a first-run user would learn that.
+				if nDropped > 0 {
+					fmt.Println("\nThe agent is wired up, but your mesh is INCOMPLETE: the note(s) listed above")
+					fmt.Println("are not in the index, so the agent will not see them. Fix them and run:")
+					fmt.Printf("  mesh index %s\n", vaultAbs)
+					fmt.Println("Then start a new agent session and Mesh will finish onboarding.")
+					return droppedNotesError(nDropped)
+				}
 				fmt.Println("\nDone. Start a new agent session (or reconnect the MCP server) and Mesh will")
 				fmt.Println("greet you and finish onboarding automatically, no commands needed.")
 				return nil
@@ -322,14 +356,24 @@ func installCmd() *cobra.Command {
 			} else {
 				fmt.Printf("  . MCP server already registered for %s in %s\n", client, p)
 			}
-			if err := indexVault(vaultAbs); err != nil {
+			nDropped, err := indexVault(vaultAbs)
+			if err != nil {
 				return err
 			}
-			fmt.Printf("\nDone. Restart %s so it loads the MCP server.\n", client)
+			// The twin of the claude-code branch above, and it gets the same treatment for
+			// the same reason: the registration stands, the word "Done." does not.
+			if nDropped > 0 {
+				fmt.Printf("\nThe MCP server is registered for %s, but your mesh is INCOMPLETE: the note(s)\n", client)
+				fmt.Println("listed above are not in the index, so the agent will not see them. Fix them and run:")
+				fmt.Printf("  mesh index %s\n", vaultAbs)
+				fmt.Printf("Then restart %s so it loads the MCP server.\n", client)
+			} else {
+				fmt.Printf("\nDone. Restart %s so it loads the MCP server.\n", client)
+			}
 			fmt.Println("Note: the auto-onboard + write-back hooks are Claude Code only. Here the agent")
 			fmt.Println("uses Mesh via the MCP server's instructions, just ask it to use Mesh, or run")
 			fmt.Println("`mesh hooks install` if you also use Claude Code in this project.")
-			return nil
+			return droppedNotesError(nDropped)
 		},
 	}
 	c.Flags().StringVar(&client, "client", "claude-code", "agent client: "+strings.Join(hooks.Clients, ", "))

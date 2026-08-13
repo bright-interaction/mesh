@@ -156,19 +156,9 @@ func initCmd() *cobra.Command {
 			// leave one note out of the vault entirely, and init used to print "1 notes"
 			// for 2 files and exit 0, so the first thing a new user ever saw was a
 			// quietly incomplete vault.
-			// The read is fallible on a read-only store and this one is writable, so an
-			// error here means the record itself could not be read. Report it rather than
-			// reading silence as "nothing was dropped", which are opposite answers.
-			dropped, derr := store.DroppedNotes()
+			nDropped, derr := reportDroppedNotes(store, root)
 			if derr != nil {
 				return derr
-			}
-			if len(dropped) > 0 {
-				fmt.Fprintf(os.Stderr, "\n%d note(s) are NOT in the index and are invisible to search and the graph:\n", len(dropped))
-				for _, d := range dropped {
-					fmt.Fprintf(os.Stderr, "  %s: %v\n", d.Path, d.Err)
-				}
-				fmt.Fprintf(os.Stderr, "fix them, then run: mesh index %s\n\n", shellpath.Quote(root))
 			}
 			fmt.Println("next:")
 			fmt.Println("  mesh new decision \"<title>\" --vault " + shellpath.Quote(root) + "   # capture a decision/gotcha")
@@ -182,13 +172,52 @@ func initCmd() *cobra.Command {
 			fmt.Println("    to check one is running; `mesh watch " + shellpath.Quote(root) + "` starts a standalone one.")
 			// Printed the next steps first, then fail: a vault that dropped notes is
 			// incomplete, and init exiting 0 over it was the original defect.
-			if len(dropped) > 0 {
-				return fmt.Errorf("%d note(s) could not be indexed", len(dropped))
-			}
-			return nil
+			return droppedNotesError(nDropped)
 		},
 	}
 	return c
+}
+
+// reportDroppedNotes names every note the last index pass left out of the index and
+// returns how many there were. Nothing is printed for a vault that indexed cleanly.
+//
+// ONE function for `mesh init` and `mesh install`, on purpose. They are twins: both are a
+// stranger's first command, both build that vault's first index, and they used to answer
+// the same vault differently. Given eight files where one has broken YAML and one collides
+// on id, init named both and exited 1 while install printed "+ indexed the vault (6 notes)"
+// then "Done." and exited 0. The first-run command was the one that lied, which is the
+// worst possible place for it. Sharing the census and the exit code means a later change
+// to either lands on both by construction instead of by somebody remembering.
+//
+// The returned error is a failure to READ the census, never the drop itself. "no dropped
+// notes" and "could not find out" are opposite answers and only one of them is good news,
+// so the read failure propagates on its own; a writable store never returns it. The drop
+// becomes the command's exit status through droppedNotesError, which callers return AFTER
+// their closing advice, because a user whose vault is incomplete still needs to be told
+// what to do next.
+func reportDroppedNotes(store *index.Store, root string) (int, error) {
+	dropped, err := store.DroppedNotes()
+	if err != nil {
+		return 0, err
+	}
+	if len(dropped) == 0 {
+		return 0, nil
+	}
+	fmt.Fprintf(os.Stderr, "\n%d note(s) are NOT in the index and are invisible to search and the graph:\n", len(dropped))
+	for _, d := range dropped {
+		fmt.Fprintf(os.Stderr, "  %s: %v\n", d.Path, d.Err)
+	}
+	fmt.Fprintf(os.Stderr, "fix them, then run: mesh index %s\n\n", shellpath.Quote(root))
+	return len(dropped), nil
+}
+
+// droppedNotesError turns the census count into the exit status, and is nil for a clean
+// vault so a caller can `return droppedNotesError(n)` as its last line.
+func droppedNotesError(n int) error {
+	if n == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d note(s) could not be indexed", n)
 }
 
 // writeStarterIndex writes the starter index.md `mesh init` drops into an empty vault,

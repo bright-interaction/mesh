@@ -275,7 +275,7 @@ func TestMigrateFileKeepsCRLF(t *testing.T) {
 			if err := os.WriteFile(p, []byte(tc.src), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			res, err := MigrateFile(p, false)
+			res, err := MigrateFile(filepath.Dir(p), p, false)
 			if err != nil || !res.Changed {
 				t.Fatalf("Changed=%v err=%v", res.Changed, err)
 			}

@@ -94,7 +94,7 @@ func carriesValue(raw map[string]any, key string) bool {
 func migrateAddableKeys(t *testing.T) []string {
 	t.Helper()
 	p := writeNoteFile(t, relatedBody)
-	if _, err := MigrateFile(p, false); err != nil {
+	if _, err := MigrateFile(filepath.Dir(p), p, false); err != nil {
 		t.Fatalf("migrating a note with no frontmatter at all: %v", err)
 	}
 	data, err := os.ReadFile(p)
@@ -126,7 +126,7 @@ func TestMigrateFileKeysAreNilAware(t *testing.T) {
 			t.Run(key+"/"+blank.name, func(t *testing.T) {
 				p := writeNoteFile(t, "---\ntitle: Alpha\n"+key+":"+blank.value+"\n---\n"+relatedBody)
 
-				res, err := MigrateFile(p, false)
+				res, err := MigrateFile(filepath.Dir(p), p, false)
 				if err != nil {
 					t.Fatalf("MigrateFile refused a note whose %q declares nothing: %v", key, err)
 				}
@@ -153,7 +153,7 @@ func TestMigrateFileKeysAreNilAware(t *testing.T) {
 					t.Errorf("%q still declares nothing after a migration that claimed to set it:\n%s", key, fmText)
 				}
 
-				res2, err := MigrateFile(p, false)
+				res2, err := MigrateFile(filepath.Dir(p), p, false)
 				if err != nil {
 					t.Fatalf("re-migrating: %v", err)
 				}
@@ -242,7 +242,7 @@ func TestBackfillsAreNilAware(t *testing.T) {
 func TestMigratedValuesAreEncodedNotFormatted(t *testing.T) {
 	t.Run("lifted wikilinks survive whatever YAML makes of them", func(t *testing.T) {
 		p := writeNoteFile(t, "# Alpha\n\n## Related\n- [[Deploy: staging]]\n- [[*star]]\n- [[&amp]]\n- [[plain-note]]\n")
-		if _, err := MigrateFile(p, false); err != nil {
+		if _, err := MigrateFile(filepath.Dir(p), p, false); err != nil {
 			t.Fatalf("lifting wikilinks into related: %v", err)
 		}
 		out, err := os.ReadFile(p)
@@ -262,7 +262,7 @@ func TestMigratedValuesAreEncodedNotFormatted(t *testing.T) {
 
 	t.Run("a when carrying a quote does not close the block", func(t *testing.T) {
 		p := writeNoteFile(t, "---\ntype: entity\nupdated: 'he said \"ship it\" on friday'\n---\n# Alpha\nbody\n")
-		if _, err := MigrateFile(p, false); err != nil {
+		if _, err := MigrateFile(filepath.Dir(p), p, false); err != nil {
 			t.Fatalf("migrating a note whose updated carries a quote: %v", err)
 		}
 		out, err := os.ReadFile(p)
@@ -319,7 +319,7 @@ func TestDeclaredValuesSurviveTheBackfills(t *testing.T) {
 
 	t.Run("declared migrate keys are not re-added", func(t *testing.T) {
 		p := writeNoteFile(t, "---\nid: alpha\ntype: gotcha\nwhen: \"2026-01-01\"\nrelated:\n    - mine\n---\n"+relatedBody)
-		res, err := MigrateFile(p, false)
+		res, err := MigrateFile(filepath.Dir(p), p, false)
 		if err != nil || res.Changed {
 			t.Fatalf("a fully declared note must be an idempotent no-op; Changed=%v actions=%v err=%v", res.Changed, res.Actions, err)
 		}
