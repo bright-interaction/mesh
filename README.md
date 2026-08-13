@@ -326,6 +326,7 @@ Set up and capture:
 | Command | Purpose |
 |---|---|
 | `mesh install` | One-shot setup: register the MCP server with your agent (plus the auto-onboard hook on Claude Code) |
+| `mesh install --remove` | The inverse: drop the mesh entry from that client's config (and the session hooks on Claude Code). Run it before deleting the binary |
 | `mesh init [path]` | Bootstrap a new vault |
 | `mesh new <type> "<title>"` | Scaffold a note (id, date, placement, skeleton auto-filled) |
 | `mesh migrate [vault]` | Bring a Foam / Obsidian-style vault up to the Mesh schema (dry run unless `--apply`) |
@@ -368,7 +369,7 @@ View:
 |---|---|
 | `mesh tui [vault]` | Keyboard three-pane terminal view (notes, ranked search, preview + neighbors) |
 | `mesh ui [vault]` | Browser app (graph, search, docs, API reference) over the same index, localhost |
-| `mesh serve-ssh [vault]` | Serve the TUI over SSH so a teammate browses the graph with `ssh`, no install (key-auth, fail-closed) |
+| `mesh serve-ssh [vault]` | Serve the TUI over SSH so a teammate browses the graph with `ssh`, no install (key-auth, fail-closed: binds `127.0.0.1:2222` by default, and `--allow-anonymous` is refused off loopback) |
 
 Team sync. These are the client side and ship here, but they all talk to a
 **team-sync hub**, which is the commercial product and is not in this repository

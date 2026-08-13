@@ -645,7 +645,17 @@ func (s *Server) toolSetupHooks(ctx context.Context, raw json.RawMessage) (any, 
 		if err != nil {
 			return nil, &rpcError{Code: codeInvalidParams, Message: err.Error()}
 		}
-		return textResult(map[string]any{"removed": n, "settings_path": p}), nil
+		out := map[string]any{"removed": n, "settings_path": p}
+		// The CLI receipt for this same operation used to read as a complete
+		// uninstall and left the MCP registration behind; this is the twin of that
+		// receipt, so it has to say the same thing. This tool cannot remove the
+		// registration itself: it is the entry that launched this very server.
+		if reg, mp, rerr := hooks.MCPRegistered("claude-code", proj); rerr == nil && reg {
+			out["still_registered"] = mp
+			out["tell_the_user"] = "This removed the session hooks only. The Mesh MCP server is still registered in " + mp +
+				"; they can run `mesh install --remove` (add --client <name> for claude-desktop, cursor, vscode, windsurf or codex) to drop that too. Doing it before deleting the mesh binary avoids leaving their agent retrying a server that no longer exists."
+		}
+		return textResult(out), nil
 	default:
 		st, _ := hooks.GetStatus(proj)
 		return textResult(map[string]any{

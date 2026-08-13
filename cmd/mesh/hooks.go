@@ -246,11 +246,11 @@ func installIndexError(vaultAbs string, cause error) error {
 // agent then uses Mesh via the MCP server's instructions.
 func installCmd() *cobra.Command {
 	var dir, client string
-	var noMCP, enforce bool
+	var noMCP, enforce, remove bool
 	c := &cobra.Command{
 		Use:   "install [vault]",
-		Short: "One-shot setup: register the MCP server (and, on Claude Code, the auto-onboard hook)",
-		Long:  "Wires a coding agent to use Mesh. --client claude-code (default) also installs the SessionStart read hook + a one-time welcome so the agent onboards you with no further commands. Other clients (claude-desktop, cursor, vscode, windsurf, codex) get the MCP server registered in their own config; session hooks are Claude Code only, so elsewhere the agent uses Mesh via the MCP server's instructions.\n\nIt also builds the vault's first index. If that fails (an unwritable vault, an unreadable .mesh/mesh.db) install stops and prints the repair instead of reporting success, because an agent wired to a mesh that cannot open just fails to connect, with no message.",
+		Short: "One-shot setup: register the MCP server (and, on Claude Code, the auto-onboard hook). --remove undoes it",
+		Long:  "Wires a coding agent to use Mesh. --client claude-code (default) also installs the SessionStart read hook + a one-time welcome so the agent onboards you with no further commands. Other clients (claude-desktop, cursor, vscode, windsurf, codex) get the MCP server registered in their own config; session hooks are Claude Code only, so elsewhere the agent uses Mesh via the MCP server's instructions.\n\nIt also builds the vault's first index. If that fails (an unwritable vault, an unreadable .mesh/mesh.db) install stops and prints the repair instead of reporting success, because an agent wired to a mesh that cannot open just fails to connect, with no message.\n\nUse --remove to undo it: that drops the mesh entry from the same client config this command wrote (and, on claude-code, the session hooks too), leaving every other MCP server untouched. Run it before you delete the mesh binary, or the client keeps retrying a server that no longer exists. Your vault and its notes are never touched.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultPath := "."
@@ -268,6 +268,9 @@ func installCmd() *cobra.Command {
 			bin, err := os.Executable()
 			if err != nil || bin == "" {
 				bin = "mesh"
+			}
+			if remove {
+				return removeInstall(client, projAbs)
 			}
 			fmt.Printf("Setting up Mesh for %s...\n", client)
 
@@ -332,7 +335,49 @@ func installCmd() *cobra.Command {
 	c.Flags().StringVar(&dir, "dir", ".", "project dir (used for claude-code .mcp.json/.claude and vscode .vscode)")
 	c.Flags().BoolVar(&noMCP, "no-mcp", false, "skip registering the MCP server (claude-code only)")
 	c.Flags().BoolVar(&enforce, "enforce-writeback", false, "also install the Stop write-back nudge now (claude-code; default: the agent asks during onboarding)")
+	c.Flags().BoolVar(&remove, "remove", false, "undo the install: drop the mesh MCP entry from this client's config (and, on claude-code, the session hooks). Your vault is untouched")
 	return c
+}
+
+// removeInstall is the inverse of an install, and the only complete uninstall Mesh
+// has. `mesh hooks uninstall` removes the session hooks and nothing else, so before
+// this existed a user who ran it, believed the receipt, and deleted the binary was
+// left with a dead mesh entry in a GLOBAL client config, pointing at an absolute path
+// that no longer resolves, retried on every agent launch.
+//
+// It removes only what an install wrote, prints a per-file receipt, and says plainly
+// what it deliberately left alone.
+func removeInstall(client, projAbs string) error {
+	fmt.Printf("Removing Mesh from %s...\n", client)
+	dropped, p, err := hooks.UnregisterMCP(client, projAbs)
+	if err != nil {
+		return err
+	}
+	if dropped {
+		fmt.Printf("  - removed the Mesh MCP server from %s\n", p)
+	} else {
+		fmt.Printf("  . no Mesh MCP server registered in %s\n", p)
+	}
+	if client == "claude-code" {
+		removed, sp, herr := hooks.Uninstall(projAbs)
+		switch {
+		case herr != nil:
+			// The common case is no .claude/settings.json at all, which is not a
+			// failure of the uninstall; report it and carry on rather than aborting
+			// half way and leaving the user unsure what was removed.
+			fmt.Printf("  . no session hooks to remove (%v)\n", herr)
+		case removed > 0:
+			fmt.Printf("  - removed %d mesh session hook(s) from %s\n", removed, sp)
+		default:
+			fmt.Printf("  . no mesh session hooks in %s\n", sp)
+		}
+	}
+	fmt.Println("\nDone. Restart the client so it drops the server.")
+	fmt.Println("Left alone on purpose: your vault, its notes, and its .mesh index (delete the")
+	fmt.Println("vault folder yourself if you want those gone), plus every other MCP server in")
+	fmt.Println("that config. Registrations for OTHER clients are separate: re-run with")
+	fmt.Println("--client <name> for each one you set up.")
+	return nil
 }
 
 // hooksCmd installs/removes the Claude Code session hooks that enforce the read-at-
@@ -404,7 +449,8 @@ func hooksUninstallCmd() *cobra.Command {
 	var dir string
 	c := &cobra.Command{
 		Use:   "uninstall",
-		Short: "Remove the mesh session hooks from .claude/settings.json",
+		Short: "Remove the mesh session hooks from .claude/settings.json (NOT the MCP registration)",
+		Long:  "Removes the SessionStart and Stop hook entries this project's .claude/settings.json holds. It does not touch the MCP server registration that `mesh install` wrote, because that lives in a different file (and, for most clients, a global one). Run `mesh install --remove` for that.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			projAbs, _ := filepath.Abs(dir)
 			removed, p, err := hooks.Uninstall(projAbs)
@@ -412,6 +458,14 @@ func hooksUninstallCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("removed %d mesh hook(s) from %s\n", removed, p)
+			// Name what this did NOT do. The bare receipt above read as a complete
+			// uninstall, so people ran it and then deleted the binary, leaving a dead
+			// mesh entry in their client config that the agent retried every launch.
+			if reg, mp, rerr := hooks.MCPRegistered("claude-code", projAbs); rerr == nil && reg {
+				fmt.Printf("still registered: the Mesh MCP server in %s.\n", mp)
+				fmt.Println("Session hooks and the MCP registration are separate files. Run `mesh install --remove`")
+				fmt.Println("to drop it (add --client <name> for claude-desktop, cursor, vscode, windsurf or codex).")
+			}
 			return nil
 		},
 	}

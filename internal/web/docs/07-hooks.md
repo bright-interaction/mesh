@@ -63,12 +63,30 @@ to enforce write-back, and wires it in.
 mesh hooks install /path/to/vault                 # read at start + nudge write-back
 mesh hooks install /path/to/vault --read-only     # just the start-of-session read
 mesh hooks install /path/to/vault --dry-run       # preview the settings.json first
-mesh hooks uninstall                              # remove them
+mesh hooks uninstall                              # remove the hooks (not the MCP server)
 ```
 
 All of these merge into the project's `.claude/settings.json` (they never clobber
 your other settings and are safe to run twice). After installing, run `/hooks` in
 Claude Code to verify and start a new session.
+
+## Removing Mesh again
+
+`mesh hooks uninstall` removes the **session hooks only**. The MCP server
+registration lives in a different file (`.mcp.json` for Claude Code, and a global
+config for Cursor, Claude Desktop, Windsurf and Codex), so removing it is a
+separate command:
+
+```
+mesh install --remove                             # drop the mesh MCP entry + the session hooks
+mesh install --remove --client cursor             # same, for another client's config
+```
+
+Run it for each client you set up, and **run it before you delete the mesh
+binary**: the registration stores the binary's absolute path, so a client left
+pointing at a deleted binary keeps retrying a server that can never start. Your
+vault, your notes and the `.mesh` index are never touched by either command;
+delete the vault folder yourself if you want those gone.
 
 ## Read-only vs enforce write-back
 

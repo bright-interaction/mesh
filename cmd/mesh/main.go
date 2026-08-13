@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,6 +29,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
+	"github.com/bright-interaction/mesh/internal/netaddr"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/sshserve"
 	"github.com/bright-interaction/mesh/internal/tui"
@@ -1792,7 +1792,7 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 	if token == "" {
 		token = os.Getenv("MESH_MCP_TOKEN")
 	}
-	if !addrIsLoopback(addr) && token == "" {
+	if !netaddr.IsLoopback(addr) && token == "" {
 		return fmt.Errorf("refusing to bind %s without a token: set --token or MESH_MCP_TOKEN (fail-closed)", addr)
 	}
 	if doWatch {
@@ -1828,22 +1828,6 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 	}
 	fmt.Fprintf(os.Stderr, "mesh mcp: serving HTTP at %s/mcp (auth: %v)\n", addr, token != "")
 	return httpSrv.ListenAndServe()
-}
-
-// addrIsLoopback reports whether host:port binds only the loopback interface.
-func addrIsLoopback(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	if host == "" {
-		return false // ":7575" binds all interfaces
-	}
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // defaultLocalReconcile is how often an owning writer re-checks the vault when no file
@@ -2198,7 +2182,10 @@ func serveSSHCmd() *cobra.Command {
 		Long: "Run an SSH server that hands every connection the Mesh TUI over the same index the agent uses, " +
 			"so a teammate browses the graph with `ssh -p <port> <host>` and no Mesh install. Read-only. " +
 			"Auth is fail-closed: pass --authorized-keys (OpenSSH format) and only those keys may connect; " +
-			"--allow-anonymous opts out for a localhost demo.",
+			"--allow-anonymous opts out, and is refused on any --addr that is not loopback, because an " +
+			"unauthenticated bind beyond loopback hands the whole vault to anyone who can reach the host. " +
+			"The default bind is 127.0.0.1:2222, so serving teammates means both --authorized-keys and an " +
+			"explicit --addr.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultDir := vaultArg(args)
@@ -2217,10 +2204,13 @@ func serveSSHCmd() *cobra.Command {
 			return err
 		},
 	}
-	c.Flags().StringVar(&addr, "addr", ":2222", "listen address")
+	// Loopback by default, like `mesh ui`. The old ":2222" published the vault to
+	// every interface, which made --allow-anonymous a LAN-wide open door rather than
+	// the "localhost demo" its own help promised.
+	c.Flags().StringVar(&addr, "addr", "127.0.0.1:2222", "listen address; binding beyond loopback requires --authorized-keys")
 	c.Flags().StringVar(&hostKey, "host-key", "", "host key path (default <vault>/.mesh/ssh_host_ed25519_key; generated if missing)")
 	c.Flags().StringVar(&authKeys, "authorized-keys", "", "OpenSSH authorized_keys file; only these public keys may connect (required unless --allow-anonymous)")
-	c.Flags().BoolVar(&allowAnon, "allow-anonymous", false, "DANGER: serve with no auth (localhost demos only)")
+	c.Flags().BoolVar(&allowAnon, "allow-anonymous", false, "DANGER: serve with no auth; refused unless --addr is loopback (localhost demos only)")
 	return c
 }
 

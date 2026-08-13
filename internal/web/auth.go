@@ -9,9 +9,10 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
-	"net"
 	"net/http"
 	"strings"
+
+	"github.com/bright-interaction/mesh/internal/netaddr"
 )
 
 // sessionCookie is the HttpOnly cookie set by POST /api/login. Its value is the
@@ -36,7 +37,7 @@ type authConfig struct {
 // newAuthConfig validates the bind/token combination, failing closed: a
 // non-loopback bind without a token is refused at startup, not silently opened.
 func newAuthConfig(addr, token string) (authConfig, error) {
-	lo := isLoopbackAddr(addr)
+	lo := netaddr.IsLoopback(addr)
 	if !lo && token == "" {
 		return authConfig{}, errRemoteNeedsToken
 	}
@@ -94,21 +95,4 @@ func (a authConfig) tokenOK(r *http.Request) bool {
 	// cookie; the CLI uses the Authorization header.
 	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
 	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
-}
-
-// isLoopbackAddr reports whether a host:port bind address is loopback-only. A bare
-// ":7474" (all interfaces) or an explicit non-loopback host is NOT loopback.
-func isLoopbackAddr(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	if host == "" {
-		return false // ":7474" binds all interfaces
-	}
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

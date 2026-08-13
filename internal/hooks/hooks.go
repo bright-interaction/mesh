@@ -99,6 +99,137 @@ func registerJSONServer(p, key, vaultAbs, binPath string) (bool, string, error) 
 	return true, p, nil
 }
 
+// MCPRegistered reports whether a client's config currently holds a Mesh MCP
+// server entry, and the path it looked at. It is what lets a receipt say what it
+// did NOT remove: `mesh hooks uninstall` clears the session hooks only, and it read
+// as a complete uninstall because nothing ever mentioned the registration left
+// behind in a different (often global) file.
+func MCPRegistered(client, projectDir string) (bool, string, error) {
+	p, format, err := clientConfig(client, projectDir)
+	if err != nil {
+		return false, "", err
+	}
+	data, rerr := os.ReadFile(p)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return false, p, nil
+		}
+		return false, p, rerr
+	}
+	if format == "toml" {
+		return strings.Contains(string(data), "[mcp_servers.mesh]"), p, nil
+	}
+	cfg := map[string]any{}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return false, p, fmt.Errorf("existing %s is not valid JSON: %w", p, err)
+		}
+	}
+	servers, _ := cfg[format].(map[string]any)
+	_, exists := servers["mesh"]
+	return exists, p, nil
+}
+
+// UnregisterMCP removes the Mesh MCP server from a client's config: the exact
+// inverse of RegisterMCP, on the same file, in the same format. It is idempotent
+// and it never touches another server's entry.
+//
+// It exists because there was no inverse at all. `mesh install` wrote an entry
+// holding the ABSOLUTE path of the mesh binary into a GLOBAL config (Claude
+// Desktop, Cursor, Codex) and the only command that sounded like an uninstall,
+// `mesh hooks uninstall`, removed the session hooks and reported success. Someone
+// who trialled Mesh and then deleted the binary was left with a permanently
+// failing MCP server their agent retried on every launch, with nothing in Mesh to
+// remove it. Returns whether anything was removed, and the path it acted on.
+func UnregisterMCP(client, projectDir string) (bool, string, error) {
+	p, format, err := clientConfig(client, projectDir)
+	if err != nil {
+		return false, "", err
+	}
+	if format == "toml" {
+		return unregisterCodexTOML(p)
+	}
+	return unregisterJSONServer(p, format)
+}
+
+func unregisterJSONServer(p, key string) (bool, string, error) {
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, p, nil // nothing registered here; not an error
+		}
+		return false, p, err
+	}
+	cfg := map[string]any{}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return false, p, fmt.Errorf("existing %s is not valid JSON: %w", p, err)
+		}
+	}
+	servers, _ := cfg[key].(map[string]any)
+	if _, exists := servers["mesh"]; !exists {
+		return false, p, nil
+	}
+	delete(servers, "mesh")
+	// Leave no empty scaffolding of ours behind, but never remove the file: it is
+	// the user's config and it may be the only thing their client points at.
+	if len(servers) == 0 {
+		delete(cfg, key)
+	} else {
+		cfg[key] = servers
+	}
+	out, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(p, append(out, '\n'), 0o644); err != nil {
+		return false, p, err
+	}
+	return true, p, nil
+}
+
+// unregisterCodexTOML drops the [mcp_servers.mesh] table registerCodexTOML
+// appended, along with the blank line that separated it, and leaves every other
+// table byte-identical. Line-based for the same reason the writer appends: this
+// stays correct without pulling in a TOML parser to round-trip a file we do not own.
+func unregisterCodexTOML(p string) (bool, string, error) {
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, p, nil
+		}
+		return false, p, err
+	}
+	lines := strings.Split(string(data), "\n")
+	kept := make([]string, 0, len(lines))
+	removed, skipping := false, false
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if skipping {
+			if !strings.HasPrefix(t, "[") {
+				continue // still inside our table
+			}
+			skipping = false // a new table starts here; keep it
+		}
+		if t == "[mcp_servers.mesh]" {
+			skipping, removed = true, true
+			for len(kept) > 0 && strings.TrimSpace(kept[len(kept)-1]) == "" {
+				kept = kept[:len(kept)-1] // the separator blank line we wrote
+			}
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	if !removed {
+		return false, p, nil
+	}
+	text := strings.TrimRight(strings.Join(kept, "\n"), "\n")
+	if text != "" {
+		text += "\n"
+	}
+	if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
+		return false, p, err
+	}
+	return true, p, nil
+}
+
 // registerCodexTOML appends a [mcp_servers.mesh] table to Codex's config.toml.
 // Appending is safe TOML and idempotent (skip if the table already exists), which
 // avoids needing a TOML parser to merge.
@@ -311,34 +442,12 @@ func Uninstall(projectDir string) (int, string, error) {
 // InstallMCP registers the Mesh MCP server in the project's .mcp.json so the agent
 // gets the mesh-* tools without any manual config. Idempotent; preserves other
 // servers. Returns whether it added the entry.
+//
+// It is RegisterMCP("claude-code", ...) under the older name. The two used to be
+// separate copies of the same writer, which is how a fix lands on one of two twins:
+// UnregisterMCP only has to know about ONE writer of .mcp.json, so keep it that way.
 func InstallMCP(projectDir, vaultAbs, binPath string) (bool, string, error) {
-	p := filepath.Join(projectDir, ".mcp.json")
-	cfg := map[string]any{}
-	if data, err := os.ReadFile(p); err == nil {
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return false, p, fmt.Errorf("existing %s is not valid JSON: %w", p, err)
-		}
-	}
-	servers, _ := cfg["mcpServers"].(map[string]any)
-	if servers == nil {
-		servers = map[string]any{}
-	}
-	if _, exists := servers["mesh"]; exists {
-		return false, p, nil
-	}
-	servers["mesh"] = map[string]any{
-		"command": binPath,
-		"args":    []any{"mcp", "--vault", vaultAbs, "--watch"},
-	}
-	cfg["mcpServers"] = servers
-	out, _ := json.MarshalIndent(cfg, "", "  ")
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return false, p, err
-	}
-	if err := os.WriteFile(p, append(out, '\n'), 0o644); err != nil {
-		return false, p, err
-	}
-	return true, p, nil
+	return RegisterMCP("claude-code", projectDir, vaultAbs, binPath)
 }
 
 func onboardMarker(vaultRoot string) string { return filepath.Join(vaultRoot, ".mesh", "onboard") }
