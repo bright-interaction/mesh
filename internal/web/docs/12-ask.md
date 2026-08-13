@@ -25,6 +25,12 @@ nothing on that" when it does not, instead of making something up. Every claim c
 a citation back to the note or `file:line` it came from, so you can verify the answer
 rather than trust it.
 
+The context is the actual text of the top-ranked notes, not the short search excerpt,
+so the answer is grounded in what the notes say rather than in their titles. That text
+is packed to a token budget (3000 by default, `--budget` on the CLI, `budget` in the
+API request), and a source that does not fit is dropped rather than cited: the numbered
+sources under an answer are exactly what the model was given.
+
 ## Bring your own model
 
 Ask is BYOAI, like the rest of Mesh's optional AI. It uses whatever you configure via

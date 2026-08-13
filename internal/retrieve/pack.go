@@ -129,10 +129,17 @@ func TotalTokensFunc(cards []Card, cost CardCost) int {
 // ask and curator ARE subject to this reserve (at their 3000 default it resolves to
 // 600, comfortably more than the 127 a fixture card costs, so it holds; below ~635 the
 // floor above is what saves them). Neither is subject to the mcp overrun that made the
-// cost injectable: both render each card into prose and DROP most of it, measured at 73
-// and 68 tokens against the 127 the packer charged, so they under-spend their budget
-// rather than blowing it. Do not "fix" that by packing them with a cheaper cost: their
-// renders are lossy, and the packer has to keep pricing the card it hands back.
+// cost injectable, but for opposite reasons now, so do not "fix" either by packing it
+// with a cheaper cost:
+//
+//	curator renders each card into prose and DROPS most of it (measured at 68 tokens
+//	against the 127 the packer charged), so it under-spends its budget. The render is
+//	lossy and the packer has to keep pricing the card it hands back.
+//
+//	ask EXPANDS each card into the note's full body (index.Store.NoteDocs) because a
+//	120-char FTS excerpt grounds nothing, so a packed card is a floor on what it sends,
+//	not a ceiling. It therefore budgets the RENDERED context itself and treats the
+//	budget it passes here as a candidate limit only. See internal/ask/ask.go.
 func tier0Reserve(cards []Card, budget int, cost CardCost) int {
 	reserve := budget / 5
 	for _, c := range cards {

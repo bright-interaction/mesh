@@ -5,6 +5,7 @@ package ask
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,29 +16,86 @@ import (
 	"github.com/bright-interaction/mesh/internal/retrieve"
 )
 
-func TestAnswerGroundsAndCites(t *testing.T) {
+// question is the query every fixture below is retrieved with.
+const question = "how do we authenticate Mollie webhooks?"
+
+// bodyOnlyFact is a sentence that lives ONLY deep in the note body: not in the note
+// title, not in any heading, and far enough from the query terms that the FTS excerpt
+// (a ~12-token window around the matches) cannot reach it.
+//
+// This test used to assert on "Mollie", which is in the note TITLE, so it passed over
+// a prompt that carried nothing but titles and 120-char excerpts and it was green for
+// the entire life of that defect. Any assertion here must be on text the prompt can
+// only hold if the BODY was read, and assertBodyOnlyFact below proves that premise at
+// runtime instead of trusting this comment, so the next fixture edit that leaks the
+// sentinel into a title or a snippet fails the build rather than passing vacuously.
+const bodyOnlyFact = "the rotation owner is the payments on-call"
+
+// sentinelVault writes a note whose answer to the question is real prose: the query
+// terms are at the top, and bodyOnlyFact is several paragraphs down.
+func sentinelVault(t *testing.T) string {
+	t.Helper()
 	dir := t.TempDir()
-	note := "---\nid: mollie-gotcha\ntype: gotcha\n---\n# Mollie webhooks need re-fetch\nMollie does not HMAC webhook bodies; re-fetch the payment by id to authenticate it.\n"
+	note := "---\nid: mollie-gotcha\ntype: gotcha\n---\n" +
+		"# Mollie webhooks need re-fetch\n" +
+		"Mollie does not HMAC webhook bodies; re-fetch the payment by id to authenticate it.\n\n" +
+		"## Rollout\nThe handler shipped behind a flag in week 12 and the flag came out in week 15. " +
+		"Staging ran the same build for two weeks with no drift, so the cutover was a config change only.\n\n" +
+		"## Operations\nThe reconciliation job runs nightly and writes its report to the ops bucket. " +
+		"Retries are capped at five attempts, after which the payment lands in the manual queue.\n\n" +
+		"## Key custody\nFor the shared signing key, " + bodyOnlyFact + " and nobody else.\n"
 	if err := os.WriteFile(filepath.Join(dir, "mollie.md"), []byte(note), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	return dir
+}
+
+func openVault(t *testing.T, dir string) (*index.Store, *retrieve.Retriever) {
+	t.Helper()
 	store, err := index.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	g, err := index.Reindex(store, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rtr := retrieve.NewFromEnv(store, g)
+	return store, retrieve.NewFromEnv(store, g)
+}
+
+// assertBodyOnlyFact proves the fixture still earns the assertion: the sentinel must
+// be absent from the question, from every card title and from every card snippet, so
+// the only path by which it can reach the prompt is a body read.
+func assertBodyOnlyFact(t *testing.T, rtr *retrieve.Retriever) {
+	t.Helper()
+	if strings.Contains(question, bodyOnlyFact) {
+		t.Fatalf("fixture broken: the question itself carries the sentinel")
+	}
+	cards, _ := rtr.Retrieve(context.Background(), question, retrieve.Options{Budget: 3000})
+	if len(cards) == 0 {
+		t.Fatalf("fixture broken: retrieval returned no cards for %q", question)
+	}
+	for _, c := range cards {
+		if strings.Contains(c.Title, bodyOnlyFact) {
+			t.Fatalf("fixture broken: sentinel is in a card TITLE (%q), so the assertion proves nothing", c.Title)
+		}
+		if strings.Contains(c.Snippet, bodyOnlyFact) {
+			t.Fatalf("fixture broken: sentinel is in the FTS snippet (%q), so the assertion proves nothing", c.Snippet)
+		}
+	}
+}
+
+func TestAnswerGroundsAndCites(t *testing.T) {
+	store, rtr := openVault(t, sentinelVault(t))
+	assertBodyOnlyFact(t, rtr)
 
 	var gotContext string
 	stub := llm.Func(func(_ context.Context, _, user string) (string, error) {
 		gotContext = user
 		return "Re-fetch the payment by id; Mollie does not sign webhooks [1].", nil
 	})
-	res, err := Answer(context.Background(), rtr, store, stub, "how do we authenticate Mollie webhooks?", 0, nil, nil)
+	res, err := Answer(context.Background(), rtr, store, stub, question, 0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,9 +105,70 @@ func TestAnswerGroundsAndCites(t *testing.T) {
 	if len(res.Citations) == 0 || res.Citations[0].Kind != "note" {
 		t.Fatalf("expected a note citation, got %+v", res.Citations)
 	}
-	// The retrieved note must have been put in the LLM context (grounding).
-	if !strings.Contains(gotContext, "Mollie") {
-		t.Fatalf("retrieved note was not in the LLM context: %q", gotContext)
+	// Grounding is the note BODY, not the title and not the bracketed FTS excerpt.
+	if !strings.Contains(gotContext, bodyOnlyFact) {
+		t.Fatalf("the note BODY never reached the LLM context (only titles/excerpts did); prompt was:\n%s", gotContext)
+	}
+}
+
+// A card that arrived by graph expansion has NO snippet at all, so snippet-only
+// grounding gave the model a numbered source with an empty body under it. bodyFor must
+// read such a card's body from the index, and fall back to the snippet only when the
+// index has nothing usable.
+func TestBodyForPrefersIndexedBodyOverSnippet(t *testing.T) {
+	graphExpanded := retrieve.Card{NodeID: "note:a", Title: "alpha", Snippet: ""}
+	docs := map[string]string{"note:a": "alpha\nthe body the index actually holds"}
+	if got := bodyFor(graphExpanded, docs); got != "the body the index actually holds" {
+		t.Errorf("graph-expanded card (empty snippet) got %q, want its indexed body", got)
+	}
+	// Body read failed or the note is not in the index: the excerpt is the fallback.
+	ftsHit := retrieve.Card{NodeID: "note:b", Title: "beta", Snippet: "the [excerpt] ... "}
+	if got := bodyFor(ftsHit, nil); got != "the [excerpt] ..." {
+		t.Errorf("missing doc got %q, want the snippet fallback", got)
+	}
+	// A doc that is the title alone grounds nothing beyond the source header.
+	titleOnly := retrieve.Card{NodeID: "note:c", Title: "gamma", Snippet: "the [excerpt] ... "}
+	if got := bodyFor(titleOnly, map[string]string{"note:c": "gamma"}); got != "the [excerpt] ..." {
+		t.Errorf("title-only doc got %q, want the snippet fallback", got)
+	}
+}
+
+// Bodies are far larger than cards, so ask budgets the RENDERED prompt itself. Every
+// source it cites must still carry text: a header with nothing under it is exactly the
+// authoritative-looking emptiness this lane exists to prevent.
+func TestAnswerBudgetsRenderedContextAndCitesOnlyWhatItSent(t *testing.T) {
+	store, rtr := openVault(t, sentinelVault(t))
+	var gotContext string
+	stub := llm.Func(func(_ context.Context, _, user string) (string, error) {
+		gotContext = user
+		return "ok [1]", nil
+	})
+	const budget = 120
+	res, err := Answer(context.Background(), rtr, store, stub, question, budget, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := gotContext
+	if i := strings.Index(body, contextBegin); i >= 0 {
+		body = body[i+len(contextBegin):]
+	}
+	if i := strings.Index(body, contextEnd); i >= 0 {
+		body = body[:i]
+	}
+	if got := retrieve.EstimateTokens(body); got > budget {
+		t.Errorf("packed %d tokens of context against a %d-token budget:\n%s", got, budget, body)
+	}
+	for _, c := range res.Citations {
+		marker := fmt.Sprintf("[%d] %s", c.N, strings.ToUpper(c.Kind))
+		i := strings.Index(body, marker)
+		if i < 0 {
+			t.Fatalf("cited source %d is not in the context at all:\n%s", c.N, body)
+		}
+		rest := body[i+len(marker):]
+		nl := strings.Index(rest, "\n")
+		if nl < 0 || strings.TrimSpace(strings.SplitN(rest[nl+1:], "\n", 2)[0]) == "" {
+			t.Errorf("source [%d] %q was cited with an empty body under its header:\n%s", c.N, c.Title, body)
+		}
 	}
 }
 

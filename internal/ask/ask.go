@@ -69,6 +69,96 @@ func sanitizeContent(s string) string {
 	return forgedDelimiter.ReplaceAllString(s, "(quoted delimiter: $1 CONTEXT)")
 }
 
+// Grounding is packed from note BODIES, not from the FTS excerpt on the card.
+//
+// c.Snippet is a display artifact: a ~12-token window around the matched terms, with
+// the matches wrapped in [brackets] and the rest replaced by " ... ". Packing that as
+// model context produced authoritative-looking answers with no facts under them, and
+// answers of "The vault has nothing on that." next to a dozen citations that did
+// contain it. Graph-expanded cards carry NO snippet at all (they were never an FTS
+// hit), so those arrived as a numbered source with an empty body.
+//
+// So the bodies are read from the index with Store.NoteDocs, the same call the
+// reranker uses, and packed to the token budget here. The snippet stays only as the
+// fallback for a note whose body could not be read.
+const (
+	// codeLaneShare is the slice of the budget held back for the code lane, so one
+	// long note body cannot crowd every source symbol out of the context.
+	codeLaneShare = 5
+	// minBodyTokens is the smallest body fragment worth citing. When less than this
+	// is left, the packer stops instead of emitting a source header with a stub of a
+	// sentence under it.
+	minBodyTokens = 80
+	// truncationMarker tells the model (and a human reading the prompt) that a body
+	// was cut by the budget rather than ending there.
+	truncationMarker = " ... [truncated to fit the context budget]"
+)
+
+// noteBodies reads the indexed text for the retrieved cards, keyed by node id. A read
+// failure is not fatal: an empty map sends every card down the snippet fallback.
+func noteBodies(store *index.Store, cards []retrieve.Card) map[string]string {
+	if store == nil || len(cards) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(cards))
+	for _, c := range cards {
+		if c.NodeID != "" {
+			ids = append(ids, c.NodeID)
+		}
+	}
+	docs, err := store.NoteDocs(ids)
+	if err != nil {
+		return nil
+	}
+	return docs
+}
+
+// bodyFor returns the grounding text for one card: the note body when the index has
+// it, the FTS excerpt otherwise. NoteDocs returns "title\nbody", and the title is
+// already on the source header, so it is dropped here; a note whose doc is the title
+// alone therefore falls back to the snippet, which is the right call because a title
+// repeated under its own header grounds nothing.
+func bodyFor(c retrieve.Card, docs map[string]string) string {
+	doc := docs[c.NodeID]
+	if c.Title != "" {
+		doc = strings.TrimPrefix(doc, c.Title)
+	}
+	if body := strings.TrimSpace(doc); body != "" {
+		return body
+	}
+	return strings.TrimSpace(c.Snippet)
+}
+
+// truncateToTokens cuts s to at most n tokens on a rune boundary (so multibyte text is
+// never sliced into garbage bytes) and marks the cut. Returns "" when not even the
+// marker fits. The search is binary because counting is a real BPE tokenization.
+func truncateToTokens(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if retrieve.EstimateTokens(s) <= n {
+		return s
+	}
+	room := n - retrieve.EstimateTokens(truncationMarker)
+	if room <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	lo, hi := 0, len(r)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if retrieve.EstimateTokens(string(r[:mid])) <= room {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	if lo == 0 {
+		return ""
+	}
+	return strings.TrimRight(string(r[:lo]), " \t\n") + truncationMarker
+}
+
 // codeReadable reports whether the caller may see the source-code index. Code symbols
 // carry no per-note scope, so the whole index is treated as dev-scoped (the same rule
 // the MCP code tools enforce via codeScopeDenied): only an unrestricted caller or one
@@ -84,6 +174,10 @@ func codeReadable(allowedScopes map[string]bool) bool {
 // unrestricted) does the same for folder ACLs. Both have to be applied at retrieval:
 // filtering the citations afterwards would still have fed the fenced note's body to the
 // model, and the answer text is what the caller reads.
+//
+// budget (tokens, default 3000) is enforced over the RENDERED context here, because
+// the note lane expands each card into its full body. Sources that do not fit are
+// dropped rather than cited, so every [N] the model is shown has real text under it.
 func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, client llm.Client, question string, budget int, allowedScopes map[string]bool, allowPath func(string) bool) (Result, error) {
 	if strings.TrimSpace(question) == "" {
 		return Result{}, fmt.Errorf("empty question")
@@ -94,23 +188,64 @@ func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, cl
 	var cites []Citation
 	var b strings.Builder
 	n := 0
+	used := 0
+
+	// The note lane packs bodies, which are far larger than a card, so it is budgeted
+	// here rather than left to the retriever: the retriever's budget only bounds how
+	// many CANDIDATES come back. Part of the budget is held back for the code lane.
+	codeLane := store != nil && codeReadable(allowedScopes)
+	noteBudget := budget
+	if codeLane {
+		noteBudget = budget - budget/codeLaneShare
+	}
 
 	if rtr != nil {
 		cards, _ := rtr.Retrieve(ctx, question, retrieve.Options{Budget: budget, AllowedScopes: allowedScopes, AllowPath: allowPath})
+		docs := noteBodies(store, cards)
 		for _, c := range cards {
+			// %q on the title already escapes newlines; the body is raw note text
+			// written by anyone on the team, so it goes through sanitizeContent to
+			// strip forged source headers.
+			header := fmt.Sprintf("[%d] NOTE %q (%s)\n", n+1, c.Title, c.Path)
+			body := sanitizeContent(bodyFor(c, docs))
+			if body == "" {
+				// No body and no excerpt: skip it rather than cite a numbered source
+				// with nothing under it, which is what a graph-expanded card used to
+				// contribute.
+				continue
+			}
+			cost := retrieve.EstimateTokens(header + body + "\n\n")
+			if used+cost > noteBudget {
+				room := noteBudget - used - retrieve.EstimateTokens(header+"\n\n")
+				if room < minBodyTokens {
+					break
+				}
+				body = truncateToTokens(body, room)
+				if body == "" {
+					break
+				}
+				cost = retrieve.EstimateTokens(header + body + "\n\n")
+			}
 			n++
-			// %q on the title already escapes newlines; the snippet is raw note body,
-			// so it goes through sanitizeContent to strip forged source headers.
-			fmt.Fprintf(&b, "[%d] NOTE %q (%s)\n%s\n\n", n, c.Title, c.Path, sanitizeContent(c.Snippet))
+			used += cost
+			b.WriteString(header)
+			b.WriteString(body)
+			b.WriteString("\n\n")
 			cites = append(cites, Citation{N: n, Kind: "note", ID: c.NoteID, Title: c.Title, Loc: c.Path})
 		}
 	}
-	if store != nil && codeReadable(allowedScopes) {
+	if codeLane {
 		if hits, err := store.SearchCode(question, 5, nil); err == nil {
 			for _, h := range hits {
-				n++
 				loc := fmt.Sprintf("%s:%d", h.Path, h.Line)
-				fmt.Fprintf(&b, "[%d] CODE %s %s (%s)\n%s\n\n", n, h.Kind, h.Name, loc, sanitizeContent(h.Signature))
+				block := fmt.Sprintf("[%d] CODE %s %s (%s)\n%s\n\n", n+1, h.Kind, h.Name, loc, sanitizeContent(h.Signature))
+				cost := retrieve.EstimateTokens(block)
+				if used+cost > budget {
+					break
+				}
+				n++
+				used += cost
+				b.WriteString(block)
 				cites = append(cites, Citation{N: n, Kind: "code", ID: h.ID, Title: h.Name, Loc: loc})
 			}
 		}

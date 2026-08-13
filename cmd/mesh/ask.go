@@ -53,6 +53,6 @@ func askCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&vaultRoot, "vault", ".", "vault root")
-	c.Flags().IntVar(&budget, "budget", 3000, "retrieval context token budget")
+	c.Flags().IntVar(&budget, "budget", 3000, "token budget for the grounding context (note bodies + code); lower-ranked sources are dropped, not cited")
 	return c
 }
