@@ -1223,6 +1223,9 @@ func codeReindexCmd() *cobra.Command {
 			if len(args) == 1 {
 				root = args[0]
 			}
+			if err := vault.RequireRoot(root); err != nil {
+				return err
+			}
 			store, err := index.Open(root)
 			if err != nil {
 				return err
@@ -1292,6 +1295,9 @@ func codeSearchCmd() *cobra.Command {
 		Short: "Search the source-code symbol index (file:line results)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := vault.RequireRoot(vaultRoot); err != nil {
+				return err
+			}
 			store, err := index.Open(vaultRoot)
 			if err != nil {
 				return err
@@ -1328,6 +1334,9 @@ func codeContextCmd() *cobra.Command {
 		Short: "Show code symbols together with the notes that reference them",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := vault.RequireRoot(vaultRoot); err != nil {
+				return err
+			}
 			store, err := index.Open(vaultRoot)
 			if err != nil {
 				return err
@@ -1736,6 +1745,9 @@ func mcpCmd() *cobra.Command {
 		Long: "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Default transport is stdio: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}. Use --http :PORT to serve over HTTP instead (POST /mcp) so any remote MCP client (Claude, Cursor, ChatGPT, ...) connects without a local install; a bearer --token is REQUIRED when binding beyond loopback. " +
 			"The server elects itself the vault's owning writer when nothing else holds it, so write-back is queryable at once with no separate daemon; beside a running `mesh watch` / `mesh sync --watch` it reads instead and routes writes through that owner. Add --watch so notes changed in your editor are searchable in the same session.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := vault.RequireRoot(vaultDir); err != nil {
+				return err
+			}
 			// Elect this process the owning writer when the vault has none. Without it the
 			// shipped agent config (`mesh mcp --vault <path>`, and nothing else) is a
 			// server that can never index: every mesh_append_note waits out the full owner
@@ -1879,6 +1891,9 @@ func watchCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := vaultArg(args)
+			if err := vault.RequireRoot(root); err != nil {
+				return err
+			}
 			// Claim the vault before opening a writable store. This is the declared owner,
 			// so it takes the claim from an opportunistic `mesh mcp` (which drops back to
 			// reading) and refuses to start beside another declared one.
@@ -1991,6 +2006,9 @@ func syncCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultDir := vaultArg(args)
+			if err := vault.RequireRoot(vaultDir); err != nil {
+				return err
+			}
 			if doWatch {
 				// The long-lived half of this command is an owning writer, so it claims the
 				// vault like `mesh watch` does. The one-shot path is not claimed: it is a

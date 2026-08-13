@@ -139,6 +139,13 @@ const maxSlugLen = 247
 // type's subdirectory, with a type-specific body skeleton. The author only fills
 // the judgment fields. Returns the path and any flywheel fields still to fill.
 func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
+	// The vault has to be there already. MkdirAll below invents every missing parent,
+	// so without this a typo in --vault produced a whole new vault plus a note nobody
+	// would ever look at, and exit 0. Checked here rather than only in the CLI because
+	// the MCP write-back tool and the web pending API reach this same writer.
+	if err := RequireRoot(root); err != nil {
+		return nil, err
+	}
 	if !spec.Type.Valid() {
 		return nil, fmt.Errorf("%w: invalid type %q", ErrInvalidSpec, spec.Type)
 	}
