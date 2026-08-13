@@ -32,8 +32,17 @@ func TestShellSnippetSkipsNonApplicable(t *testing.T) {
 		{Title: "architecture call", Applies: false, Pattern: "", Message: "n/a"},
 	}
 	out := ShellSnippet(gs)
-	if !strings.Contains(out, "npm install") || !strings.Contains(out, "--include='Dockerfile'") || !strings.Contains(out, "use bun") {
+	// The globs now go through shellpath.Quote, the module's single shell-quoting
+	// helper, instead of a hand-written 'wrapper' this package kept to itself. A glob
+	// that needs no quoting loses its quotes (--include=Dockerfile), and one the shell
+	// would expand keeps them (--include='*.sh'), which is the half that has to hold:
+	// unquoted, the shell would glob *.sh against the current directory before grep
+	// ever saw it.
+	if !strings.Contains(out, "npm install") || !strings.Contains(out, "--include=Dockerfile") || !strings.Contains(out, "use bun") {
 		t.Fatalf("snippet missing the applicable guard:\n%s", out)
+	}
+	if !strings.Contains(out, "--include='*.sh'") {
+		t.Fatalf("a glob the shell would expand must stay quoted:\n%s", out)
 	}
 	if strings.Contains(out, "architecture call") {
 		t.Fatalf("snippet included a non-applicable guard:\n%s", out)
