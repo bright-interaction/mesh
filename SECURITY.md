@@ -8,8 +8,13 @@ hosted/hub editions, access tokens), so we take reports seriously.
 Please report security issues **privately**, not as a public GitHub issue or pull
 request.
 
-- Use GitHub's **"Report a vulnerability"** (Security advisories) on this repository, or
-- Email **security@brightinteraction.com**.
+**Email security@brightinteraction.com.** That address is monitored and is the channel
+we answer on. It is also published, with our PGP key, at
+`https://brightinteraction.com/.well-known/security.txt`, so you can encrypt the report
+if you would rather not send details in the clear.
+
+GitHub's "Report a vulnerability" button is not available on this repository, so please
+do not go looking for it. If you see it appear on a future release, it works too.
 
 Include enough to reproduce: affected version or commit, the steps, and the impact you
 observed. If you have a proof of concept, attach it.
