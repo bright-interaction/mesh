@@ -27,15 +27,60 @@ type MigrateResult struct {
 
 var wikilinkTarget = regexp.MustCompile(`\[\[([^\]|#]+)`)
 
-// MigrateFile brings one file up to the Mesh schema, idempotently:
-//   - synthesize a stable id from the filename when missing,
+// Migration is one migration pass over one vault. It carries the vault-wide note id
+// claims, which is what stops the pass minting the SAME id into two files.
+//
+// A note id is vault-global, so nothing about one file can decide whether its id is free.
+// Migrating a file used to slug its basename and write that, which meant a vault holding
+// two README.md (or two index.md, or a note copied as a template) came out of
+// `mesh migrate --apply` with `id: readme` cemented into both. That is not a corner case:
+// it is the exact vault `mesh doctor` reports the collision on, and migrate is the remedy
+// doctor points at, so running the fix made the problem permanent and doctor went on
+// printing STALE over an index no reindex could change.
+//
+// Getting the claims requires the vault ROOT, and requiring it here is deliberate: there
+// is no way to migrate a file without saying which vault it belongs to, so a future caller
+// cannot reintroduce the per-file guess by forgetting an optional argument.
+type Migration struct {
+	ids *IDClaims
+}
+
+// NewMigration scans root once for the ids its notes already hold and returns a pass that
+// can migrate any file in it. Reuse the returned Migration for every file of the pass: the
+// scan is per-vault, not per-file, and claims handed out during the pass accumulate in it
+// so two files migrated in the same pass cannot mint the same id either.
+func NewMigration(root string) (*Migration, error) {
+	ids, err := LoadIDClaims(root)
+	if err != nil {
+		return nil, err
+	}
+	return &Migration{ids: ids}, nil
+}
+
+// MigrateFile migrates a single file as a one-file pass over the vault at root. It scans
+// the vault for claimed ids on every call, so a caller migrating MANY files should build
+// one Migration with NewMigration and call File instead of paying for a walk per file.
+func MigrateFile(root, path string, dryRun bool) (*MigrateResult, error) {
+	m, err := NewMigration(root)
+	if err != nil {
+		return nil, err
+	}
+	return m.File(path, dryRun)
+}
+
+// File brings one file up to the Mesh schema, idempotently:
+//   - synthesize a stable id from the filename when missing, unique across the vault,
 //   - add type: note when absent (concept/map are valid, so they are kept),
 //   - map updated -> when (falling back to the file mtime),
 //   - lift a "## Related" section's [[links]] into a related: array.
 //
 // It never fabricates do/dont/why; missing flywheel fields are reported in
 // Issues. With dryRun it reports without writing. Re-running is a no-op.
-func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
+//
+// A dry run claims ids exactly as an --apply run does, so the ids it reports are the ids
+// the apply would write. A preview that named different ids than the run it previews is
+// worse than no preview.
+func (m *Migration) File(path string, dryRun bool) (*MigrateResult, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -57,8 +102,18 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 	res := &MigrateResult{Path: path}
 	add := &yaml.Node{Kind: yaml.MappingNode}
 
+	// declaredKey, not key presence: main's rule, and the stricter one. A bare `id:`
+	// (or any null spelling) is a key that is present but declares no value, and such
+	// a note needs an id written just as much as one with no key at all.
 	if !declaredKey(raw, "id") {
-		id := Slugify(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+		// The basename is only the STARTING point. Claim decides what actually gets
+		// written, stepping to the next suffix when another note in the vault already
+		// holds the slug, so the second README.md of a vault becomes readme-2 instead of
+		// a second note claiming to be readme.
+		id, cerr := m.ids.Claim(path, Slugify(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))))
+		if cerr != nil {
+			return nil, fmt.Errorf("%s: %w", path, cerr)
+		}
 		if err := addKey(add, "id", id); err != nil {
 			return nil, err
 		}

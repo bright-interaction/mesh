@@ -35,7 +35,7 @@ func TestMigrateWritersRefuseUnparseableFrontmatter(t *testing.T) {
 			name:     "MigrateFile prepending to an indented block",
 			original: "---\n  type: entity\n  updated: 2026-04-10\n---\n# Note\nbody\n",
 			write: func(path string) error {
-				_, err := MigrateFile(path, false)
+				_, err := MigrateFile(filepath.Dir(path), path, false)
 				return err
 			},
 			wantErr: "invalid YAML",
@@ -94,7 +94,7 @@ func TestMigrateWritersStillWriteValidNotes(t *testing.T) {
 	if err := os.WriteFile(p, []byte("---\ntype: entity\nupdated: 2026-04-10\n---\n# Codeindex\nbody\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MigrateFile(p, false); err != nil {
+	if _, err := MigrateFile(dir, p, false); err != nil {
 		t.Fatalf("a valid migration must still write: %v", err)
 	}
 	if _, err := BackfillScopeFile(p, "sales", false); err != nil {

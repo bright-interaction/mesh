@@ -155,7 +155,7 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	}
 	base := Slugify(title)
 	if base == "" {
-		base = "note"
+		base = fallbackIDBase
 	}
 	if len(base) > maxSlugLen {
 		return nil, fmt.Errorf("%w: title too long: it slugs to %d characters and the filename limit is %d, so shorten the title by at least %d characters",
@@ -212,10 +212,9 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	// any concurrent caller (mesh mcp --http, the hub's /mcp, internal/web/pending_api).
 	// O_EXCL makes the claim atomic, so a loser sees ErrExist and takes the next suffix.
 	for n := 1; n <= maxIDAttempts; n++ {
-		id := base
-		if n > 1 {
-			id = fmt.Sprintf("%s-%d", base, n)
-		}
+		// Shared with the in-place rewriter in IDClaims.Claim: the two writers must mint
+		// the same candidate sequence or each reads the ids the other reserved as free.
+		id := candidateID(base, n)
 		if _, taken := claimed[id]; taken {
 			continue // held by a note somewhere in the vault, in this directory or another
 		}

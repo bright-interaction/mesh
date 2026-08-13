@@ -24,7 +24,7 @@ func TestMigrateFileAddsIdWhenRelatedIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := MigrateFile(p, false)
+	res, err := MigrateFile(dir, p, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestMigrateFileAddsIdWhenRelatedIdempotent(t *testing.T) {
 		t.Errorf("reparse mismatch: id=%q when=%q related=%v", fm.ID, fm.When, fm.Related)
 	}
 
-	res2, err := MigrateFile(p, false)
+	res2, err := MigrateFile(dir, p, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestMigrateFileNoFrontmatter(t *testing.T) {
 	if err := os.WriteFile(p, []byte("# Orphan\njust text\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := MigrateFile(p, false)
+	res, err := MigrateFile(dir, p, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestMigrateReportsFlywheelTODOs(t *testing.T) {
 	if err := os.WriteFile(p, []byte("---\nid: some-decision\ntype: decision\nwhen: 2026-01-01\n---\n# D\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := MigrateFile(p, false)
+	res, err := MigrateFile(dir, p, false)
 	if err != nil {
 		t.Fatal(err)
 	}

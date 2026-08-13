@@ -306,13 +306,14 @@ func TestScaffoldedNoteHasNoWikilinks(t *testing.T) {
 	}
 	for _, nt := range types {
 		t.Run(string(nt), func(t *testing.T) {
-			res, err := vault.CreateNote(t.TempDir(), vault.NewNoteSpec{Type: nt, Title: "Fresh " + string(nt)})
+			root := t.TempDir()
+			res, err := vault.CreateNote(root, vault.NewNoteSpec{Type: nt, Title: "Fresh " + string(nt)})
 			if err != nil {
 				t.Fatalf("CreateNote(%s): %v", nt, err)
 			}
 			for _, stage := range []string{"scaffolded", "migrated"} {
 				if stage == "migrated" {
-					if _, err := vault.MigrateFile(res.Path, false); err != nil {
+					if _, err := vault.MigrateFile(root, res.Path, false); err != nil {
 						t.Fatalf("MigrateFile(%s): %v", res.Path, err)
 					}
 				}

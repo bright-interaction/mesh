@@ -58,7 +58,7 @@ func TestMigrateRefusesUnterminatedFrontmatter(t *testing.T) {
 		name string
 		run  func(path string) (*MigrateResult, error)
 	}{
-		{"MigrateFile", func(p string) (*MigrateResult, error) { return MigrateFile(p, false) }},
+		{"MigrateFile", func(p string) (*MigrateResult, error) { return MigrateFile(filepath.Dir(p), p, false) }},
 		{"BackfillScopeFile", func(p string) (*MigrateResult, error) { return BackfillScopeFile(p, "team", false) }},
 	}
 	for _, w := range writers {

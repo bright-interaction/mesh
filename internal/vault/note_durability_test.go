@@ -53,7 +53,7 @@ func TestNoteRewriteReplacesInsteadOfTruncating(t *testing.T) {
 		{
 			name:    "MigrateFile",
 			content: "---\ntitle: Untyped\n---\n\n# Untyped\n",
-			rewrite: func(path string) (*MigrateResult, error) { return MigrateFile(path, false) },
+			rewrite: func(path string) (*MigrateResult, error) { return MigrateFile(filepath.Dir(path), path, false) },
 			want:    "type: note",
 		},
 		{

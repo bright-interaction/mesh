@@ -1466,12 +1466,19 @@ func migrateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// ONE pass, one id-claim scan, shared by every file in it. A note id is
+			// vault-global, so migrating file by file with no memory of the vault is how
+			// `id: readme` used to land in both README.md of a two-folder vault.
+			m, err := vault.NewMigration(root)
+			if err != nil {
+				return err
+			}
 			if dryRun {
 				fmt.Println("dry run (pass --apply to write); nothing on disk is changed")
 			}
 			var changed, flywheel, errored int
 			for _, f := range files {
-				res, err := vault.MigrateFile(f, dryRun)
+				res, err := m.File(f, dryRun)
 				if err != nil {
 					errored++
 					fmt.Fprintf(os.Stderr, "migrate %s: %v\n", f, err)

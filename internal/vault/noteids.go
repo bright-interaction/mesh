@@ -4,10 +4,12 @@
 package vault
 
 import (
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -30,20 +32,33 @@ const idScanBytes = 64 << 10
 // matters (CreateNote, claiming a free id): the fallback can only make an id look TAKEN
 // that might have been free, never free that is taken.
 func NoteIDForFile(path string) string {
+	id, _ := noteIDForFile(path)
+	return id
+}
+
+// noteIDForFile is NoteIDForFile plus whether the file DECLARED that id in its frontmatter
+// or merely fell back to its filename.
+//
+// The two are not interchangeable when something has to move. A declared id is the
+// author's ground truth and no tool here rewrites one; a fallback id is an accident of
+// where the file was saved, and it is the only one a migration can safely change. So when
+// a declared id and a fallback id land on the same string, the declarer is the holder and
+// the fallback is what has to yield, regardless of walk order.
+func noteIDForFile(path string) (id string, declared bool) {
 	key := strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
 	f, err := os.Open(path)
 	if err != nil {
-		return key
+		return key, false
 	}
 	defer f.Close()
 	head := make([]byte, idScanBytes)
 	n, err := io.ReadFull(f, head)
 	if n == 0 && err != nil {
-		return key
+		return key, false
 	}
 	fmText, _, had := SplitFrontmatter(string(head[:n]))
 	if !had {
-		return key
+		return key, false
 	}
 	// Only the id is decoded. A note with, say, an unquoted colon in `updated:` fails to
 	// unmarshal as a whole, and asking for the full Frontmatter would throw away the id
@@ -52,12 +67,12 @@ func NoteIDForFile(path string) string {
 		ID string `yaml:"id"`
 	}
 	if err := yaml.Unmarshal([]byte(fmText), &probe); err != nil {
-		return key
+		return key, false
 	}
 	if id := strings.TrimSpace(probe.ID); id != "" {
-		return id
+		return id, true
 	}
-	return key
+	return key, false
 }
 
 // otherFileNamedForID returns the vault-relative path of a file <id>.md that sits
@@ -87,8 +102,111 @@ func otherFileNamedForID(root, id, ownPath string) string {
 	return ""
 }
 
-// ClaimedIDs maps every note id currently claimed anywhere in the vault to the first
-// vault-relative path (in walk order) that claims it.
+// candidateID renders the n-th id in the sequence base, base-2, base-3 ... that every
+// writer in this package mints ids from.
+//
+// It is one function on purpose. CreateNote walks the sequence while claiming files with
+// O_EXCL, IDClaims walks it while rewriting notes in place, and the two have to agree on
+// the shape: if one of them stepped around "readme-2" and the other minted "readme_2",
+// each would read the id the other reserved as free and the collision they both exist to
+// prevent would come straight back the first time a vault saw both writers.
+func candidateID(base string, n int) string {
+	if n <= 1 {
+		return base
+	}
+	return base + "-" + strconv.Itoa(n)
+}
+
+// fallbackIDBase is the id base used when a title or a filename slugs to nothing (a note
+// called "..." or "___"). Without it every such file mints the SAME empty id, which is
+// the collision this whole file exists to prevent, dressed as a formatting quirk.
+const fallbackIDBase = "note"
+
+// IDClaims is a vault's note ids and the files holding them, carried across a pass that
+// mints ids into MANY files so each one gets an id no other file holds.
+//
+// It exists because a note id is vault-GLOBAL while the thing a writer looks at is one
+// file. `mesh migrate --apply` synthesized an id per file from that file's basename alone,
+// so a vault with two README.md in different folders came out of a migration with `id:
+// readme` written into BOTH, and the migration is precisely what `mesh doctor` tells the
+// operator to run when it finds that collision: the remedy cemented the defect on disk and
+// doctor then printed STALE over an index no reindex could change.
+//
+// The whole vault is scanned ONCE, up front, so a pass over 1200 notes costs one walk
+// rather than one per file. Claims made during the pass are recorded as they are handed
+// out, so two files that would mint the same id inside a single pass step around each
+// other too, not just around the notes that were already on disk.
+type IDClaims struct {
+	root    string
+	claimed map[string]idHolder // note id -> the file holding it
+}
+
+// LoadIDClaims scans root for every note id already claimed anywhere in it.
+//
+// An unreadable corner of the vault is skipped rather than failing the scan, which is
+// ClaimedIDs' behavior and the right one here for the same reason: an incomplete id scan
+// degrades to the old per-file guess for the notes it could not see, while a failed scan
+// would refuse to migrate the entire vault.
+func LoadIDClaims(root string) (*IDClaims, error) {
+	claimed, err := claimedIDHolders(root)
+	if err != nil {
+		return nil, err
+	}
+	return &IDClaims{root: root, claimed: claimed}, nil
+}
+
+// owner returns the key IDClaims records a file under: its vault-relative path, matching
+// what ClaimedIDs stores, so "this id is already held by me" can be told apart from "this
+// id is held by some other file".
+func (c *IDClaims) owner(path string) string {
+	if rel, err := filepath.Rel(c.root, path); err == nil {
+		return rel
+	}
+	return path
+}
+
+// Claim hands path the first id in base's candidate sequence that no OTHER file in the
+// vault holds, and records the claim so the rest of the pass steps around it.
+//
+// A file that already holds the id it is asking for keeps it. That is what makes a
+// migration idempotent AND leaves the incumbent alone: the indexer gives a contested id to
+// the first file in walk order, a migration pass walks in the same order, so the note that
+// is already indexed under the id keeps it and only the shadowed file moves.
+//
+// The one case where holding an id is not enough to keep it is a file that only holds it
+// by filename fallback while some OTHER note declares the same id in its frontmatter.
+// Nothing here rewrites a declared id, so the fallback is the only side that can move, and
+// claimedIDHolders has already recorded the declarer as the holder for exactly that reason.
+//
+// Every id this hands out is recorded as DECLARED, because the caller is about to write it
+// into the file's frontmatter. A second file asking for the same slug later in the pass
+// therefore yields to it instead of taking it back.
+func (c *IDClaims) Claim(path, base string) (string, error) {
+	if base == "" {
+		base = fallbackIDBase
+	}
+	me := c.owner(path)
+	for n := 1; n <= maxIDAttempts; n++ {
+		id := candidateID(base, n)
+		if holder, taken := c.claimed[id]; !taken || holder.path == me {
+			c.claimed[id] = idHolder{path: me, declared: true}
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("could not claim a free note id for %q after %d attempts; %d notes in this vault already hold ids starting with that slug, so give this note an explicit id in its frontmatter",
+		base, maxIDAttempts, maxIDAttempts)
+}
+
+// idHolder is the file recorded as holding one note id, and how strong its hold is.
+type idHolder struct {
+	path     string // vault-relative
+	declared bool   // the frontmatter says this id, rather than the filename implying it
+}
+
+// ClaimedIDs maps every note id currently claimed anywhere in the vault to the
+// vault-relative path holding it: the first file in walk order, except that a file which
+// DECLARES the id in its frontmatter takes it from one that only falls back to its
+// filename (see noteIDForFile).
 //
 // It exists because a note id is vault-GLOBAL while a note file lives in one type
 // directory. CreateNote used to prove an id free by creating decisions/<id>.md with
@@ -103,7 +221,18 @@ func otherFileNamedForID(root, id, ownPath string) string {
 // itself is written atomically either way, and a duplicate that slips through an
 // unreadable corner is still caught and quarantined by the indexer.
 func ClaimedIDs(root string) (map[string]string, error) {
-	out := map[string]string{}
+	holders, err := claimedIDHolders(root)
+	out := make(map[string]string, len(holders))
+	for id, h := range holders {
+		out[id] = h.path
+	}
+	return out, err
+}
+
+// claimedIDHolders is ClaimedIDs keeping the declared/fallback distinction its callers in
+// this package need to decide which of two files holding one id is the one that must move.
+func claimedIDHolders(root string) (map[string]idHolder, error) {
+	out := map[string]idHolder{}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// Unreadable directory or vanished entry: skip it, keep scanning.
@@ -121,7 +250,7 @@ func ClaimedIDs(root string) (map[string]string, error) {
 		if !strings.EqualFold(filepath.Ext(path), ".md") || IsConflictSibling(d.Name()) {
 			return nil
 		}
-		id := NoteIDForFile(path)
+		id, declared := noteIDForFile(path)
 		if id == "" {
 			return nil
 		}
@@ -129,8 +258,16 @@ func ClaimedIDs(root string) (map[string]string, error) {
 		if r, rerr := filepath.Rel(root, path); rerr == nil {
 			rel = r
 		}
-		if _, taken := out[id]; !taken {
-			out[id] = rel
+		// First in walk order wins, matching the indexer's incumbent rule, EXCEPT that a
+		// declared id outranks a filename fallback whenever the two collide. Without that
+		// exception a vault with README.md (no frontmatter) and keyed/overview.md
+		// (`id: readme`) records README.md as the holder, a migration then leaves
+		// README.md's fallback id alone as "already mine", and the vault comes out of the
+		// migration with two notes claiming readme: exactly the state the migration was
+		// run to clear. The declared id is the one nothing here may rewrite, so it has to
+		// be the one that stays put.
+		if prev, taken := out[id]; !taken || (declared && !prev.declared) {
+			out[id] = idHolder{path: rel, declared: declared}
 		}
 		return nil
 	})
