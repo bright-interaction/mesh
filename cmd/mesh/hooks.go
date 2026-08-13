@@ -20,6 +20,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/mcp"
+	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/spf13/cobra"
 )
 
@@ -116,7 +117,7 @@ func noIndexOrientText(root string) string {
 	b.WriteString("# Your knowledge mesh (not indexed yet)\n\n")
 	b.WriteString(fmt.Sprintf("A knowledge mesh is wired up for %s, but it has no index yet, so there is nothing to orient from and the mesh-* MCP tools will return nothing.\n\n", root))
 	b.WriteString("Build it once, then start a new session:\n\n")
-	b.WriteString(fmt.Sprintf("    mesh index %s\n\n", root))
+	b.WriteString(fmt.Sprintf("    mesh index %s\n\n", shellpath.Quote(root)))
 	b.WriteString("Until then, treat an empty mesh result as \"not indexed\", not as \"the mesh knows nothing about this\".\n")
 	return b.String()
 }
@@ -221,7 +222,7 @@ func indexVault(vaultAbs string) error {
 		return installIndexError(vaultAbs, err)
 	}
 	if n == 0 {
-		fmt.Printf("  + indexed the vault (no notes yet: add markdown under %s and run `mesh index %s`)\n", vaultAbs, vaultAbs)
+		fmt.Printf("  + indexed the vault (no notes yet: add markdown under %s and run `mesh index %s`)\n", vaultAbs, shellpath.Quote(vaultAbs))
 		return nil
 	}
 	fmt.Printf("  + indexed the vault (%d notes)\n", n)
@@ -236,7 +237,7 @@ func installIndexError(vaultAbs string, cause error) error {
 	return fmt.Errorf("the agent is wired up, but the index for %s could not be built, so do NOT restart your agent yet: it would start against a mesh that cannot open.\n"+
 		"  check that %s is writable by you (a read-only mount, a synced notes folder or a directory owned by another user all fail here)\n"+
 		"  then run: mesh index %s\n"+
-		"  cause: %w", vaultAbs, filepath.Join(vaultAbs, ".mesh"), vaultAbs, cause)
+		"  cause: %w", vaultAbs, filepath.Join(vaultAbs, ".mesh"), shellpath.Quote(vaultAbs), cause)
 }
 
 // installCmd is the one-shot agent setup. For Claude Code it registers the MCP

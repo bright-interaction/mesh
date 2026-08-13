@@ -13,6 +13,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/relate"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -183,7 +184,7 @@ func fillNoteTimelines(root string, files []string, repoPath string, apply bool)
 	}
 	fmt.Println()
 	if apply && changed > 0 {
-		fmt.Printf("run `mesh index %s` to pick the new bodies up\n", root)
+		fmt.Printf("run `mesh index %s` to pick the new bodies up\n", shellpath.Quote(root))
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d note(s) failed", failed, len(files))
@@ -271,7 +272,7 @@ func fillNoteBodies(root string, files []string, apply bool) error {
 	}
 	fmt.Println()
 	if apply && changed > 0 {
-		fmt.Printf("run `mesh index %s` to pick the new bodies up\n", root)
+		fmt.Printf("run `mesh index %s` to pick the new bodies up\n", shellpath.Quote(root))
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d note(s) failed to fill", failed, len(files))
@@ -305,7 +306,7 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 	// orphan had any candidate link.
 	store, err := index.OpenReadOnly(root)
 	if err != nil {
-		return fmt.Errorf("wire-orphans needs a built index (run: mesh index %s): %w", root, err)
+		return fmt.Errorf("wire-orphans needs a built index (run: mesh index %s): %w", shellpath.Quote(root), err)
 	}
 	defer store.Close()
 	ig, err := store.LoadGraph()
@@ -363,7 +364,7 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 		fmt.Printf("failed on %d note(s)\n", failed)
 	}
 	if apply && changed > 0 {
-		fmt.Printf("run `mesh index %s` to pick the new links up\n", root)
+		fmt.Printf("run `mesh index %s` to pick the new links up\n", shellpath.Quote(root))
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d orphan(s) failed to wire", failed, len(orphans))

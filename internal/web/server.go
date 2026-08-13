@@ -23,6 +23,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/shellpath"
 )
 
 //go:embed assets
@@ -571,7 +572,7 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 		if !ownIndex && errors.Is(err, index.ErrNoIndexYet) {
 			return fmt.Errorf("%w\n\nmesh ui reads the index, it does not build it. Either start the owning "+
 				"writer (`mesh watch %s`), index once (`mesh index %s`), or pass --own-index if nothing "+
-				"else writes this vault", err, vaultRoot, vaultRoot)
+				"else writes this vault", err, shellpath.Quote(vaultRoot), shellpath.Quote(vaultRoot))
 		}
 		return err
 	}

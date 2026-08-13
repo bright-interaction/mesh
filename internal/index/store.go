@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bright-interaction/mesh/internal/shellpath"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -216,11 +218,48 @@ func ensureVaultMeshDir(dir string) error {
 	return nil
 }
 
+// indexFileMode is the mode the index files themselves carry. Narrowing the directory
+// was only half the fix: SQLite creates mesh.db with 0666&^umask, which is 0644 under
+// the default umask, so the file holding the full text of every note was world-readable
+// on its own terms. That is invisible while it sits inside a 0700 directory and becomes
+// real the moment the bytes are copied out of it, which is the normal case: a backup
+// tool, a `cp -r`, a vault on a synced volume, or an older vault whose .mesh predates
+// the 0700 constant.
+const indexFileMode = 0o600
+
+// narrowIndexFiles chmods mesh.db and its WAL/SHM siblings down to owner-only, both on
+// create and on an existing index written by an older mesh.
+//
+// The siblings are not an afterthought: mesh.db-wal holds every recently committed note
+// body until a checkpoint folds it back, so leaving it 0644 leaks the newest writes,
+// which are the ones most worth reading. Best effort throughout, for the same reason
+// ensureVaultMeshDir is: an index on a filesystem that refuses chmod must still work.
+func narrowIndexFiles(dbPath string) {
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue // -wal/-shm need not exist yet
+		}
+		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+			if err := os.Chmod(p, perm&^0o077); err != nil {
+				slog.Warn("index: cannot narrow world-readable index file",
+					"path", p, "mode", perm.String(), "err", err)
+			}
+		}
+	}
+}
+
 // OpenAt is like Open but stores the index in an explicit directory instead of
 // <vaultRoot>/.mesh. The hub uses this to index its served vault into a dir OUTSIDE
 // the git repo, so the index is never synced to clients.
 func OpenAt(vaultRoot, meshDir string) (*Store, error) {
-	if err := os.MkdirAll(meshDir, 0o755); err != nil {
+	// The same 0700 treatment Open gets, because this is the OTHER entry point that
+	// creates the directory. It used to MkdirAll at 0755 and never narrow: harmless
+	// when reached via Open (which has already created the dir, making this call a
+	// no-op) and wide open on every path that calls OpenAt directly, which is the
+	// hub indexing the served vault. That index holds the full text of every note in
+	// the team vault, so on a shared box it was world-traversable.
+	if err := ensureVaultMeshDir(meshDir); err != nil {
 		return nil, err
 	}
 	dbPath := filepath.Join(meshDir, "mesh.db")
@@ -245,6 +284,8 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+
+	narrowIndexFiles(dbPath)
 
 	s := &Store{
 		dir:     meshDir,
@@ -476,7 +517,7 @@ func checkReadOnlySchemaVersion(db *sql.DB, vaultRoot, dbPath string) error {
 		"  your notes are safe: the index is derived from the markdown, so rebuilding it loses nothing\n"+
 		"  fix: mesh index %s   (rebuilds the index for this version)\n"+
 		"  stored embeddings survive the rebuild; re-run mesh embed only if you changed embedding model",
-		ErrSchemaMismatch, abs, stamped, SchemaVersion, root)
+		ErrSchemaMismatch, abs, stamped, SchemaVersion, shellpath.Quote(root))
 }
 
 // indexFiles are the three files one SQLite index occupies: the database plus the WAL and
@@ -507,7 +548,7 @@ func corruptIndexError(vaultRoot, dbPath string, cause error) error {
 		"  by hand: rm -f %s %s-wal %s-shm\n"+
 		"  stored embeddings go with it, so re-run mesh embed if you use semantic search\n"+
 		"  cause:   %w",
-		ErrIndexCorrupt, abs, root, abs, abs, abs, cause)
+		ErrIndexCorrupt, abs, shellpath.Quote(root), shellpath.Quote(abs), shellpath.Quote(abs), shellpath.Quote(abs), cause)
 }
 
 // recoverCorruptIndex deletes an unreadable index so it can be rebuilt, and does so ONLY

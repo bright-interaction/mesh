@@ -11,6 +11,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/llm"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/spf13/cobra"
 )
 
@@ -32,7 +33,7 @@ func askCmd() *cobra.Command {
 			// empty database instead of the command saying there is no index yet.
 			store, err := index.OpenReadOnly(vaultRoot)
 			if err != nil {
-				return fmt.Errorf("mesh ask needs a built index (run: mesh index %s): %w", vaultRoot, err)
+				return fmt.Errorf("mesh ask needs a built index (run: mesh index %s): %w", shellpath.Quote(vaultRoot), err)
 			}
 			defer store.Close()
 			client, err := llm.NewFromEnv()

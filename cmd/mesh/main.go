@@ -31,6 +31,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/netaddr"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/bright-interaction/mesh/internal/sshserve"
 	"github.com/bright-interaction/mesh/internal/tui"
 	"github.com/bright-interaction/mesh/internal/vault"
@@ -167,18 +168,18 @@ func initCmd() *cobra.Command {
 				for _, d := range dropped {
 					fmt.Fprintf(os.Stderr, "  %s: %v\n", d.Path, d.Err)
 				}
-				fmt.Fprintf(os.Stderr, "fix them, then run: mesh index %s\n\n", root)
+				fmt.Fprintf(os.Stderr, "fix them, then run: mesh index %s\n\n", shellpath.Quote(root))
 			}
 			fmt.Println("next:")
-			fmt.Println("  mesh new decision \"<title>\" --vault " + root + "   # capture a decision/gotcha")
-			fmt.Println("  mesh index " + root + "                          # rebuild after edits")
+			fmt.Println("  mesh new decision \"<title>\" --vault " + shellpath.Quote(root) + "   # capture a decision/gotcha")
+			fmt.Println("  mesh index " + shellpath.Quote(root) + "                          # rebuild after edits")
 			fmt.Println("  point your coding agent at the MCP server:")
 			fmt.Printf("    {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"%s\", \"--watch\"]}\n", abs)
 			// Say who indexes, because until this was printed the honest answer for a
 			// vault set up this way was "nobody", and nothing said so.
 			fmt.Println("    that server elects itself this vault's owning writer, so notes it writes")
-			fmt.Println("    (and notes you edit) are searchable at once. Run `mesh doctor " + root + "`")
-			fmt.Println("    to check one is running; `mesh watch " + root + "` starts a standalone one.")
+			fmt.Println("    (and notes you edit) are searchable at once. Run `mesh doctor " + shellpath.Quote(root) + "`")
+			fmt.Println("    to check one is running; `mesh watch " + shellpath.Quote(root) + "` starts a standalone one.")
 			// Printed the next steps first, then fail: a vault that dropped notes is
 			// incomplete, and init exiting 0 over it was the original defect.
 			if len(dropped) > 0 {
@@ -249,7 +250,7 @@ func doctorCmd() *cobra.Command {
 			root := vaultArg(args)
 			dbPath := filepath.Join(root, ".mesh", "mesh.db")
 			if _, err := os.Stat(dbPath); err != nil {
-				fmt.Printf("no index at %s\n  fix: mesh index %s\n", dbPath, root)
+				fmt.Printf("no index at %s\n  fix: mesh index %s\n", dbPath, shellpath.Quote(root))
 				return fmt.Errorf("no index")
 			}
 			// READ-ONLY: doctor only counts rows and reports drift, so taking the write
@@ -263,7 +264,7 @@ func doctorCmd() *cobra.Command {
 				// print "status: OK (index fresh)" with exit 0 over exactly this, because
 				// the version comparison lived only on the writable path nothing runs.
 				if errors.Is(err, index.ErrSchemaMismatch) {
-					fmt.Printf("index:  %s\n%v\nstatus: BROKEN - the index does not match this Mesh binary\n  fix: mesh index %s\n", dbPath, err, root)
+					fmt.Printf("index:  %s\n%v\nstatus: BROKEN - the index does not match this Mesh binary\n  fix: mesh index %s\n", dbPath, err, shellpath.Quote(root))
 					return fmt.Errorf("index schema mismatch")
 				}
 				return err
@@ -355,7 +356,7 @@ func doctorCmd() *cobra.Command {
 					fmt.Printf("  %s: %v\n", d.Path, d.Err)
 				}
 				fmt.Printf("status: BROKEN - %d note(s) invisible to search (another note already claims their id)\n"+
-					"  fix: give one of each pair a different id, then run mesh index %s\n", len(dupes), root)
+					"  fix: give one of each pair a different id, then run mesh index %s\n", len(dupes), shellpath.Quote(root))
 				return fmt.Errorf("%d note(s) share an id with another note", len(dupes))
 			case drift.Any():
 				fmt.Println("status: STALE - run mesh index")
@@ -387,7 +388,7 @@ func searchCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dbPath := filepath.Join(vaultDir, ".mesh", "mesh.db")
 			if _, err := os.Stat(dbPath); err != nil {
-				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, vaultDir)
+				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, shellpath.Quote(vaultDir))
 			}
 			// Read-only: this command only ever LoadGraphs and retrieves, but opening
 			// writable runs ensureSchema, which takes the write lock. That is the whole of
@@ -634,7 +635,7 @@ func embedCmd() *cobra.Command {
 				return fmt.Errorf("set --endpoint and --model (or MESH_EMBED_ENDPOINT / MESH_EMBED_MODEL).\n  example: mesh embed %s --endpoint http://localhost:11434/v1 --model nomic-embed-text", root)
 			}
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
-				return fmt.Errorf("no index (run: mesh index %s)", root)
+				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
 			store, err := index.Open(root)
 			if err != nil {
@@ -781,7 +782,7 @@ func statusCmd() *cobra.Command {
 			}
 			dbPath := filepath.Join(root, ".mesh", "mesh.db")
 			if _, err := os.Stat(dbPath); err != nil {
-				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, root)
+				return fmt.Errorf("no index at %s (run: mesh index %s)", dbPath, shellpath.Quote(root))
 			}
 			// READ-ONLY: counts, the graph and the vector stats are all reads.
 			store, err := index.OpenReadOnly(root)
@@ -888,7 +889,7 @@ func healthCmd() *cobra.Command {
 				root = args[0]
 			}
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
-				return fmt.Errorf("no index (run: mesh index %s)", root)
+				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
 			store, err := index.Open(root)
 			if err != nil {
@@ -953,7 +954,7 @@ func healthCmd() *cobra.Command {
 			if len(dupes) > 0 {
 				fmt.Printf("health: BROKEN - %d note(s) share an id with another note, so they are quarantined: "+
 					"invisible to search, to the graph, and to every lifecycle check below\n"+
-					"  fix: give one of each pair a different id, then run mesh index %s\n\n", len(dupes), root)
+					"  fix: give one of each pair a different id, then run mesh index %s\n\n", len(dupes), shellpath.Quote(root))
 				for _, d := range dupes {
 					fmt.Printf("  [duplicate-id] %s - %v\n", d.Path, d.Err)
 				}
@@ -993,7 +994,7 @@ func flywheelCmd() *cobra.Command {
 				root = args[0]
 			}
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
-				return fmt.Errorf("no index (run: mesh index %s)", root)
+				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
 			store, err := index.Open(root)
 			if err != nil {
@@ -1189,7 +1190,7 @@ func indexCmd() *cobra.Command {
 			// not collide belong in the index. The exit code is what stops a duplicate
 			// from being reported as a clean rebuild by a script or a CI step.
 			if len(dupes) > 0 {
-				return fmt.Errorf("%d note(s) share an id with another note and were left out of the index; give one of each pair a different id, then run mesh index %s again", len(dupes), root)
+				return fmt.Errorf("%d note(s) share an id with another note and were left out of the index; give one of each pair a different id, then run mesh index %s again", len(dupes), shellpath.Quote(root))
 			}
 			return nil
 		},
@@ -1973,7 +1974,7 @@ func joinCmd() *cobra.Command {
 			}
 			fmt.Println("next:")
 			fmt.Println("  mesh sync " + vaultDir + "                       # push your edits, pull teammates'")
-			fmt.Printf("  mesh mcp --vault %s --watch       # point your agent at the vault\n", vaultDir)
+			fmt.Printf("  mesh mcp --vault %s --watch       # point your agent at the vault\n", shellpath.Quote(vaultDir))
 			return nil
 		},
 	}
