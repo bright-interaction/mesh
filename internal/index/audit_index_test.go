@@ -339,7 +339,7 @@ func TestIncrementalRecordsUnparseableNewNote(t *testing.T) {
 	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
-	if d := s.DroppedNotes(); len(d) != 0 {
+	if d := mustDropped(t, s); len(d) != 0 {
 		t.Fatalf("clean vault should have no dropped notes, got %+v", d)
 	}
 
@@ -362,7 +362,7 @@ func TestIncrementalRecordsUnparseableNewNote(t *testing.T) {
 			if rec.Dropped != 1 {
 				t.Errorf("Reconciliation.Dropped = %d, want 1", rec.Dropped)
 			}
-			dropped := s.DroppedNotes()
+			dropped := mustDropped(t, s)
 			if len(dropped) != 1 || dropped[0].Path != "bad.md" {
 				t.Fatalf("the unparseable new note must be recorded, got %+v", dropped)
 			}
@@ -377,7 +377,7 @@ func TestIncrementalRecordsUnparseableNewNote(t *testing.T) {
 	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
-	if d := s.DroppedNotes(); len(d) != 0 {
+	if d := mustDropped(t, s); len(d) != 0 {
 		t.Errorf("dropped record must clear once the note parses, got %+v", d)
 	}
 	var n int

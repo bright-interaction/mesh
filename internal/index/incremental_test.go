@@ -225,7 +225,7 @@ func TestIncrementalQuarantinesDuplicateID(t *testing.T) {
 	if rec.Dropped != 1 {
 		t.Errorf("the duplicate must be reported as dropped, got Dropped=%d", rec.Dropped)
 	}
-	dropped := s.DroppedNotes()
+	dropped := mustDropped(t, s)
 	if len(dropped) != 1 || dropped[0].Path != "dup.md" {
 		t.Fatalf("DroppedNotes must name the quarantined file, got %+v", dropped)
 	}
@@ -264,7 +264,7 @@ func TestIncrementalQuarantinesDuplicateID(t *testing.T) {
 	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
-	if d := s.DroppedNotes(); len(d) != 0 {
+	if d := mustDropped(t, s); len(d) != 0 {
 		t.Errorf("quarantine must clear once the id is unique, got %+v", d)
 	}
 	var n int

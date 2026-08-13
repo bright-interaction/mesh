@@ -22,6 +22,12 @@ Findings are written to the index and surfaced as counts on the Dashboard and in
 by the tool, grouped by issue. Fixing or updating the flagged note clears it on the
 next check.
 
+If the health check reports that it cannot read the index, the index was written by an
+older Mesh and the version you upgraded to reads a different shape. No read-only surface
+can migrate it, so rebuild it once with `mesh index <vault>`. A clean bill of health is
+never reported from an index Mesh cannot read: not knowing and finding nothing are
+opposite answers, and only one of them is good news.
+
 ## Freshness in ranking (optional)
 
 Retrieval can apply a gentle freshness decay so an equal-but-stale note ranks below a

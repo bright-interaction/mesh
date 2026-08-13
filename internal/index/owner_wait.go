@@ -147,8 +147,12 @@ func (s *Store) PendingDrift(vaultRoot string) (Drift, error) {
 	if err != nil {
 		return Drift{}, err
 	}
+	known, err := s.DroppedNotes()
+	if err != nil {
+		return Drift{}, err
+	}
 	dropped := map[string]bool{}
-	for _, fe := range s.DroppedNotes() {
+	for _, fe := range known {
 		dropped[fe.Path] = true
 	}
 	if len(dropped) == 0 {

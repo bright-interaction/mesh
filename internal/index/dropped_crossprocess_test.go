@@ -46,7 +46,7 @@ func TestDroppedNotesReachAReaderInAnotherProcess(t *testing.T) {
 	}
 	defer reader.Close()
 
-	dropped := reader.DroppedNotes()
+	dropped := mustDropped(t, reader)
 	if len(dropped) != 1 {
 		t.Fatalf("a read-only reader saw %d dropped notes, want the 1 the owner recorded: %+v", len(dropped), dropped)
 	}
@@ -77,7 +77,7 @@ func TestQuarantineSentinelSurvivesTheProcessBoundary(t *testing.T) {
 	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
-	inProcess := owner.DroppedNotes()
+	inProcess := mustDropped(t, owner)
 	if err := owner.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestQuarantineSentinelSurvivesTheProcessBoundary(t *testing.T) {
 	}
 	defer reader.Close()
 
-	dropped := reader.DroppedNotes()
+	dropped := mustDropped(t, reader)
 	if len(dropped) != 1 || dropped[0].Path != "dup.md" {
 		t.Fatalf("the reader must see the quarantined file, got %+v", dropped)
 	}
@@ -124,7 +124,7 @@ func TestDroppedRecordClearsForAReaderToo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	if len(reader.DroppedNotes()) != 1 {
+	if len(mustDropped(t, reader)) != 1 {
 		t.Fatal("the reader should see the broken note before it is fixed")
 	}
 
@@ -140,7 +140,7 @@ func TestDroppedRecordClearsForAReaderToo(t *testing.T) {
 	if err := owner.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if d := reader.DroppedNotes(); len(d) != 0 {
+	if d := mustDropped(t, reader); len(d) != 0 {
 		t.Errorf("the reader still reports a note that has been fixed: %+v", d)
 	}
 }

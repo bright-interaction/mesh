@@ -149,6 +149,10 @@ anything:
   `mesh sync --watch` or `mesh mcp --watch` daemon) holds the write lock. Wait and
   retry, or stop the daemon. A full reindex only holds it for a few seconds.
 - `no index at <path>` means there is no database yet. Run `mesh index <vault>`.
+- `index schema mismatch` means the database was written by a different version of Mesh.
+  The index is derived, so Mesh rebuilds rather than migrating, and only `mesh index` can
+  do that: the everyday surfaces (`mesh mcp`, `mesh doctor`, `mesh ui`, the TUI) open the
+  index read-only and cannot write it. Run `mesh index <vault>` once after upgrading.
 
 Embeddings are the one thing a rebuild costs you: they are kept across schema upgrades
 precisely because re-creating them is a paid API call, but they cannot survive a file
@@ -261,6 +265,14 @@ one is the kind of change that is confusing if you meet it without warning.
 note in the vault in place with no backup, so writing is now opt-in via `--apply`. This is
 the one most likely to catch you: a script that calls either of them bare no longer
 rewrites anything, and it exits 0, so it looks like it worked. Add `--apply`.
+
+**Read-only surfaces refuse an index written by an older Mesh.** `mesh mcp`, `mesh doctor`,
+`mesh ui` and the TUI all open the index read-only, and only a writable open can rebuild a
+changed schema, so nothing ever migrated an upgraded index. They now say so and name the
+fix (`mesh index <vault>`) instead of answering from a schema they do not match. That
+matters most for `mesh_health` and `mesh doctor`, which reported a CLEAN vault over an
+index whose quarantine table their binary expected and the file did not have. Run
+`mesh index <vault>` once after upgrading; your notes are untouched.
 
 **`mesh doctor` exits 1 when a note does not parse.** It used to report `status: healthy`
 while holding zero indexed notes, because it counted only what had made it into the index

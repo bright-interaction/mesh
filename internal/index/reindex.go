@@ -6,6 +6,7 @@ package index
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -181,16 +182,19 @@ func (e *persistedDropErr) Unwrap() error {
 	return nil
 }
 
-// droppedFromIndex reads the dropped set the owning writer recorded. A store opened
-// against an index an older mesh wrote has no such table; that is "nothing known", not an
-// error worth failing a health call over.
-func (s *Store) droppedFromIndex() []FileError {
+// droppedFromIndex reads the dropped set the owning writer recorded. Any failure is
+// REPORTED, including a missing dropped_notes table. Swallowing that (it used to return
+// nil for "no such table", reasoning that an older index simply knows nothing) is exactly
+// how an unmigrated index made mesh_health answer "clean vault" while every quarantined
+// note stayed invisible. OpenReadOnlyAt now refuses a mismatched schema outright, so a
+// missing table here means something dropped it underneath a live store: still an error,
+// never an empty answer that reads as good news.
+func (s *Store) droppedFromIndex() ([]FileError, error) {
 	rows, err := s.readDB.Query(`SELECT path, err, duplicate FROM dropped_notes ORDER BY path`)
 	if err != nil {
-		if !strings.Contains(err.Error(), "no such table") {
-			slog.Warn("mesh: could not read dropped notes from the index", "err", err)
-		}
-		return nil
+		slog.Warn("mesh: could not read dropped notes from the index", "err", err)
+		return nil, fmt.Errorf("read dropped notes from the index at %s: %w\n"+
+			"  the index does not match this Mesh binary; rebuild it: mesh index <vault>", s.dbPath, err)
 	}
 	defer rows.Close()
 	var out []FileError
@@ -198,7 +202,7 @@ func (s *Store) droppedFromIndex() []FileError {
 		var path, msg string
 		var dup int
 		if err := rows.Scan(&path, &msg, &dup); err != nil {
-			return out
+			return out, fmt.Errorf("read dropped notes from the index at %s: %w", s.dbPath, err)
 		}
 		fe := FileError{Path: path}
 		if msg != "" || dup != 0 {
@@ -206,7 +210,7 @@ func (s *Store) droppedFromIndex() []FileError {
 		}
 		out = append(out, fe)
 	}
-	return out
+	return out, rows.Err()
 }
 
 func errText(err error) string {
@@ -223,7 +227,11 @@ func errText(err error) string {
 // A read-only store never runs a pass, so it has nothing of its own to report and reads
 // what the owning writer recorded instead. Without that, mesh_health in every `mesh mcp`
 // window would report a clean vault no matter how many notes were missing from it.
-func (s *Store) DroppedNotes() []FileError {
+//
+// It returns an error rather than an empty slice when that read fails, because "no
+// dropped notes" and "could not find out" are opposite answers and only one of them is
+// good news. Every caller must surface the failure; a writable store never errors.
+func (s *Store) DroppedNotes() ([]FileError, error) {
 	if s.readOnly {
 		return s.droppedFromIndex()
 	}
@@ -231,7 +239,7 @@ func (s *Store) DroppedNotes() []FileError {
 	defer s.mu.Unlock()
 	out := make([]FileError, len(s.dropped))
 	copy(out, s.dropped)
-	return out
+	return out, nil
 }
 
 // Reindex walks the vault, parses it, builds the graph + communities, persists

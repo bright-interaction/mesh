@@ -83,7 +83,12 @@ type reuseEvent struct {
 // (see schemaKeep and metaKeptWithVectors); their note_hash is stale against the new
 // hash, so they are excluded from retrieval until the next `mesh embed`, which re-stamps
 // them from the content-hash cache without paying for a single new embedding.
-const SchemaVersion = 5
+// v6: dropped_notes landed in schema.sql on 2026-08-09 with NO version bump, so every
+// index written by a released binary before that date is stamped 5 and has no such table.
+// Nothing rebuilt it, because only the writable Open compares versions and the shipped
+// per-window setup is read-only. The bump is what makes those databases identifiable, and
+// OpenReadOnlyAt now refuses them by version instead of querying a table that is not there.
+const SchemaVersion = 6
 
 type job struct {
 	fn    func(*sql.Tx) error
@@ -302,6 +307,19 @@ func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("open read-only index: %w", err)
 	}
+	// Then check the SHAPE, not just that the file opens. Only the writable Open compares
+	// schema_version (in ensureSchema) and rebuilds on a mismatch, and the shipped setup
+	// has no writable process: every `mesh mcp` window, `mesh doctor`, `mesh ui` and the
+	// TUI are read-only. So an upgraded user's index was never migrated and every read-only
+	// surface queried a schema its binary does not match. That did not fail loudly, it
+	// failed quietly: a v5 index has no dropped_notes table, and mesh_health swallowed the
+	// "no such table" and reported a CLEAN vault while quarantined notes stayed invisible.
+	// An index one version older still has no note_health, and mesh_health answered a bare
+	// "internal error" with the cause on stderr, which the agent client hides.
+	if err := checkReadOnlySchemaVersion(readDB, vaultRoot, dbPath); err != nil {
+		readDB.Close()
+		return nil, err
+	}
 	s := &Store{
 		dir:      meshDir,
 		dbPath:   dbPath,
@@ -403,6 +421,62 @@ func isUnreadableDB(err error) bool {
 	m := err.Error()
 	return strings.Contains(m, "file is not a database") || strings.Contains(m, "SQLITE_NOTADB") ||
 		strings.Contains(m, "database disk image is malformed") || strings.Contains(m, "SQLITE_CORRUPT")
+}
+
+// ErrSchemaMismatch marks an index whose schema_version is not this binary's
+// SchemaVersion: written by an older (or newer) Mesh and never rebuilt, because only the
+// writable Open migrates and a read-only surface cannot. A sentinel so callers can give
+// their own surface-specific advice (`mesh doctor` prints a status line, the viewer says
+// it does not build indexes) instead of pattern-matching the message.
+var ErrSchemaMismatch = errors.New("index schema mismatch")
+
+// schemaVersionInIndex reads meta.schema_version from a read-only connection. A missing
+// meta table or missing row answers 0: that is a database this Mesh never stamped, which
+// is a mismatch, not an internal error.
+func schemaVersionInIndex(db *sql.DB) (int, error) {
+	var v int
+	err := db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&v)
+	switch {
+	case err == nil:
+		return v, nil
+	case errors.Is(err, sql.ErrNoRows), strings.Contains(err.Error(), "no such table"):
+		return 0, nil
+	default:
+		return 0, err
+	}
+}
+
+// checkReadOnlySchemaVersion is the read-only twin of the version comparison ensureSchema
+// makes on the writable path. It cannot migrate (a read-only store has no write
+// connection), so it fails closed with the command that CAN: `mesh index`. Serving reads
+// off a mismatched schema is what produced a false clean bill of health, and answering a
+// bare "internal error" from a missing table is what hid the cause.
+func checkReadOnlySchemaVersion(db *sql.DB, vaultRoot, dbPath string) error {
+	found, err := schemaVersionInIndex(db)
+	if err != nil {
+		return fmt.Errorf("read index schema version: %w", err)
+	}
+	if found == SchemaVersion {
+		return nil
+	}
+	abs, aerr := filepath.Abs(dbPath)
+	if aerr != nil {
+		abs = dbPath
+	}
+	root, rerr := filepath.Abs(vaultRoot)
+	if rerr != nil {
+		root = vaultRoot
+	}
+	stamped := fmt.Sprintf("v%d", found)
+	if found == 0 {
+		stamped = "unstamped"
+	}
+	return fmt.Errorf("%w: %s was written by a different version of Mesh (index schema %s, this binary expects v%d)\n"+
+		"  read-only surfaces cannot migrate it, so this one refuses to answer from a schema it does not match\n"+
+		"  your notes are safe: the index is derived from the markdown, so rebuilding it loses nothing\n"+
+		"  fix: mesh index %s   (rebuilds the index for this version)\n"+
+		"  stored embeddings survive the rebuild; re-run mesh embed only if you changed embedding model",
+		ErrSchemaMismatch, abs, stamped, SchemaVersion, root)
 }
 
 // indexFiles are the three files one SQLite index occupies: the database plus the WAL and

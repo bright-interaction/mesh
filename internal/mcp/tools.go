@@ -491,7 +491,21 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 	// two issue kinds rather than one misleading label: "unparseable" means fix the
 	// frontmatter, "duplicate-id" means the note was quarantined because another note
 	// already holds its id and one of the two needs a new one.
-	for _, d := range s.store.DroppedNotes() {
+	//
+	// A failure to READ that record is reported, never treated as "nothing dropped":
+	// answering {"counts":{},"findings":null} to a question the tool could not answer is
+	// how an index written by an older Mesh passed as a clean vault. The message names the
+	// remedy rather than going through internalErr, whose deliberately generic "internal
+	// error" left the cause on stderr where the agent client hides it.
+	dropped, derr := s.store.DroppedNotes()
+	if derr != nil {
+		slog.Error("mesh mcp: health could not read the dropped-note record", "err", derr)
+		return nil, &rpcError{Code: codeInternalError, Message: "mesh_health cannot read which notes the index dropped, " +
+			"so it cannot tell you whether the vault is clean. The index was written by a different version of Mesh " +
+			"and no read-only surface can migrate it. Rebuild it: run `mesh index <vault>` in a terminal. " +
+			"Your notes are safe; the index is derived from the markdown."}
+	}
+	for _, d := range dropped {
 		detail := ""
 		if d.Err != nil {
 			// The THIRD copy of the same shape, and the one that survived the sweep that

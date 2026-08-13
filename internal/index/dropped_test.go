@@ -50,7 +50,7 @@ func TestReindexRecordsDroppedUnparseableNotes(t *testing.T) {
 		t.Errorf("the broken note should not have been indexed (its YAML is invalid), got ids %v", ids)
 	}
 
-	dropped := store.DroppedNotes()
+	dropped := mustDropped(t, store)
 	if len(dropped) != 1 {
 		t.Fatalf("expected exactly 1 dropped note, got %d: %+v", len(dropped), dropped)
 	}
@@ -68,7 +68,7 @@ func TestReindexRecordsDroppedUnparseableNotes(t *testing.T) {
 	if _, _, err := ReindexFull(store, dir); err != nil {
 		t.Fatal(err)
 	}
-	if d := store.DroppedNotes(); len(d) != 0 {
+	if d := mustDropped(t, store); len(d) != 0 {
 		t.Errorf("dropped record should clear once the vault parses cleanly, got %+v", d)
 	}
 }

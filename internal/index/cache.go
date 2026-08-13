@@ -142,11 +142,15 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 		li.cache.Seed(notes)
 		li.seeded = true
 		li.refreshHealthIfDue()
+		dropped, err := li.store.DroppedNotes() // recorded by ReindexFull
+		if err != nil {
+			return Reconciliation{}, err
+		}
 		return Reconciliation{
 			Added:     len(notes),
 			Reindexed: true,
 			Graph:     g,
-			Dropped:   len(li.store.DroppedNotes()), // recorded by ReindexFull
+			Dropped:   len(dropped),
 			Dur:       time.Since(start),
 		}, nil
 	}

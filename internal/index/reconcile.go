@@ -52,7 +52,11 @@ func Reconcile(s *Store, root string) (Reconciliation, error) {
 	}
 	r.Reindexed = true
 	r.Graph = g
-	r.Dropped = len(s.DroppedNotes()) // recorded by the ReindexFull inside Reindex
+	dropped, err := s.DroppedNotes() // recorded by the ReindexFull inside Reindex
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	r.Dropped = len(dropped)
 	r.Dur = time.Since(start)
 	return r, nil
 }

@@ -245,6 +245,14 @@ func doctorCmd() *cobra.Command {
 			// to be mid-reconcile. Reproduced 2026-08-10 on the live vault.
 			store, err := index.OpenReadOnly(root)
 			if err != nil {
+				// An index written by an older Mesh is a diagnosis, not a crash: doctor is
+				// the command a stranger runs to find out what is wrong, and it used to
+				// print "status: OK (index fresh)" with exit 0 over exactly this, because
+				// the version comparison lived only on the writable path nothing runs.
+				if errors.Is(err, index.ErrSchemaMismatch) {
+					fmt.Printf("index:  %s\n%v\nstatus: BROKEN - the index does not match this Mesh binary\n  fix: mesh index %s\n", dbPath, err, root)
+					return fmt.Errorf("index schema mismatch")
+				}
 				return err
 			}
 			defer store.Close()
