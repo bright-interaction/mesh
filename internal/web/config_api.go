@@ -144,7 +144,24 @@ func scrubKeyEnv(c *meshcfg.Config) {
 // before the allow-list existed live forever, because the config row survives the write
 // and outlives the admin role that made it; refusing to re-persist it means the next
 // config write takes it back out.
+//
+// It runs ONLY once an allow-list exists. CheckEndpointURL refuses every host when
+// MESH_ALLOWED_ENDPOINT_HOSTS is unset, and unset is the state of every deployment that
+// has not opted in, so scrubbing unconditionally blanked all three endpoints on the next
+// unrelated config write, silently, with a 200. The upgrade itself became the data loss,
+// and it took the localhost sovereign setup with it, since a config.toml written by
+// `mesh embed` is http and fails on scheme before the host is even considered.
+//
+// Skipping the scrub does not reopen the exfiltration. That fix is on the WRITE path,
+// which is the one facing the untrusted admin, and it is unconditional: PUT still cannot
+// set an endpoint that is not allow-listed. What is deferred is only the cleanup of a URL
+// that was already on disk, and config.toml is the operator's own file. An operator who
+// wants that cleanup gets it by naming the hosts they trust, which is the same act that
+// makes the field settable again.
 func scrubEndpoints(c *meshcfg.Config) {
+	if len(meshcfg.AllowedEndpointHosts()) == 0 {
+		return
+	}
 	drop := func(field string, v *string) {
 		if err := meshcfg.CheckEndpointURL(field, *v); err != nil {
 			slog.Warn("mesh ui: dropping a disallowed endpoint URL from config.toml", "field", field, "url", *v, "error", err)
