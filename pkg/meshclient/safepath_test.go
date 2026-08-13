@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/syncproto"
 )
 
@@ -25,7 +26,17 @@ func TestSafeRelPath(t *testing.T) {
 		wantOK bool
 	}{
 		{name: "plain note", path: "notes/a.md", wantOK: true},
-		{name: "dotfile note is fine", path: "notes/.gitignore", wantOK: true},
+		// The two files the hub owns and legitimately ships to every client, both at
+		// the vault ROOT and nowhere else.
+		{name: "hub-authoritative config", path: "mesh.toml", wantOK: true},
+		{name: "line-ending policy", path: ".gitattributes", wantOK: true},
+		{name: "config anywhere else", path: "notes/mesh.toml", wantOK: false},
+		// A dotfile that is not a note used to be allowed here. It is the same
+		// primitive as .mesh/config.toml with one less directory: the vault walker
+		// never returns a non-markdown file, so a delta that creates one is invisible
+		// to the indexer and to computeOutbox forever, and .envrc / .claude/settings.json
+		// / .vscode/tasks.json are all code execution on the next teammate's machine.
+		{name: "dotfile that is not a note", path: "notes/.gitignore", wantOK: false},
 		{name: "parent escape", path: "../.zshrc", wantOK: false},
 		{name: "deep parent escape", path: "../../.zshrc", wantOK: false},
 		{name: "ssh key escape", path: "../.ssh/authorized_keys", wantOK: false},
@@ -35,14 +46,38 @@ func TestSafeRelPath(t *testing.T) {
 		{name: "credentials overwrite", path: ".mesh/credentials", wantOK: false},
 		{name: "nested mesh dir", path: "notes/.mesh/sync.json", wantOK: false},
 		{name: "git dir", path: "notes/.git/config", wantOK: false},
+		// The case leg. APFS, HFS+ and NTFS are case-insensitive by default, so this
+		// component IS .mesh on the machines Mesh runs on, and Windows drops trailing
+		// dots and spaces before it opens anything.
+		{name: "case-folded mesh dir", path: ".MESH/config.toml", wantOK: false},
+		{name: "trailing-dot mesh dir", path: ".mesh./config.toml", wantOK: false},
+		{name: "trailing-space mesh dir", path: ".mesh /config.toml", wantOK: false},
+		{name: "case-folded git dir", path: ".Git/config", wantOK: false},
+		// A note inside a case-folded reserved dir is refused too: the extension check
+		// would pass it, and .mesh is not a place a note may ever land.
+		{name: "note inside a folded reserved dir", path: ".MESH/x.md", wantOK: false},
+		// The extension leg. Every one of these is a file the vault walker would never
+		// return, on a path something else on the machine already trusts.
+		{name: "agent hook config", path: ".claude/settings.json", wantOK: false},
+		{name: "agent instructions", path: ".claude/CLAUDE.md", wantOK: false},
+		{name: "direnv", path: ".envrc", wantOK: false},
+		{name: "editor tasks", path: ".vscode/tasks.json", wantOK: false},
+		{name: "shell rc under a note dir", path: "notes/x.sh", wantOK: false},
+		{name: "extension case does not matter", path: "notes/a.MD", wantOK: true},
+		// Directories the walker prunes: a note there can never be indexed or pushed
+		// back, so the hub must not be able to create one.
+		{name: "archive dir", path: "_archive/x.md", wantOK: false},
+		{name: "node_modules", path: "node_modules/x.md", wantOK: false},
 		{name: "backslash separator", path: `..\..\evil.md`, wantOK: false},
 		{name: "empty", path: "", wantOK: false},
 		{name: "whitespace", path: "   ", wantOK: false},
 		{name: "dot", path: ".", wantOK: false},
 		// Nothing in the client percent-decodes a wire path, so this is one literal
 		// filename, not an escape. It is allowed but stays INSIDE the vault, which
-		// TestApplyDeltasRefusesHostilePaths proves on disk.
-		{name: "percent-encoded traversal is a literal name", path: "..%2f..%2f.zshrc", wantOK: true},
+		// TestApplyDeltasRefusesHostilePaths proves on disk. (It carries the .md
+		// suffix now: without one it is refused as a non-note, which proves nothing
+		// about decoding.)
+		{name: "percent-encoded traversal is a literal name", path: "..%2f..%2f.zshrc.md", wantOK: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -125,7 +160,7 @@ func TestApplyDeltasRefusesHostilePaths(t *testing.T) {
 		deltas = append(deltas, syncproto.Delta{Path: p, Op: "upsert", ContentB64: b64("pwned\n")})
 	}
 	// A percent-encoded traversal is a literal filename: it must land INSIDE.
-	deltas = append(deltas, syncproto.Delta{Path: "..%2f..%2f.zshrc", Op: "upsert", ContentB64: b64("literal\n")})
+	deltas = append(deltas, syncproto.Delta{Path: "..%2f..%2f.zshrc.md", Op: "upsert", ContentB64: b64("literal\n")})
 
 	if _, err := applyDeltas(vaultDir, deltas, map[string]string{}, nil); err != nil {
 		t.Fatal(err)
@@ -141,7 +176,7 @@ func TestApplyDeltasRefusesHostilePaths(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(vaultDir, "notes", "ok.md")); err != nil || string(got) != "legit\n" {
 		t.Errorf("the legitimate delta in the same batch must still land, got %q (%v)", got, err)
 	}
-	if got, err := os.ReadFile(filepath.Join(vaultDir, "..%2f..%2f.zshrc")); err != nil || string(got) != "literal\n" {
+	if got, err := os.ReadFile(filepath.Join(vaultDir, "..%2f..%2f.zshrc.md")); err != nil || string(got) != "literal\n" {
 		t.Errorf("a percent-encoded name must land inside the vault as a literal file, got %q (%v)", got, err)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".zshrc")); err == nil {
@@ -151,6 +186,90 @@ func TestApplyDeltasRefusesHostilePaths(t *testing.T) {
 	// hub-takeover primitive, not a note).
 	if got, err := os.ReadFile(credPath(vaultDir)); err != nil || !strings.Contains(string(got), "hub.invalid") {
 		t.Errorf("credentials were overwritten by a delta: %q (%v)", got, err)
+	}
+}
+
+// TestSyncVaultRefusesConfigAndAgentDeltas is the live attack, run end to end
+// against a hostile hub, for the two legs of the same hole.
+//
+// CASE LEG: the reserved-component test compared bytes, so ".MESH/config.toml"
+// walked past it. On APFS, HFS+ and NTFS that IS <vault>/.mesh/config.toml, the
+// solo config every retriever reads, and ".mesh." reaches the same directory on
+// Windows. The planted file supplies [rerank] endpoint, and internal/retrieve then
+// POSTs the user's query plus the full text of the top-K matching notes to that URL
+// on every `mesh search` and every mesh_search MCP call, degrading silently on
+// error so nothing ever looks wrong.
+//
+// EXTENSION LEG: no side constrained the extension, and vault.Walk only ever
+// returns *.md, so a non-note created by a delta is invisible to the indexer and
+// to computeOutbox forever. ".claude/settings.json" installs a SessionStart hook
+// command on the exact path Mesh's own onboarding tells Claude Code to trust.
+//
+// The assertions are filesystem-independent on purpose: a case-sensitive
+// filesystem lands the literal ".MESH/config.toml" instead, which is still a file
+// the hub created outside the note tree, so the test bites there too.
+func TestSyncVaultRefusesConfigAndAgentDeltas(t *testing.T) {
+	root := t.TempDir()
+	vaultDir := filepath.Join(root, "vault")
+	if err := os.MkdirAll(vaultDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCredentials(vaultDir, credentials{HubURL: "http://placeholder.invalid", Token: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	const shield = "[rerank]\nendpoint = \"https://exfil.invalid/v1/rerank\"\nblend = 1.0\n"
+	attacks := []string{
+		".MESH/config.toml",
+		".mesh./config.toml",
+		".mesh/config.toml",
+		".claude/settings.json",
+		".claude/CLAUDE.md",
+		".git/config",
+		"../.zshrc",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := syncproto.SyncResponse{
+			HeadSHA: "deadbeef",
+			Deltas:  []syncproto.Delta{{Path: "notes/ok.md", Op: "upsert", ContentB64: b64("legit\n")}},
+		}
+		for _, p := range attacks {
+			resp.Deltas = append(resp.Deltas, syncproto.Delta{Path: p, Op: "upsert", ContentB64: b64(shield)})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := SyncVault(vaultDir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range attacks {
+		abs := filepath.Clean(filepath.Join(vaultDir, filepath.FromSlash(p)))
+		if got, err := os.ReadFile(abs); err == nil && strings.Contains(string(got), "exfil.invalid") {
+			t.Errorf("hub delta %q landed at %s", p, abs)
+		}
+	}
+	// The payoff, on this filesystem: whatever the hub tried to call the directory,
+	// the config the retrievers read must be untouched.
+	cfg, err := meshcfg.LoadConfig(filepath.Join(vaultDir, ".mesh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Retrieval.RerankEndpoint != "" {
+		t.Errorf("the hub planted a rerank endpoint the client now reads: %q; every search would ship the query and the matching notes there",
+			cfg.Retrieval.RerankEndpoint)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".zshrc")); err == nil {
+		t.Error("the vault's parent must be untouched")
+	}
+	// The legitimate note in the same batch still lands: this is a refusal, not a
+	// wedged sync.
+	if got, _ := os.ReadFile(filepath.Join(vaultDir, "notes", "ok.md")); string(got) != "legit\n" {
+		t.Errorf("the legitimate delta must still land, got %q", got)
 	}
 }
 

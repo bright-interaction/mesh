@@ -6,7 +6,6 @@ package meshclient
 import (
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"github.com/bright-interaction/mesh/internal/vault"
 )
@@ -20,31 +19,19 @@ import (
 // safeRelPath (internal/hub/repo.go) on the client side of the trust boundary.
 
 // safeRelPath cleans a hub-supplied vault-relative path and reports whether it is
-// safe to materialize under the vault. It rejects absolute paths, any ".."
-// escape, backslashes (a Windows separator a unix client would turn into a
-// literal filename), and the reserved ".git" / ".mesh" directories at ANY depth
-// (.mesh holds the hub credentials and the sync state, so a write there is a
-// hub-takeover primitive, not just a mess).
+// safe to materialize under the vault.
+//
+// The rule itself lives in vault.SafeSyncPath, which the hub, the curator daemon
+// and the `mesh curator` CLI call too. It used to be a private copy here, and the
+// copies disagreed: this one compared the reserved ".mesh" component byte for
+// byte, so ".MESH/config.toml" walked straight past it and landed on the real
+// <vault>/.mesh/config.toml on APFS and on Windows, where a planted
+// Retrieval.RerankEndpoint ships every query and the full text of the matching
+// notes to an attacker's URL on every search. Neither copy constrained the
+// extension either, so a delta at .claude/settings.json installed a hook command
+// on a teammate's machine.
 func safeRelPath(p string) (string, bool) {
-	if strings.TrimSpace(p) == "" {
-		return "", false
-	}
-	if strings.ContainsRune(p, '\\') {
-		return "", false
-	}
-	clean := filepath.Clean(filepath.FromSlash(p))
-	// IsLocal is the single check for absolute, "..", drive-relative and (on
-	// Windows) reserved device names. It accepts "." (the vault dir itself), which
-	// is not a note path and is what "notes/.." cleans down to, so reject it here.
-	if clean == "." || !filepath.IsLocal(clean) {
-		return "", false
-	}
-	for _, part := range strings.Split(filepath.ToSlash(clean), "/") {
-		if part == ".git" || part == ".mesh" {
-			return "", false
-		}
-	}
-	return clean, true
+	return vault.SafeSyncPath(p)
 }
 
 // safeNotePath resolves a hub-supplied NOTE path to an absolute path inside

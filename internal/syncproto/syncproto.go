@@ -52,7 +52,29 @@ type VaultInfo struct {
 	ServerTime    int64  `json:"server_time"`
 }
 
-// OutboxItem is one local change a client pushes.
+// PATH CONTRACT, both directions. Every Path on this wire (OutboxItem, Delta,
+// Conflict, Tombstone, CurationJob) is a vault-relative, forward-slash path to a
+// MARKDOWN NOTE, or one of two hub-owned files at the vault root: "mesh.toml" and
+// ".gitattributes". No absolute path, no "..", no backslash, no reserved or hidden
+// directory (.mesh, .git, .claude, ...), no other extension.
+//
+// Both ends enforce it independently through vault.SafeSyncPath, because each end
+// is the other's untrusted input: a hostile or MITM'd hub can put anything in a
+// Delta, and any teammate with the write role (which is every member until an ACL
+// says otherwise) can put anything in an Outbox. A path outside the contract is
+// refused, and on the push side it comes back in SyncResponse.Rejected rather than
+// being dropped in silence.
+//
+// The rule is derived from what vault.Walk indexes, which is why it is this tight:
+// a file the walker never returns can never be re-indexed or re-pushed by the
+// client that received it, so landing one is a permanent one-way write onto
+// someone else's disk. The dangerous instances are exactly the useful ones for an
+// attacker: .mesh/config.toml (its rerank endpoint makes every later search POST
+// the query and the matching notes to a URL of their choosing) and
+// .claude/settings.json (a hook command run by the teammate's agent).
+
+// OutboxItem is one local change a client pushes. Path must satisfy the path
+// contract above; the hub refuses anything else and names it in Rejected.
 type OutboxItem struct {
 	Path       string `json:"path"`
 	Op         string `json:"op"` // "upsert" | "delete"
@@ -71,7 +93,9 @@ type SyncRequest struct {
 	Proto int `json:"proto,omitempty"`
 }
 
-// Delta is one change the hub sends back for the client to apply.
+// Delta is one change the hub sends back for the client to apply. Path must
+// satisfy the path contract above; the client skips anything else and logs it,
+// rather than failing the round, so one bad entry cannot wedge a sync.
 type Delta struct {
 	Path       string `json:"path"`
 	Op         string `json:"op"` // "upsert" | "delete"
@@ -105,8 +129,9 @@ type SyncResponse struct {
 	// TombstoneSeq is the hub's current delete high-water mark; the client persists it
 	// and sends it back as SyncRequest.TombstoneSeq.
 	TombstoneSeq int64 `json:"tombstone_seq,omitempty"`
-	// Rejected lists outbox paths the hub refused to accept because the client lacks
-	// write permission (viewer role, or a read-only folder ACL). The client keeps its
+	// Rejected lists outbox paths the hub refused to accept: the client lacks write
+	// permission (viewer role, or a read-only folder ACL), the note is too large or
+	// not text, or the path is outside the path contract above. The client keeps its
 	// local copy; the edit simply did not land upstream. Older clients ignore this.
 	Rejected []string `json:"rejected,omitempty"`
 }

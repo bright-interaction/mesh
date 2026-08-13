@@ -445,7 +445,8 @@ func takeMineRejectedReceipt(baseRel, sibling string, sum meshclient.Summary) []
 		fmt.Sprintf("the hub REFUSED %s: your version was NOT pushed and the team cannot see it (HEAD %s).",
 			textdiff.Sanitize(baseRel), short8(sum.Head)),
 		"  a refusal means write access, not a merge: a viewer role, a folder ACL, the note's scope, " +
-			"or a note that is too large or not text. Ask an admin for write access on this path.",
+			"a note that is too large or not text, or a path the hub does not accept (it takes .md " +
+			"notes under the vault, nothing hidden or reserved). Ask an admin for write access on this path.",
 		fmt.Sprintf("  your version is KEPT in both places: at %s locally and in the parked sibling %s. Nothing was deleted.",
 			textdiff.Sanitize(baseRel), textdiff.Sanitize(sibling)),
 		"  the note stays queued as a local change, so every later `mesh sync` retries the push; " +

@@ -2049,7 +2049,7 @@ func syncSummaryLines(sum meshclient.Summary) []string {
 		lines = append(lines, fmt.Sprintf("  protected your unsaved local edit; incoming hub version saved at %s", sib))
 	}
 	for _, rej := range sum.Rejected {
-		lines = append(lines, fmt.Sprintf("  rejected by hub (no write permission, scope, or too large): %s -- kept local, will retry", rej))
+		lines = append(lines, fmt.Sprintf("  rejected by hub (no write permission, scope, too large, or not a .md note): %s -- kept local, will retry", rej))
 	}
 	return lines
 }

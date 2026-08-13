@@ -101,7 +101,7 @@ type Summary struct {
 	ConflictSiblings []string // merge conflicts: our pushed version parked here
 	Protected        []string // external-editor race: incoming hub version parked here
 	Dropped          []string // full-reconcile: locals removed because deleted upstream
-	Rejected         []string // hub refused these (viewer/ACL/scope/oversize); kept dirty to retry
+	Rejected         []string // hub refused these (viewer/ACL/scope/oversize/unsupported path); kept dirty to retry
 	Remaining        int      // dirty notes deferred to the next round because the batch was bounded
 }
 

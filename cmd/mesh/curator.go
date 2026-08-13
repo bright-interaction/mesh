@@ -18,6 +18,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/merge"
 	"github.com/bright-interaction/mesh/internal/syncproto"
 	"github.com/bright-interaction/mesh/internal/textdiff"
+	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/bright-interaction/mesh/pkg/meshclient"
 	"github.com/spf13/cobra"
 )
@@ -378,19 +379,12 @@ func curatorAcceptCmd() *cobra.Command {
 }
 
 // safeRelPath reports whether a hub-supplied note path is safe to join to the
-// local vault and read: vault-relative (no absolute, no ".." escape) and not in a
-// reserved directory. Mirrors the curator daemon's own write-boundary guard.
+// local vault and read. It defers to vault.SafeSyncPath, the same guard the sync
+// client, the hub and the curator daemon use, so a path one of them refuses is
+// never read by the other.
 func safeRelPath(p string) bool {
-	clean := filepath.FromSlash(p)
-	if !filepath.IsLocal(clean) {
-		return false
-	}
-	for _, part := range strings.Split(filepath.ToSlash(clean), "/") {
-		if part == ".git" || part == ".mesh" {
-			return false
-		}
-	}
-	return true
+	_, ok := vault.SafeSyncPath(p)
+	return ok
 }
 
 func parseJobID(arg string) (int64, error) {
