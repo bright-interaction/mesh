@@ -24,9 +24,15 @@ func askCmd() *cobra.Command {
 		Short: "Answer a question from your notes + code (BYOAI, grounded with citations)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := index.Open(vaultRoot)
+			// Read-only: ask retrieves and answers, it never writes the index (the
+			// retriever reads vectors and FTS, ask.Answer reads code hits). A writable
+			// open would take the SQLite write lock away from the owning writer for a
+			// pure read, and would silently CREATE an empty index on a vault that has
+			// none, so the LLM would answer "nothing in your notes about that" from an
+			// empty database instead of the command saying there is no index yet.
+			store, err := index.OpenReadOnly(vaultRoot)
 			if err != nil {
-				return err
+				return fmt.Errorf("mesh ask needs a built index (run: mesh index %s): %w", vaultRoot, err)
 			}
 			defer store.Close()
 			client, err := llm.NewFromEnv()

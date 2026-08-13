@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -42,16 +43,10 @@ func orientCmd() *cobra.Command {
 			if root == "" {
 				root = "."
 			}
-			store, err := index.Open(root)
+			text, err := orientTextFor(root)
 			if err != nil {
 				return err
 			}
-			defer store.Close()
-			g, err := store.LoadGraph()
-			if err != nil {
-				return err
-			}
-			text := orientText(store, g)
 			// First session after `mesh install`: prepend a one-time welcome so the
 			// agent greets the user and finishes onboarding. Only consume on the hook
 			// path (the real SessionStart), never on a manual `mesh orient`.
@@ -75,6 +70,55 @@ func orientCmd() *cobra.Command {
 	c.Flags().BoolVar(&hook, "hook", false, "emit the Claude Code SessionStart JSON envelope (additionalContext)")
 	c.Flags().StringVar(&vaultFlag, "vault", "", "vault root (defaults to the positional arg or .)")
 	return c
+}
+
+// orientTextFor renders the orientation for a vault from a READ-ONLY store.
+//
+// Read-only is load-bearing twice over, because this is the one command wired into
+// .claude/settings.json for SessionStart (startup AND resume), so it runs at the start
+// of every single session, concurrently with whatever else the user has running.
+//
+//  1. A writable open applies the schema, starts a writer goroutine and TRUNCATE-
+//     checkpoints on Close, so while `mesh watch` holds the write lock mid-reindex this
+//     blocked for the DSN's full busy_timeout and then failed: the agent started its
+//     session with NO orientation at all, which is the entire feature. Orient only reads
+//     (LoadGraph + ChangedSince), so it has no business taking the write lock.
+//  2. index.Open CREATES the database when it is absent. That turned the repair printed
+//     by corruptIndexError ("rm -f mesh.db mesh.db-wal mesh.db-shm") into a trap: the very
+//     next SessionStart minted an empty database, and from then on every read-only surface
+//     opened it happily and served an empty mesh, so `mesh search` answered "no matches"
+//     instead of "no index at <path>". Read-only cannot create, so the vault stays
+//     honestly index-less until the user runs `mesh index`.
+//
+// ErrNoIndexYet is therefore an ORIENTATION, not an error: the hook still has to emit its
+// envelope (a failed SessionStart hook says nothing to the user on Claude Code), so the
+// session begins knowing the mesh exists and exactly which command builds it.
+func orientTextFor(root string) (string, error) {
+	store, err := index.OpenReadOnly(root)
+	if err != nil {
+		if errors.Is(err, index.ErrNoIndexYet) {
+			return noIndexOrientText(root), nil
+		}
+		return "", err
+	}
+	defer store.Close()
+	g, err := store.LoadGraph()
+	if err != nil {
+		return "", err
+	}
+	return orientText(store, g), nil
+}
+
+// noIndexOrientText is the orientation for a vault that has no index yet. It names the
+// one command that fixes it, because the agent reading this is the one who can run it.
+func noIndexOrientText(root string) string {
+	var b strings.Builder
+	b.WriteString("# Your knowledge mesh (not indexed yet)\n\n")
+	b.WriteString(fmt.Sprintf("A knowledge mesh is wired up for %s, but it has no index yet, so there is nothing to orient from and the mesh-* MCP tools will return nothing.\n\n", root))
+	b.WriteString("Build it once, then start a new session:\n\n")
+	b.WriteString(fmt.Sprintf("    mesh index %s\n\n", root))
+	b.WriteString("Until then, treat an empty mesh result as \"not indexed\", not as \"the mesh knows nothing about this\".\n")
+	return b.String()
 }
 
 func orientText(store *index.Store, g *graph.Graph) string {
@@ -144,15 +188,52 @@ Keep it short and friendly, then carry on with whatever they need.
 
 // indexVault builds the initial index so the first orientation (and the agent) see
 // real content immediately, instead of an empty mesh on the first session.
-func indexVault(vaultAbs string) {
-	if store, err := index.Open(vaultAbs); err == nil {
-		if _, err := index.Reindex(store, vaultAbs); err == nil {
-			if n, _ := store.Count("notes"); n > 0 {
-				fmt.Printf("  + indexed the vault (%d notes)\n", n)
-			}
-		}
-		store.Close()
+//
+// It returns its error, and that is the whole point. This used to swallow all three of
+// them (the open, the reindex and the count), so `mesh install` registered the MCP server
+// over an unreadable .mesh/mesh.db or an unwritable vault, printed "Done.", armed a
+// welcome that could never fire and exited 0. The user restarted their agent, the MCP
+// server died at startup, and on Claude Code that surfaces as a bare connect timeout with
+// no message at all: first-run setup reporting success is exactly the moment a failure
+// must be loud.
+//
+// OpenRebuild rather than Open, matching `mesh index`: install IS the first build, so a
+// corrupt index file is the thing being replaced, not an obstacle. It discards the file
+// only for that one error class (see recoverCorruptIndex), and says so out loud.
+func indexVault(vaultAbs string) error {
+	store, recovered, err := index.OpenRebuild(vaultAbs)
+	if err != nil {
+		return installIndexError(vaultAbs, err)
 	}
+	defer store.Close()
+	if recovered {
+		fmt.Printf("  ! %s was corrupt and unreadable; discarded it and rebuilt from the markdown\n", filepath.Join(vaultAbs, ".mesh", "mesh.db"))
+		fmt.Println("    your notes are intact; stored embeddings went with it, so re-run `mesh embed` if you use semantic search")
+	}
+	if _, err := index.Reindex(store, vaultAbs); err != nil {
+		return installIndexError(vaultAbs, err)
+	}
+	n, err := store.Count("notes")
+	if err != nil {
+		return installIndexError(vaultAbs, err)
+	}
+	if n == 0 {
+		fmt.Printf("  + indexed the vault (no notes yet: add markdown under %s and run `mesh index %s`)\n", vaultAbs, vaultAbs)
+		return nil
+	}
+	fmt.Printf("  + indexed the vault (%d notes)\n", n)
+	return nil
+}
+
+// installIndexError names the remedy for the one failure a stranger meets on their first
+// run. The wrapped cause already carries its own repair when it is a corrupt index or a
+// held write lock; what it cannot know is that the agent has just been wired to a mesh
+// that will not open, which is what makes this worth stopping for.
+func installIndexError(vaultAbs string, cause error) error {
+	return fmt.Errorf("the agent is wired up, but the index for %s could not be built, so do NOT restart your agent yet: it would start against a mesh that cannot open.\n"+
+		"  check that %s is writable by you (a read-only mount, a synced notes folder or a directory owned by another user all fail here)\n"+
+		"  then run: mesh index %s\n"+
+		"  cause: %w", vaultAbs, filepath.Join(vaultAbs, ".mesh"), vaultAbs, cause)
 }
 
 // installCmd is the one-shot agent setup. For Claude Code it registers the MCP
@@ -166,7 +247,7 @@ func installCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "install [vault]",
 		Short: "One-shot setup: register the MCP server (and, on Claude Code, the auto-onboard hook)",
-		Long:  "Wires a coding agent to use Mesh. --client claude-code (default) also installs the SessionStart read hook + a one-time welcome so the agent onboards you with no further commands. Other clients (claude-desktop, cursor, vscode, windsurf, codex) get the MCP server registered in their own config; session hooks are Claude Code only, so elsewhere the agent uses Mesh via the MCP server's instructions.",
+		Long:  "Wires a coding agent to use Mesh. --client claude-code (default) also installs the SessionStart read hook + a one-time welcome so the agent onboards you with no further commands. Other clients (claude-desktop, cursor, vscode, windsurf, codex) get the MCP server registered in their own config; session hooks are Claude Code only, so elsewhere the agent uses Mesh via the MCP server's instructions.\n\nIt also builds the vault's first index. If that fails (an unwritable vault, an unreadable .mesh/mesh.db) install stops and prints the repair instead of reporting success, because an agent wired to a mesh that cannot open just fails to connect, with no message.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultPath := "."
@@ -210,7 +291,11 @@ func installCmd() *cobra.Command {
 				} else {
 					fmt.Printf("  . session hooks already in %s\n", res.SettingsPath)
 				}
-				indexVault(vaultAbs)
+				// Before SetOnboardPending and before "Done.": a welcome armed over a
+				// vault with no working index fires into a session that has no mesh.
+				if err := indexVault(vaultAbs); err != nil {
+					return err
+				}
 				if err := hooks.SetOnboardPending(vaultAbs); err != nil {
 					return err
 				}
@@ -230,7 +315,9 @@ func installCmd() *cobra.Command {
 			} else {
 				fmt.Printf("  . MCP server already registered for %s in %s\n", client, p)
 			}
-			indexVault(vaultAbs)
+			if err := indexVault(vaultAbs); err != nil {
+				return err
+			}
 			fmt.Printf("\nDone. Restart %s so it loads the MCP server.\n", client)
 			fmt.Println("Note: the auto-onboard + write-back hooks are Claude Code only. Here the agent")
 			fmt.Println("uses Mesh via the MCP server's instructions, just ask it to use Mesh, or run")

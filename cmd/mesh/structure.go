@@ -297,7 +297,13 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 		return nil
 	}
 
-	store, err := index.Open(root)
+	// Read-only: wire-orphans writes LINKS INTO THE MARKDOWN (BackfillRelatedFile), never
+	// into the index, which is why it tells you to run `mesh index` afterwards to pick the
+	// new links up. A writable open took the write lock for a pure read, and worse, it
+	// CREATED the index when absent, so the "needs a built index" message below could
+	// never fire: the command instead ran against an empty graph and reported that no
+	// orphan had any candidate link.
+	store, err := index.OpenReadOnly(root)
 	if err != nil {
 		return fmt.Errorf("wire-orphans needs a built index (run: mesh index %s): %w", root, err)
 	}
