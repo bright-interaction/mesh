@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // MigrateResult records what a migration pass did to one file.
@@ -53,32 +55,36 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 		return nil, err
 	}
 	res := &MigrateResult{Path: path}
-	var add []string
+	add := &yaml.Node{Kind: yaml.MappingNode}
 
-	if _, ok := raw["id"]; !ok || strings.TrimSpace(fm.ID) == "" {
+	if !declaredKey(raw, "id") {
 		id := Slugify(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
-		add = append(add, "id: "+id)
+		if err := addKey(add, "id", id); err != nil {
+			return nil, err
+		}
 		res.Actions = append(res.Actions, "added id "+id)
 	}
-	if _, ok := raw["type"]; !ok {
-		add = append(add, "type: note")
+	if !declaredKey(raw, "type") {
+		if err := addKey(add, "type", string(TypeNote)); err != nil {
+			return nil, err
+		}
 		res.Actions = append(res.Actions, "added type note")
 	}
-	if _, ok := raw["when"]; !ok {
-		when, src := fm.Updated, "updated"
+	if !declaredKey(raw, "when") {
+		when, src := strings.TrimSpace(fm.Updated), "updated"
 		if when == "" {
 			when, src = fileMtimeDate(path), "file mtime"
 		}
-		add = append(add, `when: "`+when+`"`)
+		if err := addKey(add, "when", when); err != nil {
+			return nil, err
+		}
 		res.Actions = append(res.Actions, "set when from "+src)
 	}
-	if _, ok := raw["related"]; !ok {
+	if !declaredKey(raw, "related") {
 		if links := relatedLinks(body); len(links) > 0 {
-			block := "related:"
-			for _, l := range links {
-				block += "\n  - " + l
+			if err := addKey(add, "related", links); err != nil {
+				return nil, err
 			}
-			add = append(add, block)
 			res.Actions = append(res.Actions, "lifted "+strconv.Itoa(len(links))+" related links")
 		}
 	}
@@ -91,7 +97,7 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 		}
 	}
 
-	if len(add) == 0 {
+	if len(add.Content) == 0 {
 		return res, nil // already clean: idempotent no-op
 	}
 	res.Changed = true
@@ -99,18 +105,35 @@ func MigrateFile(path string, dryRun bool) (*MigrateResult, error) {
 		return res, nil
 	}
 
-	newFM := strings.Join(add, "\n")
-	if fmText != "" {
-		newFM += "\n" + fmText
+	newFM, err := mergeFrontmatter(add, fmText)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	out := "---\n" + newFM + "\n---\n" + body
 	if !had {
 		out = "---\n" + newFM + "\n---\n\n" + body
 	}
-	if err := writeNoteChecked(path, out); err != nil {
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// matchEOL rewrites out's line endings to the ones src is written with. Every block this
+// file encodes is built with \n while the body keeps the author's bytes, so a CRLF note came
+// back with LF markers and an LF frontmatter block glued onto CRLF prose: line endings no
+// author wrote, on a shape the repo deliberately preserves (SPEC 6.5, internal/merge). It is
+// also what fed the section bug below, since a half-converted note has some CRLF headings
+// and some LF ones.
+//
+// An LF note is returned byte for byte, so a lone \r a note carries as content is never
+// promoted into a line ending.
+func matchEOL(out, src string) string {
+	crlf := strings.Count(src, "\r\n")
+	if crlf == 0 || crlf <= strings.Count(src, "\n")-crlf {
+		return out
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(out, "\r\n", "\n"), "\n", "\r\n")
 }
 
 // BackfillScopeFile stamps `scope: <scope>` onto a note that declares no scope yet,
@@ -134,7 +157,10 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 		return nil, err
 	}
 	res := &MigrateResult{Path: path}
-	if _, ok := raw["scope"]; ok {
+	// declaredKey, not key presence: a bare `scope:` (or any null spelling, or `scope: ""`)
+	// counted as labeled, so the backfill reported an idempotent no-op on a note that never
+	// carried a scope at all and EffectiveScopes stayed on the dev fail-safe forever.
+	if declaredKey(raw, "scope") {
 		return res, nil // already labeled: idempotent no-op
 	}
 	if strings.TrimSpace(scope) == "" {
@@ -145,15 +171,19 @@ func BackfillScopeFile(path, scope string, dryRun bool) (*MigrateResult, error) 
 	if dryRun {
 		return res, nil
 	}
-	newFM := "scope: " + scope
-	if fmText != "" {
-		newFM += "\n" + fmText
+	add := &yaml.Node{Kind: yaml.MappingNode}
+	if err := addKey(add, "scope", scope); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	newFM, err := mergeFrontmatter(add, fmText)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	out := "---\n" + newFM + "\n---\n" + body
 	if !had {
 		out = "---\n" + newFM + "\n---\n\n" + body
 	}
-	if err := writeNoteChecked(path, out); err != nil {
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -183,23 +213,12 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 	res := &MigrateResult{Path: path}
 	// Anything the author actually wrote under `related` is the ground truth and a derived
 	// list must never overwrite it. That INCLUDES `related: []`, which is how a note records
-	// that its links were considered and there are none.
-	//
-	// A bare `related:` with nothing under it is not that. It parses to nil rather than to
-	// an empty list, so reading "declared" as "the key is present" got the two exactly
-	// backwards: the accidental empty key was treated as a deliberate decision, while the
-	// deliberate `related: []` was the one thing this would overwrite. 1098 of the live
-	// vault's 1227 notes carry the bare key, so the inversion did not skip a handful of
-	// notes, it skipped nearly every note `mesh structure --wire-orphans` exists to reach,
-	// and reported "already declaring related" about each one. Same nil-versus-empty trap as
-	// a zero-value pgtype.Text: absent and empty are different answers, and only one of
-	// them is a claim.
-	bareKey := false
-	if v, ok := raw["related"]; ok {
-		if v != nil {
-			return res, nil
-		}
-		bareKey = true
+	// that its links were considered and there are none. A bare `related:` is not that, and
+	// declaredKey is where the two are told apart; 1105 of the live vault's 1366 notes carry
+	// the bare key, so this is nearly every note `mesh structure --wire-orphans` exists to
+	// reach.
+	if declaredKey(raw, "related") {
+		return res, nil
 	}
 	var clean []string
 	seen := map[string]bool{}
@@ -217,45 +236,139 @@ func BackfillRelatedFile(path string, related []string, dryRun bool) (*MigrateRe
 	if dryRun {
 		return res, nil
 	}
-	var b strings.Builder
-	b.WriteString("related:\n")
-	for _, r := range clean {
-		b.WriteString("    - " + r + "\n")
+	add := &yaml.Node{Kind: yaml.MappingNode}
+	if err := addKey(add, "related", clean); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	// The new block is PREPENDED, so the bare key it replaces has to go or the note ends up
-	// declaring `related` twice. That is not cosmetic: yaml.v3 rejects a duplicate mapping
-	// key outright, so writeNoteChecked refuses the write and the note is reported as a
-	// failure instead of being wired. Every note reachable by the fix above is in exactly
-	// this shape, so the two changes are one change.
-	if bareKey {
-		fmText = dropBareTopLevelKey(fmText, "related")
+	newFM, err := mergeFrontmatter(add, fmText)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if fmText != "" {
-		fmText += "\n"
-	}
-	out := "---\n" + b.String() + fmText + "---\n" + body
-	if err := writeNoteChecked(path, out); err != nil {
+	out := "---\n" + newFM + "\n---\n" + body
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
 }
 
-// dropBareTopLevelKey removes a top-level `key:` line that carries no value (nothing
-// after the colon but whitespace or a comment). Anchored at column 0 so an indented key
-// of the same name nested under another mapping is left alone, and value-carrying lines
-// are never touched: this only ever deletes a line YAML already read as nil.
-func dropBareTopLevelKey(fmText, key string) string {
-	lines := strings.Split(fmText, "\n")
-	out := make([]string, 0, len(lines))
-	for _, ln := range lines {
-		if rest, found := strings.CutPrefix(ln, key+":"); found {
-			if rest = strings.TrimSpace(rest); rest == "" || strings.HasPrefix(rest, "#") {
-				continue
-			}
-		}
-		out = append(out, ln)
+// declaredKey reports whether a note actually declares a value under key. Key PRESENCE is
+// not a declaration: a bare `related:` parses to nil, and so does every null spelling (~,
+// null, Null, NULL), while `id: ""` parses to a blank string. Each of those is an empty
+// scaffold line rather than the author saying something, and reading presence as a value got
+// it backwards on four keys of MigrateFile, on BackfillScopeFile and on BackfillRelatedFile:
+// the accidental empty key counted as a deliberate decision, while the deliberate
+// `related: []` ("I looked, there are none") was the one shape a backfill would overwrite.
+// An empty list or map IS a claim and stays declared, which is the whole distinction. Same
+// nil-versus-empty trap as a zero-value pgtype.Text: absent and empty are different answers
+// and only one of them is an answer.
+//
+// Every writer here goes through this one predicate. Four keys got the same question wrong
+// independently and a fifth was fixed on its own, which is the shape of a rule that lives in
+// five copies instead of one.
+func declaredKey(raw map[string]any, key string) bool {
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return false
 	}
-	return strings.Join(out, "\n")
+	s, isString := v.(string)
+	return !isString || strings.TrimSpace(s) != ""
+}
+
+// addKey queues a key/value pair for a frontmatter block, encoding the value through yaml
+// instead of formatting it into a line. A hand-built line is an injection point: a
+// "## Related" wikilink lifted verbatim turned `- [[Deploy: staging]]` into a nested mapping,
+// `- [[*star]]` into an unknown alias and `- [[&amp]]` into an anchor whose value silently
+// vanished, and a synthesized `when: "<value>"` closed early on any value carrying a quote.
+// Every one of those made the whole block unparseable, so writeNoteChecked could only refuse
+// the write and the note was reported as a migration failure on every run. The encoder quotes
+// whatever needs quoting.
+func addKey(m *yaml.Node, key string, value any) error {
+	v := &yaml.Node{}
+	if err := v.Encode(value); err != nil {
+		return fmt.Errorf("frontmatter %s: %w", key, err)
+	}
+	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, v)
+	return nil
+}
+
+// mergeFrontmatter renders the keys a writer is adding and puts them in front of the block
+// the note already has, after DELETING any entry those keys already occupy.
+//
+// The delete goes through the mapping rather than through a line match, because a
+// line-editing dropper and the nil test that decides to edit are two readers of the same
+// YAML and they drifted: the test fired on `related: ~` while the dropper only ever removed
+// a line with nothing after the colon, so the note came out declaring `related` twice,
+// yaml.v3 refuses a duplicate mapping key outright, and the note could never be wired. There
+// is only one reader now, so the two cannot disagree again.
+func mergeFrontmatter(add *yaml.Node, fmText string) (string, error) {
+	keys := make([]string, 0, len(add.Content)/2)
+	for i := 0; i < len(add.Content); i += 2 {
+		keys = append(keys, add.Content[i].Value)
+	}
+	rest, err := dropTopLevelKeys(fmText, keys...)
+	if err != nil {
+		return "", err
+	}
+	block, err := encodeFrontmatter(add)
+	if err != nil {
+		return "", err
+	}
+	if rest != "" {
+		block += "\n" + rest
+	}
+	return block, nil
+}
+
+// dropTopLevelKeys removes each key from a frontmatter block's top-level mapping, whatever
+// value shape it carries, and returns the block re-encoded. It returns the input untouched
+// when it removes nothing, so a note that only GAINS keys keeps the author's own bytes,
+// comments and formatting exactly as written.
+func dropTopLevelKeys(fmText string, keys ...string) (string, error) {
+	if strings.TrimSpace(fmText) == "" {
+		return fmText, nil
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(fmText), &doc); err != nil {
+		return "", fmt.Errorf("frontmatter: %w", err)
+	}
+	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmText, nil
+	}
+	m := doc.Content[0]
+	drop := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		drop[k] = true
+	}
+	kept := make([]*yaml.Node, 0, len(m.Content))
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if drop[m.Content[i].Value] {
+			continue
+		}
+		kept = append(kept, m.Content[i], m.Content[i+1])
+	}
+	if len(kept) == len(m.Content) {
+		return fmText, nil
+	}
+	if len(kept) == 0 {
+		return "", nil
+	}
+	m.Content = kept
+	return encodeFrontmatter(m)
+}
+
+// encodeFrontmatter renders a mapping node as a frontmatter block, at the four-space indent
+// the vault's notes already use.
+func encodeFrontmatter(m *yaml.Node) (string, error) {
+	var b strings.Builder
+	enc := yaml.NewEncoder(&b)
+	enc.SetIndent(4)
+	if err := enc.Encode(m); err != nil {
+		return "", fmt.Errorf("frontmatter: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return "", fmt.Errorf("frontmatter: %w", err)
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
 }
 
 // BackfillBodyFile repairs a note whose body is still the TODO skeleton an older Mesh
@@ -321,7 +434,7 @@ func BackfillBodyFile(path string, dryRun bool) (*MigrateResult, error) {
 		return res, nil
 	}
 	out := "---\n" + fmText + "\n---\n" + newBody
-	if err := writeNoteChecked(path, out); err != nil {
+	if err := writeNoteChecked(path, matchEOL(out, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -343,30 +456,26 @@ func fillBodySections(body string, fm *Frontmatter, sections []bodySection) (str
 		if Unfilled(v) {
 			continue // frontmatter itself has nothing real to offer yet
 		}
-		heading := "## " + s.heading + "\n"
 		// A section can be in one of three states, and only the first two may be touched.
 		// Absent, so the note predates this heading existing (every gotcha and post-mortem
 		// written before Related was added to their templates). Present but still holding a
 		// placeholder, which includes placeholders this template used to emit and no longer
 		// does. Or present and authored, which is judgment and is never overwritten.
-		switch {
-		case !strings.Contains(newBody, heading):
+		h, end, ok := findSection(newBody, s.heading)
+		if !ok {
 			newBody = appendSection(newBody, s.heading, v)
 			filled = append(filled, s.heading+" (added)")
-		default:
-			replaced := false
-			for _, ph := range append([]string{s.placeholder}, retiredPlaceholders[s.heading]...) {
-				old := heading + ph
-				if strings.Contains(newBody, old) {
-					newBody = strings.Replace(newBody, old, heading+v, 1)
-					replaced = true
-					break
-				}
+			continue
+		}
+		// A section holding none of its placeholders is authored, and authored is judgment:
+		// it is left exactly as written, even where it disagrees with the frontmatter field.
+		for _, ph := range append([]string{s.placeholder}, retiredPlaceholders[s.heading]...) {
+			if !opensWithPlaceholder(newBody[h.content:end], ph) {
+				continue
 			}
-			if !replaced {
-				continue // authored already; leave it exactly as written
-			}
+			newBody = newBody[:h.content] + v + newBody[h.content+len(ph):]
 			filled = append(filled, s.heading)
+			break
 		}
 	}
 	return newBody, filled
@@ -436,7 +545,7 @@ func BackfillTimelineFile(path string, resolve CommitResolver, dryRun bool) (*Mi
 	if dryRun {
 		return res, nil
 	}
-	if err := writeNoteChecked(path, "---\n"+fmText+"\n---\n"+newBody); err != nil {
+	if err := writeNoteChecked(path, matchEOL("---\n"+fmText+"\n---\n"+newBody, string(data))); err != nil {
 		return nil, err
 	}
 	return res, nil
@@ -576,22 +685,11 @@ func repairEntityPage(body string, fm *Frontmatter) (string, []string) {
 // TODO comment. It refuses anything else, so a section a human has written is never
 // touched, and it never removes a heading that has real prose or nested content under it.
 func dropPlaceholderSection(body, heading string) (string, bool) {
-	start := sectionStart(body, heading)
-	if start < 0 {
+	h, end, ok := findSection(body, heading)
+	if !ok {
 		return body, false
 	}
-	rest := body[start:]
-	nl := strings.Index(rest, "\n")
-	if nl < 0 {
-		return body, false
-	}
-	inner := rest[nl+1:]
-	end := strings.Index(inner, "\n## ")
-	tail := ""
-	if end >= 0 {
-		tail = inner[end+1:]
-		inner = inner[:end]
-	}
+	inner, tail := body[h.content:end], body[end:]
 	if strings.TrimSpace(inner) == "" {
 		return body, false
 	}
@@ -604,23 +702,84 @@ func dropPlaceholderSection(body, heading string) (string, bool) {
 			return body, false // authored content: leave the whole section alone
 		}
 	}
-	head := strings.TrimRight(body[:start], "\n")
+	head := strings.TrimRight(body[:h.off], "\n")
 	if tail == "" {
 		return head + "\n", true
 	}
 	return head + "\n\n" + tail, true
 }
 
-// sectionStart returns the offset of a "## <heading>" line, or -1.
-func sectionStart(body, heading string) int {
-	h := "## " + heading + "\n"
-	if strings.HasPrefix(body, h) {
-		return 0
+// bodyHeading is one level-2 heading of a note body: where its line starts, its text, and
+// where its content starts (the first byte past the heading line).
+type bodyHeading struct {
+	off     int
+	text    string
+	content int
+}
+
+// bodyHeadings returns every level-2 heading LINE of body, in reading order. It is the one
+// section locator in this file: fillBodySections, dropPlaceholderSection and
+// lastTrailingRelated all ask it where a section is.
+//
+// They used to ask strings.Contains for "## "+heading+"\n" instead, and that needle is
+// wrong three ways at once. A CRLF note ends the line "\r\n", so EVERY section read as
+// absent and the backfill bolted a second copy of each one onto a note that already had
+// them, silently, reporting success; CRLF is a shape this repo deliberately preserves
+// (SPEC 6.5). "### Cause" CONTAINS "## Cause", so an h3 satisfied the h2 test and the
+// mapped field was never projected, on exactly the older hand-edited notes the backfill
+// exists to reach. And the needle matched inside a fence, so a gotcha DOCUMENTING the
+// scaffold had the example in its code block rewritten while its real section stayed
+// missing. relatedLinks has always read the stripped body for that last reason.
+func bodyHeadings(body string) []bodyHeading {
+	// Fences and comments are blanked, not removed: the stripped copy has the same bytes
+	// and lines as the input, so an offset found here indexes the raw body.
+	clean, _ := StripFencesAndComments(body)
+	var out []bodyHeading
+	for off := 0; off < len(clean); {
+		line, next := clean[off:], len(clean)
+		if i := strings.IndexByte(line, '\n'); i >= 0 {
+			line, next = line[:i], off+i+1
+		}
+		// Trailing whitespace and the \r of a CRLF note are not part of the heading; a
+		// deeper level is a different heading, and "## " is a prefix no h3 can carry.
+		if t := strings.TrimRight(line, " \t\r"); strings.HasPrefix(t, "## ") {
+			out = append(out, bodyHeading{off: off, text: strings.TrimSpace(t[len("## "):]), content: next})
+		}
+		off = next
 	}
-	if i := strings.Index(body, "\n"+h); i >= 0 {
-		return i + 1
+	return out
+}
+
+// findSection locates the "## <heading>" section: its heading line, and the offset where
+// the section ends (the next level-2 heading, or the end of the body).
+func findSection(body, heading string) (h bodyHeading, end int, ok bool) {
+	headings := bodyHeadings(body)
+	for i, cur := range headings {
+		if cur.text != heading {
+			continue
+		}
+		end = len(body)
+		if i+1 < len(headings) {
+			end = headings[i+1].off
+		}
+		return cur, end, true
 	}
-	return -1
+	return bodyHeading{}, 0, false
+}
+
+// opensWithPlaceholder reports whether a section's content opens with exactly the
+// placeholder LINE. The placeholder has to be the whole first line, so prose an author
+// wrote next to it is never mistaken for the prompt, and the trailing bytes of the line
+// (a CRLF note's \r) stay where they are when the caller splices the field in.
+func opensWithPlaceholder(content, ph string) bool {
+	if ph == "" || !strings.HasPrefix(content, ph) {
+		return false
+	}
+	rest := content[len(ph):]
+	if i := strings.IndexByte(rest, '\n'); i >= 0 {
+		rest = rest[:i]
+	}
+	return strings.TrimRight(rest, " \t\r") == ""
 }
 
 // retiredPlaceholders are placeholder texts a template USED to emit for a heading. A note
@@ -682,20 +841,15 @@ const provenancePrefix = "<!-- authored by "
 // section of body, or -1. A Related section with other headings after it is not the
 // closing link list, so it is left alone.
 func lastTrailingRelated(body string) int {
-	i := strings.LastIndex(body, "\n## Related\n")
-	if i < 0 {
-		if strings.HasPrefix(body, "## Related\n") {
-			i = 0
-		} else {
-			return -1
-		}
-	} else {
-		i++ // skip the leading newline
-	}
-	if strings.Contains(body[i+len("## Related\n"):], "\n## ") {
+	headings := bodyHeadings(body)
+	if len(headings) == 0 {
 		return -1
 	}
-	return i
+	last := headings[len(headings)-1]
+	if last.text != "Related" {
+		return -1
+	}
+	return last.off
 }
 
 // noFrontmatterErr names which of the two shapes a had=false file actually is. They need

@@ -16,6 +16,14 @@ import (
 // hand-built YAML block with a bare os.WriteFile, so `mesh migrate` could still write a
 // note whose frontmatter does not re-parse, making it silently invisible. Both must now
 // refuse the write and leave the file exactly as it was.
+//
+// The two cases here used to be a quote inside a synthesized `when: "<value>"` and an
+// operator scope of `[unclosed`. Neither breaks the block any more: values go through the
+// yaml encoder now rather than into a formatted line, and those two inputs are asserted to
+// survive intact in TestMigratedValuesAreEncodedNotFormatted. What a writer still cannot
+// control is the block it is prepending TO, so that is what these cases plant: a note whose
+// mapping is indented under the document root parses perfectly well on its own and cannot
+// take a column-0 key in front of it.
 func TestMigrateWritersRefuseUnparseableFrontmatter(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -24,10 +32,8 @@ func TestMigrateWritersRefuseUnparseableFrontmatter(t *testing.T) {
 		wantErr  string
 	}{
 		{
-			// `updated` holds a double quote, so the synthesized `when: "<value>"` line
-			// closes early and the merged block is no longer valid YAML.
-			name:     "MigrateFile quoting a value that contains a quote",
-			original: "---\ntype: entity\nupdated: 'he said \"ship it\" on friday'\n---\n# Note\nbody\n",
+			name:     "MigrateFile prepending to an indented block",
+			original: "---\n  type: entity\n  updated: 2026-04-10\n---\n# Note\nbody\n",
 			write: func(path string) error {
 				_, err := MigrateFile(path, false)
 				return err
@@ -35,11 +41,10 @@ func TestMigrateWritersRefuseUnparseableFrontmatter(t *testing.T) {
 			wantErr: "invalid YAML",
 		},
 		{
-			// An operator-supplied scope that is not a valid YAML scalar.
-			name:     "BackfillScopeFile with a scope that breaks the block",
-			original: "---\nid: n\ntype: note\nwhen: \"2026-01-01\"\n---\n# Note\nbody\n",
+			name:     "BackfillScopeFile prepending to an indented block",
+			original: "---\n  id: n\n  type: note\n  when: \"2026-01-01\"\n---\n# Note\nbody\n",
 			write: func(path string) error {
-				_, err := BackfillScopeFile(path, "[unclosed", false)
+				_, err := BackfillScopeFile(path, "sales", false)
 				return err
 			},
 			wantErr: "invalid YAML",
