@@ -4,6 +4,7 @@
 package web
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,6 +25,15 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
 		http.Error(w, "q is required", http.StatusBadRequest)
+		return
+	}
+	// Bound the query TEXT, single-sourced from internal/mcp like the numeric caps
+	// below. This surface is the exposed one: on the default loopback bind there is no
+	// auth, no rate limiter and no Origin check on /api/search, so any page open in the
+	// user's browser could fire searches in a loop, and a 65001-byte q cost 1.07s of CPU
+	// each. graph.MaxQueryTerms bounds the work itself; this is the clear refusal.
+	if len(q) > mcp.SearchQueryMaxBytes {
+		http.Error(w, fmt.Sprintf("q is too long: %d bytes, maximum %d. Search for the few words you want, not a whole document.", len(q), mcp.SearchQueryMaxBytes), http.StatusBadRequest)
 		return
 	}
 	// Bound the request with the SAME numbers the MCP twin enforces, single-sourced from

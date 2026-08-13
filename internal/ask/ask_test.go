@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/index/code"
 	"github.com/bright-interaction/mesh/internal/llm"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 )
@@ -183,6 +184,69 @@ func TestCodeReadableGate(t *testing.T) {
 	}
 	if codeReadable(map[string]bool{"sales": true}) {
 		t.Error("sales-scoped caller must NOT see the dev-scoped code index")
+	}
+}
+
+// indexDemoCode puts one searchable symbol in the store's code index, so the code lane
+// of Answer has something to return.
+func indexDemoCode(t *testing.T, store *index.Store) {
+	t.Helper()
+	files := []*code.CodeFile{
+		{Path: "payments/mollie.go", Lang: "go", Package: "payments", Symbols: []code.Symbol{
+			{Name: "AuthenticateMollieWebhook", Kind: "func", Start: 42, End: 60,
+				Signature: "func AuthenticateMollieWebhook(id string) error"},
+		}},
+	}
+	if _, err := store.IndexCodeFull(files); err != nil {
+		t.Fatalf("IndexCodeFull: %v", err)
+	}
+}
+
+// The code lane must read with the CALLER's context, not a background one.
+//
+// This is the line where two fixes meet: the lane is entered through the codeLane gate
+// that holds back part of the budget for code, and the read inside it takes ctx so a
+// cancelled agent tool call or a hung-up HTTP request actually stops the FTS read. The
+// compiler only proves that SOME context is passed, so a future edit could hand it
+// context.Background() and still build; that is exactly the regression this catches.
+//
+// The live-context half is not decoration: it proves the fixture really reaches the
+// code lane, so the cancelled-context assertion cannot pass vacuously over a lane that
+// was never entered.
+func TestAnswerCodeLaneHonoursCallerCancellation(t *testing.T) {
+	store, rtr := openVault(t, sentinelVault(t))
+	indexDemoCode(t, store)
+
+	stub := llm.Func(func(_ context.Context, _, _ string) (string, error) {
+		return "answered [1].", nil
+	})
+
+	// Premise: with a live context the code lane is entered and cites a symbol.
+	live, err := Answer(context.Background(), rtr, store, stub, question, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawCode bool
+	for _, c := range live.Citations {
+		if c.Kind == "code" {
+			sawCode = true
+		}
+	}
+	if !sawCode {
+		t.Fatalf("fixture broken: the code lane cited nothing with a live context, so the cancellation assertion would prove nothing; citations = %+v", live.Citations)
+	}
+
+	// The real assertion: a caller who has already given up gets no code read.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, err := Answer(cancelled, rtr, store, stub, question, 0, nil)
+	if err != nil {
+		t.Fatalf("Answer with a cancelled context returned an error: %v", err)
+	}
+	for _, c := range got.Citations {
+		if c.Kind == "code" {
+			t.Fatalf("the code lane ran after the caller cancelled: it dropped ctx and read with a background context instead; citations = %+v", got.Citations)
+		}
 	}
 }
 

@@ -88,7 +88,12 @@ func (r *Ranker) Score(query string, limit int) []ScoredNode {
 // eat the whole limit, so a scoped caller could get nothing back while readable
 // matches existed further down the ranking.
 func (r *Ranker) ScoreScoped(query string, limit int, allowed map[string]bool) []ScoredNode {
-	qterms := Tokenize(query)
+	// TokenizeQuery, not Tokenize: this loop is O(corpus x queryTerms), so an
+	// unbounded query text turned into unbounded CPU. A 1 MiB query admitted by the
+	// hub's 1 MiB body limit produced ~100k terms and burned minutes of single-core
+	// time on a 500-note vault. The cap is shared with the FTS side so both keyword
+	// signals see the same terms.
+	qterms := TokenizeQuery(query)
 	if len(qterms) == 0 {
 		return nil
 	}
@@ -180,6 +185,42 @@ func Tokenize(s string) []string {
 		flush()
 	}
 	flush()
+	return out
+}
+
+// MaxQueryTerms bounds how many distinct terms one query may contribute to a
+// keyword signal. Both signals cost time linear in the term count (FTS5 evaluates
+// one phrase per term, graph-BM25 walks the corpus per term), so an uncapped query
+// is an uncapped amount of work on every surface that takes one. 64 is generous:
+// no real question, in English or Swedish, carries more than a couple of dozen
+// content words once stopwords are dropped.
+const MaxQueryTerms = 64
+
+// TokenizeQuery is Tokenize for the QUERY side of retrieval. It additionally drops
+// repeated terms and truncates at MaxQueryTerms.
+//
+// Deduplicating first matters as much as the cap: a query that repeats one word ten
+// thousand times collapses to a single term instead of filling the whole budget with
+// copies of itself, and repeating a phrase in an OR expression never changed which
+// notes matched, only how long the match took.
+//
+// Every caller that turns user text into search terms must use this rather than
+// Tokenize: Tokenize is the CORPUS-side tokenizer, where the input is a note Mesh
+// already read from disk, not something a stranger types.
+func TokenizeQuery(s string) []string {
+	toks := Tokenize(s)
+	seen := make(map[string]bool, len(toks))
+	out := make([]string, 0, MaxQueryTerms)
+	for _, t := range toks {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+		if len(out) == MaxQueryTerms {
+			break
+		}
+	}
 	return out
 }
 

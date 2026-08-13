@@ -72,7 +72,7 @@ func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases 
 			want["note:"+id] = true
 		}
 
-		fts, _ := store.Search(c.Query, surfaceK)
+		fts, _ := store.Search(context.Background(), c.Query, surfaceK)
 		cards, _ := r.Retrieve(context.Background(), c.Query, retrieve.Options{Budget: budget})
 
 		cr := CaseResult{Query: c.Query}

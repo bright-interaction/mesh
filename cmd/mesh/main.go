@@ -1300,7 +1300,7 @@ func codeSearchCmd() *cobra.Command {
 			if langs != "" {
 				langList = strings.Split(langs, ",")
 			}
-			hits, err := store.SearchCode(strings.Join(args, " "), limit, langList)
+			hits, err := store.SearchCode(cmd.Context(), strings.Join(args, " "), limit, langList)
 			if err != nil {
 				return err
 			}
@@ -1333,7 +1333,7 @@ func codeContextCmd() *cobra.Command {
 			}
 			defer store.Close()
 			q := strings.Join(args, " ")
-			hits, err := store.SearchCode(q, limit, nil)
+			hits, err := store.SearchCode(cmd.Context(), q, limit, nil)
 			if err != nil {
 				return err
 			}

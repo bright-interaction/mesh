@@ -6,6 +6,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/ask"
 	"github.com/bright-interaction/mesh/internal/llm"
+	"github.com/bright-interaction/mesh/internal/mcp"
 )
 
 // askMaxInFlight caps concurrent POST /api/ask requests. Each one forks a `claude -p`
@@ -74,6 +76,13 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	// The third caller of retrieval that takes free text, so it takes the same text
+	// bound as mesh_search and /api/search. The 16 KiB body limit above bounds the
+	// request, not the question.
+	if len(req.Question) > mcp.SearchQueryMaxBytes {
+		http.Error(w, fmt.Sprintf("question is too long: %d bytes, maximum %d. Ask in a sentence or two.", len(req.Question), mcp.SearchQueryMaxBytes), http.StatusBadRequest)
 		return
 	}
 	client, err := llm.NewFromEnv()

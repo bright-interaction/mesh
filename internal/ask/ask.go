@@ -235,7 +235,10 @@ func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, cl
 		}
 	}
 	if codeLane {
-		if hits, err := store.SearchCode(question, 5, nil); err == nil {
+		// ctx, not a dropped context: the code FTS read now takes the caller's
+		// context and a server-side deadline, so a pathological query ends in a
+		// named error instead of a core pinned at 100% with nothing to cancel.
+		if hits, err := store.SearchCode(ctx, question, 5, nil); err == nil {
 			for _, h := range hits {
 				loc := fmt.Sprintf("%s:%d", h.Path, h.Line)
 				block := fmt.Sprintf("[%d] CODE %s %s (%s)\n%s\n\n", n+1, h.Kind, h.Name, loc, sanitizeContent(h.Signature))

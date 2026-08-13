@@ -319,6 +319,20 @@ tool. Results are token-packed now; previously `budget=0` skipped packing entire
 **The hub's curation activity endpoint takes `?cursor`**, so failed jobs older than the
 newest page are reachable. A malformed cursor returns 400 rather than being ignored.
 
+**Search no longer hangs on a very large repetitive note.** One multi-megabyte note of
+repeated text, a pasted deploy log or a concatenated transcript, could pin a core at 100%
+for minutes with nothing able to cancel it, because SQLite was being asked to pick the
+result excerpt and that costs roughly the square of the number of matches inside a single
+document. Mesh builds the excerpt itself now. Matching and ranking still see the whole
+note, so nothing becomes less findable, and the excerpt looks the same. A search that
+somehow still runs long fails after 10 seconds with a message rather than hanging.
+
+**The search query itself is now capped**, on `mesh_search`, `mesh_code_search`,
+`mesh_code_context`, `GET /api/search` and `POST /api/ask`. A query over 4096 bytes is
+refused with a message naming the limit, and a query is read as at most 64 distinct terms
+on every surface, the CLI included. Repeating a word never changed which notes matched,
+only how long the search took.
+
 ## Commands
 
 Set up and capture:

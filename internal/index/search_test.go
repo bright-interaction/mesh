@@ -3,7 +3,10 @@
 
 package index
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestSearchRanksAndResolvesPath(t *testing.T) {
 	dir := t.TempDir()
@@ -21,7 +24,7 @@ func TestSearchRanksAndResolvesPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	hits, err := s.Search("modernc sqlite", 10)
+	hits, err := s.Search(context.Background(), "modernc sqlite", 10)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -48,10 +51,10 @@ func TestSearchSanitizesReservedSyntax(t *testing.T) {
 	s.IndexVault([]*ParsedNote{a}, g)
 
 	// Reserved FTS5 grammar must be neutralized, not error.
-	if _, err := s.Search("NEAR(* OR )", 5); err != nil {
+	if _, err := s.Search(context.Background(), "NEAR(* OR )", 5); err != nil {
 		t.Errorf("reserved syntax should be sanitized, got error: %v", err)
 	}
-	if hits, _ := s.Search("nonexistentterm", 10); len(hits) != 0 {
+	if hits, _ := s.Search(context.Background(), "nonexistentterm", 10); len(hits) != 0 {
 		t.Errorf("expected no matches, got %d", len(hits))
 	}
 }

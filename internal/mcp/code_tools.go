@@ -53,6 +53,11 @@ func (s *Server) toolCodeSearch(ctx context.Context, raw json.RawMessage) (any, 
 	if strings.TrimSpace(a.Query) == "" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query required"}
 	}
+	// Same text bound as mesh_search: this reaches the same FTS5 query builder, so an
+	// uncapped query is the same uncapped work here.
+	if e := checkQueryLength(a.Query); e != nil {
+		return nil, e
+	}
 	// Cap the limit like every other limit-taking tool. SearchCode only FLOORS it
 	// (index/code_index.go: `if limit <= 0 { limit = 12 }`) and then over-fetches 4x for
 	// the test-code re-rank, so mesh_code_search{"limit":1000000} asked SQLite for four
@@ -60,7 +65,7 @@ func (s *Server) toolCodeSearch(ctx context.Context, raw json.RawMessage) (any, 
 	// into the caller's context. The default matches SearchCode's own floor, so an
 	// unspecified limit behaves exactly as before.
 	a.Limit = clampLimit(a.Limit, codeSearchLimitDefault, codeSearchLimitMax)
-	hits, err := s.store.SearchCode(a.Query, a.Limit, a.Languages)
+	hits, err := s.store.SearchCode(ctx, a.Query, a.Limit, a.Languages)
 	if err != nil {
 		return nil, internalErr(err)
 	}
@@ -130,11 +135,14 @@ func (s *Server) toolCodeContext(ctx context.Context, raw json.RawMessage) (any,
 	if strings.TrimSpace(a.Query) == "" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query required"}
 	}
+	if e := checkQueryLength(a.Query); e != nil {
+		return nil, e
+	}
 	limit := a.Limit
 	if limit <= 0 || limit > 10 {
 		limit = 5
 	}
-	hits, err := s.store.SearchCode(a.Query, limit, nil)
+	hits, err := s.store.SearchCode(ctx, a.Query, limit, nil)
 	if err != nil {
 		return nil, internalErr(err)
 	}

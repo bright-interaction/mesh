@@ -37,7 +37,7 @@ func ToolSpecs() []map[string]any {
 	tools := []map[string]any{
 		{
 			"name":        "mesh_search",
-			"description": "Fused retrieval over the vault (full-text + graph proximity), tier-0 boosted (decisions/gotchas/post-mortems first). Returns ranked cards. Pass a token budget to get the best bundle that fits (default 8000). limit defaults to 20 and is capped at 100: narrow the query rather than raising it. Start here.",
+			"description": "Fused retrieval over the vault (full-text + graph proximity), tier-0 boosted (decisions/gotchas/post-mortems first). Returns ranked cards. Pass a token budget to get the best bundle that fits (default 8000). limit defaults to 20 and is capped at 100: narrow the query rather than raising it. The query is at most 4096 bytes and is read as at most 64 distinct terms, so send keywords, not a pasted document. Start here.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -113,7 +113,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_code_search",
-			"description": "Locate SOURCE-CODE symbols (functions, types, methods, classes) by name across the indexed repos, ranked by name match. Returns cards with a file:line locator and signature so you jump straight to a definition instead of grepping the tree. Use this for 'where is X defined / what's in this area of the code'. This is the code index; mesh_search is for notes/knowledge. limit defaults to 12 and is capped at 100: narrow the query rather than raising it.",
+			"description": "Locate SOURCE-CODE symbols (functions, types, methods, classes) by name across the indexed repos, ranked by name match. Returns cards with a file:line locator and signature so you jump straight to a definition instead of grepping the tree. Use this for 'where is X defined / what's in this area of the code'. This is the code index; mesh_search is for notes/knowledge. limit defaults to 12 and is capped at 100: narrow the query rather than raising it. The query is at most 4096 bytes and is read as at most 64 distinct terms.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -696,7 +696,35 @@ const (
 	SearchLimitDefault  = searchLimitDefault
 	SearchLimitMax      = searchLimitMax
 	SearchBudgetDefault = searchBudgetDefault
+	SearchQueryMaxBytes = searchQueryMaxBytes
 )
+
+// searchQueryMaxBytes bounds the raw query TEXT, the one search input that had no
+// bound while limit, budget, neighbors depth and changed_since were all clamped and
+// single-sourced.
+//
+// It mattered because the retrieval cost scales with the query: the hub accepts a
+// 1 MiB POST /mcp body from any peer holding a valid team token at 20 req/s, and a
+// 1048578-byte query burned 4 minutes 9 seconds of single-core CPU on a 500-note
+// vault, running to completion after the client had hung up. graph.MaxQueryTerms is
+// the structural fix and applies on every surface including the CLI; this cap is the
+// entry-point half, so a stranger gets a clear refusal instead of a slow success.
+// 4 KiB is far more than any real question and still leaves room for a pasted
+// paragraph or stack trace.
+const searchQueryMaxBytes = 4096
+
+// checkQueryLength rejects a query that is too long to be a question, naming both
+// the measurement and the remedy. Shared by every tool that takes free text so the
+// surfaces cannot drift apart.
+func checkQueryLength(q string) *rpcError {
+	if len(q) <= searchQueryMaxBytes {
+		return nil
+	}
+	return &rpcError{
+		Code:    codeInvalidParams,
+		Message: fmt.Sprintf("query is too long: %d bytes, maximum %d. Send the few words you are actually searching for, not a whole document.", len(q), searchQueryMaxBytes),
+	}
+}
 
 // searchCard is the MCP wire shape of a retrieval card: the retriever's card plus the
 // provenance the agent needs to judge the snippet. retrieve.Card carries no source
@@ -716,6 +744,9 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	json.Unmarshal(raw, &a)
 	if strings.TrimSpace(a.Query) == "" {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "query is required"}
+	}
+	if e := checkQueryLength(a.Query); e != nil {
+		return nil, e
 	}
 	limit := clampLimit(a.Limit, searchLimitDefault, searchLimitMax)
 	budget := a.Budget

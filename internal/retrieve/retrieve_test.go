@@ -266,7 +266,7 @@ func TestScopedSearchLimitsCountOnlyReadableRows(t *testing.T) {
 		"---\nid: team\ntype: note\nwhen: 2026-01-01\ntitle: Widget team\nscope: [team]\n---\n# Widget team\nwidget\n"})
 	r := buildVaultFrom(t, srcs)
 
-	hits, err := r.store.SearchScoped("widget", 5, map[string]bool{"team": true})
+	hits, err := r.store.SearchScoped(context.Background(), "widget", 5, map[string]bool{"team": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestScopedSearchLimitsCountOnlyReadableRows(t *testing.T) {
 		t.Errorf("scoped graph ranking should spend its limit on readable nodes, got %d hits", len(scored))
 	}
 	// The unrestricted forms must be unchanged.
-	all, err := r.store.Search("widget", 5)
+	all, err := r.store.Search(context.Background(), "widget", 5)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,7 +46,7 @@ func TestCodeIndexRoundTrip(t *testing.T) {
 		t.Errorf("edges = %d, want 2 (Hello->greet, Greet->Hello); ToUpper has no symbol", st.Edges)
 	}
 
-	hits, err := s.SearchCode("Hello", 5, nil)
+	hits, err := s.SearchCode(context.Background(), "Hello", 5, nil)
 	if err != nil {
 		t.Fatalf("SearchCode: %v", err)
 	}
@@ -68,7 +69,7 @@ func TestCodeIndexRoundTrip(t *testing.T) {
 		t.Errorf("Hello callers = %+v, want [Greeter.Greet]", callers)
 	}
 
-	if filtered, _ := s.SearchCode("Hello", 5, []string{"py"}); len(filtered) != 0 {
+	if filtered, _ := s.SearchCode(context.Background(), "Hello", 5, []string{"py"}); len(filtered) != 0 {
 		t.Errorf("py-filtered search returned %d, want 0", len(filtered))
 	}
 

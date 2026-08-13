@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index/code"
 )
 
@@ -23,6 +25,10 @@ import (
 // tables, own FTS, own search) so locating a function never disturbs note
 // retrieval, its ranking, or the tier-0 budget. The note graph and the code graph
 // share only the SQLite file and the FTS5 tokenizer.
+
+// codeExcerptTokens is the excerpt width for code hits, matching the token count the
+// FTS5 snippet() call used before the excerpt moved into Go.
+const codeExcerptTokens = 10
 
 // codeEdgeFanoutCap drops a callee name that resolves to more than this many
 // symbols: a call to a name like "Error", "String", or "New" matches dozens of
@@ -218,9 +224,13 @@ func rebuildCodeEdges(tx *sql.Tx) error {
 // column holds the split-identifier search text. It over-fetches and re-ranks with
 // a test-code penalty so a real symbol (DeployHandler) outranks the many verbose
 // test names that also mention the query terms. langs optionally restricts to a set
-// of language tags. Shares buildFTS5Query with note search so both tokenize alike.
-func (s *Store) SearchCode(query string, limit int, langs []string) ([]CodeHit, error) {
-	match := buildFTS5Query(query)
+// of language tags. Shares the query tokenizer, the excerpt builder and the
+// server-side deadline with note search so the two FTS reads cannot drift apart:
+// this one is far less exposed (its rows are per-symbol over files already capped at
+// 1 MB) but it is the same shape, and the same uncapped query text reached it.
+func (s *Store) SearchCode(ctx context.Context, query string, limit int, langs []string) ([]CodeHit, error) {
+	terms := graph.TokenizeQuery(query)
+	match := fts5Match(terms)
 	if match == "" {
 		return nil, nil
 	}
@@ -242,9 +252,12 @@ func (s *Store) SearchCode(query string, limit int, langs []string) ([]CodeHit, 
 		}
 		langFilter = " AND cs.lang IN (" + strings.Join(ph, ",") + ")"
 	}
+	// No snippet(): the excerpt is built in Go from the signature already selected
+	// here, which is the same text the FTS signature column holds. That drops the one
+	// SQL construct whose cost grows with the square of a document's match count (see
+	// buildExcerpt) and costs no extra read, since the column was on the wire already.
 	q := `
 SELECT cs.id, cs.name, cs.kind, cs.lang, cs.path, cs.start_line, COALESCE(cs.signature,''), COALESCE(cs.doc,''),
-       snippet(code_search, 6, '[', ']', ' ... ', 10),
        bm25(code_search, ` + weights + `)
 FROM code_search
 JOIN code_symbols cs ON cs.id = code_search.symbol_id
@@ -252,18 +265,22 @@ WHERE code_search MATCH ?` + langFilter + `
 ORDER BY bm25(code_search, ` + weights + `)
 LIMIT ?`
 	args = append(args, fetch)
-	rows, err := s.readDB.Query(q, args...)
+
+	ctx, cancel := withSearchDeadline(ctx)
+	defer cancel()
+	rows, err := s.readDB.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, searchErr(ctx, err)
 	}
 	defer rows.Close()
 	var out []CodeHit
 	for rows.Next() {
 		var h CodeHit
 		var rank float64
-		if err := rows.Scan(&h.ID, &h.Name, &h.Kind, &h.Lang, &h.Path, &h.Line, &h.Signature, &h.Doc, &h.Snippet, &rank); err != nil {
-			return nil, err
+		if err := rows.Scan(&h.ID, &h.Name, &h.Kind, &h.Lang, &h.Path, &h.Line, &h.Signature, &h.Doc, &rank); err != nil {
+			return nil, searchErr(ctx, err)
 		}
+		h.Snippet = buildExcerpt(h.Signature, terms, codeExcerptTokens)
 		h.Score = -rank // bm25 is lower-is-better; negate so higher is better
 		if looksLikeTest(h.Path, h.Name) {
 			h.Score *= 0.4 // demote test symbols; "where is X" wants the production definition
@@ -271,7 +288,7 @@ LIMIT ?`
 		out = append(out, h)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, searchErr(ctx, err)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 	if len(out) > limit {

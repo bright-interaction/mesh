@@ -4,12 +4,54 @@
 package index
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
+
+// SearchTimeout is the server-side deadline applied to an FTS read whose caller
+// brought no deadline of its own (the CLI, the TUI, the eval harness). It exists so
+// a pathological corpus degrades into a named error a user can act on instead of a
+// process pinned at 100% CPU with nothing to cancel it. A caller that already has a
+// deadline, such as an HTTP request or an agent tool call, keeps its own.
+const SearchTimeout = 10 * time.Second
+
+// searchExcerptTokens is the excerpt width for note hits, matching the token count
+// the FTS5 snippet() call used before the excerpt moved into Go.
+const searchExcerptTokens = 12
+
+// withSearchDeadline returns ctx unchanged when it already carries a deadline, and
+// otherwise bounds it with SearchTimeout.
+func withSearchDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, SearchTimeout)
+}
+
+// searchErr names the remedy when a search is cut short. A bare
+// "context deadline exceeded" tells a user nothing about what to do next, and the
+// driver reports an interrupted statement rather than the context error, so the
+// context is consulted as well as the error.
+func searchErr(ctx context.Context, err error) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("search timed out after %s: use fewer, more specific words, or split your largest note files into smaller ones: %w", SearchTimeout, err)
+	case errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled):
+		return fmt.Errorf("search cancelled: %w", err)
+	}
+	return err
+}
 
 // SearchHit is one FTS5 result over the note corpus.
 type SearchHit struct {
@@ -24,8 +66,8 @@ type SearchHit struct {
 // notes. User input is sanitized into quoted literal tokens so FTS5's reserved
 // grammar (NEAR/OR/NOT/AND/*/parens) can never break the parser or inject.
 // Unrestricted: see SearchScoped for the access-controlled form.
-func (s *Store) Search(query string, limit int) ([]SearchHit, error) {
-	return s.SearchScoped(query, limit, nil)
+func (s *Store) Search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+	return s.SearchScoped(ctx, query, limit, nil)
 }
 
 // SearchScoped is Search restricted to notes whose scope intersects allowed
@@ -36,8 +78,9 @@ func (s *Store) Search(query string, limit int) ([]SearchHit, error) {
 // higher-ranked unreadable notes consume the whole limit and starve a scoped
 // caller down to zero hits even though readable matches existed. Filtering here
 // means the limit counts only rows the caller may actually read.
-func (s *Store) SearchScoped(query string, limit int, allowed map[string]bool) ([]SearchHit, error) {
-	match := buildFTS5Query(query)
+func (s *Store) SearchScoped(ctx context.Context, query string, limit int, allowed map[string]bool) ([]SearchHit, error) {
+	terms := graph.TokenizeQuery(query)
+	match := fts5Match(terms)
 	if match == "" {
 		return nil, nil
 	}
@@ -49,10 +92,15 @@ func (s *Store) SearchScoped(query string, limit int, allowed map[string]bool) (
 		// Scoping is on but the caller may read nothing: no row can qualify.
 		return nil, nil
 	}
+	// The body prefix, not snippet(): see buildExcerpt for why asking FTS5 to pick the
+	// window is what made one repetitive note hang the whole product. substr runs in
+	// SQLite so a multi-megabyte body is never carried into Go, and it counts
+	// characters, so it cannot cut a rune in half. MATCH and bm25 still see the WHOLE
+	// body, so recall and ranking are unchanged; only the excerpt is bounded.
 	q := `
 SELECT si.node_id, si.title,
        COALESCE(n.path, ''),
-       snippet(search_index, 4, '[', ']', ' ... ', 12),
+       substr(si.body, 1, ` + strconv.Itoa(excerptScanChars) + `),
        bm25(search_index)
 FROM search_index si
 LEFT JOIN notes n ON n.id = substr(si.node_id, 6)
@@ -63,25 +111,33 @@ LIMIT ?`
 	args = append(args, match)
 	args = append(args, scopeArgs...)
 	args = append(args, limit)
-	rows, err := s.readDB.Query(q, args...)
+
+	ctx, cancel := withSearchDeadline(ctx)
+	defer cancel()
+	rows, err := s.readDB.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, searchErr(ctx, err)
 	}
 	defer rows.Close()
 
 	var out []SearchHit
 	for rows.Next() {
 		var h SearchHit
+		var body string
 		var rank float64
-		if err := rows.Scan(&h.NodeID, &h.Title, &h.Path, &h.Snippet, &rank); err != nil {
-			return nil, err
+		if err := rows.Scan(&h.NodeID, &h.Title, &h.Path, &body, &rank); err != nil {
+			return nil, searchErr(ctx, err)
 		}
+		h.Snippet = buildExcerpt(body, terms, searchExcerptTokens)
 		// FTS5 bm25 returns lower-is-better; negate so the fuser (M1 step 3)
 		// can treat all signals as higher-is-better.
 		h.Score = -rank
 		out = append(out, h)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, searchErr(ctx, err)
+	}
+	return out, nil
 }
 
 // scopePredicate renders the notes.scope read filter as a parameterized SQL
@@ -118,17 +174,29 @@ func scopePredicate(allowed map[string]bool) (sql string, args []any, readable b
 }
 
 // buildFTS5Query turns raw user input into an FTS5 MATCH expression. It uses the
-// shared graph tokenizer (lowercase, unicode boundaries, stopwords dropped) so
-// FTS and graph-BM25 see the same terms, then joins them with OR: an agent's
-// natural-language query ("how do we store data") should recall any note that
-// matches a content word and let bm25 rank, not require that every word be
-// present AND-style. Reserved FTS grammar can't leak because each token is a
-// quoted alphanumeric literal. Empty input returns "" so the caller
-// short-circuits.
+// shared graph query tokenizer (lowercase, unicode boundaries, stopwords dropped,
+// duplicates dropped, capped at graph.MaxQueryTerms) so FTS and graph-BM25 see the
+// same terms, then joins them with OR: an agent's natural-language query ("how do we
+// store data") should recall any note that matches a content word and let bm25 rank,
+// not require that every word be present AND-style. Reserved FTS grammar can't leak
+// because each token is a quoted alphanumeric literal. Empty input returns "" so the
+// caller short-circuits.
+//
+// The cap is load-bearing, not hygiene: FTS5 evaluates one phrase per OR term, so a
+// 1 MiB query (accepted by the hub's 1 MiB request body limit, from any peer holding
+// a valid team token) turned into ~100k phrases and 4 minutes 9 seconds of
+// single-core CPU on a 500-note vault, running to completion after the client had
+// already hung up.
 func buildFTS5Query(q string) string {
-	toks := graph.Tokenize(q)
-	out := make([]string, 0, len(toks))
-	for _, t := range toks {
+	return fts5Match(graph.TokenizeQuery(q))
+}
+
+// fts5Match renders already-tokenized query terms as an FTS5 MATCH expression. Split
+// out from buildFTS5Query so a caller that also needs the terms themselves, to build
+// the result excerpt, tokenizes exactly once and cannot drift from what was matched.
+func fts5Match(terms []string) string {
+	out := make([]string, 0, len(terms))
+	for _, t := range terms {
 		out = append(out, `"`+strings.ReplaceAll(t, `"`, `""`)+`"`)
 	}
 	return strings.Join(out, " OR ")

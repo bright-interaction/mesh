@@ -520,7 +520,11 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// card loop) starved a scoped caller to zero results as soon as ~4*Limit
 	// higher-ranked unreadable notes matched the query.
 	fetchLimit := opt.Limit
-	ftsHits, err := r.store.SearchScoped(query, fetchLimit, opt.AllowedScopes)
+	// ctx, not context.Background(): this call used to drop the caller's context, so
+	// cancelling the agent tool call or the HTTP request left the FTS read running to
+	// completion. With the deadline the store now applies, a pathological query ends in
+	// a named error instead of a process pinned at 100% CPU with nothing to cancel.
+	ftsHits, err := r.store.SearchScoped(ctx, query, fetchLimit, opt.AllowedScopes)
 	if err != nil {
 		return nil, err
 	}
