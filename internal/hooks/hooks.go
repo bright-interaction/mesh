@@ -63,7 +63,7 @@ func RegisterMCP(client, projectDir, vaultAbs, binPath string) (bool, string, er
 	if err != nil {
 		return false, "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return false, p, err
 	}
 	if format == "toml" {
@@ -389,7 +389,7 @@ func Install(o Options) (Result, error) {
 	if len(res.Added) == 0 {
 		return res, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return res, err
 	}
 	if err := os.WriteFile(p, append(out, '\n'), 0o644); err != nil {
@@ -456,10 +456,10 @@ func onboardMarker(vaultRoot string) string { return filepath.Join(vaultRoot, ".
 // onboarding instruction so the agent greets the user and finishes setup itself.
 func SetOnboardPending(vaultRoot string) error {
 	p := onboardMarker(vaultRoot)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(p, []byte("1"), 0o644)
+	return os.WriteFile(p, []byte("1"), 0o600)
 }
 
 // ConsumeOnboardPending returns true at most once (clearing the marker), so the

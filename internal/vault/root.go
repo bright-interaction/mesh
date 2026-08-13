@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+
+	"github.com/bright-interaction/mesh/internal/shellpath"
 )
 
 // ErrNoVault is returned when a caller points Mesh at a vault root that is not there.
@@ -43,7 +45,7 @@ func RequireRoot(root string) error {
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("%w at %s: that path does not exist, and Mesh will not create a vault from a typo. "+
-				"Check the path, or run `mesh init %s` if you really want a new vault there", ErrNoVault, root, root)
+				"Check the path, or run `mesh init %s` if you really want a new vault there", ErrNoVault, root, shellpath.Quote(root))
 		}
 		return err
 	}

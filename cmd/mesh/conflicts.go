@@ -16,6 +16,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/merge"
+	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/bright-interaction/mesh/internal/textdiff"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"github.com/bright-interaction/mesh/pkg/meshclient"
@@ -384,7 +385,7 @@ func takeMineReConflictedReceipt(baseRel string, sum meshclient.Summary) []strin
 	lines := syncHeadlineLines(sum)
 	lines = append(lines, "the note advanced again, so your version was re-parked (no data lost):")
 	for _, s := range mine {
-		lines = append(lines, fmt.Sprintf("  %s  (review: mesh conflicts diff %s)", textdiff.Sanitize(s), s))
+		lines = append(lines, fmt.Sprintf("  %s  (review: mesh conflicts diff %s)", textdiff.Sanitize(s), shellpath.Quote(s)))
 	}
 	return append(lines, otherConflictLines(len(others), others)...)
 }

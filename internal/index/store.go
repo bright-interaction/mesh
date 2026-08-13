@@ -207,7 +207,9 @@ func ensureVaultMeshDir(dir string) error {
 		return err
 	}
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		if err := os.Chmod(dir, perm&^0o077); err != nil {
+		// fi.Mode(), not perm: Perm() masks off setgid/setuid/sticky, so chmod'ing the
+		// masked value silently cleared them. Only group/other are meant to change.
+		if err := os.Chmod(dir, fi.Mode()&^0o077); err != nil {
 			// Best effort: a vault on a filesystem that refuses chmod (or one owned by
 			// another uid) must still be indexable. Log it rather than fail the command,
 			// but log it at WARN, because the credentials beside it are exposed.
@@ -234,14 +236,21 @@ const indexFileMode = 0o600
 // body until a checkpoint folds it back, so leaving it 0644 leaks the newest writes,
 // which are the ones most worth reading. Best effort throughout, for the same reason
 // ensureVaultMeshDir is: an index on a filesystem that refuses chmod must still work.
-func narrowIndexFiles(dbPath string) {
+func narrowIndexFiles(dbPath string) { NarrowDBFiles(dbPath) }
+
+// NarrowDBFiles is narrowIndexFiles for any SQLite database this project owns, exported
+// so internal/hub narrows hub.db through the SAME code rather than growing a second copy
+// of it. hub.db is the higher-value target of the two: it holds client and invite token
+// hashes plus AES-GCM connector PATs whose key, when MESH_HUB_SECRET_KEY is unset, is
+// derived from hub.db itself, so one read yields key and ciphertext together.
+func NarrowDBFiles(dbPath string) {
 	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		fi, err := os.Stat(p)
 		if err != nil {
 			continue // -wal/-shm need not exist yet
 		}
 		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-			if err := os.Chmod(p, perm&^0o077); err != nil {
+			if err := os.Chmod(p, fi.Mode()&^0o077); err != nil {
 				slog.Warn("index: cannot narrow world-readable index file",
 					"path", p, "mode", perm.String(), "err", err)
 			}
@@ -328,6 +337,12 @@ func OpenReadOnly(vaultRoot string) (*Store, error) {
 // OpenReadOnlyAt is OpenReadOnly with an explicit index directory, mirroring OpenAt.
 func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 	dbPath := filepath.Join(meshDir, "mesh.db")
+	// A read-only open does not CREATE the index, but SQLite still creates -wal and -shm
+	// beside it at 0666&^umask, and those persist after close because a mode=ro
+	// connection cannot checkpoint them away. Without this, a user whose only surfaces
+	// are read-only (mesh ui without --own-index, mesh doctor, the TUI) keeps a 0755
+	// .mesh and a 0644 mesh.db forever and mints two fresh 0644 files on every open.
+	defer narrowIndexFiles(dbPath)
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w at %s: start the owning writer first (`mesh watch` or `mesh sync --watch`), or run `mesh index` once", ErrNoIndexYet, dbPath)

@@ -337,7 +337,7 @@ func installCmd() *cobra.Command {
 				if nDropped > 0 {
 					fmt.Println("\nThe agent is wired up, but your mesh is INCOMPLETE: the note(s) listed above")
 					fmt.Println("are not in the index, so the agent will not see them. Fix them and run:")
-					fmt.Printf("  mesh index %s\n", vaultAbs)
+					fmt.Printf("  mesh index %s\n", shellpath.Quote(vaultAbs))
 					fmt.Println("Then start a new agent session and Mesh will finish onboarding.")
 					return droppedNotesError(nDropped)
 				}
@@ -365,7 +365,7 @@ func installCmd() *cobra.Command {
 			if nDropped > 0 {
 				fmt.Printf("\nThe MCP server is registered for %s, but your mesh is INCOMPLETE: the note(s)\n", client)
 				fmt.Println("listed above are not in the index, so the agent will not see them. Fix them and run:")
-				fmt.Printf("  mesh index %s\n", vaultAbs)
+				fmt.Printf("  mesh index %s\n", shellpath.Quote(vaultAbs))
 				fmt.Printf("Then restart %s so it loads the MCP server.\n", client)
 			} else {
 				fmt.Printf("\nDone. Restart %s so it loads the MCP server.\n", client)
@@ -587,8 +587,8 @@ func spawnExtraction(vault, transcript string) {
 		self = "mesh"
 	}
 	logPath := filepath.Join(vault, ".mesh", "extract.log")
-	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
-	lf, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o700)
+	lf, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	cmd := exec.Command(self, "extract", "--to-pending", vault, transcript)
 	if lf != nil {
 		cmd.Stdout, cmd.Stderr = lf, lf

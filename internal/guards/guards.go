@@ -95,11 +95,11 @@ func ShellSnippet(guards []Guard) string {
 		// grep -E (POSIX/RE2) rejects lookaround/backreferences; skip such patterns
 		// rather than emit a check that errors at runtime.
 		if strings.Contains(g.Pattern, "(?") || strings.Contains(g.Pattern, `\1`) {
-			b.WriteString(fmt.Sprintf("\n# SKIPPED %s: pattern uses lookaround/backrefs (not grep -E compatible); refine by hand: %s\n", g.Title, g.Pattern))
+			b.WriteString(fmt.Sprintf("\n# SKIPPED %s: pattern uses lookaround/backrefs (not grep -E compatible); refine by hand: %s\n", commentSafe(g.Title), commentSafe(g.Pattern)))
 			continue
 		}
 		includes := ""
-		for _, gl := range strings.Split(g.Globs, ",") {
+		for _, gl := range splitGlobs(g.Globs) {
 			if gl = strings.TrimSpace(gl); gl != "" {
 				// shellpath.Quote, not a hand-written ' + gl + ': a glob carrying an
 				// apostrophe closed the quote and the rest of the glob became shell syntax
@@ -111,8 +111,96 @@ func ShellSnippet(guards []Guard) string {
 		}
 		msg := strings.ReplaceAll(g.Message, "'", "")
 		b.WriteString(fmt.Sprintf("\n# %s  [%s]\nif grep -rnE%s -- %s . >/dev/null 2>&1; then\n  echo 'GUARD: %s'; fail=1\nfi\n",
-			g.Title, g.Severity, includes, shellpath.Quote(g.Pattern), msg))
+			commentSafe(g.Title), g.Severity, includes, shellpath.Quote(g.Pattern), msg))
 	}
 	b.WriteString("\nexit $fail\n")
 	return b.String()
+}
+
+// commentSafe flattens anything destined for a `#` comment line in the generated hook.
+//
+// Guard.Title and Guard.Pattern come from note frontmatter in the vault: team-synced,
+// connector-ingested, and written by an LLM. A newline in a Title ends the comment, and
+// every following line of that Title becomes an executable statement in a file whose
+// whole purpose is to be installed as a pre-commit hook. Measured: a Title of
+// "harmless\ntouch /tmp/pwned" created /tmp/pwned when the snippet was run.
+//
+// Message and Severity are already safe (Message is single-quoted with its own quotes
+// stripped, Severity is normalised to block/warn above), so this covers the two fields
+// that reach a comment raw.
+func commentSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+// splitGlobs splits a comma-separated glob list WITHOUT cutting inside a brace set.
+//
+// `strings.Split(g.Globs, ",")` turned "*.{js,ts}" into "*.{js" and "ts}", and the
+// system prompt that produces these fields teaches comma lists and glob syntax in the
+// same breath, so the shape is invited. Two failures stacked: the split mangled it, and
+// grep's --include uses fnmatch, which has no brace expansion, so even unsplit it would
+// match nothing. A guard that silently never fires is worse than no guard, so a brace
+// set is expanded here into the separate --include globs grep can actually use.
+func splitGlobs(globs string) []string {
+	var out []string
+	var cur strings.Builder
+	depth := 0
+	for _, r := range globs {
+		switch {
+		case r == '{':
+			depth++
+			cur.WriteRune(r)
+		case r == '}':
+			if depth > 0 {
+				depth--
+			}
+			cur.WriteRune(r)
+		case r == ',' && depth == 0:
+			out = append(out, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	out = append(out, cur.String())
+
+	var expanded []string
+	for _, g := range out {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			continue
+		}
+		expanded = append(expanded, expandBraces(g)...)
+	}
+	return expanded
+}
+
+// expandBraces turns "*.{js,ts}" into ["*.js", "*.ts"]. One level is enough for the
+// shapes these fields carry; anything unbalanced is passed through untouched so a weird
+// glob degrades to "matches nothing" rather than to mangled shell.
+func expandBraces(g string) []string {
+	o := strings.Index(g, "{")
+	if o < 0 {
+		return []string{g}
+	}
+	c := strings.Index(g[o:], "}")
+	if c < 0 {
+		return []string{g}
+	}
+	c += o
+	prefix, suffix := g[:o], g[c+1:]
+	var out []string
+	for _, alt := range strings.Split(g[o+1:c], ",") {
+		if alt = strings.TrimSpace(alt); alt != "" {
+			out = append(out, expandBraces(prefix+alt+suffix)...)
+		}
+	}
+	if len(out) == 0 {
+		return []string{prefix + suffix}
+	}
+	return out
 }

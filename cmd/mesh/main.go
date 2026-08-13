@@ -389,7 +389,7 @@ func doctorCmd() *cobra.Command {
 				for _, fe := range ferrs {
 					fmt.Printf("  %s: %v\n", fe.Path, fe.Err)
 				}
-				fmt.Printf("status: BROKEN - %d note(s) invisible to search (they do not parse)\n  fix: mesh lint %s\n", len(ferrs), root)
+				fmt.Printf("status: BROKEN - %d note(s) invisible to search (they do not parse)\n  fix: mesh lint %s\n", len(ferrs), shellpath.Quote(root))
 				return fmt.Errorf("%d note(s) invisible to search", len(ferrs))
 			case len(dupes) > 0:
 				// BEFORE the drift branch on purpose. A duplicate id manufactures drift
@@ -406,7 +406,7 @@ func doctorCmd() *cobra.Command {
 				// the vault and there is no process running that will ever catch it up.
 				// Named apart from plain STALE because the fix is two commands, not one.
 				fmt.Println("status: STALE - the index is behind the vault and no owning writer is running to catch it up")
-				fmt.Printf("  fix: mesh index %s, then start an owner (see the owner line above)\n", root)
+				fmt.Printf("  fix: mesh index %s, then start an owner (see the owner line above)\n", shellpath.Quote(root))
 				return fmt.Errorf("index stale, and no owning writer")
 			case drift.Any():
 				fmt.Println("status: STALE - run mesh index")
@@ -677,7 +677,7 @@ func embedCmd() *cobra.Command {
 				keyEnv = cfg.KeyEnv
 			}
 			if endpoint == "" || model == "" {
-				return fmt.Errorf("set --endpoint and --model (or MESH_EMBED_ENDPOINT / MESH_EMBED_MODEL).\n  example: mesh embed %s --endpoint http://localhost:11434/v1 --model nomic-embed-text", root)
+				return fmt.Errorf("set --endpoint and --model (or MESH_EMBED_ENDPOINT / MESH_EMBED_MODEL).\n  example: mesh embed %s --endpoint http://localhost:11434/v1 --model nomic-embed-text", shellpath.Quote(root))
 			}
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
 				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
@@ -2049,7 +2049,7 @@ func joinCmd() *cobra.Command {
 				fmt.Println(line)
 			}
 			fmt.Println("next:")
-			fmt.Println("  mesh sync " + vaultDir + "                       # push your edits, pull teammates'")
+			fmt.Println("  mesh sync " + shellpath.Quote(vaultDir) + "                       # push your edits, pull teammates'")
 			fmt.Printf("  mesh mcp --vault %s --watch       # point your agent at the vault\n", shellpath.Quote(vaultDir))
 			return nil
 		},

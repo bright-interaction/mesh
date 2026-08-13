@@ -71,3 +71,58 @@ func TestPrintedRemedyIsOneArgument(t *testing.T) {
 		t.Errorf("the pasted remedy expanded to %s arguments, want 1", out)
 	}
 }
+
+// The safe set had two holes, both found by measuring real shells rather than reasoning
+// about metacharacters. Each case below failed before the deny-list became an allow-list.
+func TestQuoteSafeSetGaps(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"zsh EQUALS-expands a word-initial =", "=notes", "'=notes'"},
+		{"= is only special word-initially", "/tmp/a=b", "/tmp/a=b"},
+		{"a bare CR is ENTER when the remedy is pasted", "/tmp/vault\rmalicious", "'/tmp/vault\rmalicious'"},
+		{"a leading - is a flag, never handed over bare", "-weird", "'-weird'"},
+		{"vertical tab", "/tmp/a\vb", "'/tmp/a\vb'"},
+		{"form feed", "/tmp/a\fb", "'/tmp/a\fb'"},
+		{"ESC starts a terminal escape sequence", "/tmp/a\x1b[31mb", "'/tmp/a\x1b[31mb'"},
+		{"ordinary non-ASCII stays bare so output is not noisy", "/tmp/école", "/tmp/école"},
+	} {
+		if got := Quote(tc.in); got != tc.want {
+			t.Errorf("%s: Quote(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+// sh on macOS is bash in sh mode, so testing only sh never exercises the shell the user
+// actually pastes into. zsh is the macOS default and the one that EQUALS-expands.
+func TestQuotedPathSurvivesEveryShellTheUserMightPasteInto(t *testing.T) {
+	for _, shell := range []string{"sh", "bash", "zsh"} {
+		bin, err := exec.LookPath(shell)
+		if err != nil {
+			t.Logf("no %s on this box, skipping", shell)
+			continue
+		}
+		for _, p := range []string{
+			"/tmp/plain", "/tmp/My Notes", "/tmp/it's a vault", "=notes", "/tmp/a=b",
+			"~/Documents", "/tmp/$HOME and `backticks`", "/tmp/star*glob?",
+			"/tmp/vault\rmalicious", "/tmp/a\vb", "/tmp/école",
+		} {
+			out, err := exec.Command(bin, "-c", "printf %s "+Quote(p)).Output()
+			if err != nil {
+				t.Errorf("%s rejected %q (quoted %s): %v", shell, p, Quote(p), err)
+				continue
+			}
+			if got := string(out); got != p {
+				t.Errorf("%s received %q, want %q (quoted as %s)", shell, got, p, Quote(p))
+			}
+		}
+	}
+}
+
+// A positional path starting with '-' is a flag no amount of quoting can fix.
+func TestPathArgDefusesALeadingDash(t *testing.T) {
+	if got := PathArg("-weird"); got != "./-weird" {
+		t.Errorf("PathArg(-weird) = %q, want ./-weird", got)
+	}
+	if got := PathArg("/abs/path"); got != "/abs/path" {
+		t.Errorf("PathArg left an ordinary path alone? got %q", got)
+	}
+}

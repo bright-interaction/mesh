@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -51,6 +52,15 @@ func TestIndexCreationPathsAreOwnerOnly(t *testing.T) {
 		},
 	}
 
+	// umask 077 made every assertion below pass over a reverted fix, because nothing
+	// forced a wide starting state and `perm&0o077 != 0` was then testing the RUNNER's
+	// umask rather than the code. Proven by mutation: with OpenAt back on
+	// os.MkdirAll(0o755) and narrowIndexFiles deleted, the whole internal/index suite
+	// passed at umask 077 and failed at 022. So set the umask wide for the duration,
+	// and assert literal modes rather than "no group/other bits".
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+
 	for _, tc := range openers {
 		t.Run(tc.name, func(t *testing.T) {
 			store, dir := tc.open(t, t.TempDir())
@@ -60,8 +70,8 @@ func TestIndexCreationPathsAreOwnerOnly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-				t.Errorf("index dir %s is %v, want no group/other bits", dir, perm)
+			if perm := fi.Mode().Perm(); perm != 0o700 {
+				t.Errorf("index dir %s is %04o, want 0700", dir, perm)
 			}
 
 			// mesh.db must be narrow in its own right, not merely sheltered by the
@@ -88,8 +98,8 @@ func assertOwnerOnly(t *testing.T, p string) {
 		}
 		t.Fatal(err)
 	}
-	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		t.Errorf("%s is %v, want no group/other bits", p, perm)
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("%s is %04o, want 0600", p, perm)
 	}
 }
 
@@ -127,6 +137,7 @@ func TestOpenNarrowsAnIndexLeftWideByAnOlderMesh(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	assertOwnerOnly(t, db+"-wal")
 
 	for _, p := range []string{dir, db} {
 		fi, err := os.Stat(p)
