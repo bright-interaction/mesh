@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // scopedServer builds a server over a vault with two notes in distinct scopes, each
@@ -86,6 +88,19 @@ func TestHealthScopeFilter(t *testing.T) {
 	res := toolJSON(t, out)
 	for _, f := range asList(res["findings"]) {
 		fm, _ := f.(map[string]any)
+		// Operational findings are about the VAULT, not a note (no owning writer, a note
+		// that would not parse), so they are shown to every caller. They still may not
+		// name anything: an empty note id and an empty path is what makes them safe to
+		// show across scopes, so that is asserted rather than assumed.
+		if fm["issue"] == index.NoOwnerIssue {
+			if fm["note_id"] != "" || fm["path"] != "" {
+				t.Fatalf("the no-owner finding names a note across scopes: %v", fm)
+			}
+			continue
+		}
+		if fm["issue"] == "unparseable" {
+			continue // a note that never parsed has no scope to check; shown to all
+		}
 		if fm["note_id"] != "note-a" {
 			t.Fatalf("health leaked out-of-scope finding: %v", fm)
 		}

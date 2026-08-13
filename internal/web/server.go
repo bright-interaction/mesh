@@ -552,6 +552,15 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 	}
 	newSrv := NewServer
 	if ownIndex {
+		// Claim the vault first. This process is a DECLARED owner, so it takes the claim
+		// from an opportunistic `mesh mcp` (which drops back to reading) and refuses to
+		// start beside another declared owner, rather than silently becoming the second
+		// long-lived writer this whole split exists to prevent.
+		lock, lerr := index.AcquireOwnerLock(filepath.Join(vaultRoot, ".mesh"), "mesh ui --own-index", false)
+		if lerr != nil {
+			return lerr
+		}
+		defer lock.Release()
 		newSrv = NewOwningServer
 	}
 	s, err := newSrv(vaultRoot)

@@ -66,6 +66,7 @@ func TestDoctorReportsUnparseableNotes(t *testing.T) {
 	tests := []struct {
 		name       string
 		notes      map[string]string
+		noOwner    bool // leave the vault unowned instead of holding the claim
 		wantErr    bool
 		wantOut    string
 		notWantOut string
@@ -85,11 +86,22 @@ func TestDoctorReportsUnparseableNotes(t *testing.T) {
 			notWantOut: "status: healthy",
 		},
 		{
-			name:       "a clean vault is still reported as fine",
+			name:       "a clean vault with an owning writer is still reported as fine",
 			notes:      map[string]string{"good.md": goodNote},
 			wantErr:    false,
 			wantOut:    "status:",
 			notWantOut: "BROKEN",
+		},
+		{
+			// A fresh index over perfect notes with nothing keeping it fresh: every
+			// count above is right and every note written from here on is invisible to
+			// search. Doctor called that "healthy" and exited 0.
+			name:       "a clean vault nothing owns is a failure, not healthy",
+			notes:      map[string]string{"good.md": goodNote},
+			noOwner:    true,
+			wantErr:    true,
+			wantOut:    "status: NO OWNER",
+			notWantOut: "status: healthy",
 		},
 	}
 	for _, tc := range tests {
@@ -100,6 +112,16 @@ func TestDoctorReportsUnparseableNotes(t *testing.T) {
 			}
 			if _, err := runCLI(t, indexCmd(), dir); err != nil {
 				t.Fatalf("mesh index: %v", err)
+			}
+			if !tc.noOwner {
+				// Play the owning writer, the way `mesh watch` or an elected `mesh mcp`
+				// does. Without it every vault here reads as unowned, which is a real
+				// failure and not the one these cases are about.
+				lock, err := index.AcquireOwnerLock(filepath.Join(dir, ".mesh"), "test owner", false)
+				if err != nil {
+					t.Fatalf("acquire owner lock: %v", err)
+				}
+				defer lock.Release()
 			}
 
 			out, err := runCLI(t, doctorCmd(), dir)

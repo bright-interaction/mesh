@@ -66,6 +66,7 @@
       '<section class="set-group"><h2 class="set-h">Agent (MCP) tools</h2>' +
       '<p class="api-lead">Point your coding agent at the MCP server, then retrieve cheaply with these tools.</p>' +
       '<div class="api-config"><div class="api-config-bar"><span>agent config</span><button class="btn ghost" id="copy-cfg">copy</button></div><pre>' + esc(cfg) + "</pre></div>" +
+      (mcp.note ? '<p class="api-lead">' + esc(mcp.note) + "</p>" : "") +
       '<details class="api-contract"><summary>Retrieval contract</summary><pre>' + esc(mcp.contract || "") + "</pre></details>" +
       '<div class="tools">' + (mcp.tools || []).map(toolCard).join("") + "</div>" +
       "</section>" +

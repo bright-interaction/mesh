@@ -4,6 +4,11 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,52 +34,123 @@ func TestLocalSweepStaysUnderTheWriteBackBound(t *testing.T) {
 	}
 }
 
+// owningWriterConstructors maps a command function DISCOVERED as an owning writer to the
+// constructor the flag checks need. It is a lookup, never the subject list: the subjects
+// come from the AST (see owningWriterCommands), and a command that claims the vault
+// without an entry here fails the build instead of quietly dropping off the guard.
+var owningWriterConstructors = map[string]func() *cobra.Command{
+	"watchCmd": watchCmd,
+	"mcpCmd":   mcpCmd,
+	"syncCmd":  syncCmd,
+}
+
+// owningWriterCommands returns every function in this package that claims the vault's
+// owning-writer role, read out of the AST.
+//
+// The subject list used to be three names written by hand here, next to a comment
+// asserting that `mesh mcp --watch` could be the owning writer. It could not: `mesh mcp`
+// opened the index read-only, so its watcher only ever re-read what some other process
+// had persisted. The comment was the documentation five other surfaces copied, and both
+// tests below stayed green the whole time, because a hand-written list cannot notice that
+// one of its entries stopped being what it says it is.
+//
+// Ownership is now a claim in code (claimIndexOwnership for a declared owner,
+// mcp.NewOwningServer for the elected one), so the guard reads the claim instead of a
+// human's summary of it, and a fourth owning writer joins these checks by existing.
+func owningWriterCommands(t *testing.T) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, pkg := range pkgs {
+		for path, file := range pkg.Files {
+			if strings.HasSuffix(path, "_test.go") {
+				continue
+			}
+			for _, decl := range file.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Recv != nil || fn.Body == nil {
+					continue
+				}
+				claims := false
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					switch f := call.Fun.(type) {
+					case *ast.Ident:
+						if f.Name == "claimIndexOwnership" {
+							claims = true
+						}
+					case *ast.SelectorExpr:
+						if f.Sel.Name == "NewOwningServer" {
+							claims = true
+						}
+					}
+					return !claims
+				})
+				if claims {
+					out = append(out, fn.Name.Name)
+				}
+			}
+		}
+	}
+	sort.Strings(out)
+	if len(out) < 3 {
+		t.Fatalf("found only %d owning-writer command(s) (%v); `mesh watch`, `mesh sync --watch` and "+
+			"`mesh mcp` all claim the vault, so the scanner is broken, not the code", len(out), out)
+	}
+	return out
+}
+
+// owningWriterCmd resolves a discovered command name to its constructor, failing when the
+// lookup has not kept up with the code.
+func owningWriterCmd(t *testing.T, name string) *cobra.Command {
+	t.Helper()
+	make, ok := owningWriterConstructors[name]
+	if !ok {
+		t.Fatalf("%s claims the vault's owning-writer role but is not in owningWriterConstructors; "+
+			"add it there so the cadence checks below cover it", name)
+	}
+	return make()
+}
+
 // TestOwningWritersUseTheLocalSweepDefault: the constant above is worth nothing if the
-// commands that actually own an index do not use it. All three can be the owning writer
-// (`mesh watch`, `mesh mcp --watch`, and `mesh sync --watch`, which is the one running on
-// the laptop), so all three carry the same local cadence.
+// commands that actually own an index do not use it. Every command that claims the vault
+// carries the same local cadence, because any of them can be the process a reader is
+// waiting on.
 func TestOwningWritersUseTheLocalSweepDefault(t *testing.T) {
 	want := defaultLocalReconcile.String()
-	for _, tc := range []struct {
-		name string
-		cmd  func() *cobra.Command
-	}{
-		{"mesh watch", watchCmd},
-		{"mesh mcp", mcpCmd},
-		{"mesh sync", syncCmd},
-	} {
-		f := tc.cmd().Flags().Lookup("reconcile")
+	for _, name := range owningWriterCommands(t) {
+		f := owningWriterCmd(t, name).Flags().Lookup("reconcile")
 		if f == nil {
-			t.Fatalf("%s has no --reconcile flag", tc.name)
+			t.Fatalf("%s has no --reconcile flag", name)
 		}
 		if f.DefValue != want {
-			t.Errorf("%s --reconcile defaults to %s, want %s (the sweep under the write-back bound)", tc.name, f.DefValue, want)
+			t.Errorf("%s --reconcile defaults to %s, want %s (the sweep under the write-back bound)", name, f.DefValue, want)
 		}
 	}
 }
 
 // TestOwningWritersShareTheFullReconcileCadence: the cheap sweep and the authoritative
 // content-hash pass are two different cadences on one ticker, and the expensive one is
-// what heats an idle laptop. All three owning writers must expose it and default it the
-// same way, for the same reason the sweep default is pinned above: `mesh mcp --watch`
-// runs once per open agent session, so a command that quietly kept the old
+// what heats an idle laptop. Every owning writer must expose it and default it the same
+// way, for the same reason the sweep default is pinned above: `mesh mcp --watch` runs
+// once per open agent session, so a command that quietly kept the old
 // every-tick-is-authoritative behaviour would put the cost straight back.
 func TestOwningWritersShareTheFullReconcileCadence(t *testing.T) {
 	want := watch.DefaultFullReconcile.String()
-	for _, tc := range []struct {
-		name string
-		cmd  func() *cobra.Command
-	}{
-		{"mesh watch", watchCmd},
-		{"mesh mcp", mcpCmd},
-		{"mesh sync", syncCmd},
-	} {
-		f := tc.cmd().Flags().Lookup("full-reconcile")
+	for _, name := range owningWriterCommands(t) {
+		f := owningWriterCmd(t, name).Flags().Lookup("full-reconcile")
 		if f == nil {
-			t.Fatalf("%s has no --full-reconcile flag, so its authoritative pass is not tunable", tc.name)
+			t.Fatalf("%s has no --full-reconcile flag, so its authoritative pass is not tunable", name)
 		}
 		if f.DefValue != want {
-			t.Errorf("%s --full-reconcile defaults to %s, want %s", tc.name, f.DefValue, want)
+			t.Errorf("%s --full-reconcile defaults to %s, want %s", name, f.DefValue, want)
 		}
 	}
 	if watch.DefaultFullReconcile <= defaultLocalReconcile {

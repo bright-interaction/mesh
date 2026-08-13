@@ -155,7 +155,13 @@ func initCmd() *cobra.Command {
 			// leave one note out of the vault entirely, and init used to print "1 notes"
 			// for 2 files and exit 0, so the first thing a new user ever saw was a
 			// quietly incomplete vault.
-			dropped := store.DroppedNotes()
+			// The read is fallible on a read-only store and this one is writable, so an
+			// error here means the record itself could not be read. Report it rather than
+			// reading silence as "nothing was dropped", which are opposite answers.
+			dropped, derr := store.DroppedNotes()
+			if derr != nil {
+				return derr
+			}
 			if len(dropped) > 0 {
 				fmt.Fprintf(os.Stderr, "\n%d note(s) are NOT in the index and are invisible to search and the graph:\n", len(dropped))
 				for _, d := range dropped {
@@ -167,7 +173,14 @@ func initCmd() *cobra.Command {
 			fmt.Println("  mesh new decision \"<title>\" --vault " + root + "   # capture a decision/gotcha")
 			fmt.Println("  mesh index " + root + "                          # rebuild after edits")
 			fmt.Println("  point your coding agent at the MCP server:")
-			fmt.Printf("    {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"%s\"]}\n", abs)
+			fmt.Printf("    {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"%s\", \"--watch\"]}\n", abs)
+			// Say who indexes, because until this was printed the honest answer for a
+			// vault set up this way was "nobody", and nothing said so.
+			fmt.Println("    that server elects itself this vault's owning writer, so notes it writes")
+			fmt.Println("    (and notes you edit) are searchable at once. Run `mesh doctor " + root + "`")
+			fmt.Println("    to check one is running; `mesh watch " + root + "` starts a standalone one.")
+			// Printed the next steps first, then fail: a vault that dropped notes is
+			// incomplete, and init exiting 0 over it was the original defect.
 			if len(dropped) > 0 {
 				return fmt.Errorf("%d note(s) could not be indexed", len(dropped))
 			}
@@ -261,6 +274,9 @@ func doctorCmd() *cobra.Command {
 			nodes, _ := store.Count("nodes")
 			edges, _ := store.Count("edges")
 			fmt.Printf("index:  %s\n  notes %d  nodes %d  edges %d\n", dbPath, notes, nodes, edges)
+			// Who, if anyone, keeps this index fresh. Printed before drift because it
+			// explains drift: an index nothing owns can only ever go staler.
+			hasOwner := reportOwner(os.Stdout, root)
 
 			drift, err := store.DriftReport(root)
 			if err != nil {
@@ -344,6 +360,13 @@ func doctorCmd() *cobra.Command {
 			case drift.Any():
 				fmt.Println("status: STALE - run mesh index")
 				return fmt.Errorf("index stale")
+			case !hasOwner:
+				// Ranked below the two above because they are already broken NOW, while
+				// this one guarantees the next edit breaks. It is still a failure: a vault
+				// nothing indexes is a vault whose knowledge stops accumulating, and the
+				// only prior symptom was an owner_down flag ten seconds into a write-back.
+				fmt.Println("status: NO OWNER - the index is fresh but nothing is keeping it that way")
+				return fmt.Errorf("no owning writer")
 			case lintProblems > 0:
 				fmt.Println("status: OK (index fresh; lint problems exist)")
 			default:
@@ -767,6 +790,7 @@ func statusCmd() *cobra.Command {
 			}
 			defer store.Close()
 			fmt.Printf("index:  %s\n", dbPath)
+			hasOwner := reportOwner(os.Stdout, root)
 			for _, t := range []struct{ label, table string }{
 				{"notes", "notes"},
 				{"nodes", "nodes"},
@@ -831,6 +855,12 @@ func statusCmd() *cobra.Command {
 				fmt.Printf("  weights      learned fts=%.2f graph=%.2f vec=%.2f (MESH_WEIGHT_*)\n", wf, wg, wv)
 			} else {
 				fmt.Println("  weights      built-in defaults (run: mesh tune <cases.json> to fit your corpus)")
+			}
+			// Reported last so the stats above are all printed first, and as a non-zero
+			// exit so a script that checks `mesh status` sees the one condition under
+			// which every number above quietly stops moving.
+			if !hasOwner {
+				return fmt.Errorf("no owning writer")
 			}
 			return nil
 		},
@@ -1658,6 +1688,42 @@ func isKebab(filename string) bool {
 	return true
 }
 
+// claimIndexOwnership takes the vault's owning-writer claim for a DECLARED owner: a
+// command whose whole job is to keep the index fresh (`mesh watch`, `mesh sync --watch`,
+// `mesh ui --own-index`). It fails when another declared owner already holds the vault,
+// which is the case nothing checked at all before: two watchers against one mesh.db is
+// exactly the contention the single-writer split removed, and it used to be started by
+// hand routinely, because the only symptom is latency.
+//
+// An opportunistic `mesh mcp` claim is taken over rather than refused; that server drops
+// back to reading the moment it notices, so the operator's explicit command wins.
+func claimIndexOwnership(vaultDir, role string) (*index.OwnerLock, error) {
+	return index.AcquireOwnerLock(filepath.Join(vaultDir, ".mesh"), role, false)
+}
+
+// reportOwner prints the vault's owning writer and reports whether one is missing, for
+// the two commands whose job is to tell an operator whether this vault is working. A
+// vault with no owner indexes nothing: notes written or edited go missing from search
+// with no other signal, which is why this is a failure and not a note in passing.
+func reportOwner(w io.Writer, vaultDir string) bool {
+	info, live := index.OwnerStatus(filepath.Join(vaultDir, ".mesh"))
+	if live {
+		fmt.Fprintf(w, "owner:  %s\n", info.Describe())
+		return true
+	}
+	fmt.Fprintf(w, "owner:  NONE\n  %s\n", index.NoOwnerRemedy(vaultDir))
+	return false
+}
+
+// mcpOwnerRole names this server in the vault's owner lock, so a peer that loses the
+// election (or a `mesh doctor` run) can say which process to go and look at.
+func mcpOwnerRole(watching bool) string {
+	if watching {
+		return "mesh mcp --watch"
+	}
+	return "mesh mcp"
+}
+
 func mcpCmd() *cobra.Command {
 	var vaultDir string
 	var doWatch bool
@@ -1666,13 +1732,23 @@ func mcpCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve the agent retrieval contract over MCP (JSON-RPC on stdio, or HTTP with --http)",
-		Long:  "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Default transport is stdio: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}. Use --http :PORT to serve over HTTP instead (POST /mcp) so any remote MCP client (Claude, Cursor, ChatGPT, ...) connects without a local install; a bearer --token is REQUIRED when binding beyond loopback. Add --watch so editor changes are searchable in the same session.",
+		Long: "Long-running MCP server a coding agent spawns to search, fetch, and write back to the vault. Default transport is stdio: {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"<path>\"]}. Use --http :PORT to serve over HTTP instead (POST /mcp) so any remote MCP client (Claude, Cursor, ChatGPT, ...) connects without a local install; a bearer --token is REQUIRED when binding beyond loopback. " +
+			"The server elects itself the vault's owning writer when nothing else holds it, so write-back is queryable at once with no separate daemon; beside a running `mesh watch` / `mesh sync --watch` it reads instead and routes writes through that owner. Add --watch so notes changed in your editor are searchable in the same session.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			srv, err := mcp.NewServer(vaultDir)
+			// Elect this process the owning writer when the vault has none. Without it the
+			// shipped agent config (`mesh mcp --vault <path>`, and nothing else) is a
+			// server that can never index: every mesh_append_note waits out the full owner
+			// bound and the note stays unqueryable. See mcp.NewOwningServer.
+			srv, err := mcp.NewOwningServer(vaultDir, mcpOwnerRole(doWatch))
 			if err != nil {
 				return err
 			}
 			defer srv.Close()
+			if srv.OwnsIndex() {
+				fmt.Fprintf(os.Stderr, "mesh mcp: index OWNED by this process (nothing else holds this vault)\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "mesh mcp: index read-only; another mesh process owns this vault and indexes for it\n")
+			}
 			if httpAddr != "" {
 				return serveMCPHTTP(srv, httpAddr, httpToken, doWatch, debounce, reconcile, fullReconcile)
 			}
@@ -1701,7 +1777,7 @@ func mcpCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
-	c.Flags().BoolVar(&doWatch, "watch", false, "live-reindex the vault in the background so editor changes are searchable without a restart")
+	c.Flags().BoolVar(&doWatch, "watch", false, "live-reindex the vault in the background so editor changes are searchable without a restart (needs this server to be the owning writer, which it elects itself to be unless another one is running)")
 	c.Flags().StringVar(&httpAddr, "http", "", "serve MCP over HTTP at host:port (POST /mcp) instead of stdio")
 	c.Flags().StringVar(&httpToken, "token", "", "bearer token for --http (or MESH_MCP_TOKEN); REQUIRED when binding beyond loopback")
 	c.Flags().DurationVar(&debounce, "debounce", 300*time.Millisecond, "quiet window to coalesce a burst of saves")
@@ -1818,6 +1894,14 @@ func watchCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := vaultArg(args)
+			// Claim the vault before opening a writable store. This is the declared owner,
+			// so it takes the claim from an opportunistic `mesh mcp` (which drops back to
+			// reading) and refuses to start beside another declared one.
+			owner, err := claimIndexOwnership(root, "mesh watch")
+			if err != nil {
+				return err
+			}
+			defer owner.Release()
 			store, err := index.Open(root)
 			if err != nil {
 				return err
@@ -1910,6 +1994,16 @@ func syncCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultDir := vaultArg(args)
+			if doWatch {
+				// The long-lived half of this command is an owning writer, so it claims the
+				// vault like `mesh watch` does. The one-shot path is not claimed: it is a
+				// single bounded pass, and SQLite's busy timeout already covers it.
+				owner, err := claimIndexOwnership(vaultDir, "mesh sync --watch")
+				if err != nil {
+					return err
+				}
+				defer owner.Release()
+			}
 			store, err := index.Open(vaultDir)
 			if err != nil {
 				return err

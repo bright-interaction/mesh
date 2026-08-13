@@ -49,6 +49,9 @@ func dupNoteRow(t *testing.T, s *Store, id string) (notePath, nodePath string) {
 	return notePath, nodePath
 }
 
+// mustDropped, which asserts the record could be read at all, lives in
+// schema_version_readonly_test.go with the rest of that guard.
+
 func droppedPaths(fes []FileError) []string {
 	out := make([]string, 0, len(fes))
 	for _, fe := range fes {
@@ -82,7 +85,7 @@ func TestFullReindexQuarantinesADuplicateInsteadOfLosingIt(t *testing.T) {
 	if notePath != filepath.Join("a", "README.md") {
 		t.Errorf("the first file in walk order must win the id, got %q", notePath)
 	}
-	dropped := s.DroppedNotes()
+	dropped := mustDropped(t, s)
 	if len(dropped) != 1 || dropped[0].Path != filepath.Join("b", "README.md") {
 		t.Fatalf("the losing file must be reported as dropped, got %v", droppedPaths(dropped))
 	}
@@ -152,7 +155,7 @@ func TestFullAndIncrementalAgreeOnTheDuplicateWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	fullPath, fullNodePath := dupNoteRow(t, fullStore, "readme")
-	fullDropped := droppedPaths(fullStore.DroppedNotes())
+	fullDropped := droppedPaths(mustDropped(t, fullStore))
 
 	// The incremental path: the LiveIndexer's cache is seeded FIRST (its first Reconcile
 	// is a full one), so the reconcile that sees b/README.md is genuinely the incremental
@@ -171,7 +174,7 @@ func TestFullAndIncrementalAgreeOnTheDuplicateWinner(t *testing.T) {
 		t.Errorf("the quarantined file must not be indexed as Added, got Added=%d", rec.Added)
 	}
 	incPath, incNodePath := dupNoteRow(t, incStore, "readme")
-	incDropped := droppedPaths(incStore.DroppedNotes())
+	incDropped := droppedPaths(mustDropped(t, incStore))
 
 	if fullPath != incPath {
 		t.Errorf("the full path and the incremental path gave id readme to DIFFERENT files "+

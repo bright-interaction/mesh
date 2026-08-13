@@ -58,6 +58,13 @@ The agent then retrieves with cheap tools (`mesh_search`, `mesh_fetch`, ...) ins
 reading whole files, and writes back what it learns with `mesh_append_note`. See the
 **API** tab for every tool and the **Agents** doc for the flywheel.
 
+That config is self-sufficient: the MCP server claims this vault's **owning writer**
+role when nothing else holds it, so what it writes back is searchable at once and what
+you edit in your editor is picked up live. If you also run `mesh watch` or
+`mesh sync --watch`, that one owns the index instead and the MCP server reads it.
+Either way exactly one process indexes. `mesh doctor <vault>` says which, and fails
+with `status: NO OWNER` when nothing is indexing at all.
+
 ## This app
 
 You are looking at `mesh ui`, the web app over one vault. The left rail:

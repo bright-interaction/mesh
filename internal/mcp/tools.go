@@ -402,7 +402,7 @@ var computedHealthIssue = map[string]bool{"dead_ref": true, "overdue": true, "co
 // owner never runs the pass is nothing at all, and mesh_health would report a clean vault
 // by virtue of never having looked.
 func (s *Server) healthPass(now time.Time, issue string) ([]index.HealthFinding, map[string]int, *rpcError) {
-	if s.store.ReadOnly() {
+	if !s.owns() {
 		findings, err := s.store.ScanHealth(s.vaultRoot, now)
 		if err != nil {
 			return nil, nil, internalErr(err)
@@ -527,6 +527,17 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		findings = append(findings, index.HealthFinding{Issue: kind, Path: d.Path, Detail: detail})
 		counts[kind]++
 	}
+	// No owning writer is a health finding about the VAULT's setup, not about a note, and
+	// it is the most consequential one this tool can report: with nothing owning the
+	// index, every note written from here (and every note edited in an editor) stays
+	// unqueryable, silently. It used to be invisible, which is how a shipped agent config
+	// that could never index anything survived for days.
+	if a.Issue == "" || a.Issue == index.NoOwnerIssue {
+		if f, missing := s.ownerFinding(); missing {
+			findings = append(findings, f)
+			counts[index.NoOwnerIssue]++
+		}
+	}
 	// Scope read check: findings carry a note id + path, so an unfiltered health pass
 	// leaks the existence and paths of notes outside the caller's scope (and the global
 	// counts do the same in aggregate). Drop out-of-scope findings and recompute counts
@@ -535,7 +546,7 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		kept := findings[:0]
 		scoped := make(map[string]int, len(counts))
 		for _, f := range findings {
-			if f.Issue == "unparseable" {
+			if f.Issue == "unparseable" || f.Issue == index.NoOwnerIssue {
 				// No parsed note, so no scope to check: an operational finding shown to all.
 				kept = append(kept, f)
 				scoped[f.Issue]++
@@ -552,6 +563,23 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		counts = scoped
 	}
 	return textResult(map[string]any{"findings": findings, "counts": counts}), nil
+}
+
+// ownerFinding reports the vault's missing owning writer, and whether there is one to
+// report. It answers from the lock rather than from this server's own role, because a
+// read-only window beside a live `mesh watch` is perfectly healthy and must not be told
+// otherwise.
+func (s *Server) ownerFinding() (index.HealthFinding, bool) {
+	if s.owns() {
+		return index.HealthFinding{}, false
+	}
+	if _, live := index.OwnerStatus(s.store.MeshDir()); live {
+		return index.HealthFinding{}, false
+	}
+	// No vault root in the detail: this string can reach a remote MCP client (--http, the
+	// hosted viewer), and every other operator-facing path on this surface is scrubbed
+	// before it leaves the process. The caller already knows which vault it connected to.
+	return index.HealthFinding{Issue: index.NoOwnerIssue, Detail: index.NoOwnerRemedy("")}, true
 }
 
 // toolSetupHooks drives the session-hook onboarding: status returns the pitch +

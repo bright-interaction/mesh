@@ -213,7 +213,7 @@ func (s *Server) refreshCode() (codeRefresh, error) {
 	if !on || len(roots) == 0 {
 		return codeRefresh{}, nil
 	}
-	if s.store.ReadOnly() {
+	if !s.owns() {
 		stats, err := s.store.CodeIndexSize()
 		if err != nil {
 			return codeRefresh{}, err

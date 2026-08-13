@@ -21,6 +21,13 @@ func (s *Server) handleMCPTools(w http.ResponseWriter, r *http.Request) {
 			"command": "mesh",
 			"args":    []string{"mcp", "--vault", s.exposedVaultRoot(), "--watch"},
 		},
+		// Say what this config does about indexing. It is the whole setup a user pastes,
+		// and for four days it was a server that could not index anything, with nothing
+		// anywhere saying so.
+		"note": "This is the whole setup. The server claims the vault's owning-writer role when nothing " +
+			"else holds it, so write-backs are searchable at once and editor changes are picked up live. " +
+			"Beside a running `mesh watch` or `mesh sync --watch` it reads that owner's index instead. " +
+			"`mesh doctor <vault>` names the owner, or fails with `status: NO OWNER`.",
 	})
 }
 

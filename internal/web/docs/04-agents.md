@@ -14,7 +14,11 @@ mesh mcp --vault /path/to/vault --watch
 ```
 
 `--watch` keeps the index fresh as you edit notes, so a file you change is searchable
-in the same session. New to a project? `mesh_setup_hooks` (or `mesh hooks install`)
+in the same session. It works because that server claims this vault's owning-writer
+role when nothing else holds it; beside a running `mesh watch` or `mesh sync --watch`
+it reads what that owner indexes and routes its write-backs through it. One indexer,
+either way. Check with `mesh doctor <vault>`, which names the owner or fails with
+`status: NO OWNER`. New to a project? `mesh_setup_hooks` (or `mesh hooks install`)
 wires Claude Code so the agent reads the mesh at session start and is nudged to write
 back before finishing, automatically.
 

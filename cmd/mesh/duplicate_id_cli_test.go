@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // Two README.md files in different folders, no frontmatter, so both resolve to the note id
@@ -112,6 +114,14 @@ func TestDuplicateNoteIDIsReportedByEveryOperatorCommand(t *testing.T) {
 		if out, err := runCLI(t, indexCmd(), dir); err != nil {
 			t.Fatalf("mesh index still fails after the remedy: %v\n%s", err, out)
 		}
+		// Play the owning writer, the way `mesh watch` or an elected `mesh mcp` does.
+		// Without it doctor reports NO OWNER, which is a real failure of this temp vault
+		// and not the duplicate-id verdict this case is about.
+		lock, err := index.AcquireOwnerLock(filepath.Join(dir, ".mesh"), "test owner", false)
+		if err != nil {
+			t.Fatalf("acquire owner lock: %v", err)
+		}
+		defer lock.Release()
 		if out, err := runCLI(t, doctorCmd(), dir); err != nil {
 			t.Fatalf("doctor still fails after the remedy: %v\n%s", err, out)
 		}

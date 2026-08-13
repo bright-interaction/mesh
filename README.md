@@ -227,11 +227,23 @@ Mesh speaks MCP (JSON-RPC) over stdio. Point your agent at:
 
 The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note or one heading by anchor), `mesh_god_nodes` (the hub map to orient), `mesh_changed_since` (deltas on resume), and the write-back tools `mesh_append_note` / `mesh_write_entity`. The retrieval contract (how to query cheaply, and to write back when done) is served as the MCP `initialize` instructions and the `mesh://contract` resource, so any agent uses it well without extra prompting.
 
+That is the whole setup. The server elects itself the vault's **owning writer**
+when nothing else holds the vault (a claim in `<vault>/.mesh/owner.lock`), so a
+note it writes back is queryable immediately and no separate daemon is needed.
+Start a `mesh watch` or `mesh sync --watch` beside it and that one takes
+ownership instead; the MCP server notices, reads the index rather than writing
+it, and routes its write-backs through the owner. Exactly one process indexes
+either way, which is the point.
+
 The `--watch` flag runs the live reindexer inside the server, so notes you (or a
 teammate) edit in your editor become searchable in the same session without a
 restart. Watch progress goes to stderr; stdout stays the pure JSON-RPC stream.
-Omit it for the classic behavior where the index only refreshes on the agent's
-own write-backs.
+Omit it and the index only refreshes on the agent's own write-backs. On a vault
+somebody else owns, `--watch` re-reads what that owner indexed rather than
+indexing itself.
+
+Not sure anything is indexing? `mesh doctor <vault>` names the owner, or fails
+with `status: NO OWNER` when there is none.
 
 ## Team sync
 

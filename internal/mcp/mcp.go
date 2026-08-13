@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,13 @@ type Server struct {
 	// in its view. Guarded by reloadMu; nil until the first refresh.
 	viewHashes map[string]string
 
+	// owner is the vault's owning-writer claim when THIS process elected itself (see
+	// NewOwningServer). nil on a read-only server and on the hub, which owns an index
+	// nobody else can reach. A declared owner (`mesh watch`, `mesh sync --watch`,
+	// `mesh ui --own-index`) can take the claim back mid-session, so every write path
+	// asks owns() rather than assuming the store's writability is the whole answer.
+	owner *index.OwnerLock
+
 	reindexMu      sync.Mutex // guards the mesh_reindex throttle state below
 	lastReindexAt  time.Time
 	lastReindex    index.Reconciliation
@@ -72,10 +80,14 @@ type Server struct {
 }
 
 // NewServer opens the vault's index (at <vaultRoot>/.mesh) READ-ONLY and loads it into
-// memory. This is the per-window server a coding agent spawns, and there can be many of
-// them at once against one vault, so none of them may hold the SQLite write lock: only
-// the single owning writer (`mesh watch` / `mesh sync --watch`) indexes. Write-back still
-// works, because creating a note is a filesystem write the owner picks up; see toolWrite.
+// memory. This is the per-window server for a vault that already has an owning writer:
+// there can be many of these at once against one vault, so none of them may hold the
+// SQLite write lock. Write-back still works, because creating a note is a filesystem
+// write the owner picks up; see toolWrite.
+//
+// Most callers want NewOwningServer, which uses this whenever the vault is already
+// owned and otherwise elects itself. Use NewServer directly only where something else
+// is guaranteed to be the writer.
 //
 // NewServerAt (the hub) deliberately does NOT go through here: the hub owns the index it
 // serves, so it keeps a writable store.
@@ -84,7 +96,43 @@ func NewServer(vaultRoot string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newServerWithStore(vaultRoot, store)
+	return newServerWithStore(vaultRoot, store, nil)
+}
+
+// NewOwningServer elects this process the vault's OWNING WRITER when no other live
+// writer holds it, and falls back to the read-only server (NewServer) when one does.
+// role names this surface in the lock, for the error a losing peer prints.
+//
+// This exists because the shipped agent config is `mesh mcp --vault <path>` and nothing
+// else. A read-only MCP server cannot index, so on a vault with no separate `mesh watch`
+// running (which is every new user) mesh_append_note blocked the full owner bound,
+// returned index_stale + owner_down, and left the note unqueryable, while a note edited
+// in the user's editor never became searchable at all. Electing here makes the shipped
+// configuration self-sufficient without reintroducing multi-writer contention: the lock
+// is what keeps it to one.
+//
+// The claim is preemptible. A declared owner started later (`mesh watch`,
+// `mesh sync --watch`, `mesh ui --own-index`) takes it, and this server drops back to
+// reader behaviour on its own; see owns.
+func NewOwningServer(vaultRoot, role string) (*Server, error) {
+	lock, err := index.AcquireOwnerLock(filepath.Join(vaultRoot, ".mesh"), role, true)
+	if err != nil {
+		if errors.Is(err, index.ErrOwnerHeld) {
+			return NewServer(vaultRoot) // someone else owns it: read beside them, as before
+		}
+		return nil, err
+	}
+	store, err := index.Open(vaultRoot)
+	if err != nil {
+		_ = lock.Release()
+		return nil, err
+	}
+	s, err := newServerWithStore(vaultRoot, store, lock)
+	if err != nil {
+		_ = lock.Release()
+		return nil, err
+	}
+	return s, nil
 }
 
 // NewServerAt is like NewServer but keeps the index in an explicit dir instead of
@@ -95,11 +143,11 @@ func NewServerAt(vaultRoot, indexDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newServerWithStore(vaultRoot, store)
+	return newServerWithStore(vaultRoot, store, nil)
 }
 
-func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
-	s := &Server{vaultRoot: vaultRoot, store: store, cache: index.NewNoteCache(), ready: make(chan struct{}), bg: make(chan struct{}), ownerIndexTimeout: ownerIndexTimeout}
+func newServerWithStore(vaultRoot string, store *index.Store, owner *index.OwnerLock) (*Server, error) {
+	s := &Server{vaultRoot: vaultRoot, store: store, owner: owner, cache: index.NewNoteCache(), ready: make(chan struct{}), bg: make(chan struct{}), ownerIndexTimeout: ownerIndexTimeout}
 	// The initial load runs in the background so the MCP handshake answers
 	// immediately: a full reload of a grown vault plus the note<->code bridge
 	// exceeds a client's connect timeout (Claude Code kills the server at 30s
@@ -120,7 +168,7 @@ func newServerWithStore(vaultRoot string, store *index.Store) (*Server, error) {
 			return
 		}
 		close(s.ready)
-		if store.ReadOnly() {
+		if !s.owns() {
 			// Both enrichment passes below are writes. They belong to the owning writer
 			// now, not to every window that connects; doing them here would just be N
 			// servers taking the write lock at startup, which is the contention this
@@ -178,8 +226,35 @@ func (s *Server) FlywheelStats() (index.FlywheelStats, error) { return s.store.F
 
 func (s *Server) Close() error {
 	<-s.bg // never close the store under the initial background load/enrichment
-	return s.store.Close()
+	err := s.store.Close()
+	// Give the vault up AFTER the store is closed, so the next owner never starts
+	// indexing while this process still has a writable connection open.
+	if rerr := s.owner.Release(); err == nil {
+		err = rerr
+	}
+	return err
 }
+
+// owns reports whether this process is the vault's owning writer RIGHT NOW: the store is
+// writable and, when this server elected itself, it still holds the claim.
+//
+// Every write path branches on this rather than on store.ReadOnly(), because an elected
+// claim is preemptible: a declared owner started later takes the lock, and from that
+// moment this server must behave exactly like the read-only one (publish the file, wait
+// for the owner, re-read) or two processes reindex the same vault.
+func (s *Server) owns() bool {
+	if s.store.ReadOnly() {
+		return false
+	}
+	if s.owner != nil {
+		return s.owner.Held()
+	}
+	return true
+}
+
+// OwnsIndex reports whether this server is the vault's owning writer, so the command
+// that started it can tell the operator which of the two it got.
+func (s *Server) OwnsIndex() bool { return s.owns() }
 
 // snapshot returns the current graph + retriever under a read lock, so a
 // concurrent rebuild swapping them in never tears a reader's view.
@@ -202,7 +277,7 @@ func (s *Server) swap(g *graph.Graph) {
 // store re-indexes (and seeds the parsed-note cache so later reconciles are incremental),
 // a read-only one reads the owning writer's persisted result. Startup calls this.
 func (s *Server) load() error {
-	if s.store.ReadOnly() {
+	if !s.owns() {
 		_, err := s.refresh() // the startup load has no previous view to report a delta against
 		return err
 	}
@@ -339,7 +414,7 @@ func (s *Server) awaitOwnerCaughtUp(ctx context.Context) (index.Reconciliation, 
 // is allowed to take: the owner of its index reindexes directly, a read-only server
 // waits for the owning writer to do it.
 func (s *Server) publishWriteBack(ctx context.Context, noteID string) error {
-	if s.store.ReadOnly() {
+	if !s.owns() {
 		return s.awaitOwnerIndexed(ctx, noteID)
 	}
 	_, err := s.reconcileOnce(true)
@@ -374,7 +449,7 @@ func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error)
 	// The counts describe this server's VIEW rather than the vault: a snapshot swap
 	// classifies nothing on disk, but it can say exactly which notes it gained, lost or
 	// saw change, which is what the watcher's log line and mesh_reindex both want.
-	if s.store.ReadOnly() {
+	if !s.owns() {
 		start := time.Now()
 		rec, err := s.refresh()
 		if err != nil {
@@ -408,7 +483,7 @@ const reindexThrottle = 5 * time.Second
 // watcher calls (that is reconcileOnce): a watcher tick must never sit waiting on the
 // owner, it just picks up whatever has landed.
 func (s *Server) reindexPass(ctx context.Context) (index.Reconciliation, error) {
-	if s.store.ReadOnly() {
+	if !s.owns() {
 		return s.awaitOwnerCaughtUp(ctx)
 	}
 	return s.reconcileOnce(true)
