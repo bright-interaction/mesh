@@ -95,12 +95,14 @@ func TestDoctorReportsUnparseableNotes(t *testing.T) {
 		{
 			// A fresh index over perfect notes with nothing keeping it fresh: every
 			// count above is right and every note written from here on is invisible to
-			// search. Doctor called that "healthy" and exited 0.
-			name:       "a clean vault nothing owns is a failure, not healthy",
+			// search. Doctor called that "healthy" and exited 0, then over-corrected and
+			// called it a failure. It is neither: the verdict names the gap, the exit
+			// code stays 0, and the escalation lives in TestDoctorFailsOnDriftWithNoOwner.
+			name:       "a clean vault nothing owns is a notice, not healthy and not a failure",
 			notes:      map[string]string{"good.md": goodNote},
 			noOwner:    true,
-			wantErr:    true,
-			wantOut:    "status: NO OWNER",
+			wantErr:    false,
+			wantOut:    "NOTICE: no owning writer",
 			notWantOut: "status: healthy",
 		},
 	}

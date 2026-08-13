@@ -395,7 +395,7 @@ var computedHealthIssue = map[string]bool{"dead_ref": true, "overdue": true, "co
 // server is allowed to take.
 //
 // A writable store runs the pass and PERSISTS it, which is what feeds the web dashboard
-// and the curator. A read-only store (every `mesh mcp` window) computes exactly the same
+// and the curator. A read-only store (a `mesh mcp` window beside another owner) computes exactly the same
 // findings in memory and writes nothing: the analysis is a read over the vault plus this
 // index, and only recording it is the owning writer's privilege. Serving the persisted
 // rows instead would answer with whatever the owner last wrote, which on a vault whose

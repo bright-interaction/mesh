@@ -341,6 +341,20 @@ func doctorCmd() *cobra.Command {
 			lintProblems += len(issues) + len(ferrs)
 			fmt.Printf("lint:   %d problems (run mesh lint for detail)\n", lintProblems)
 
+			// A missing owner on an in-sync vault is a NOTICE, not a failure. `mesh init`
+			// leaves exactly that state (fresh index, nothing running yet) and the README
+			// puts `mesh doctor` in CI and calls its exit code the contract, so failing
+			// here made the documented CI recipe impossible to pass on a healthy vault:
+			// `mesh init CIvault && mesh doctor CIvault` printed +0 +0 -0, 0 lint problems
+			// and then exited 1. It becomes a real failure only in the compound branch
+			// below, where the index has ALREADY drifted and nothing is running to fix it.
+			// The owner line and its remedy are still printed either way; only the verdict
+			// and the exit code changed.
+			ownerNotice := ""
+			if !hasOwner {
+				ownerNotice = " - NOTICE: no owning writer, so nothing will keep it fresh (see owner: NONE above)"
+			}
+
 			switch {
 			case len(ferrs) > 0:
 				for _, fe := range ferrs {
@@ -358,18 +372,20 @@ func doctorCmd() *cobra.Command {
 				fmt.Printf("status: BROKEN - %d note(s) invisible to search (another note already claims their id)\n"+
 					"  fix: give one of each pair a different id, then run mesh index %s\n", len(dupes), shellpath.Quote(root))
 				return fmt.Errorf("%d note(s) share an id with another note", len(dupes))
+			case drift.Any() && !hasOwner:
+				// Stale AND unowned is the compound failure: the index is already behind
+				// the vault and there is no process running that will ever catch it up.
+				// Named apart from plain STALE because the fix is two commands, not one.
+				fmt.Println("status: STALE - the index is behind the vault and no owning writer is running to catch it up")
+				fmt.Printf("  fix: mesh index %s, then start an owner (see the owner line above)\n", root)
+				return fmt.Errorf("index stale, and no owning writer")
 			case drift.Any():
 				fmt.Println("status: STALE - run mesh index")
 				return fmt.Errorf("index stale")
-			case !hasOwner:
-				// Ranked below the two above because they are already broken NOW, while
-				// this one guarantees the next edit breaks. It is still a failure: a vault
-				// nothing indexes is a vault whose knowledge stops accumulating, and the
-				// only prior symptom was an owner_down flag ten seconds into a write-back.
-				fmt.Println("status: NO OWNER - the index is fresh but nothing is keeping it that way")
-				return fmt.Errorf("no owning writer")
 			case lintProblems > 0:
-				fmt.Println("status: OK (index fresh; lint problems exist)")
+				fmt.Printf("status: OK (index fresh; lint problems exist)%s\n", ownerNotice)
+			case ownerNotice != "":
+				fmt.Printf("status: OK (index fresh)%s\n", ownerNotice)
 			default:
 				fmt.Println("status: healthy")
 			}
@@ -857,11 +873,15 @@ func statusCmd() *cobra.Command {
 			} else {
 				fmt.Println("  weights      built-in defaults (run: mesh tune <cases.json> to fit your corpus)")
 			}
-			// Reported last so the stats above are all printed first, and as a non-zero
-			// exit so a script that checks `mesh status` sees the one condition under
-			// which every number above quietly stops moving.
+			// Reported last so the stats above are all printed first, and as a NOTICE
+			// rather than a non-zero exit. `mesh status` reports what the index holds; it
+			// never computes drift, so the one honest thing it can say about a missing
+			// owner is that nothing will keep these numbers moving. Failing on it made a
+			// freshly initialised vault (`mesh init` leaves no owner running) report a
+			// perfectly correct index and then exit 1, the same over-reach `mesh doctor`
+			// had. The owner line and its remedy are still printed by reportOwner above.
 			if !hasOwner {
-				return fmt.Errorf("no owning writer")
+				fmt.Println("notice: no owning writer, so every count above stops moving from here (not a failure; see owner: NONE above)")
 			}
 			return nil
 		},
@@ -1714,7 +1734,12 @@ func claimIndexOwnership(vaultDir, role string) (*index.OwnerLock, error) {
 // reportOwner prints the vault's owning writer and reports whether one is missing, for
 // the two commands whose job is to tell an operator whether this vault is working. A
 // vault with no owner indexes nothing: notes written or edited go missing from search
-// with no other signal, which is why this is a failure and not a note in passing.
+// with no other signal, so it is always PRINTED, with the remedy.
+//
+// Whether it also FAILS is the caller's decision, and on its own neither caller does:
+// a fresh `mesh init` vault has no owner running yet and is not broken, and the README
+// puts `mesh doctor` in CI. Only `mesh doctor` escalates, and only when the index has
+// also drifted, which is the case a missing owner guarantees nobody will clear.
 func reportOwner(w io.Writer, vaultDir string) bool {
 	info, live := index.OwnerStatus(filepath.Join(vaultDir, ".mesh"))
 	if live {

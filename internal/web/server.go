@@ -584,11 +584,7 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 	}
 	exp := BuildExport(s.graph, vaultRoot, nil, nil)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))
-	if ownIndex {
-		fmt.Printf("index: OWNED by this process (it reindexes and writes)\n")
-	} else {
-		fmt.Printf("index: read-only; the owning writer (mesh watch / mesh sync --watch) indexes\n")
-	}
+	fmt.Print(indexOwnershipLine(vaultRoot, ownIndex))
 	if memberMode {
 		fmt.Printf("auth: per-member (hub client token; views scoped per member)\n")
 	} else if auth.authRequired() {
@@ -610,4 +606,25 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 		MaxHeaderBytes:    1 << 16,
 	}
 	return srv.ListenAndServe()
+}
+
+// indexOwnershipLine is the `mesh ui` startup line about who indexes this vault.
+//
+// It consults the lock on disk instead of inferring from --own-index. Without that flag
+// this line used to print "the owning writer (mesh watch / mesh sync --watch) indexes"
+// unconditionally, so a vault with no owner.lock at all was told an owner was indexing
+// it, on the same machine where `mesh doctor` printed "owner: NONE". A startup banner
+// that asserts a healthy setup is worse than no banner: it is the line an operator reads
+// INSTEAD of checking, and it sent them looking for a broken watcher that did not exist.
+//
+// Extracted from Serve so the claim is testable without binding a port.
+func indexOwnershipLine(vaultRoot string, ownIndex bool) string {
+	if ownIndex {
+		return "index: OWNED by this process (it reindexes and writes)\n"
+	}
+	if info, live := index.OwnerStatus(filepath.Join(vaultRoot, ".mesh")); live {
+		return fmt.Sprintf("index: read-only; %s owns this vault and indexes it\n", info.Describe())
+	}
+	return fmt.Sprintf("index: read-only, and NOTHING is indexing this vault\n  %s\n",
+		index.NoOwnerRemedy(vaultRoot))
 }

@@ -114,9 +114,10 @@ func TestDuplicateNoteIDIsReportedByEveryOperatorCommand(t *testing.T) {
 		if out, err := runCLI(t, indexCmd(), dir); err != nil {
 			t.Fatalf("mesh index still fails after the remedy: %v\n%s", err, out)
 		}
-		// Play the owning writer, the way `mesh watch` or an elected `mesh mcp` does.
-		// Without it doctor reports NO OWNER, which is a real failure of this temp vault
-		// and not the duplicate-id verdict this case is about.
+		// Play the owning writer, the way `mesh watch` or an elected `mesh mcp` does, so
+		// the verdict under test is the duplicate-id one and nothing else. A vault with
+		// no owner no longer fails doctor on its own, but it does change the printed
+		// verdict line, and this case is about that line clearing completely.
 		lock, err := index.AcquireOwnerLock(filepath.Join(dir, ".mesh"), "test owner", false)
 		if err != nil {
 			t.Fatalf("acquire owner lock: %v", err)

@@ -202,8 +202,8 @@ type codeRefresh struct {
 // refresh. enabled=false (no error) when code indexing is not enabled. Env
 // MESH_CODE_ROOTS / MESH_CODE_INDEX override the config file.
 //
-// Indexing code is a WRITE, so a read-only server (every `mesh mcp` window) does not do
-// it: like the note index, the code index has one owner. It reports the size of the index
+// Indexing code is a WRITE, so a read-only server (a `mesh mcp` window that lost the
+// owner election) does not do it: like the note index, the code index has one owner. It reports the size of the index
 // it is serving instead, and names what does refresh it. Silently returning nothing would
 // leave an agent believing one mesh_reindex covered code too, which is the same class of
 // quiet lie as a write-back that reports success without being queryable.

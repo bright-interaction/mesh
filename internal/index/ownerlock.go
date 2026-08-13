@@ -178,9 +178,13 @@ func AcquireOwnerLock(meshDir, role string, preemptible bool) (*OwnerLock, error
 }
 
 // OwnerStatus reports who owns the vault's index, and whether that claim is live. It is
-// what `mesh doctor`, `mesh status` and mesh_health call: "no owning writer" is a
-// FAILURE of the vault's setup (nothing will index the notes you write), and it used to
-// be completely invisible.
+// what `mesh doctor`, `mesh status`, `mesh ui` and mesh_health call: a vault nothing
+// indexes used to be completely invisible, and every one of those surfaces now says so.
+//
+// Saying so is not the same as failing. `mesh init` leaves a perfectly good vault with
+// no owner running, so a missing owner alone is a NOTICE; `mesh doctor` escalates it to
+// a non-zero exit only alongside index drift, which is the case where the absence has
+// already cost something and nothing running will put it right.
 func OwnerStatus(meshDir string) (OwnerInfo, bool) {
 	return readOwner(filepath.Join(meshDir, OwnerLockName))
 }

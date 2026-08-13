@@ -101,6 +101,13 @@ notes claim the same id. The last two matter most: such a note is invisible to s
 to the graph, so doctor names the offending files and reports `status: BROKEN` instead of
 a healthy looking summary.
 
+A missing **owning writer** is the one thing doctor reports without failing on. It always
+prints the owner line (`owner: NONE` plus how to start one), but on a fresh, in-sync vault
+that is a NOTICE and the exit code stays 0, because `mesh init` leaves exactly that state
+and CI checkouts legitimately have nothing running. It is only a failure in combination:
+an index that has already drifted with nothing running to catch it up exits non-zero as
+`status: STALE`. `mesh status` never fails on a missing owner at all; it reports counts.
+
 A note id is vault-wide, not per folder. Two files that resolve to the same id (two
 `README.md` with no frontmatter `id:`, or a note copied as a template that kept its
 `id:` line) cannot both be indexed, so Mesh keeps one, quarantines the other, and says
@@ -150,9 +157,14 @@ anything:
   retry, or stop the daemon. A full reindex only holds it for a few seconds.
 - `no index at <path>` means there is no database yet. Run `mesh index <vault>`.
 - `index schema mismatch` means the database was written by a different version of Mesh.
-  The index is derived, so Mesh rebuilds rather than migrating, and only `mesh index` can
-  do that: the everyday surfaces (`mesh mcp`, `mesh doctor`, `mesh ui`, the TUI) open the
-  index read-only and cannot write it. Run `mesh index <vault>` once after upgrading.
+  The index is derived, so Mesh rebuilds rather than migrating, and only a WRITABLE open
+  can do that. `mesh doctor`, `mesh ui` (without `--own-index`) and the TUI open the index
+  read-only, so they report the mismatch and stop rather than answering from a schema they
+  do not match. `mesh mcp` is **not** in that list: it elects itself the vault's owning
+  writer when nothing else holds the lock and opens the index writable, so starting it
+  against an index stamped with an older schema version rebuilds that index in place.
+  Nothing is lost (the index is derived from your notes), but do not expect `mesh mcp` to
+  leave an out-of-date index alone. Run `mesh index <vault>` once after upgrading.
 
 Embeddings are the one thing a rebuild costs you: they are kept across schema upgrades
 precisely because re-creating them is a paid API call, but they cannot survive a file
@@ -242,8 +254,9 @@ Omit it and the index only refreshes on the agent's own write-backs. On a vault
 somebody else owns, `--watch` re-reads what that owner indexed rather than
 indexing itself.
 
-Not sure anything is indexing? `mesh doctor <vault>` names the owner, or fails
-with `status: NO OWNER` when there is none.
+Not sure anything is indexing? `mesh doctor <vault>` names the owner, or prints
+`owner: NONE` with the fix when there is none. That on its own is a notice, not a
+failing exit; doctor fails when the index has drifted with no owner to catch it up.
 
 ## Team sync
 
@@ -278,13 +291,15 @@ note in the vault in place with no backup, so writing is now opt-in via `--apply
 the one most likely to catch you: a script that calls either of them bare no longer
 rewrites anything, and it exits 0, so it looks like it worked. Add `--apply`.
 
-**Read-only surfaces refuse an index written by an older Mesh.** `mesh mcp`, `mesh doctor`,
-`mesh ui` and the TUI all open the index read-only, and only a writable open can rebuild a
-changed schema, so nothing ever migrated an upgraded index. They now say so and name the
-fix (`mesh index <vault>`) instead of answering from a schema they do not match. That
-matters most for `mesh_health` and `mesh doctor`, which reported a CLEAN vault over an
+**Read-only surfaces refuse an index written by an older Mesh.** `mesh doctor`, `mesh ui`
+(without `--own-index`) and the TUI open the index read-only, and only a writable open can
+rebuild a changed schema, so nothing ever migrated an upgraded index. They now say so and
+name the fix (`mesh index <vault>`) instead of answering from a schema they do not match.
+That matters most for `mesh_health` and `mesh doctor`, which reported a CLEAN vault over an
 index whose quarantine table their binary expected and the file did not have. Run
-`mesh index <vault>` once after upgrading; your notes are untouched.
+`mesh index <vault>` once after upgrading; your notes are untouched. `mesh mcp` is the
+exception: it now elects itself the owning writer, opens the index writable, and therefore
+rebuilds a schema-mismatched index rather than refusing it.
 
 **`mesh doctor` exits 1 when a note does not parse.** It used to report `status: healthy`
 while holding zero indexed notes, because it counted only what had made it into the index

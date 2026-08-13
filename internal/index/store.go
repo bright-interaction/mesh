@@ -350,9 +350,12 @@ func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 	}
 	// Then check the SHAPE, not just that the file opens. Only the writable Open compares
 	// schema_version (in ensureSchema) and rebuilds on a mismatch, and the shipped setup
-	// has no writable process: every `mesh mcp` window, `mesh doctor`, `mesh ui` and the
-	// TUI are read-only. So an upgraded user's index was never migrated and every read-only
-	// surface queried a schema its binary does not match. That did not fail loudly, it
+	// had no writable process at all: `mesh mcp`, `mesh doctor`, `mesh ui` and the TUI
+	// were all read-only. (`mesh mcp` now elects itself the owning writer and opens
+	// writable, so it is the one surface that DOES rebuild a mismatched index; the three
+	// below still land here.) So an upgraded user's index was never migrated and every
+	// read-only surface queried a schema its binary does not match. That did not fail
+	// loudly, it
 	// failed quietly: a v5 index has no dropped_notes table, and mesh_health swallowed the
 	// "no such table" and reported a CLEAN vault while quarantined notes stayed invisible.
 	// An index one version older still has no note_health, and mesh_health answered a bare

@@ -12,7 +12,8 @@ import (
 
 // Waiting for the single owning writer.
 //
-// Every read-only surface (the per-window `mesh mcp`, the web viewer) publishes a
+// Every read-only surface (a `mesh mcp` window that did not win the owner election, the
+// web viewer) publishes a
 // change the same way: put the durable artifact on disk, then wait for the owner to
 // absorb it, then re-read. These are the mechanics of that wait, here rather than in
 // one surface, because the two surfaces answer the same question and a fix that lands

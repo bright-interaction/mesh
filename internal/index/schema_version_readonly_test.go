@@ -79,9 +79,11 @@ func ageIndex(t *testing.T, vaultRoot string, version int, dropTables ...string)
 
 // TestReadOnlyOpenRefusesAnIndexFromAnOlderMesh is the read-only twin of the version
 // comparison ensureSchema makes. Only the WRITABLE Open ever compared schema_version, and
-// the shipped setup has no writable process: `mesh mcp`, `mesh doctor`, `mesh ui` and the
-// TUI all open read-only. So an upgraded user's index was never migrated and every one of
-// those surfaces queried a schema its binary does not match.
+// the shipped setup had no writable process: `mesh mcp`, `mesh doctor`, `mesh ui` and the
+// TUI all opened read-only. So an upgraded user's index was never migrated and every one
+// of those surfaces queried a schema its binary does not match. (`mesh mcp` has since been
+// given the owning-writer election, so it opens writable and rebuilds instead of landing
+// here; the other three still do.)
 //
 // It was not a hypothetical. dropped_notes landed in schema.sql on 2026-08-09 with no
 // version bump, so a v5 index has no such table, and mesh_health answered

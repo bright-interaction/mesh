@@ -62,8 +62,10 @@ That config is self-sufficient: the MCP server claims this vault's **owning writ
 role when nothing else holds it, so what it writes back is searchable at once and what
 you edit in your editor is picked up live. If you also run `mesh watch` or
 `mesh sync --watch`, that one owns the index instead and the MCP server reads it.
-Either way exactly one process indexes. `mesh doctor <vault>` says which, and fails
-with `status: NO OWNER` when nothing is indexing at all.
+Either way exactly one process indexes. `mesh doctor <vault>` says which, and prints
+`owner: NONE` with the fix when nothing is indexing at all. On an otherwise in-sync
+vault that is a notice and doctor still exits 0; it fails when the index has already
+drifted and there is no owner to catch it up.
 
 ## This app
 
