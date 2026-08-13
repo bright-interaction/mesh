@@ -54,13 +54,21 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 			}
 		}
 
-		// INSERT OR REPLACE (not a plain INSERT) so a duplicate effectiveID does not
-		// abort the whole reindex. Two files that share a basename and carry no
-		// frontmatter id resolve to the same effectiveID; a plain INSERT hit the
-		// notes.id PRIMARY KEY and rolled back the entire transaction, taking the whole
-		// index offline. This converges the full path with IndexVaultIncremental (which
-		// already uses OR REPLACE) and BuildGraph (which collapses the node): last-wins,
-		// while BuildGraph still raises a duplicate-id Issue surfaced by index/doctor/lint.
+		// INSERT OR REPLACE (not a plain INSERT) so a duplicate effectiveID cannot abort
+		// the whole reindex and take the index offline with an opaque PRIMARY KEY error.
+		//
+		// It is a backstop, NOT the duplicate policy. The comment here used to claim that
+		// last-wins "converges the full path with IndexVaultIncremental and BuildGraph",
+		// and that claim was simply false: OR REPLACE gives notes.path to the LAST file
+		// walked while BuildGraph's AddNode gives nodes.note_path to the FIRST, so one
+		// search card carried one file's path and the other file's snippet, and the loser,
+		// having no notes row at all, was reported as Added by every DriftReport forever.
+		// Believing the comment is why the collision survived the 2026-08-07 sweep.
+		//
+		// Callers must hand IndexVault a de-duplicated set: ReindexFull and `mesh index`
+		// run ClaimUniqueIDs first, which picks one owner per id (the incumbent, else walk
+		// order, the same rule DriftDeltaReport uses) and reports the rest through
+		// RecordDropped. BuildGraph still raises its duplicate-id Issue for lint.
 		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err

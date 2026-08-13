@@ -150,11 +150,27 @@ func initCmd() *cobra.Command {
 			}
 			abs, _ := filepath.Abs(root)
 			fmt.Printf("initialized Mesh vault at %s (%d notes, %d nodes, %d edges)\n", root, g.CountByKind()["note"], g.NodeCount(), g.EdgeCount())
+			// Name what the pass could not index, and fail. Two files with the same
+			// effective id (two README.md with no frontmatter id is the everyday case)
+			// leave one note out of the vault entirely, and init used to print "1 notes"
+			// for 2 files and exit 0, so the first thing a new user ever saw was a
+			// quietly incomplete vault.
+			dropped := store.DroppedNotes()
+			if len(dropped) > 0 {
+				fmt.Fprintf(os.Stderr, "\n%d note(s) are NOT in the index and are invisible to search and the graph:\n", len(dropped))
+				for _, d := range dropped {
+					fmt.Fprintf(os.Stderr, "  %s: %v\n", d.Path, d.Err)
+				}
+				fmt.Fprintf(os.Stderr, "fix them, then run: mesh index %s\n\n", root)
+			}
 			fmt.Println("next:")
 			fmt.Println("  mesh new decision \"<title>\" --vault " + root + "   # capture a decision/gotcha")
 			fmt.Println("  mesh index " + root + "                          # rebuild after edits")
 			fmt.Println("  point your coding agent at the MCP server:")
 			fmt.Printf("    {\"command\": \"mesh\", \"args\": [\"mcp\", \"--vault\", \"%s\"]}\n", abs)
+			if len(dropped) > 0 {
+				return fmt.Errorf("%d note(s) could not be indexed", len(dropped))
+			}
 			return nil
 		},
 	}
@@ -271,6 +287,23 @@ func doctorCmd() *cobra.Command {
 			// exited 1. An unparseable note is invisible to search and the graph, which is
 			// the most severe thing doctor can find, not something it may drop.
 			parsed, ferrs := index.ParseFiles(files, 0)
+			for _, pn := range parsed {
+				if rel, rerr := filepath.Rel(root, pn.Path); rerr == nil {
+					pn.Path = rel
+				}
+			}
+			// Which notes an index pass would have to QUARANTINE, resolved exactly as the
+			// indexer resolves it (incumbent first, then walk order). Without this, a
+			// duplicate id was diagnosed only as endless drift: the quarantined file has
+			// no notes row, so it read as "+1 new" on every run and doctor printed STALE
+			// and exited 1 forever, pointing at `mesh index`, which produced a
+			// byte-identical index every time. The advice after that was `mesh migrate`,
+			// whose --apply stamps the SAME id into both files and cements the collision.
+			incumbent, ierr := store.IDOwners()
+			if ierr != nil {
+				incumbent = nil
+			}
+			_, dupes := index.ClaimUniqueIDs(parsed, incumbent)
 			_, issues := index.BuildGraph(parsed)
 			lintProblems := 0
 			for _, pn := range parsed {
@@ -290,6 +323,16 @@ func doctorCmd() *cobra.Command {
 				}
 				fmt.Printf("status: BROKEN - %d note(s) invisible to search (they do not parse)\n  fix: mesh lint %s\n", len(ferrs), root)
 				return fmt.Errorf("%d note(s) invisible to search", len(ferrs))
+			case len(dupes) > 0:
+				// BEFORE the drift branch on purpose. A duplicate id manufactures drift
+				// that no reindex can clear, so STALE was always the verdict printed and
+				// the real cause never was.
+				for _, d := range dupes {
+					fmt.Printf("  %s: %v\n", d.Path, d.Err)
+				}
+				fmt.Printf("status: BROKEN - %d note(s) invisible to search (another note already claims their id)\n"+
+					"  fix: give one of each pair a different id, then run mesh index %s\n", len(dupes), root)
+				return fmt.Errorf("%d note(s) share an id with another note", len(dupes))
 			case drift.Any():
 				fmt.Println("status: STALE - run mesh index")
 				return fmt.Errorf("index stale")
@@ -841,7 +884,7 @@ func healthCmd() *cobra.Command {
 			if werr != nil {
 				return werr
 			}
-			_, ferrs := index.ParseFiles(files, 0)
+			parsed, ferrs := index.ParseFiles(files, 0)
 			if len(ferrs) > 0 {
 				fmt.Printf("health: BROKEN - %d note(s) do not parse, so they are invisible to search, "+
 					"to the graph, and to every lifecycle check below\n  fix: mesh lint %s\n\n", len(ferrs), root)
@@ -854,20 +897,45 @@ func healthCmd() *cobra.Command {
 				}
 				fmt.Println()
 			}
+			// The same blind spot, one step further along: a note that parses fine but
+			// whose id another note already holds IS quarantined by every index pass, so
+			// it is just as absent from the rows every check below reads. health printed
+			// "vault healthy" over it, and mesh_health returned nothing, because
+			// dropped_notes was only ever written by the incremental path.
+			for _, pn := range parsed {
+				if rel, rerr := filepath.Rel(root, pn.Path); rerr == nil {
+					pn.Path = rel
+				}
+			}
+			incumbent, ierr := store.IDOwners()
+			if ierr != nil {
+				incumbent = nil
+			}
+			_, dupes := index.ClaimUniqueIDs(parsed, incumbent)
+			if len(dupes) > 0 {
+				fmt.Printf("health: BROKEN - %d note(s) share an id with another note, so they are quarantined: "+
+					"invisible to search, to the graph, and to every lifecycle check below\n"+
+					"  fix: give one of each pair a different id, then run mesh index %s\n\n", len(dupes), root)
+				for _, d := range dupes {
+					fmt.Printf("  [duplicate-id] %s - %v\n", d.Path, d.Err)
+				}
+				fmt.Println()
+			}
+			invisible := len(ferrs) + len(dupes)
 			if len(findings) == 0 {
-				if len(ferrs) == 0 {
+				if invisible == 0 {
 					fmt.Println("vault healthy: no dead refs, overdue reviews, or contradictions")
 					return nil
 				}
-				return fmt.Errorf("%d note(s) invisible to search", len(ferrs))
+				return fmt.Errorf("%d note(s) invisible to search", invisible)
 			}
 			fmt.Printf("health: %d dead refs, %d overdue, %d contradictions\n\n",
 				counts["dead_ref"], counts["overdue"], counts["contradiction"])
 			for _, f := range findings {
 				fmt.Printf("  [%s] %s - %s\n", f.Issue, f.Path, f.Detail)
 			}
-			if len(ferrs) > 0 {
-				return fmt.Errorf("%d note(s) invisible to search", len(ferrs))
+			if invisible > 0 {
+				return fmt.Errorf("%d note(s) invisible to search", invisible)
 			}
 			return nil
 		},
@@ -1016,31 +1084,58 @@ func indexCmd() *cobra.Command {
 			for _, fe := range ferrs {
 				fmt.Fprintf(os.Stderr, "parse %s: %v\n", fe.Path, fe.Err)
 			}
+			// The store is opened BEFORE the graph is built, because which of two files
+			// sharing an id gets indexed is resolved against the ids already in the index
+			// (see index.ClaimUniqueIDs), and building the graph from a set that still
+			// holds both files is exactly how the full path and the incremental path came
+			// to disagree about which note an id meant. --dry-run still opens nothing.
+			var store *index.Store
+			var incumbent map[string]string
+			if !dryRun {
+				// OpenRebuild, not Open: this command IS the rebuild, so a database it
+				// cannot read is the thing being replaced, not a dead end. Before this, a
+				// corrupt .mesh/mesh.db failed search, doctor, health AND index with the
+				// same "file is not a database (26)", so the repair command was itself
+				// blocked. It discards the file only for that one error class; see
+				// recoverCorruptIndex.
+				var recovered bool
+				var oerr error
+				store, recovered, oerr = index.OpenRebuild(root)
+				if oerr != nil {
+					return oerr
+				}
+				defer store.Close()
+				if recovered {
+					fmt.Fprintf(os.Stderr, "warning: %s was corrupt and unreadable; removed it and rebuilt from the markdown. "+
+						"Notes are intact. Any stored embeddings went with it, so re-run mesh embed if you use semantic search.\n",
+						filepath.Join(root, ".mesh", "mesh.db"))
+				}
+				if owners, ierr := store.IDOwners(); ierr == nil {
+					incumbent = owners
+				}
+			}
+			notes, dupes := index.ClaimUniqueIDs(notes, incumbent)
+			for _, d := range dupes {
+				fmt.Fprintf(os.Stderr, "quarantined %s: %v\n", d.Path, d.Err)
+			}
 			g, issues := index.BuildGraph(notes)
 			communities := g.DetectCommunities(0)
-			printStats(root, len(files), len(ferrs), parseDur, w, communities, notes, g, issues)
+			printStats(root, len(files), len(ferrs)+len(dupes), parseDur, w, communities, notes, g, issues)
 			if dryRun {
+				if len(dupes) > 0 {
+					return fmt.Errorf("%d note(s) share an id with another note and would not be indexed", len(dupes))
+				}
 				return nil
-			}
-			// OpenRebuild, not Open: this command IS the rebuild, so a database it cannot
-			// read is the thing being replaced, not a dead end. Before this, a corrupt
-			// .mesh/mesh.db failed search, doctor, health AND index with the same
-			// "file is not a database (26)", so the repair command was itself blocked.
-			// It discards the file only for that one error class; see recoverCorruptIndex.
-			store, recovered, err := index.OpenRebuild(root)
-			if err != nil {
-				return err
-			}
-			defer store.Close()
-			if recovered {
-				fmt.Fprintf(os.Stderr, "warning: %s was corrupt and unreadable; removed it and rebuilt from the markdown. "+
-					"Notes are intact. Any stored embeddings went with it, so re-run mesh embed if you use semantic search.\n",
-					filepath.Join(root, ".mesh", "mesh.db"))
 			}
 			n, err := store.IndexVault(notes, g)
 			if err != nil {
 				return err
 			}
+			// Record what this pass left out, so `mesh health`, `mesh doctor` and
+			// mesh_health in every MCP window can see it. Only ReindexFull and the
+			// incremental reconcile did this, so a vault indexed with `mesh index`
+			// reported dropped_notes empty however many notes it had quarantined.
+			store.RecordDropped(root, append(ferrs, dupes...))
 			fmt.Printf("wrote:  %d notes to %s\n", n, store.Path())
 			// Apply whatever the read-only surfaces queued for an owning writer. This is
 			// the command every owner_down message points people at ("start an owner, or
@@ -1051,6 +1146,12 @@ func indexCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "warning: could not apply the queued index ops: %v\n", err)
 			} else if applied > 0 {
 				fmt.Printf("applied: %d queued op(s) from read-only surfaces (review-queue changes, usage counters)\n", applied)
+			}
+			// Non-zero AFTER the index is written, not instead of it: the notes that did
+			// not collide belong in the index. The exit code is what stops a duplicate
+			// from being reported as a clean rebuild by a script or a CI step.
+			if len(dupes) > 0 {
+				return fmt.Errorf("%d note(s) share an id with another note and were left out of the index; give one of each pair a different id, then run mesh index %s again", len(dupes), root)
 			}
 			return nil
 		},

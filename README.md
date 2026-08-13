@@ -95,11 +95,18 @@ reconciles at startup, on every change (debounced), and on a periodic safety
 tick that always converges, so a missed file event never leaves the index stale.
 
 `mesh doctor` is the one to put in CI, so treat its exit code as the contract: **0 only
-when the index is fresh and every note parsed**. It exits non-zero when the index is
-stale, when there is no index yet, and when any note fails to parse. That last one
-matters most: a note that does not parse is invisible to search and to the graph, so
-doctor names the offending files and reports `status: BROKEN` instead of a healthy
-looking summary.
+when the index is fresh and every note is actually in it**. It exits non-zero when the
+index is stale, when there is no index yet, when any note fails to parse, and when two
+notes claim the same id. The last two matter most: such a note is invisible to search and
+to the graph, so doctor names the offending files and reports `status: BROKEN` instead of
+a healthy looking summary.
+
+A note id is vault-wide, not per folder. Two files that resolve to the same id (two
+`README.md` with no frontmatter `id:`, or a note copied as a template that kept its
+`id:` line) cannot both be indexed, so Mesh keeps one, quarantines the other, and says
+which is which: `mesh index`, `mesh init`, `mesh doctor` and `mesh health` all name the
+file and exit non-zero. The fix is to give one of the two a different id, in its
+frontmatter or by renaming the file, then reindex.
 
 Already have a Foam / Obsidian-style vault? Bring it up to the Mesh schema in one idempotent pass:
 
@@ -260,6 +267,13 @@ while holding zero indexed notes, because it counted only what had made it into 
 and an unparseable note never gets there. It now reports `status: BROKEN` and names how
 many notes are invisible to search. If you gate CI on `mesh doctor`, it can now fail.
 
+**`mesh index` and `mesh init` exit 1 when two notes claim one id.** Only one of the two
+can be indexed. Both commands used to pick a winner silently, so `mesh init` printed
+"1 notes" for two files and exited 0, and the loser was missing from search with no
+signal at all. They now name the file they left out and fail, and the winner is stable:
+whichever file already holds the id in the index keeps it, so a rebuild and a live
+`mesh watch` never disagree about which note the id means.
+
 **`mesh index` can delete a corrupt index.** A `.mesh/mesh.db` that SQLite refuses to open
 used to dead-end every command including the one that rebuilds it. `mesh index` now
 removes and rebuilds it, strictly when the failure is a corrupt database and never for any
@@ -299,7 +313,7 @@ Index and retrieve:
 
 | Command | Purpose |
 |---|---|
-| `mesh index [vault]` | Parse + persist the index (`.mesh/mesh.db`) |
+| `mesh index [vault]` | Parse + persist the index (`.mesh/mesh.db`). Non-zero if a note was left out because another note claims its id |
 | `mesh watch [vault]` | Live-reindex on every change (debounced + periodic reconcile) |
 | `mesh embed [vault]` | Embed notes via a BYOAI endpoint (turns on semantic search) |
 | `mesh search "<query>"` | Fused, budget-packed retrieval (semantic + rerank when configured) |
@@ -316,7 +330,7 @@ Inspect and maintain:
 | `mesh version` | The commit this binary was built from, plus the Go version. Include it in a security report (see SECURITY.md) |
 | `mesh lint [vault]` | Frontmatter / links / filenames (non-zero exit for CI) |
 | `mesh doctor [vault]` | Index freshness (drift), counts, health. Non-zero if the index is stale or any note is invisible to search |
-| `mesh health [vault]` | Knowledge lifecycle: dead source refs, overdue reviews, contradictions |
+| `mesh health [vault]` | Knowledge lifecycle: dead source refs, overdue reviews, contradictions, plus notes missing from the index |
 | `mesh structure [vault]` | Grade the vault's organization: types, connectivity, tier-0, maps |
 | `mesh flywheel [vault]` | Write-back reuse metrics: does written-back knowledge get used again? |
 | `mesh guards <list\|suggest>` | Turn gotchas into candidate pre-commit guards (knowledge to enforcement) |

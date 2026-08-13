@@ -4,7 +4,6 @@
 package index
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,7 +48,13 @@ func (s *Store) NoteHashes() (map[string]string, error) {
 }
 
 func (s *Store) DriftReport(root string) (Drift, error) {
-	rows, err := s.readDB.Query(`SELECT path, retrieval_hash FROM notes`)
+	// id comes back alongside the hash so incumbent can be built from the SAME rows: the
+	// drift check has to resolve a duplicate id exactly as the indexer does. Without the
+	// incumbent, drift disagreed with the indexer about which of two colliding files
+	// belongs in the index, and the file the indexer had deliberately quarantined came
+	// back as Added on every single run, so `mesh doctor` said STALE and exited 1 forever
+	// while `mesh index` kept producing a byte-identical index.
+	rows, err := s.readDB.Query(`SELECT path, id, retrieval_hash FROM notes`)
 	if err != nil {
 		return Drift{}, err
 	}
@@ -58,13 +63,15 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
 	defer rows.Close()
 	dbHash := map[string]string{}
+	incumbent := map[string]string{}
 	for rows.Next() {
-		var p, h string
-		if err := rows.Scan(&p, &h); err != nil {
+		var p, id, h string
+		if err := rows.Scan(&p, &id, &h); err != nil {
 			rows.Close()
 			return Drift{}, err
 		}
 		dbHash[p] = h
+		incumbent[id] = p
 	}
 	rows.Close()
 
@@ -74,6 +81,14 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 	}
 	var d Drift
 	seen := map[string]bool{}
+	// Parse first, resolve id ownership, then classify: which file owns an id decides
+	// whether another file is drift at all, and that cannot be known one file at a time.
+	type parsedFile struct {
+		rel string
+		pn  *ParsedNote
+	}
+	parsedFiles := make([]parsedFile, 0, len(files))
+	claims := make([]idClaim, 0, len(files))
 	for _, f := range files {
 		rel, err := filepath.Rel(root, f)
 		if err != nil {
@@ -89,11 +104,26 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 			}
 			continue
 		}
-		h, ok := dbHash[rel]
+		pn.Path = rel
+		parsedFiles = append(parsedFiles, parsedFile{rel: rel, pn: pn})
+		claims = append(claims, idClaim{ID: effectiveID(pn), Path: rel})
+	}
+	owner := resolveIDOwners(claims, incumbent)
+	for _, pf := range parsedFiles {
+		if o, ok := owner[effectiveID(pf.pn)]; ok && o != pf.rel {
+			// Quarantined: an index pass will not hold this file, so its absence is not
+			// drift. If it still has a stale row (its id changed into a collision) that
+			// row must go, exactly as the unparseable branch above does.
+			if _, ok := dbHash[pf.rel]; ok {
+				d.Removed = append(d.Removed, pf.rel)
+			}
+			continue
+		}
+		h, ok := dbHash[pf.rel]
 		if !ok {
-			d.Added = append(d.Added, rel)
-		} else if retrievalHash(pn) != h {
-			d.Changed = append(d.Changed, rel)
+			d.Added = append(d.Added, pf.rel)
+		} else if retrievalHash(pf.pn) != h {
+			d.Changed = append(d.Changed, pf.rel)
 		}
 	}
 	for p := range dbHash {
@@ -169,32 +199,33 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 	upsertIDs := map[string]bool{}
 	removed := map[string]bool{}
 	seen := map[string]bool{}
-	// finalOwner maps each id to the single path that will own it after this
-	// reconcile. Two live files resolving to the same effectiveID is a data error the
-	// schema cannot represent (notes.id is the PK), so exactly one of them can be
-	// indexed. This used to abort the WHOLE delta, which froze the entire vault's
-	// index: after one duplicate appeared, no edit to any other note was indexed until
-	// the process restarted, and a restart only postponed it (the full reindex tolerates
-	// the duplicate via INSERT OR REPLACE, so the next incremental failed again). The
-	// hosted worker discarded the error, so the hub served a frozen index with zero
-	// signal. Quarantine instead: the incumbent keeps the id (converging, never
-	// flip-flopping), the challenger is dropped with a recorded reason, and the rest of
-	// the delta applies normally.
-	finalOwner := map[string]string{}
-	claim := func(id, rel string) bool {
-		if other, dup := finalOwner[id]; dup {
-			dd.Dropped = append(dd.Dropped, FileError{
-				Path: rel,
-				// Wrapped, not just formatted: consumers (mesh_health) need to tell a
-				// duplicate-id quarantine from unparseable frontmatter, because the two
-				// have different remedies. errors.Is beats matching on the message text.
-				Err: fmt.Errorf("%w %q: already claimed by %q; ids must be unique before this file can be indexed", ErrDuplicateNoteID, id, other),
-			})
-			return false
-		}
-		finalOwner[id] = rel
-		return true
+	// Two live files resolving to the same effectiveID is a data error the schema cannot
+	// represent (notes.id is the PK), so exactly one of them can be indexed. This used to
+	// abort the WHOLE delta, which froze the entire vault's index: after one duplicate
+	// appeared, no edit to any other note was indexed until the process restarted, and a
+	// restart only postponed it. Quarantine instead: one file keeps the id, the others
+	// are dropped with a recorded reason, and the rest of the delta applies normally.
+	//
+	// The winner is chosen by the shared resolveIDOwners, against the id owners already
+	// in the index, so this path and the full path (ClaimUniqueIDs in ReindexFull) agree
+	// on WHICH file wins. While the choice was made here in walk order and there in
+	// INSERT OR REPLACE order, the note you could actually retrieve flipped depending on
+	// whether the watcher or a `mesh index` ran last.
+	incumbent := make(map[string]string, len(dbByPath))
+	for p, r := range dbByPath {
+		incumbent[r.id] = p
 	}
+	// Gather every file's claim BEFORE classifying any of them: whether a file is drift
+	// depends on whether it owns its id, and a single streaming pass can only see the
+	// claims that came before it.
+	type scannedFile struct {
+		rel string
+		id  string
+		pn  *ParsedNote // nil when the mtime fast path skipped the parse
+		err error       // parse failure
+	}
+	scanned := make([]scannedFile, 0, len(files))
+	claims := make([]idClaim, 0, len(files))
 	for _, f := range files {
 		rel, err := filepath.Rel(root, f)
 		if err != nil {
@@ -205,16 +236,29 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 		// not parsed. It still owns its id (from the DB) for the collision check.
 		if r, ok := dbByPath[rel]; mtimeFast && ok && r.mtime != 0 {
 			if fi, statErr := os.Stat(f); statErr == nil && fi.ModTime().Unix() == r.mtime {
-				claim(r.id, rel)
+				scanned = append(scanned, scannedFile{rel: rel, id: r.id})
+				claims = append(claims, idClaim{ID: r.id, Path: rel})
 				continue
 			}
 		}
-		pn, err := ParseFile(f)
-		if err != nil {
+		pn, perr := ParseFile(f)
+		if perr != nil {
+			scanned = append(scanned, scannedFile{rel: rel, err: perr})
+			continue
+		}
+		pn.Path = rel
+		id := effectiveID(pn)
+		scanned = append(scanned, scannedFile{rel: rel, id: id, pn: pn})
+		claims = append(claims, idClaim{ID: id, Path: rel})
+	}
+	owner := resolveIDOwners(claims, incumbent)
+
+	for _, sf := range scanned {
+		if sf.err != nil {
 			// A file that no longer parses but is in the index must be dropped (a full
 			// reindex would), not silently kept stale by the incremental cache path.
-			if r, ok := dbByPath[rel]; ok {
-				dd.Drift.Removed = append(dd.Drift.Removed, rel)
+			if r, ok := dbByPath[sf.rel]; ok {
+				dd.Drift.Removed = append(dd.Drift.Removed, sf.rel)
 				removed[r.id] = true
 			}
 			// Record it either way. A brand-new unparseable file is NOT in the index, so
@@ -223,12 +267,11 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 			// note was missing from search and the graph. That is the exact failure
 			// recordDropped was added to prevent, and it was wired only into ReindexFull,
 			// so the watcher and the hosted hub (the incremental paths) never saw it.
-			dd.Dropped = append(dd.Dropped, FileError{Path: rel, Err: err})
+			dd.Dropped = append(dd.Dropped, FileError{Path: sf.rel, Err: sf.err})
 			continue
 		}
-		pn.Path = rel
-		id := effectiveID(pn)
-		if !claim(id, rel) {
+		if o, ok := owner[sf.id]; ok && o != sf.rel {
+			dd.Dropped = append(dd.Dropped, FileError{Path: sf.rel, Err: duplicateIDErr(sf.id, o)})
 			// A file Mesh REFUSES to index must not keep its previous index entry. This
 			// used to `continue` before ever consulting dbByPath, so the row the file was
 			// last indexed under was neither refreshed nor removed: search kept serving
@@ -243,23 +286,26 @@ func (s *Store) DriftDeltaReport(root string, mtimeFast bool) (DriftDelta, error
 			// was the exact opposite of what happened.
 			//
 			// Do what the unparseable branch above does: drop the stale row too.
-			if r, ok := dbByPath[rel]; ok {
-				dd.Drift.Removed = append(dd.Drift.Removed, rel)
+			if r, ok := dbByPath[sf.rel]; ok {
+				dd.Drift.Removed = append(dd.Drift.Removed, sf.rel)
 				removed[r.id] = true
 			}
 			continue
 		}
-		r, ok := dbByPath[rel]
+		if sf.pn == nil {
+			continue // mtime fast path: unchanged and still the owner, so nothing to do
+		}
+		r, ok := dbByPath[sf.rel]
 		switch {
 		case !ok:
-			dd.Drift.Added = append(dd.Drift.Added, rel)
-			dd.Upserts = append(dd.Upserts, pn)
-			upsertIDs[id] = true
-		case retrievalHash(pn) != r.hash:
-			dd.Drift.Changed = append(dd.Drift.Changed, rel)
-			dd.Upserts = append(dd.Upserts, pn)
-			upsertIDs[id] = true
-			if r.id != id { // frontmatter id changed under the same path: retire the old id
+			dd.Drift.Added = append(dd.Drift.Added, sf.rel)
+			dd.Upserts = append(dd.Upserts, sf.pn)
+			upsertIDs[sf.id] = true
+		case retrievalHash(sf.pn) != r.hash:
+			dd.Drift.Changed = append(dd.Drift.Changed, sf.rel)
+			dd.Upserts = append(dd.Upserts, sf.pn)
+			upsertIDs[sf.id] = true
+			if r.id != sf.id { // frontmatter id changed under the same path: retire the old id
 				removed[r.id] = true
 			}
 		}

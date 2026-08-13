@@ -186,6 +186,16 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		fm.Do, fm.Dont, fm.Why = spec.Do, spec.Dont, spec.Why
 	}
 
+	// Every id already claimed ANYWHERE in the vault, because a note id is vault-global
+	// while a note file lives in one type directory. The O_EXCL claim below is scoped to
+	// dir, so on its own it proves nothing about the other type directories: a gotcha and
+	// a decision with the same title both got `id: <slug>`, both got a success receipt,
+	// and one of the two was silently unretrievable from that moment on.
+	claimed, err := ClaimedIDs(root)
+	if err != nil {
+		return nil, err
+	}
+
 	// Claim the filename by CREATING it, and let the id follow the claim. The old shape
 	// picked a free path with os.Stat and then wrote it with os.WriteFile, which is
 	// check-then-act: two agents writing back the same title concurrently both saw the
@@ -198,6 +208,9 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		id := base
 		if n > 1 {
 			id = fmt.Sprintf("%s-%d", base, n)
+		}
+		if _, taken := claimed[id]; taken {
+			continue // held by a note somewhere in the vault, in this directory or another
 		}
 		path := filepath.Join(dir, id+".md")
 		fm.ID = id
@@ -254,9 +267,29 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		// The note is a NEW directory entry, so the data fsync alone does not make it
 		// reachable after a power cut. Fsync the directory too, after the file.
 		syncDir(dir)
+		// Re-check for a racer in another directory now that our own file exists. The
+		// vault scan above is check-then-act ACROSS directories: two CreateNote calls for
+		// the same title with different types can both scan, both find the id free, and
+		// both create, because their O_EXCL claims are in different directories and never
+		// meet. Both would then return success for one id, and the indexer would have to
+		// quarantine one of the two notes the caller was told it had written.
+		//
+		// Whoever sees the other backs off and takes the next suffix, rather than one
+		// keeping the id by some ordering rule: backing off is what preserves the promise
+		// this function makes, that a receipt names a note that exists and is retrievable.
+		// Both racers backing off at once is possible and harmless (each moves to the next
+		// suffix and the loop is bounded); it needs the two creates to land inside the
+		// microseconds between the other's create and its stat scan, and every retry
+		// re-rolls that timing.
+		if other := otherFileNamedForID(root, id, path); other != "" {
+			os.Remove(path)
+			claimed[id] = other
+			continue
+		}
 		return &CreateResult{Path: path, ID: id, When: date, TODOs: fm.Validate()}, nil
 	}
-	return nil, fmt.Errorf("could not claim a free id for %q after %d attempts", base, maxIDAttempts)
+	return nil, fmt.Errorf("%w: could not claim a free note id for %q after %d attempts; %d notes in this vault already hold ids starting with that slug, so give this note a more specific title",
+		ErrInvalidSpec, base, maxIDAttempts, maxIDAttempts)
 }
 
 // maxIDAttempts bounds the suffix search so a pathological directory cannot spin forever.

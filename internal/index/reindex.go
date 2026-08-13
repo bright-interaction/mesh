@@ -26,12 +26,26 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 		return nil, nil, err
 	}
 	notes, ferrs := ParseFiles(files, 0)
-	s.recordDropped(root, ferrs)
 	for _, pn := range notes {
 		if rel, err := filepath.Rel(root, pn.Path); err == nil {
 			pn.Path = rel
 		}
 	}
+	// Quarantine duplicate ids BEFORE the graph and the notes table are written, and
+	// record the drop. Without this the full path let both files through and the two
+	// stores disagreed about which one the id meant: INSERT OR REPLACE gave notes.path to
+	// the last file walked, AddNode gave nodes.note_path to the first, so a search card
+	// paired one file's path with the other file's snippet. The loser also had no notes
+	// row, which every later DriftReport read as Added, so `mesh doctor` printed STALE
+	// forever over an index that was already byte-identical to a fresh one.
+	incumbent, ierr := s.IDOwners()
+	if ierr != nil {
+		// A cold or unreadable index is not a reason to fail the pass: with no incumbent
+		// the tie falls back to walk order, which is the same rule a first index uses.
+		incumbent = nil
+	}
+	notes, dups := ClaimUniqueIDs(notes, incumbent)
+	s.recordDropped(root, append(ferrs, dups...))
 	g, _ := BuildGraph(notes)
 	g.DetectCommunities(0)
 	if _, err := s.IndexVault(notes, g); err != nil {
@@ -59,11 +73,23 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 // already in the index). Only entries that are NEW since the last record are logged,
 // because the watcher calls this on every reconcile tick and re-warning about the same
 // broken file forever would drown the log the warning exists to be seen in.
+// RecordDropped is recordDropped for a caller outside this package that runs its own
+// pass (`mesh index` parses, dedupes and calls IndexVault itself so it can print stats
+// and support --dry-run). Without it that command wrote a correct index and told nobody
+// what it had to leave out: dropped_notes stayed empty, so `mesh health` and mesh_health
+// reported a clean vault right after a CLI index had quarantined a note.
+func (s *Store) RecordDropped(root string, ferrs []FileError) { s.recordDropped(root, ferrs) }
+
 func (s *Store) recordDropped(root string, ferrs []FileError) {
 	rel := make([]FileError, 0, len(ferrs))
 	for _, fe := range ferrs {
 		p := fe.Path
-		if r, err := filepath.Rel(root, p); err == nil {
+		// Relativize only a path that really is under root. Callers hand this a MIX:
+		// parse failures carry the walked path (usually absolute) while a duplicate-id
+		// quarantine already carries the vault-relative one. Against a relative root
+		// ("sub"), Rel happily turns the already-relative "x.md" into "../x.md", which
+		// names no file at all and would send the operator hunting outside the vault.
+		if r, err := filepath.Rel(root, p); err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
 			p = r
 		}
 		rel = append(rel, FileError{Path: p, Err: fe.Err})

@@ -67,9 +67,13 @@ func parseSince(s string) (time.Time, error) {
 // searchable" and exited 0 while the notes it had just written were in neither the
 // index nor the graph. That is the same defect `mesh doctor` carried.
 //
-// BuildGraph's issues (broken links, duplicate ids) stay unreported here on purpose:
-// they do not remove a note from search, and `mesh lint` / `mesh index` already
-// report them in full.
+// BuildGraph's broken-link issues stay unreported here on purpose: they do not remove a
+// note from search, and `mesh lint` / `mesh index` already report them in full. A
+// duplicate id is NOT in that class, whatever the earlier version of this comment
+// assumed: exactly one file can hold an id, so the other one is quarantined and is as
+// absent from search as an unparseable note. It is reported below, and an imported note
+// losing that contest fails the ingest like any other note the connector wrote and Mesh
+// cannot serve.
 func reindexVault(vaultRoot string, ownedFolders ...string) error {
 	files, err := vault.Walk(vaultRoot)
 	if err != nil {
@@ -82,17 +86,7 @@ func reindexVault(vaultRoot string, ownedFolders ...string) error {
 		if r, rerr := filepath.Rel(vaultRoot, fe.Path); rerr == nil {
 			rel = r
 		}
-		owned := false
-		for _, folder := range ownedFolders {
-			if folder == "" {
-				continue
-			}
-			if within(filepath.ToSlash(folder), filepath.ToSlash(rel)) {
-				owned = true
-				break
-			}
-		}
-		if owned {
+		if ownedPath(rel, ownedFolders) {
 			ownedBad++
 			fmt.Fprintf(os.Stderr, "ingest: just-imported note %s will not parse, so it is invisible to search and the graph: %v\n", rel, fe.Err)
 			continue
@@ -104,23 +98,54 @@ func reindexVault(vaultRoot string, ownedFolders ...string) error {
 			pn.Path = rel
 		}
 	}
-	g, _ := index.BuildGraph(notes)
-	g.DetectCommunities(0)
 	store, err := index.Open(vaultRoot)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
+	// The third caller that parses a vault and writes it itself, so it needs the same
+	// duplicate-id claim pass the other two run. An importer is the likeliest source of a
+	// collision of all: it writes files nobody reviewed, and a connector that reuses a
+	// slug would otherwise silently displace an existing note in the index.
+	incumbent, ierr := store.IDOwners()
+	if ierr != nil {
+		incumbent = nil
+	}
+	notes, dupes := index.ClaimUniqueIDs(notes, incumbent)
+	for _, d := range dupes {
+		fmt.Fprintf(os.Stderr, "ingest: %s is NOT indexed and is invisible to search and the graph: %v\n", d.Path, d.Err)
+		if ownedPath(d.Path, ownedFolders) {
+			ownedBad++
+		}
+	}
+	g, _ := index.BuildGraph(notes)
+	g.DetectCommunities(0)
 	if _, err := store.IndexVault(notes, g); err != nil {
 		return err
 	}
+	store.RecordDropped(vaultRoot, append(ferrs, dupes...))
 	// Reported AFTER the index is written, not instead of it: the notes that DID
 	// parse still belong in the index, so the healthy part of the import lands and
 	// the failure is what the exit code carries.
 	if ownedBad > 0 {
-		return fmt.Errorf("%d just-imported note(s) will not parse and are invisible to search; the connector wrote them, so this is an import failure, not vault damage", ownedBad)
+		return fmt.Errorf("%d just-imported note(s) are invisible to search (they will not parse, or another note already claims their id); the connector wrote them, so this is an import failure, not vault damage", ownedBad)
 	}
 	return nil
+}
+
+// ownedPath reports whether a vault-relative note path sits in one of the folders this
+// ingest run wrote, which is what separates "the connector broke this" from "the vault
+// was already like that".
+func ownedPath(rel string, ownedFolders []string) bool {
+	for _, folder := range ownedFolders {
+		if folder == "" {
+			continue
+		}
+		if within(filepath.ToSlash(folder), filepath.ToSlash(rel)) {
+			return true
+		}
+	}
+	return false
 }
 
 // within reports whether the vault-relative path rel sits inside folder. Both are
