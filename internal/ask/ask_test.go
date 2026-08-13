@@ -145,7 +145,7 @@ func TestAnswerBudgetsRenderedContextAndCitesOnlyWhatItSent(t *testing.T) {
 		return "ok [1]", nil
 	})
 	const budget = 120
-	res, err := Answer(context.Background(), rtr, store, stub, question, budget, nil)
+	res, err := Answer(context.Background(), rtr, store, stub, question, budget, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestAnswerCodeLaneHonoursCallerCancellation(t *testing.T) {
 	})
 
 	// Premise: with a live context the code lane is entered and cites a symbol.
-	live, err := Answer(context.Background(), rtr, store, stub, question, 0, nil)
+	live, err := Answer(context.Background(), rtr, store, stub, question, 0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestAnswerCodeLaneHonoursCallerCancellation(t *testing.T) {
 	// The real assertion: a caller who has already given up gets no code read.
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	got, err := Answer(cancelled, rtr, store, stub, question, 0, nil)
+	got, err := Answer(cancelled, rtr, store, stub, question, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("Answer with a cancelled context returned an error: %v", err)
 	}
