@@ -63,12 +63,31 @@ type HTTP struct {
 	Client   *http.Client
 }
 
+// rerankTimeout bounds one scoring round trip.
+const rerankTimeout = 60 * time.Second
+
+// NewHTTP builds a client for an endpoint that arrived from a MEMBER-writable source:
+// .mesh/config.toml, PUT /api/config, or the hub. It is SSRF-guarded, so a private
+// destination needs the operator's MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1 opt-in (named in
+// the refusal). Use NewOperatorHTTP for a flag or process-env endpoint.
 func NewHTTP(endpoint, model, key string) *HTTP {
+	return newHTTP(endpoint, model, key, safehttp.LLMClient(rerankTimeout))
+}
+
+// NewOperatorHTTP builds a client for an endpoint the OPERATOR supplied directly, on
+// the command line or in the process environment. That is the documented sovereign
+// setup (MESH_RERANK_ENDPOINT=http://127.0.0.1:8787/rerank against tools/rerank-server),
+// and no HTTP surface can write a flag or an env var, so loopback is allowed here.
+func NewOperatorHTTP(endpoint, model, key string) *HTTP {
+	return newHTTP(endpoint, model, key, safehttp.OperatorLLMClient(rerankTimeout))
+}
+
+func newHTTP(endpoint, model, key string, hc *http.Client) *HTTP {
 	return &HTTP{
 		Endpoint: strings.TrimRight(endpoint, "/"),
 		ModelID:  model,
 		Key:      key,
-		Client:   safehttp.LLMClient(60 * time.Second),
+		Client:   hc,
 	}
 }
 
@@ -121,8 +140,9 @@ func (h *HTTP) Rerank(ctx context.Context, query string, docs []string) ([]Resul
 		results = append(results, Result{Index: r.Index, Score: r.RelevanceScore})
 	}
 	// Require a full permutation: a partial result set (some docs unscored) would
-	// silently corrupt the caller's per-candidate scoring, so fail loudly instead
-	// and let the caller degrade to the fused order.
+	// silently corrupt the caller's per-candidate scoring, so fail loudly instead.
+	// The caller surfaces this as retrieve.ErrRerankUnavailable rather than pretending
+	// the fused order was reranked.
 	if len(results) != len(docs) {
 		return nil, fmt.Errorf("rerank: got %d scores for %d docs", len(results), len(docs))
 	}

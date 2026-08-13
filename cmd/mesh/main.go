@@ -539,6 +539,12 @@ func embedCmd() *cobra.Command {
 			root := vaultArg(args)
 			// Resolve config flag-first, then env, then the persisted solo config.toml.
 			cfg, _ := meshcfg.Load(filepath.Join(root, ".mesh"))
+			// Track WHERE the endpoint came from. A flag or an env var is operator input
+			// that no HTTP surface can write, so a localhost model server named there is
+			// dialed directly; the same URL read back out of config.toml is
+			// member-writable (the web config API rewrites that file) and stays behind
+			// the SSRF guard. See internal/safehttp.
+			operatorEndpoint := endpoint != "" || os.Getenv("MESH_EMBED_ENDPOINT") != ""
 			if endpoint == "" {
 				endpoint = firstNonEmpty(os.Getenv("MESH_EMBED_ENDPOINT"), cfg.Endpoint)
 			}
@@ -596,7 +602,11 @@ func embedCmd() *cobra.Command {
 					refs = append(refs, chunkRef{NodeID: nf.NodeID, ChunkIx: ix, Text: text, NoteHash: noteHash})
 				}
 			}
-			emb := embed.NewHTTP(endpoint, model, os.Getenv(keyEnv))
+			newEmbedder := embed.NewHTTP
+			if operatorEndpoint {
+				newEmbedder = embed.NewOperatorHTTP
+			}
+			emb := newEmbedder(endpoint, model, os.Getenv(keyEnv))
 			if batch <= 0 {
 				batch = 32
 			}
@@ -731,23 +741,39 @@ func statusCmd() *cobra.Command {
 			fmt.Println("retrieval signals:")
 			fmt.Println("  fts + graph  always on")
 			total, live, stale, _ := store.VectorStats()
-			if r.VectorsActive() {
-				fmt.Printf("  vectors      active (model %s, %d live", r.VectorModel(), live)
+			// PROBE, do not just report configuration. Both stages used to print "active"
+			// off the config alone, so an endpoint that was down, or refused by the SSRF
+			// guard, was reported as working while every query silently ignored it.
+			// retrieve.Signals is the single place that decides; the MCP mesh://retrieval
+			// resource renders the same report.
+			sig := r.Signals(cmd.Context())
+			switch {
+			case sig.VectorsConfigured && !sig.VectorsReachable:
+				fmt.Printf("  vectors      UNREACHABLE (model %s, %d stored): %s\n", sig.VectorModel, live, sig.VectorsError)
+				fmt.Println("               searches run without the semantic signal until the endpoint answers")
+				fmt.Println("               check MESH_EMBED_ENDPOINT; a private address set in config.toml or the web UI needs MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1")
+			case sig.VectorsConfigured:
+				fmt.Printf("  vectors      active (model %s, %d live", sig.VectorModel, live)
 				if stale > 0 {
 					fmt.Printf(", %d stale - run mesh embed to refresh", stale)
 				}
-				if r.HNSWActive() {
+				if sig.ANN {
 					fmt.Print(", ANN/hnsw")
 				}
 				fmt.Println(")")
-			} else if total > 0 {
+			case total > 0:
 				fmt.Println("  vectors      stored but query embedder not configured (re-run mesh embed, or set MESH_EMBED_ENDPOINT + MESH_EMBED_MODEL)")
-			} else {
+			default:
 				fmt.Println("  vectors      off (run: mesh embed)")
 			}
-			if r.RerankActive() {
-				fmt.Printf("  rerank       active (cross-encoder %s)\n", r.RerankModel())
-			} else {
+			switch {
+			case sig.RerankConfigured && !sig.RerankReachable:
+				fmt.Printf("  rerank       UNREACHABLE (cross-encoder %s): %s\n", sig.RerankModel, sig.RerankError)
+				fmt.Println("               searches FAIL while it is configured and down; start the endpoint (see tools/rerank-server),")
+				fmt.Println("               or unset MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL to turn rerank off")
+			case sig.RerankConfigured:
+				fmt.Printf("  rerank       active (cross-encoder %s)\n", sig.RerankModel)
+			default:
 				fmt.Println("  rerank       off (set MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL; see tools/rerank-server)")
 			}
 			if wf, wg, wv := r.Weights(); wf != 0 || wg != 0 || wv != 0 {

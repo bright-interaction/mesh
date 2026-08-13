@@ -167,16 +167,34 @@ mesh embed my-vault                                 # one vector per note
 export MESH_RERANK_ENDPOINT=http://127.0.0.1:8787/rerank
 export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
 
-mesh status my-vault    # shows which retrieval signals are active
+mesh status my-vault    # PROBES both endpoints and says which signals really work
 ```
+
+Both endpoints above are local, and that is the supported default: an endpoint you
+pass on the command line or set in the environment is operator input, so Mesh dials
+it as given, `localhost` and `127.0.0.1` included. The SSRF guard applies to the
+endpoint someone else could have written for you: the `[embedding]` / `[rerank]`
+fields in `.mesh/config.toml`, which the web UI's settings page rewrites over
+`PUT /api/config`. If your endpoint lives there and is private, opt in explicitly:
+
+```
+export MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1   # allow a private/loopback endpoint that
+                                           # came from config.toml or the web UI
+```
+
+Mesh names that variable in the refusal itself, so you never have to find this
+paragraph to get unstuck.
 
 Vector search in this repository is a brute-force cosine scan, which stays under
 5 ms well past a few thousand notes. The commercial build adds an approximate
 (HNSW) index for vaults large enough to need one, see [LICENSING.md](LICENSING.md).
 
 Once set, `mesh search` / `eval` / `mcp` fuse the semantic signal and apply the
-rerank automatically. Both degrade safely: no embedder means lexical-only, a
-down rerank endpoint falls back to the fused order. Pointing either env var at a
+rerank automatically. Turning a stage OFF is safe (no embedder means lexical-only),
+but a stage you turned ON and that cannot be reached is an error, not a quiet
+downgrade: `mesh search` fails and names the endpoint, rather than handing back
+unreranked results that look reranked. Unset `MESH_RERANK_ENDPOINT` and
+`MESH_RERANK_MODEL` to turn rerank off for real. Pointing either env var at a
 cloud provider sends note content off-box, so keep them local to stay sovereign.
 A ready-to-run local cross-encoder server lives in `tools/rerank-server/`.
 

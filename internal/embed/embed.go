@@ -61,12 +61,31 @@ type HTTP struct {
 // endpoint that cannot answer it in 5s is not usable for retrieval anyway.
 const dimProbeTimeout = 5 * time.Second
 
+// embedTimeout bounds a real embedding batch (not the short Dim probe above).
+const embedTimeout = 60 * time.Second
+
+// NewHTTP builds a client for an endpoint that arrived from a MEMBER-writable source:
+// .mesh/config.toml, PUT /api/config, or the hub. It is SSRF-guarded, so a private
+// destination needs the operator's MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1 opt-in (named in
+// the refusal). Use NewOperatorHTTP for a flag or process-env endpoint.
 func NewHTTP(baseURL, model, key string) *HTTP {
+	return newHTTP(baseURL, model, key, safehttp.LLMClient(embedTimeout))
+}
+
+// NewOperatorHTTP builds a client for an endpoint the OPERATOR supplied directly, on
+// the command line or in the process environment. That is the documented local BYOAI
+// setup (MESH_EMBED_ENDPOINT=http://localhost:11434/v1), and no HTTP surface can write
+// a flag or an env var, so a loopback destination is allowed without a second opt-in.
+func NewOperatorHTTP(baseURL, model, key string) *HTTP {
+	return newHTTP(baseURL, model, key, safehttp.OperatorLLMClient(embedTimeout))
+}
+
+func newHTTP(baseURL, model, key string, hc *http.Client) *HTTP {
 	return &HTTP{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		ModelID: model,
 		Key:     key,
-		Client:  safehttp.LLMClient(60 * time.Second),
+		Client:  hc,
 	}
 }
 

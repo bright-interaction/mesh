@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,4 +58,56 @@ func TestLLMClientGuardAndOptIn(t *testing.T) {
 		t.Fatalf("opted-in LLMClient could not reach loopback: %v", err)
 	}
 	resp.Body.Close()
+}
+
+// An endpoint the OPERATOR supplied (a CLI flag, a process env var) is dialed even on
+// loopback with no second opt-in: no HTTP surface can write a flag or the environment,
+// so it already carries the authority MESH_ALLOW_PRIVATE_LLM_ENDPOINT expresses. This is
+// the constructor split that made the documented local BYOAI setup work at all.
+func TestOperatorLLMClientReachesLoopback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if AllowPrivateLLMEndpoint() {
+		t.Fatal("precondition: MESH_ALLOW_PRIVATE_LLM_ENDPOINT must be unset for this test")
+	}
+	resp, err := OperatorLLMClient(5 * time.Second).Get(srv.URL)
+	if err != nil {
+		t.Fatalf("OperatorLLMClient could not reach a local endpoint: %v", err)
+	}
+	resp.Body.Close()
+}
+
+// Every refusal a stranger can trigger has to name its remedy. The BYOAI refusal named
+// none: the opt-in appeared in no README, no doc, no .env.example and no error string,
+// so `mesh embed` against a local Ollama dead-ended on "refusing to connect".
+func TestLLMClientRefusalNamesTheOptIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	_, err := LLMClient(5 * time.Second).Get(srv.URL)
+	if err == nil {
+		t.Fatal("LLMClient reached a loopback endpoint; SSRF guard did not fire")
+	}
+	if !strings.Contains(err.Error(), "MESH_ALLOW_PRIVATE_LLM_ENDPOINT") {
+		t.Errorf("the SSRF refusal must name the operator opt-in, got: %v", err)
+	}
+}
+
+// The plain connector guard keeps its bare message: MESH_ALLOW_PRIVATE_LLM_ENDPOINT does
+// nothing for an ingest connector, so naming it there would send the user somewhere that
+// cannot help them.
+func TestPlainClientRefusalDoesNotNameTheLLMOptIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	_, err := Client(5 * time.Second).Get(srv.URL)
+	if err == nil {
+		t.Fatal("Client reached a loopback endpoint; SSRF guard did not fire")
+	}
+	if strings.Contains(err.Error(), "MESH_ALLOW_PRIVATE_LLM_ENDPOINT") {
+		t.Errorf("the connector guard must not advertise the BYOAI opt-in, got: %v", err)
+	}
 }

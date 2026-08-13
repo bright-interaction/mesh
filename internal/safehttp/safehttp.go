@@ -26,25 +26,52 @@ import (
 
 // Client returns an http.Client that refuses non-public destinations (the SSRF guard)
 // and follows at most 3 redirects, each re-dialed through the guard.
-func Client(timeout time.Duration) *http.Client { return newClient(timeout, false) }
+func Client(timeout time.Duration) *http.Client { return newClient(timeout, false, "") }
 
 // LoopbackAllowed is like Client but permits private/loopback destinations. Use ONLY
 // for an operator-configured sovereign endpoint (e.g. a self-hosted Ollama on
 // 127.0.0.1), gated behind an operator env var, never a member-editable config field.
-func LoopbackAllowed(timeout time.Duration) *http.Client { return newClient(timeout, true) }
+func LoopbackAllowed(timeout time.Duration) *http.Client { return newClient(timeout, true, "") }
 
-// LLMClient returns the HTTP client for BYOAI endpoints (embeddings, rerank, LLM). It
-// is SSRF-guarded by default so a config-set endpoint cannot probe the host, the
+// llmRemedy is appended to the guard's refusal on a BYOAI endpoint. A stranger
+// following the README pointed an endpoint at their own machine and got a bare
+// "refusing to connect to non-public address" with no way forward, because the opt-in
+// was named in no doc, no help string and no error. Every refusal a user can trigger
+// has to name its remedy.
+const llmRemedy = "; this looks like a model server on your own machine, so either pass the endpoint " +
+	"in the process environment / on the command line (operator input, allowed by default) or set " +
+	"MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1 to allow a private endpoint that came from the config file or the web UI"
+
+// LLMClient returns the HTTP client for a BYOAI endpoint (embeddings, rerank, LLM)
+// whose URL arrived from a MEMBER-writable source: the hub, .mesh/config.toml, or
+// PUT /api/config. It is SSRF-guarded so such an endpoint cannot probe the host, the
 // Tailscale tailnet, or cloud metadata and exfil vault content. An OPERATOR (not a
 // member via the config API) may set MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1 to permit a
 // sovereign localhost endpoint. The config API never writes this var, so a member
 // cannot flip the guard off.
+//
+// For an endpoint that came from a CLI flag or the process environment use
+// OperatorLLMClient instead: those two sources are already operator authority.
 func LLMClient(timeout time.Duration) *http.Client {
 	if AllowPrivateLLMEndpoint() {
 		return LoopbackAllowed(timeout)
 	}
-	return Client(timeout)
+	return newClient(timeout, false, llmRemedy)
 }
+
+// OperatorLLMClient returns the HTTP client for a BYOAI endpoint the OPERATOR supplied
+// directly: a CLI flag, or a process environment variable such as
+// MESH_EMBED_ENDPOINT / MESH_RERANK_ENDPOINT / MESH_CURATOR_ENDPOINT. Neither source is
+// reachable from any HTTP surface (the config API writes config.toml, never a flag and
+// never the environment), so an endpoint arriving that way carries exactly the same
+// operator authority as MESH_ALLOW_PRIVATE_LLM_ENDPOINT itself and a loopback
+// destination is allowed.
+//
+// This split is the whole point: the SSRF guard exists for the endpoint a member can
+// WRITE, and blanket-applying it to the operator's own command line is what made every
+// documented local BYOAI setup (a localhost Ollama, tools/rerank-server on 127.0.0.1)
+// unusable out of the box.
+func OperatorLLMClient(timeout time.Duration) *http.Client { return LoopbackAllowed(timeout) }
 
 // AllowPrivateLLMEndpoint reports whether the operator opted into private BYOAI
 // endpoints (a localhost Ollama, an in-tailnet model server) via the env var.
@@ -53,11 +80,13 @@ func AllowPrivateLLMEndpoint() bool {
 	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 }
 
-func newClient(timeout time.Duration, allowPrivate bool) *http.Client {
+// newClient builds the guarded client. remedy is appended to a refusal so the caller's
+// own opt-in is named in the error the user actually sees; pass "" when there is none.
+func newClient(timeout time.Duration, allowPrivate bool, remedy string) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			DialContext:           dialContext(allowPrivate),
+			DialContext:           dialContext(allowPrivate, remedy),
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 20 * time.Second,
 			MaxIdleConns:          10,
@@ -91,7 +120,7 @@ func newClient(timeout time.Duration, allowPrivate bool) *http.Client {
 // dialContext resolves the host and refuses to connect if ANY resolved address is
 // blocked (unless allowPrivate). It then dials the vetted IP directly (no
 // re-resolution), closing the DNS-rebind window.
-func dialContext(allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func dialContext(allowPrivate bool, remedy string) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -107,7 +136,7 @@ func dialContext(allowPrivate bool) func(ctx context.Context, network, addr stri
 		if !allowPrivate {
 			for _, ip := range ips {
 				if BlockedIP(ip.IP) {
-					return nil, fmt.Errorf("refusing to connect to non-public address %s (SSRF guard)", ip.IP)
+					return nil, fmt.Errorf("refusing to connect to non-public address %s (SSRF guard)%s", ip.IP, remedy)
 				}
 			}
 		}

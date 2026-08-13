@@ -15,7 +15,7 @@ func (s *Server) handleResourcesList() any {
 			{"uri": "mesh://capabilities", "name": "Mesh capabilities", "description": "Vault stats + tool surface", "mimeType": "application/json"},
 			{"uri": "mesh://contract", "name": "Agent usage contract", "description": "How to retrieve from Mesh cheaply", "mimeType": "text/markdown"},
 			{"uri": "mesh://community", "name": "Community overview", "description": "The vault's clusters by size, each with an exemplar, for orientation", "mimeType": "application/json"},
-			{"uri": "mesh://stats", "name": "Retrieval stats", "description": "Which signals are active and how fresh the vectors are (live vs stale, re-embed coverage)", "mimeType": "application/json"},
+			{"uri": "mesh://stats", "name": "Retrieval stats", "description": "Which signals are active AND reachable (each BYOAI endpoint is probed), plus how fresh the vectors are (live vs stale, re-embed coverage)", "mimeType": "application/json"},
 		},
 	}
 }
@@ -35,7 +35,7 @@ func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage
 		b, _ := json.Marshal(map[string]any{"communities": communityOverview(g, 50, scopeFromCtx(ctx))})
 		return contents(p.URI, "application/json", string(b)), nil
 	case "mesh://stats":
-		return contents(p.URI, "application/json", s.statsJSON()), nil
+		return contents(p.URI, "application/json", s.statsJSON(ctx)), nil
 	case "mesh://capabilities":
 		// resources/read is NOT routed through handleToolsCall, so the scope class gate
 		// never runs here: the filtering has to be done inline. A scope-confined caller
@@ -82,12 +82,18 @@ func (s *Server) counts(sf *ScopeFilter) (notes, nodes, edges int) {
 	return notes, nodes, edges
 }
 
-// statsJSON reports the live retrieval state: which signals will fire and how
-// fresh the vectors are. Lightweight - it reads vector counts + meta and the
-// already-built retriever from the snapshot; it does NOT load vector blobs or
-// probe the embedding endpoint.
-func (s *Server) statsJSON() string {
+// statsJSON reports the live retrieval state: which signals will fire and how fresh the
+// vectors are.
+//
+// It PROBES the configured BYOAI endpoints (retrieve.Signals, the same report
+// `mesh status` renders) rather than answering from configuration. An agent asking this
+// resource whether rerank is on was told "active: true" for an endpoint that had never
+// answered a single request, so the agent's own reasoning about result quality was built
+// on a flag that could not be false. reachable is the truthful field; active means only
+// that the operator asked for the stage.
+func (s *Server) statsJSON(ctx context.Context) string {
 	_, r := s.snapshot()
+	sig := r.Signals(ctx)
 	model, dim := s.store.VectorMeta()
 	total, live, stale, _ := s.store.VectorStats()
 	freshPct := 0.0
@@ -99,18 +105,22 @@ func (s *Server) statsJSON() string {
 		// client needs (see the capabilities branch above).
 		"vault": filepath.Base(s.vaultRoot),
 		"vectors": map[string]any{
-			"active":          r.VectorsActive(), // embedder configured AND live vectors present
+			"active":          sig.VectorsConfigured, // embedder configured AND live vectors present
+			"reachable":       sig.VectorsReachable,  // the endpoint answered a probe just now
+			"error":           sig.VectorsError,      // empty unless the probe failed
 			"model":           model,
 			"dim":             dim,
 			"total":           total,
 			"live":            live,
 			"stale_or_orphan": stale, // edited or deleted notes; cleared by mesh embed
 			"fresh_pct":       freshPct,
-			"ann":             r.HNSWActive(), // HNSW index serving the scan (vs brute force)
+			"ann":             sig.ANN, // HNSW index serving the scan (vs brute force)
 		},
 		"rerank": map[string]any{
-			"active": r.RerankActive(),
-			"model":  r.RerankModel(),
+			"active":    sig.RerankConfigured,
+			"reachable": sig.RerankReachable,
+			"error":     sig.RerankError,
+			"model":     sig.RerankModel,
 		},
 	})
 	return string(b)

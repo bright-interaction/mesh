@@ -323,9 +323,13 @@ func newFromEnvPrefix(p string) (Client, error) {
 			temp = &f
 		}
 	}
-	// SSRF-guarded by default; an operator can allow a sovereign localhost endpoint
-	// (Ollama, a self-hosted model server) with MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1.
-	hc := safehttp.LLMClient(120 * time.Second)
+	// Every endpoint this constructor can reach comes from the PROCESS ENVIRONMENT
+	// (<prefix>_ENDPOINT, MESH_ANTHROPIC_BASE), which no HTTP surface can write: the
+	// config API writes .mesh/config.toml only. That is operator authority, the same
+	// authority MESH_ALLOW_PRIVATE_LLM_ENDPOINT expresses, so a sovereign localhost
+	// model server is reachable without a second opt-in. Guarding it instead just made
+	// the documented `MESH_CURATOR_AGENT=local` setup fail with an SSRF refusal.
+	hc := safehttp.OperatorLLMClient(120 * time.Second)
 
 	switch agent {
 	case "cli":

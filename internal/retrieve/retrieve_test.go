@@ -692,18 +692,11 @@ func TestRerankReordersHead(t *testing.T) {
 	}
 }
 
-func TestRerankDegradesOnError(t *testing.T) {
-	r := buildVault(t)
-	base, _ := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
-	r.EnableRerank(errReranker{})
-	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
-	if err != nil {
-		t.Fatalf("a failing reranker must not fail retrieval: %v", err)
-	}
-	if len(cards) == 0 || cards[0].NodeID != base[0].NodeID {
-		t.Errorf("failed rerank must leave the fused order intact")
-	}
-}
+// The old TestRerankDegradesOnError asserted the exact defect: it required a failing
+// reranker to return the fused order with a nil error, which is how a configured
+// endpoint that never answered looked identical to a working one. The replacement lives
+// in byoai_local_endpoint_test.go as TestRerankSurfacesEndpointFailure. Silent-degrade
+// cases that are NOT failures (no reranker, a flat response) keep their own tests.
 
 func TestRerankConstantScoresKeepFusedOrder(t *testing.T) {
 	r := buildVault(t)

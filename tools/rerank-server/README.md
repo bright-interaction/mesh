@@ -57,13 +57,27 @@ Env knobs: `RERANK_MODEL` (default `Xenova/ms-marco-MiniLM-L-6-v2`),
 ```bash
 export MESH_RERANK_ENDPOINT=http://127.0.0.1:8787/rerank
 export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
-mesh status ./vault              # confirms: rerank  active (cross-encoder ...)
+mesh status ./vault              # probes the endpoint: rerank  active (cross-encoder ...)
 mesh search "rerank" --vault ./vault   # now rerank-refined
 ```
 
-`mesh search`, `mesh eval`, and `mesh mcp` all pick it up automatically. Unset
-the two env vars to turn it back off (rerank never gates retrieval; if the
-endpoint is down, Mesh silently falls back to the fused order).
+`mesh status` sends a real one-document scoring request, so `active` means the
+server answered, not merely that the two variables are set. A configured endpoint
+that is down prints `rerank UNREACHABLE` with the reason.
+
+`mesh search`, `mesh eval`, and `mesh mcp` all pick it up automatically. Unset the
+two env vars to turn it back off. While it IS set, an endpoint Mesh cannot reach
+fails the query and says so: a reranker you asked for and did not get would
+otherwise return the plain fused order, exit 0, and look exactly like a working
+one, which is how a dead reranker went unnoticed while every result was silently
+unreranked.
+
+Setting `MESH_RERANK_ENDPOINT` here in the environment is what makes the loopback
+address above work with no further configuration: an endpoint from the environment
+or a CLI flag is operator input and is dialed as given. Mesh's SSRF guard applies to
+the `[rerank]` endpoint in `<vault>/.mesh/config.toml` instead, because the web UI
+can rewrite that file; to allow a private endpoint from there, set
+`MESH_ALLOW_PRIVATE_LLM_ENDPOINT=1`.
 
 Rerank is independent of embeddings: it reorders the fused FTS + graph (+ vector,
 if on) candidates, so it works with or without `mesh embed`. It pairs best with

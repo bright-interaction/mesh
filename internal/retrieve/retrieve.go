@@ -8,6 +8,8 @@ package retrieve
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"os"
 	"sort"
@@ -177,7 +179,7 @@ func (r *Retriever) loadWeights(rv meshcfg.Retrieval) {
 // env-first, then the solo .mesh/config.toml (written by `mesh embed`), so a solo
 // dev does not re-export env vars every session. Env always wins.
 func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
-	endpoint := envOr("MESH_EMBED_ENDPOINT", emb.Endpoint)
+	endpoint, fromEnv := envOrFile("MESH_EMBED_ENDPOINT", emb.Endpoint)
 	model := envOr("MESH_EMBED_MODEL", emb.Model)
 	if endpoint == "" || model == "" {
 		return
@@ -199,21 +201,39 @@ func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
 	} else if rv.HNSWThreshold > 0 {
 		r.hnswGate = rv.HNSWThreshold
 	}
-	r.EnableVectors(embed.NewHTTP(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs)
+	// The endpoint's SOURCE picks the HTTP client. From the process environment it is
+	// operator input and may point at a local model server; from config.toml it is
+	// member-writable (the web config API rewrites that file) and stays SSRF-guarded.
+	newEmbedder := embed.NewHTTP
+	if fromEnv {
+		newEmbedder = embed.NewOperatorHTTP
+	}
+	r.EnableVectors(newEmbedder(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs)
 }
 
 // envOr returns the env var if set (non-empty), else the fallback.
 func envOr(key, fallback string) string {
+	v, _ := envOrFile(key, fallback)
+	return v
+}
+
+// envOrFile is envOr plus the PROVENANCE of the value it returned: true when it came
+// from the process environment, false when it came from the config file. That boolean is
+// load-bearing for BYOAI endpoints. An env var is operator input (no HTTP surface can
+// write the environment), so a localhost model server named there is allowed; the same
+// URL arriving through .mesh/config.toml could have been written by any caller of
+// PUT /api/config, so it stays behind the SSRF guard.
+func envOrFile(key, fallback string) (string, bool) {
 	if v := os.Getenv(key); v != "" {
-		return v
+		return v, true
 	}
-	return fallback
+	return fallback, false
 }
 
 // enableRerank turns on the cross-encoder rerank stage when the endpoint + model
 // are set (BYOAI, sovereign or cloud), env-first then the solo config file.
 func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
-	endpoint := envOr("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
+	endpoint, fromEnv := envOrFile("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
 	model := envOr("MESH_RERANK_MODEL", rv.RerankModel)
 	if endpoint == "" || model == "" {
 		return
@@ -227,18 +247,115 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 	}
 	// Same allow-list as the embedding key: see enableVectors.
 	keyEnv := meshcfg.ResolveKeyEnv("rerank.key_env", rv.RerankKeyEnv, "MESH_RERANK_KEY")
-	r.EnableRerank(rerank.NewHTTP(endpoint, model, os.Getenv(keyEnv)))
+	// Same provenance split as enableVectors: MESH_RERANK_ENDPOINT is operator input and
+	// may be the local tools/rerank-server on 127.0.0.1; rerank.endpoint in config.toml
+	// is member-writable and stays guarded.
+	newReranker := rerank.NewHTTP
+	if fromEnv {
+		newReranker = rerank.NewOperatorHTTP
+	}
+	r.EnableRerank(newReranker(endpoint, model, os.Getenv(keyEnv)))
 }
 
-// EnableRerank turns on the cross-encoder rerank stage. The reranker reorders
-// the top-K fused candidates; it never gates retrieval, so a failing endpoint
-// degrades silently to the fused order. Returns false for a nil reranker.
+// EnableRerank turns on the cross-encoder rerank stage. The reranker reorders the top-K
+// fused candidates. Once enabled it is part of the contract: an endpoint that cannot be
+// reached fails the query with ErrRerankUnavailable rather than quietly returning the
+// fused order as if it had been reranked. Returns false for a nil reranker.
 func (r *Retriever) EnableRerank(rr rerank.Reranker) bool {
 	if rr == nil {
 		return false
 	}
 	r.rr, r.rerankName = rr, rr.Model()
 	return true
+}
+
+// ErrRerankUnavailable wraps every failure of a CONFIGURED reranker, so a caller that
+// genuinely wants to keep serving (a long-lived server, say) can errors.Is it and choose
+// to, while the default for a one-shot CLI or MCP call is to surface it. It never fires
+// when no reranker is configured.
+var ErrRerankUnavailable = errors.New("rerank endpoint unavailable")
+
+// rerankProbeTimeout bounds the liveness probe below. A cross-encoder scoring one short
+// sentinel document answers in well under a second; anything slower is not usable on a
+// query path either.
+const rerankProbeTimeout = 5 * time.Second
+
+// RerankProbe sends ONE sentinel scoring request to the configured reranker and reports
+// whether it answered. `mesh status` prints "rerank active" off configuration alone,
+// which told a user with a dead endpoint that everything was fine; a probe is the only
+// honest answer to "is it on". Returns nil when nothing is configured (there is nothing
+// to be wrong) and wraps failures in ErrRerankUnavailable.
+func (r *Retriever) RerankProbe(ctx context.Context) error {
+	if r.rr == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, rerankProbeTimeout)
+	defer cancel()
+	if _, err := r.rr.Rerank(ctx, "mesh rerank probe", []string{"mesh rerank probe"}); err != nil {
+		return fmt.Errorf("%w: %w", ErrRerankUnavailable, err)
+	}
+	return nil
+}
+
+// SignalReport is the honest answer to "which retrieval signals will actually fire":
+// each optional stage as CONFIGURED plus, separately, whether its endpoint answered.
+// Reporting configuration alone is what let a dead reranker read as "active" on every
+// surface at once, so the two are never collapsed into one flag here.
+type SignalReport struct {
+	VectorsConfigured bool
+	VectorsReachable  bool
+	VectorsError      string // empty when reachable or not configured
+	VectorModel       string
+	ANN               bool
+
+	RerankConfigured bool
+	RerankReachable  bool
+	RerankError      string // empty when reachable or not configured
+	RerankModel      string
+}
+
+// Signals probes every configured BYOAI stage once and returns what is really on. It is
+// the single renderer behind `mesh status` and the MCP mesh://retrieval resource, which
+// used to answer the same question from their own copies of the logic and could not
+// disagree only by accident. A stage that is not configured is reported unreachable with
+// no error: there is nothing to be wrong with it.
+func (r *Retriever) Signals(ctx context.Context) SignalReport {
+	rep := SignalReport{
+		VectorsConfigured: r.VectorsActive(),
+		VectorModel:       r.VectorModel(),
+		ANN:               r.HNSWActive(),
+		RerankConfigured:  r.RerankActive(),
+		RerankModel:       r.RerankModel(),
+	}
+	if rep.VectorsConfigured {
+		if err := r.EmbedderProbe(); err != nil {
+			rep.VectorsError = err.Error()
+		} else {
+			rep.VectorsReachable = true
+		}
+	}
+	if rep.RerankConfigured {
+		if err := r.RerankProbe(ctx); err != nil {
+			rep.RerankError = err.Error()
+		} else {
+			rep.RerankReachable = true
+		}
+	}
+	return rep
+}
+
+// EmbedderProbe reports whether the configured query embedder answers. Like RerankProbe
+// this exists because `mesh status` was reporting configuration, not reachability. Dim()
+// performs the round trip (and caches the result), so a width of 0 means the endpoint did
+// not answer. Returns nil when no embedder is configured.
+func (r *Retriever) EmbedderProbe() error {
+	if r.emb == nil {
+		return nil
+	}
+	if r.emb.Dim() == 0 {
+		return fmt.Errorf("embedding endpoint unavailable: model %s returned no vector width", r.emb.Model())
+	}
+	return nil
 }
 
 // RerankActive reports whether a cross-encoder rerank stage is configured.
@@ -518,11 +635,14 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 
 	// Cross-encoder rerank of the top-K head: a model that reads the query and
 	// each candidate jointly reorders the strongest fused results, which is the
-	// lever for top-1 precision. It refines the head only and never gates: any
-	// endpoint error leaves the fused order intact. Skipped when tuning the fusion
-	// itself (NoRerank), so the fused order is what gets measured.
+	// lever for top-1 precision. It refines the head only. A CONFIGURED endpoint that
+	// cannot be reached now fails the query (ErrRerankUnavailable) instead of returning
+	// the fused order dressed up as reranked. Skipped when tuning the fusion itself
+	// (NoRerank), so the fused order is what gets measured.
 	if !opt.NoRerank {
-		r.rerankHead(ctx, query, cards, fused)
+		if err := r.rerankHead(ctx, query, cards, fused); err != nil {
+			return nil, err
+		}
 	}
 
 	// Limit bounds the RETURNED set, after the reranker has had its say (so it can
@@ -653,9 +773,19 @@ func sortCards(cards []Card) {
 // factor was folded in twice (once by the card loop, once here, an effective 1.21x
 // on the fused half of the blend), and the freshness decay was applied to the tail
 // only, so the head never decayed at all.
-func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, fusedRaw map[string]float64) {
+//
+// It returns an error when the CONFIGURED reranker could not score the head. That is a
+// deliberate reversal: this used to return silently on a connect error, so a user who
+// pointed MESH_RERANK_ENDPOINT at a server that was down (or, before the client split
+// above, at a loopback address the SSRF guard refused) got byte-identical unreranked
+// results, exit 0, and `mesh status` still printing "rerank active". Zero requests ever
+// reached their server and nothing said so. A reranker the operator asked for and that
+// cannot be reached is an error, not a no-op. Conditions that are NOT errors (no
+// reranker configured, a head too short to reorder, a flat uninformative response) still
+// leave the fused order intact and return nil.
+func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, fusedRaw map[string]float64) error {
 	if r.rr == nil || len(cards) < 2 {
-		return
+		return nil
 	}
 	k := rerankK
 	if k > len(cards) {
@@ -668,7 +798,7 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 	}
 	docText, err := r.store.NoteDocs(ids)
 	if err != nil {
-		return
+		return fmt.Errorf("rerank: reading note bodies for the head: %w", err)
 	}
 	docs := make([]string, k)
 	for i, id := range ids {
@@ -679,8 +809,11 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 		}
 	}
 	res, err := r.rr.Rerank(ctx, query, docs)
-	if err != nil || len(res) != k {
-		return
+	if err != nil {
+		return fmt.Errorf("%w (cross-encoder %s): %w\n  start the rerank endpoint (see tools/rerank-server), or unset MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL to search without it", ErrRerankUnavailable, r.rerankName, err)
+	}
+	if len(res) != k {
+		return fmt.Errorf("%w (cross-encoder %s): endpoint returned %d scores for %d documents", ErrRerankUnavailable, r.rerankName, len(res), k)
 	}
 	scores := make([]float64, k)
 	lo, hi := res[0].Score, res[0].Score
@@ -697,7 +830,7 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 	// fused head order intact rather than collapsing it to alphabetical via the
 	// constant-score branch of minMax.
 	if hi == lo {
-		return
+		return nil
 	}
 	norm := minMaxFloored(scores)
 	// The head's fused scores, normalized over the head, so the blend can give the
@@ -737,6 +870,7 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 		}
 	}
 	sortCards(cards)
+	return nil
 }
 
 // card builds a Card from a node id, reading title/path/type/tier-0 from the
