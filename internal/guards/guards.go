@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/bright-interaction/mesh/internal/index"
@@ -94,7 +95,11 @@ func ShellSnippet(guards []Guard) string {
 		}
 		// grep -E (POSIX/RE2) rejects lookaround/backreferences; skip such patterns
 		// rather than emit a check that errors at runtime.
-		if strings.Contains(g.Pattern, "(?") || strings.Contains(g.Pattern, `\1`) {
+		// regexp.Compile is an ALLOW-list by construction and replaces a two-token
+		// deny-list that named "(?" and `\1` and nothing else. Measured: `\2`..`\9`,
+		// `npm (install` and `npm [install` were all emitted, and grep -E exited 2 on
+		// each, which the discarded stderr turned into "no violations found".
+		if _, rerr := regexp.Compile(g.Pattern); rerr != nil || strings.Contains(g.Pattern, "(?") || strings.Contains(g.Pattern, `\1`) {
 			b.WriteString(fmt.Sprintf("\n# SKIPPED %s: pattern uses lookaround/backrefs (not grep -E compatible); refine by hand: %s\n", commentSafe(g.Title), commentSafe(g.Pattern)))
 			continue
 		}
@@ -110,12 +115,22 @@ func ShellSnippet(guards []Guard) string {
 			}
 		}
 		msg := strings.ReplaceAll(g.Message, "'", "")
-		b.WriteString(fmt.Sprintf("\n# %s  [%s]\nif grep -rnE%s -- %s . >/dev/null 2>&1; then\n  echo 'GUARD: %s'; fail=1\nfi\n",
-			commentSafe(g.Title), g.Severity, includes, shellpath.Quote(g.Pattern), msg))
+		// Capture the CONTENT, never branch on the pipeline status: a rejected pattern
+		// exits 2 and an empty result exits 1, and `>/dev/null 2>&1` made those the same
+		// branch. This is the repo-wide rule in CLAUDE.md 15b, applied to emitted shell.
+		b.WriteString(fmt.Sprintf("\n# %s  [%s]\nhits=\"$(grep -rnE%s -- %s . 2>&1 || true)\"\nif [ -n \"$hits\" ]; then\n  echo 'GUARD: %s'; fail=1\nfi\n",
+			commentSafe(g.Title), commentSafe(g.Severity), includes, shellpath.Quote(g.Pattern), msg))
 	}
 	b.WriteString("\nexit $fail\n")
 	return b.String()
 }
+
+const (
+	// maxGlobLen and maxGlobExpansion bound brace expansion. A real glob list is a
+	// handful of extensions; anything past these is malformed model output or an attack.
+	maxGlobLen       = 512
+	maxGlobExpansion = 64
+)
 
 // commentSafe flattens anything destined for a `#` comment line in the generated hook.
 //
@@ -125,9 +140,10 @@ func ShellSnippet(guards []Guard) string {
 // whole purpose is to be installed as a pre-commit hook. Measured: a Title of
 // "harmless\ntouch /tmp/pwned" created /tmp/pwned when the snippet was run.
 //
-// Message and Severity are already safe (Message is single-quoted with its own quotes
-// stripped, Severity is normalised to block/warn above), so this covers the two fields
-// that reach a comment raw.
+// EVERY field that reaches a comment goes through this, including Severity. Relying on
+// parseGuard normalising Severity to block/warn was the same mistake one argument to the
+// right: ShellSnippet and Guard are both exported, so the next caller that builds a Guard
+// itself reopens the injection. The invariant belongs where it is consumed.
 func commentSafe(s string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' {
@@ -183,6 +199,14 @@ func splitGlobs(globs string) []string {
 // shapes these fields carry; anything unbalanced is passed through untouched so a weird
 // glob degrades to "matches nothing" rather than to mangled shell.
 func expandBraces(g string) []string {
+	// Bounded in both directions, because Globs is an LLM-written field with no size
+	// validation on the way in. Measured before this cap: 23 adjacent {a,b} groups (115
+	// bytes) produced 8.4M globs and 6.2GB, and 400KB of nested braces was killed by the
+	// kernel. Over either bound the glob is passed through unexpanded, which degrades to
+	// "grep matches nothing" rather than to a dead process.
+	if len(g) > maxGlobLen {
+		return []string{g}
+	}
 	o := strings.Index(g, "{")
 	if o < 0 {
 		return []string{g}
@@ -196,8 +220,14 @@ func expandBraces(g string) []string {
 	var out []string
 	for _, alt := range strings.Split(g[o+1:c], ",") {
 		if alt = strings.TrimSpace(alt); alt != "" {
+			if len(out) >= maxGlobExpansion {
+				return []string{g} // refuse wholesale rather than expand partially
+			}
 			out = append(out, expandBraces(prefix+alt+suffix)...)
 		}
+	}
+	if len(out) > maxGlobExpansion {
+		return []string{g}
 	}
 	if len(out) == 0 {
 		return []string{prefix + suffix}

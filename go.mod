@@ -6,7 +6,7 @@ go 1.26.4
 // fix (GO-2026-5856), which govulncheck reports as reachable from the hub's TLS
 // server and every outbound BYOAI call. CI resolves its Go from this file
 // (go-version-file: go.mod), so the pin covers local builds, CI and the images alike.
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0

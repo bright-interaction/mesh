@@ -589,6 +589,14 @@ func spawnExtraction(vault, transcript string) {
 	logPath := filepath.Join(vault, ".mesh", "extract.log")
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o700)
 	lf, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// The perm above applies only on CREATE, and this is an append to a long-lived log,
+	// so a vault that ran an older mesh keeps its 0644 extract.log forever. That file is
+	// the extraction subprocess's stdout over a session transcript.
+	if lf != nil {
+		if fi, serr := lf.Stat(); serr == nil && fi.Mode().Perm()&0o077 != 0 {
+			_ = lf.Chmod(fi.Mode() &^ 0o077)
+		}
+	}
 	cmd := exec.Command(self, "extract", "--to-pending", vault, transcript)
 	if lf != nil {
 		cmd.Stdout, cmd.Stderr = lf, lf

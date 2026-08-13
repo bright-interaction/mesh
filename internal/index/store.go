@@ -258,6 +258,13 @@ func NarrowDBFiles(dbPath string) {
 	}
 }
 
+// EnsureOwnerOnlyDir is ensureVaultMeshDir for any directory this project owns, exported
+// so internal/hub REPAIRS its data directory rather than only setting a mode on create.
+// MkdirAll's perm applies solely when it creates, and the hub's directory is a bind mount
+// that always already exists, so the 0700 constant alone was a no-op on every real
+// deployment while a fresh install got 0700 and looked correct.
+func EnsureOwnerOnlyDir(dir string) error { return ensureVaultMeshDir(dir) }
+
 // OpenAt is like Open but stores the index in an explicit directory instead of
 // <vaultRoot>/.mesh. The hub uses this to index its served vault into a dir OUTSIDE
 // the git repo, so the index is never synced to clients.
@@ -272,6 +279,15 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		return nil, err
 	}
 	dbPath := filepath.Join(meshDir, "mesh.db")
+	// Deferred, not straight-line: a corrupt or unreadable database returns before any
+	// later statement, and that is precisely the case where the file sits at 0644 while
+	// the operator retries. Matches OpenReadOnlyAt.
+	defer narrowIndexFiles(dbPath)
+	// The directory half of the same claim. Repair only, never create: a read-only open
+	// must still fail closed on a vault that has no index at all.
+	if fi, serr := os.Stat(meshDir); serr == nil && fi.IsDir() {
+		_ = ensureVaultMeshDir(meshDir)
+	}
 
 	writeDB, err := sql.Open("sqlite", dsn(dbPath))
 	if err != nil {
@@ -293,8 +309,6 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		}
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-
-	narrowIndexFiles(dbPath)
 
 	s := &Store{
 		dir:     meshDir,
@@ -343,6 +357,17 @@ func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 	// are read-only (mesh ui without --own-index, mesh doctor, the TUI) keeps a 0755
 	// .mesh and a 0644 mesh.db forever and mints two fresh 0644 files on every open.
 	defer narrowIndexFiles(dbPath)
+	// The DIRECTORY half of the same claim, which the first version of this fix left out
+	// while its comment promised it. Repair only, never create: a read-only open must
+	// still fail closed on a vault that has no index at all, so this runs on an existing
+	// directory and is a no-op otherwise. Every surface that only ever opens read-only
+	// (mesh ui without --own-index, the TUI, mesh doctor, an MCP window that lost the
+	// owner-lock race) reaches this and nothing else, so without it .mesh stays 0755
+	// forever and the credentials, ingest config and extraction log inside it are
+	// protected by their own modes alone.
+	if fi, serr := os.Stat(meshDir); serr == nil && fi.IsDir() {
+		_ = ensureVaultMeshDir(meshDir)
+	}
 	if _, err := os.Stat(dbPath); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w at %s: start the owning writer first (`mesh watch` or `mesh sync --watch`), or run `mesh index` once", ErrNoIndexYet, dbPath)

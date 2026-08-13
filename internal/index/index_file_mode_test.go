@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 )
 
@@ -29,11 +28,13 @@ func TestIndexCreationPathsAreOwnerOnly(t *testing.T) {
 			// The path every CLI command takes: <vault>/.mesh.
 			name: "Open",
 			open: func(t *testing.T, vault string) (*Store, string) {
+				dir := filepath.Join(vault, ".mesh")
+				mkWide(t, dir)
 				s, err := Open(vault)
 				if err != nil {
 					t.Fatal(err)
 				}
-				return s, filepath.Join(vault, ".mesh")
+				return s, dir
 			},
 		},
 		{
@@ -43,7 +44,37 @@ func TestIndexCreationPathsAreOwnerOnly(t *testing.T) {
 			name: "OpenAt",
 			open: func(t *testing.T, vault string) (*Store, string) {
 				dir := filepath.Join(t.TempDir(), "hub-index")
+				mkWide(t, dir)
 				s, err := OpenAt(vault, dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return s, dir
+			},
+		},
+		{
+			// The read-only path. It does not CREATE the index, but it is the ONLY
+			// path many users ever take (mesh ui without --own-index, the TUI, an MCP
+			// window that lost the owner-lock race), so if it does not repair a vault
+			// left wide by an older mesh, nothing ever does. It was absent from this
+			// table while the commit that changed it claimed the table enumerated the
+			// constructors.
+			name: "OpenReadOnlyAt",
+			open: func(t *testing.T, vault string) (*Store, string) {
+				w, err := Open(vault)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.Close()
+				dir := filepath.Join(vault, ".mesh")
+				// Put it back the way an older mesh left it.
+				if err := os.Chmod(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(filepath.Join(dir, "mesh.db"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				s, err := OpenReadOnlyAt(vault, dir)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -52,14 +83,12 @@ func TestIndexCreationPathsAreOwnerOnly(t *testing.T) {
 		},
 	}
 
-	// umask 077 made every assertion below pass over a reverted fix, because nothing
-	// forced a wide starting state and `perm&0o077 != 0` was then testing the RUNNER's
-	// umask rather than the code. Proven by mutation: with OpenAt back on
-	// os.MkdirAll(0o755) and narrowIndexFiles deleted, the whole internal/index suite
-	// passed at umask 077 and failed at 022. So set the umask wide for the duration,
-	// and assert literal modes rather than "no group/other bits".
-	old := syscall.Umask(0o022)
-	defer syscall.Umask(old)
+	// No umask mutation: syscall.Umask is PROCESS-global and Go runs every test in one
+	// process, so setting it raced the sibling mode assertions in this package and made
+	// the suite fail intermittently (observed once at 139s, passing at 36s on re-run). An
+	// intermittent guard is worse than none. Each opener forces a WIDE starting state with
+	// an explicit Chmod instead, which is deterministic and strictly stronger: a
+	// constructor that fails to narrow is caught at ANY umask.
 
 	for _, tc := range openers {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,5 +176,17 @@ func TestOpenNarrowsAnIndexLeftWideByAnOlderMesh(t *testing.T) {
 		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 			t.Errorf("reopening left %s at %v; an existing wide index must be narrowed, not tolerated", p, fs.FileMode(perm))
 		}
+	}
+}
+
+// mkWide creates dir in the world-traversable state an older mesh left behind, so the
+// assertions above measure the CODE rather than the runner's umask.
+func mkWide(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { // MkdirAll's perm is umask-masked
+		t.Fatal(err)
 	}
 }

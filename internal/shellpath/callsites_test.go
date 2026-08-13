@@ -276,7 +276,12 @@ func isQuoteCall(e ast.Expr) bool {
 		return false
 	}
 	pkg, ok := sel.X.(*ast.Ident)
-	return ok && pkg.Name == "shellpath" && sel.Sel.Name == "Quote"
+	if !ok || pkg.Name != "shellpath" {
+		return false
+	}
+	// PathArg as well as Quote. Accepting only Quote made the guard reject the safer of
+	// the two helpers, so adopting PathArg at a positional site failed the build.
+	return sel.Sel.Name == "Quote" || sel.Sel.Name == "PathArg"
 }
 
 func describe(fset *token.FileSet, call *ast.CallExpr, rel, lit string) string {
@@ -306,6 +311,12 @@ func countVerbs(s string) int {
 			// Skip flags and width/precision to land on the verb letter itself.
 			j := i + 1
 			for j < len(s) && strings.ContainsRune("+-# 0123456789.*", rune(s[j])) {
+				// A '*' takes its width or precision from an ARGUMENT, so %*d consumes
+				// two and %.*f likewise. Counting them as one put every later index off
+				// by one, which reads the wrong argument in both directions.
+				if s[j] == '*' {
+					n++
+				}
 				j++
 			}
 			if j < len(s) {

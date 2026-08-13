@@ -544,7 +544,7 @@ func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]s
 // somebody deliberately made private is worse than the gap it closes.
 func writeFileAtomic(path string, b []byte, newPerm os.FileMode) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	perm := newPerm
