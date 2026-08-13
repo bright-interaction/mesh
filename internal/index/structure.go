@@ -33,7 +33,8 @@ var canonicalTypes = map[string]bool{
 var tier0Structure = map[string]bool{"decision": true, "gotcha": true, "post-mortem": true}
 
 // godDegreeStruct mirrors retrieve.godDegree: graph expansion skips hubs above this
-// degree, so a note that links only to hubs gains nothing from the graph signal.
+// KNOWLEDGE degree (distinct other notes linked in or out), so a note that links only
+// to hubs gains nothing from the graph signal.
 const godDegreeStruct = 24
 
 // bloatedBodyLines is the body-length over which a note reads as a log-dump rather
@@ -48,7 +49,9 @@ type StructureFinding struct {
 	Detail   string
 }
 
-// ClusterMember is one note in a cluster, for building a map from.
+// ClusterMember is one note in a cluster, for building a map from. Degree is the
+// note's knowledge degree (distinct other notes linking in or out), so a cluster's
+// members are offered most-connected first rather than longest first.
 type ClusterMember struct {
 	Title  string
 	Path   string
@@ -87,9 +90,12 @@ type StructureReport struct {
 // grade. Pure; no I/O.
 func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote, parseErrs []FileError) StructureReport {
 	rep := StructureReport{ByType: map[string]int{}}
+	// Knowledge degree, not raw fan-out: the hub-only check below asks "are all my
+	// links to hubs", and raw fan-out counts each note's own headings and tags, which
+	// would promote the longest notes in the vault to hubs and flag their neighbours.
 	deg := map[string]int{}
 	for _, n := range g.Nodes() {
-		deg[n.ID] = n.Degree
+		deg[n.ID] = n.KnowledgeDegree
 	}
 
 	clusterSize := map[int]int{}
@@ -121,7 +127,7 @@ func AnalyzeStructure(g *graph.Graph, parsed []*ParsedNote, parseErrs []FileErro
 		}
 		clusterSize[node.Community]++
 		clusterMembers[node.Community] = append(clusterMembers[node.Community], ClusterMember{
-			Title: strings.TrimSpace(pn.FM.Title), Path: pn.Path, Type: t, Degree: node.Degree,
+			Title: strings.TrimSpace(pn.FM.Title), Path: pn.Path, Type: t, Degree: node.KnowledgeDegree,
 		})
 		if t == "map" {
 			clusterHasMap[node.Community] = true

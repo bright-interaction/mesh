@@ -33,23 +33,27 @@ type Export struct {
 
 type ExportMeta struct {
 	Vault     string `json:"vault"`    // absolute vault root, for the editor:// bridge
-	IndexID   string `json:"index_id"` // galaxy center: the highest-degree note
+	IndexID   string `json:"index_id"` // galaxy center: the most-connected note
 	NodeCount int    `json:"node_count"`
 	EdgeCount int    `json:"edge_count"`
 	MaxOrbit  int    `json:"max_orbit"` // largest graph-distance from the index note
 }
 
 type ExportNode struct {
-	ID        string   `json:"id"`    // frontmatter id
-	Label     string   `json:"label"` // title
-	Path      string   `json:"path"`  // vault-relative
-	Line      int      `json:"line"`  // source line for the editor bridge (1 = top)
-	Type      string   `json:"type"`  // frontmatter type (decision/gotcha/entity/...)
-	Community int      `json:"community"`
-	Degree    int      `json:"degree"`
-	Size      float64  `json:"size"`  // sqrt(degree), the client scales to a radius
-	Orbit     int      `json:"orbit"` // graph-distance from the index note (0 = center)
-	Tags      []string `json:"tags,omitempty"`
+	ID        string `json:"id"`    // frontmatter id
+	Label     string `json:"label"` // title
+	Path      string `json:"path"`  // vault-relative
+	Line      int    `json:"line"`  // source line for the editor bridge (1 = top)
+	Type      string `json:"type"`  // frontmatter type (decision/gotcha/entity/...)
+	Community int    `json:"community"`
+	// Degree is the note's KNOWLEDGE degree: distinct other notes linking to it or
+	// from it. The client labels it "links" in the hover card, and raw fan-out would
+	// count the note's own headings and tags, so a long unlinked note would show a
+	// link count it does not have and be drawn as a giant.
+	Degree int      `json:"degree"`
+	Size   float64  `json:"size"`  // sqrt(degree), the client scales to a radius
+	Orbit  int      `json:"orbit"` // graph-distance from the index note (0 = center)
+	Tags   []string `json:"tags,omitempty"`
 }
 
 type ExportEdge struct {
@@ -62,7 +66,7 @@ type ExportComm struct {
 	ID    int    `json:"id"`
 	Size  int    `json:"size"`
 	Color string `json:"color"` // hex; perceptually-spaced for the top N, gray for the tail
-	Label string `json:"label"` // exemplar (highest-degree member) title
+	Label string `json:"label"` // exemplar (most-connected member) title
 }
 
 // scopeVisible reports whether a note node is visible under an allowed-scope set.
@@ -103,10 +107,10 @@ func BuildExport(g *graph.Graph, vaultRoot string, allowed map[string]bool, allo
 		}
 	}
 
-	// Index note (galaxy center) = highest degree, ties by id for determinism.
+	// Index note (galaxy center) = most connected, ties by id for determinism.
 	var index *graph.Node
 	for _, n := range notes {
-		if index == nil || n.Degree > index.Degree || (n.Degree == index.Degree && n.ID < index.ID) {
+		if index == nil || n.KnowledgeDegree > index.KnowledgeDegree || (n.KnowledgeDegree == index.KnowledgeDegree && n.ID < index.ID) {
 			index = n
 		}
 	}
@@ -140,7 +144,7 @@ func BuildExport(g *graph.Graph, vaultRoot string, allowed map[string]bool, allo
 	commExemplar := map[int]*graph.Node{}
 	for _, n := range notes {
 		commSize[n.Community]++
-		if ex := commExemplar[n.Community]; ex == nil || n.Degree > ex.Degree || (n.Degree == ex.Degree && n.ID < ex.ID) {
+		if ex := commExemplar[n.Community]; ex == nil || n.KnowledgeDegree > ex.KnowledgeDegree || (n.KnowledgeDegree == ex.KnowledgeDegree && n.ID < ex.ID) {
 			commExemplar[n.Community] = n
 		}
 	}
@@ -173,8 +177,8 @@ func BuildExport(g *graph.Graph, vaultRoot string, allowed map[string]bool, allo
 	for _, n := range notes {
 		nodes = append(nodes, ExportNode{
 			ID: n.NoteID, Label: n.Label, Path: n.NotePath, Line: lineOf(n),
-			Type: typeOf(n), Community: n.Community, Degree: n.Degree,
-			Size: math.Sqrt(float64(n.Degree) + 1), Orbit: orbit[n.ID], Tags: tagsOf(g, n.ID),
+			Type: typeOf(n), Community: n.Community, Degree: n.KnowledgeDegree,
+			Size: math.Sqrt(float64(n.KnowledgeDegree) + 1), Orbit: orbit[n.ID], Tags: tagsOf(g, n.ID),
 		})
 	}
 	sort.Slice(nodes, func(i, j int) bool { // stable, importance-first

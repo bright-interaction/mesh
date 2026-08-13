@@ -135,7 +135,10 @@ func orientText(store *index.Store, g *graph.Graph) string {
 		if n.Kind != "note" {
 			continue
 		}
-		hubs = append(hubs, hub{n.Label, n.NotePath, n.Degree})
+		// KnowledgeDegree, not Degree: this line is printed as "[N links]", and raw
+		// degree counts a note's own headings and tags, so the longest note in the
+		// vault would head the entry points with a link count it does not have.
+		hubs = append(hubs, hub{n.Label, n.NotePath, n.KnowledgeDegree})
 	}
 	sort.Slice(hubs, func(i, j int) bool {
 		if hubs[i].deg != hubs[j].deg {

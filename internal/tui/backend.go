@@ -79,14 +79,17 @@ func NewLocalBackend(vaultRoot string) (*LocalBackend, func() error, error) {
 	return b, store.Close, nil
 }
 
-// Notes lists every note, hubs first (highest degree), ties by title.
+// Notes lists every note, hubs first (most connected), ties by title. Connectedness
+// is the knowledge degree (distinct other notes linking in or out), never raw
+// fan-out: raw fan-out counts a note's own headings and tags, so the list would be
+// ordered by note length and the browser would open on the longest page, not the hub.
 func (b *LocalBackend) Notes() []NoteRef {
 	var out []NoteRef
 	for _, n := range b.graph.Nodes() {
 		if n.Kind != "note" {
 			continue
 		}
-		out = append(out, NoteRef{ID: n.NoteID, Title: n.Label, Path: n.NotePath, Type: typeOf(n), Degree: n.Degree, Community: n.Community})
+		out = append(out, NoteRef{ID: n.NoteID, Title: n.Label, Path: n.NotePath, Type: typeOf(n), Degree: n.KnowledgeDegree, Community: n.Community})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Degree != out[j].Degree {

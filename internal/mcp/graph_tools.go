@@ -14,7 +14,7 @@ import (
 
 // notePrefix is the node-id namespace for notes (see internal/graph: a note's
 // node id is "note:<frontmatter-id>").
-const notePrefix = "note:"
+const notePrefix = graph.NotePrefix
 
 // neighborRef is one note/tag/heading adjacent to the center note.
 type neighborRef struct {
@@ -26,7 +26,10 @@ type neighborRef struct {
 	Direction string `json:"direction"` // out (this note -> neighbor) | in (neighbor -> this note)
 	Depth     int    `json:"depth"`
 	Community int    `json:"community"`
-	Degree    int    `json:"degree"`
+	// Degree is connectedness: for a note, how many distinct other notes link to it
+	// or from it (its knowledge degree); for a tag, how many nodes carry the tag.
+	// Never raw fan-out for a note, which would just be "how many headings has it".
+	Degree int `json:"degree"`
 }
 
 // toolNeighbors returns the typed neighborhood of a note out to a small depth, so
@@ -55,7 +58,7 @@ func (s *Server) toolNeighbors(ctx context.Context, raw json.RawMessage) (any, *
 	// Undirected BFS recording the shortest hop and the edge that first reached
 	// each neighbor. We GATHER the full neighborhood (bounded by a hard ceiling so
 	// memory is safe even on a mega-hub), then sort by importance and trim to limit
-	// so the kept neighbors are the highest-degree ones, not just the first ones
+	// so the kept neighbors are the most-connected ones, not just the first ones
 	// the adjacency happened to list. The payload is always <= limit (token-safe);
 	// the response reports the true total + a truncated flag so the agent never
 	// mistakes a trimmed view for a complete one.
@@ -116,7 +119,7 @@ func (s *Server) toolNeighbors(ctx context.Context, raw json.RawMessage) (any, *
 		truncated = true
 	}
 	return textResult(map[string]any{
-		"center":        map[string]any{"id": center.NoteID, "title": center.Label, "path": center.NotePath, "community": center.Community, "degree": center.Degree},
+		"center":        map[string]any{"id": center.NoteID, "title": center.Label, "path": center.NotePath, "community": center.Community, "degree": center.KnowledgeDegree},
 		"depth":         depth,
 		"depth_reached": reached,
 		"neighbors":     out,
@@ -141,14 +144,23 @@ func refFor(g *graph.Graph, nodeID, relation, dir string, depth int) (neighborRe
 	if id == "" {
 		id = n.ID // tags have no frontmatter id; keep the node id
 	}
+	// A note ranks by its knowledge degree (distinct linked notes). A tag has no
+	// "references" edges at all, so its knowledge degree is 0 and its raw fan-out IS
+	// the number of notes carrying it, which is the honest connectedness of a tag.
+	deg := n.KnowledgeDegree
+	if n.Kind != "note" {
+		deg = n.Degree // total fan-out, wanted here: a tag's edges are its members
+	}
 	return neighborRef{
 		ID: id, Kind: n.Kind, Title: n.Label, Path: n.NotePath,
 		Relation: relation, Direction: dir, Depth: depth,
-		Community: n.Community, Degree: n.Degree,
+		Community: n.Community, Degree: deg,
 	}, true
 }
 
-// memberRef is one note inside a community.
+// memberRef is one note inside a community. Degree is the note's knowledge degree
+// (distinct other notes linking to it or from it), so the members an agent is shown
+// first are the anchors of the cluster and not merely its longest pages.
 type memberRef struct {
 	ID     string `json:"id"`
 	Title  string `json:"title"`
@@ -160,7 +172,7 @@ type memberRef struct {
 type communitySummary struct {
 	Community  int         `json:"community"`
 	Size       int         `json:"size"`
-	Exemplar   string      `json:"exemplar"`    // title of the highest-degree member
+	Exemplar   string      `json:"exemplar"`    // title of the most-connected member
 	ExemplarID string      `json:"exemplar_id"` // its frontmatter id
 	Top        []memberRef `json:"top,omitempty"`
 }
@@ -192,7 +204,7 @@ func (s *Server) toolCommunity(ctx context.Context, raw json.RawMessage) (any, *
 	return textResult(map[string]any{"communities": overview, "count": len(overview)}), nil
 }
 
-// communityMembers returns the readable notes in a community (highest-degree first,
+// communityMembers returns the readable notes in a community (most-connected first,
 // capped) plus the true total readable count.
 // scopedGraphCounts returns the node count and edge count VISIBLE to a scoped caller:
 // only readable nodes, and only edges whose endpoints are both readable (so an edge
@@ -221,7 +233,7 @@ func communityMembers(g *graph.Graph, comm, limit int, sf *ScopeFilter) (members
 			continue
 		}
 		total++
-		members = append(members, memberRef{n.NoteID, n.Label, n.NotePath, n.Degree})
+		members = append(members, memberRef{n.NoteID, n.Label, n.NotePath, n.KnowledgeDegree})
 	}
 	sort.Slice(members, func(i, j int) bool {
 		if members[i].Degree != members[j].Degree {
@@ -236,7 +248,7 @@ func communityMembers(g *graph.Graph, comm, limit int, sf *ScopeFilter) (members
 }
 
 // communityOverview groups notes by community, largest first, with each
-// community's top-degree exemplar and a few top members.
+// community's most-connected exemplar and a few top members.
 func communityOverview(g *graph.Graph, limit int, sf *ScopeFilter) []communitySummary {
 	byComm := map[int][]*graph.Node{}
 	for _, n := range g.Nodes() {
@@ -248,14 +260,14 @@ func communityOverview(g *graph.Graph, limit int, sf *ScopeFilter) []communitySu
 	out := make([]communitySummary, 0, len(byComm))
 	for comm, ns := range byComm {
 		sort.Slice(ns, func(i, j int) bool {
-			if ns[i].Degree != ns[j].Degree {
-				return ns[i].Degree > ns[j].Degree
+			if ns[i].KnowledgeDegree != ns[j].KnowledgeDegree {
+				return ns[i].KnowledgeDegree > ns[j].KnowledgeDegree
 			}
 			return ns[i].NoteID < ns[j].NoteID
 		})
 		cs := communitySummary{Community: comm, Size: len(ns), Exemplar: ns[0].Label, ExemplarID: ns[0].NoteID}
 		for i := 0; i < len(ns) && i < 3; i++ {
-			cs.Top = append(cs.Top, memberRef{ns[i].NoteID, ns[i].Label, ns[i].NotePath, ns[i].Degree})
+			cs.Top = append(cs.Top, memberRef{ns[i].NoteID, ns[i].Label, ns[i].NotePath, ns[i].KnowledgeDegree})
 		}
 		out = append(out, cs)
 	}

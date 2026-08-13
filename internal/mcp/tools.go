@@ -55,7 +55,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_god_nodes",
-			"description": "The map: the most-connected notes (hubs), best entry points to orient before searching.",
+			"description": "The map: the most-connected notes (hubs), ranked by how many other notes link to and from them, best entry points to orient before searching.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{"limit": intp}}),
 		},
 		{
@@ -799,6 +799,10 @@ func (s *Server) toolGodNodes(ctx context.Context, raw json.RawMessage) (any, *r
 	// note corpus as "hubs" - the orientation call, the one an agent makes FIRST, was the
 	// one that could blow out its context before it had read anything.
 	a.Limit = clampLimit(a.Limit, 10, 100)
+	// degree is the note's KNOWLEDGE degree: how many distinct other notes link to it
+	// or from it. Raw fan-out would rank the vault's longest note first (its own
+	// headings and tags each add one) and report a link count it does not have, which
+	// is the worst possible answer from the tool an agent calls first to orient.
 	type hub struct {
 		ID        string `json:"id"`
 		Title     string `json:"title"`
@@ -816,7 +820,7 @@ func (s *Server) toolGodNodes(ctx context.Context, raw json.RawMessage) (any, *r
 		if !sf.allowsNode(n) { // hide hubs the caller cannot read (no title enumeration)
 			continue
 		}
-		hubs = append(hubs, hub{n.NoteID, n.Label, n.NotePath, n.Degree, n.Community})
+		hubs = append(hubs, hub{n.NoteID, n.Label, n.NotePath, n.KnowledgeDegree, n.Community})
 	}
 	sort.Slice(hubs, func(i, j int) bool {
 		if hubs[i].Degree != hubs[j].Degree {

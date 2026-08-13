@@ -22,9 +22,13 @@ func TestLocalBackend(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("hub.md", "---\nid: hub\ntype: note\nwhen: 2026-01-01\ntags: [core]\n---\n# Hub\nthe storage decision links [[alpha]] and [[beta]]\n")
+	write("hub.md", "---\nid: hub\ntype: note\nwhen: 2026-01-01\ntags: [core]\n---\n# Hub\nthe storage decision links [[alpha]], [[beta]] and [[gamma]]\n")
 	write("alpha.md", "---\nid: alpha\ntype: note\nwhen: 2026-01-01\n---\n# Alpha\nsee [[beta]]\n")
 	write("beta.md", "---\nid: beta\ntype: note\nwhen: 2026-01-01\n---\n# Beta\nleaf\n")
+	// gamma makes hub a REAL hub: three linked notes against alpha's and beta's two.
+	// Without it every note in the triangle is equally connected and "hub-first" only
+	// held because raw fan-out counted hub's extra tag and heading edges.
+	write("gamma.md", "---\nid: gamma\ntype: note\nwhen: 2026-01-01\n---\n# Gamma\nleaf\n")
 
 	// The owning writer indexes; the TUI reads. The backend used to index for itself,
 	// which made every browser a second writer against a vault that already has one.
@@ -37,11 +41,14 @@ func TestLocalBackend(t *testing.T) {
 	defer closeFn()
 
 	notes := be.Notes()
-	if len(notes) != 3 {
-		t.Fatalf("want 3 notes, got %d", len(notes))
+	if len(notes) != 4 {
+		t.Fatalf("want 4 notes, got %d", len(notes))
 	}
 	if notes[0].ID != "hub" {
-		t.Fatalf("notes should be hub-first (highest degree), got %q", notes[0].ID)
+		t.Fatalf("notes should be hub-first (most connected), got %q", notes[0].ID)
+	}
+	if notes[0].Degree != 3 {
+		t.Fatalf("the hub links 3 notes, so its degree must be 3 (links, not headings), got %d", notes[0].Degree)
 	}
 
 	cards, err := be.Search("storage decision")

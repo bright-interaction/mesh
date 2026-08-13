@@ -34,7 +34,10 @@ const (
 	expandSeeds = 5   // expand from the top-N fused notes
 	expandK     = 3   // pull at most K strong note-neighbors per seed
 	expandDecay = 0.4 // a neighbor inherits this fraction of the seed's score
-	godDegree   = 24  // skip expansion into hub nodes above this degree
+	// godDegree: skip expansion into hub notes above this KNOWLEDGE degree (distinct
+	// other notes linked in or out). Measured on raw fan-out it also skipped any note
+	// with enough headings, so a 25-section runbook was passed over for a two-line stub.
+	godDegree = 24
 
 	rerankK = 30 // rerank at most this many top fused candidates
 
@@ -1009,7 +1012,7 @@ func (r *Retriever) strongNeighbors(id string, k int) []neighbor {
 	seen := map[string]float64{}
 	consider := func(other string, w float64) {
 		n, ok := r.graph.Node(other)
-		if !ok || n.Kind != "note" || n.Degree > godDegree {
+		if !ok || n.Kind != "note" || n.KnowledgeDegree > godDegree {
 			return
 		}
 		if w > seen[other] {

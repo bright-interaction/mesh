@@ -18,12 +18,18 @@ func linkedGraph() *graph.Graph {
 	add("hub", "Hub")
 	add("alpha", "Alpha")
 	add("beta", "Beta")
+	add("gamma", "Gamma")
 	g.AddNode(&graph.Node{ID: "tag:core", Kind: "tag", Label: "core"})
 	edge := func(s, t, rel string) { g.AddEdge(graph.Edge{Source: s, Target: t, Relation: rel}) }
 	edge("note:hub", "note:alpha", "references")
 	edge("note:hub", "note:beta", "references")
 	edge("note:alpha", "note:beta", "references")
+	edge("note:hub", "note:gamma", "references")
 	edge("note:hub", "tag:core", "tagged")
+	// Production always recomputes degrees once the graph is assembled (BuildGraph and
+	// LoadGraph both do), and connectedness now means knowledge degree, which only that
+	// pass fills in. A fixture that skips it is not the graph the export sees.
+	g.RecomputeDegrees()
 	g.DetectCommunities(0)
 	return g
 }
@@ -31,12 +37,14 @@ func linkedGraph() *graph.Graph {
 func TestBuildExport(t *testing.T) {
 	exp := BuildExport(linkedGraph(), "/vault", nil, nil)
 
-	// Notes only (the tag node is excluded), index = highest degree.
-	if exp.Meta.NodeCount != 3 || len(exp.Nodes) != 3 {
-		t.Fatalf("want 3 note nodes, got %d", len(exp.Nodes))
+	// Notes only (the tag node is excluded), index = the most-connected note. hub links
+	// three notes, alpha and beta two each, gamma one: the center is a real hub, not
+	// whichever note happens to own the most headings.
+	if exp.Meta.NodeCount != 4 || len(exp.Nodes) != 4 {
+		t.Fatalf("want 4 note nodes, got %d", len(exp.Nodes))
 	}
 	if exp.Meta.IndexID != "hub" {
-		t.Fatalf("index should be the highest-degree note (hub), got %q", exp.Meta.IndexID)
+		t.Fatalf("index should be the most-connected note (hub), got %q", exp.Meta.IndexID)
 	}
 	if exp.Nodes[0].ID != "hub" {
 		t.Fatalf("nodes should be importance-sorted (hub first), got %q", exp.Nodes[0].ID)
@@ -49,8 +57,8 @@ func TestBuildExport(t *testing.T) {
 			t.Fatalf("empty edge endpoint: %+v", e)
 		}
 	}
-	if exp.Meta.EdgeCount != 3 {
-		t.Fatalf("want 3 note-note edges (the tag edge excluded), got %d", exp.Meta.EdgeCount)
+	if exp.Meta.EdgeCount != 4 {
+		t.Fatalf("want 4 note-note edges (the tag edge excluded), got %d", exp.Meta.EdgeCount)
 	}
 
 	byID := map[string]ExportNode{}
@@ -61,16 +69,24 @@ func TestBuildExport(t *testing.T) {
 	if byID["hub"].Orbit != 0 {
 		t.Fatalf("index note orbit must be 0, got %d", byID["hub"].Orbit)
 	}
-	if byID["alpha"].Orbit != 1 || byID["beta"].Orbit != 1 {
-		t.Fatalf("hub's neighbors should be orbit 1: alpha=%d beta=%d", byID["alpha"].Orbit, byID["beta"].Orbit)
+	if byID["alpha"].Orbit != 1 || byID["beta"].Orbit != 1 || byID["gamma"].Orbit != 1 {
+		t.Fatalf("hub's neighbors should be orbit 1: alpha=%d beta=%d gamma=%d",
+			byID["alpha"].Orbit, byID["beta"].Orbit, byID["gamma"].Orbit)
 	}
 	// Tags surfaced from tagged edges.
 	if len(byID["hub"].Tags) != 1 || byID["hub"].Tags[0] != "core" {
 		t.Fatalf("hub should carry the 'core' tag, got %v", byID["hub"].Tags)
 	}
-	// Size grows with degree.
+	// Size grows with connectedness, and connectedness is links: gamma is a one-link
+	// leaf, so it must be the smallest dot no matter how long its page is.
 	if byID["hub"].Size <= byID["alpha"].Size {
-		t.Fatalf("higher-degree note should have a larger size: hub=%v alpha=%v", byID["hub"].Size, byID["alpha"].Size)
+		t.Fatalf("more-connected note should have a larger size: hub=%v alpha=%v", byID["hub"].Size, byID["alpha"].Size)
+	}
+	if byID["gamma"].Size >= byID["alpha"].Size {
+		t.Fatalf("a one-link leaf should be smaller than a two-link note: gamma=%v alpha=%v", byID["gamma"].Size, byID["alpha"].Size)
+	}
+	if byID["hub"].Degree != 3 || byID["gamma"].Degree != 1 {
+		t.Fatalf("exported degree must be distinct linked notes: hub=%d gamma=%d", byID["hub"].Degree, byID["gamma"].Degree)
 	}
 	// Communities all carry a valid color.
 	if len(exp.Communities) == 0 {

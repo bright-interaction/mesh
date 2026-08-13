@@ -7,13 +7,24 @@
 // a rename never rots an edge or an agent citation (spec section 3.6).
 package graph
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // Edge confidence levels (from a graph extraction model).
 const (
 	ConfExtracted = "EXTRACTED"
 	ConfInferred  = "INFERRED"
 	ConfAmbiguous = "AMBIGUOUS"
+)
+
+// NotePrefix is the node-id namespace for notes, and RelReferences is the only
+// relation that carries knowledge between two notes ("contains" is a note's own
+// headings, "tagged" is its tags: both are scaffolding inside one note).
+const (
+	NotePrefix    = "note:"
+	RelReferences = "references"
 )
 
 type Node struct {
@@ -26,7 +37,25 @@ type Node struct {
 	SourceLoc string // "L<line>" for the editor deep link
 	Community int
 	Attrs     map[string]any
-	Degree    int
+
+	// Degree is raw fan-out: every edge on the node, of every relation, in and out.
+	// It counts a note's own headings and tags, so it measures how LONG a note is at
+	// least as much as how connected it is. Use it only where total fan-out is
+	// genuinely what you want; for "how connected is this note" use KnowledgeDegree.
+	Degree int
+
+	// KnowledgeDegree is how many DISTINCT other notes this note links to or is
+	// linked from, over "references" edges only (in and out, self excluded). That is
+	// the connectedness a reader means by "most-connected note": a note with 30
+	// headings and no links scores 0, and a note referenced by 12 notes that it also
+	// links back to scores 12, because that is 12 connections and not 24 edges.
+	// Non-note nodes (headings, tags) have no references edges, so theirs is 0.
+	//
+	// It is filled by RecomputeDegrees, not by AddEdge: a distinct neighbour cannot be
+	// counted incrementally (a->b and b->a are two edges but one neighbour). Both graph
+	// build paths (BuildGraph and LoadGraph) call RecomputeDegrees once when assembly
+	// is done, so any code holding a fully built graph can read this.
+	KnowledgeDegree int
 }
 
 type Edge struct {
@@ -109,17 +138,45 @@ func (g *Graph) AddEdge(e Edge) {
 	}
 }
 
-// RecomputeDegrees sets every node's Degree from its adjacency lists, making the
-// value independent of node/edge insertion order. AddEdge only bumps endpoints that
-// already exist at insertion time, so a graph assembled by interleaving AddNode and
-// AddEdge (BuildGraph: a references edge to a not-yet-added later note never counts
-// that note's inbound degree) would otherwise disagree with one built nodes-first
-// (LoadGraph). Call this once after the graph is fully assembled so both paths agree.
+// RecomputeDegrees sets every node's Degree and KnowledgeDegree from its adjacency
+// lists, making both values independent of node/edge insertion order. AddEdge only
+// bumps endpoints that already exist at insertion time, so a graph assembled by
+// interleaving AddNode and AddEdge (BuildGraph: a references edge to a not-yet-added
+// later note never counts that note's inbound degree) would otherwise disagree with one
+// built nodes-first (LoadGraph). Call this once after the graph is fully assembled so
+// both paths agree, and so KnowledgeDegree is populated at all.
 func (g *Graph) RecomputeDegrees() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	seen := make(map[string]bool)
 	for id, n := range g.nodes {
 		n.Degree = len(g.adj[id]) + len(g.rev[id])
+
+		// Knowledge degree: distinct OTHER notes reached over "references" edges, in
+		// either direction. Heading/tag scaffolding never counts, and two notes that
+		// link to each other are one connection, not two.
+		clear(seen)
+		k := 0
+		count := func(other string) {
+			// A heading node id is "note:<id>#<anchor>", so it carries the note prefix
+			// too; the anchor is what separates a whole note from a slice of one.
+			if other == id || seen[other] || !strings.HasPrefix(other, NotePrefix) || strings.Contains(other, "#") {
+				return
+			}
+			seen[other] = true
+			k++
+		}
+		for _, e := range g.adj[id] {
+			if e.Relation == RelReferences {
+				count(e.Target)
+			}
+		}
+		for _, e := range g.rev[id] {
+			if e.Relation == RelReferences {
+				count(e.Source)
+			}
+		}
+		n.KnowledgeDegree = k
 	}
 }
 
