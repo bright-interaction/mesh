@@ -76,3 +76,23 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// Retracted releases. Both are still fetchable by explicit version (a module proxy entry
+// is immutable, so nothing can remove them) but `go get` will no longer SELECT either,
+// and it tells the user why. This is the non-destructive alternative to deleting the
+// tags: a published tag is product surface, `git checkout v0.6.0` keeps working, and
+// every existing checksum stays valid.
+retract (
+	// The v0.6.0 fixes, with the hook injection only half closed: Guard.Severity still
+	// reaches the same comment line raw. Also: the generated hook is fail-open, because
+	// a rejected grep pattern exits 2 and reads as "no violations"; brace expansion of
+	// an LLM-written glob field is unbounded; the hub's directory hardening is a no-op
+	// on any existing deployment.
+	v0.6.1
+	// mesh guards: Guard.Title is interpolated raw into the generated pre-commit hook,
+	// so a newline in a note's title becomes an executable line in a file the product
+	// invites you to install. Also: `mesh doctor` exits 1 on a healthy vault, breaking
+	// the CI contract the README documents; `mesh migrate` cements the duplicate-id
+	// collision it is supposed to resolve; the index is created world-readable.
+	v0.6.0
+)
