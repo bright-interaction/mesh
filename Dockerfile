@@ -10,7 +10,7 @@
 # or `make install`; this exists for people who would rather run Mesh in a container.
 
 # ---------- build stage ----------
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
 # The commit being built, stamped into buildinfo.Version below so `mesh version` and the
