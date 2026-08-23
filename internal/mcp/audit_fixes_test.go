@@ -424,7 +424,7 @@ func TestWriteBackReconcilesIncrementally(t *testing.T) {
 		"name": "mesh_search", "arguments": map[string]any{"query": "incremental writeback reconcile"}}))
 	found := false
 	for _, c := range asCards(out) {
-		if c["NodeID"] == "note:incremental-writeback" {
+		if c["NoteID"] == "incremental-writeback" {
 			found = true
 		}
 	}

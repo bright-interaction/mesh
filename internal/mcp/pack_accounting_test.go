@@ -139,9 +139,14 @@ func TestSearchCardTokensPricesTheLabelledForm(t *testing.T) {
 				}
 				return
 			}
-			if got != plain {
-				t.Errorf("an own-note card prices at %d against the unlabelled %d: nothing is "+
-					"added to it on the wire", got, plain)
+			// An own note has nothing ADDED on the wire, and since 2026-08-23 it has one
+			// field REMOVED: searchCard shadows Card.NodeID away because it is exactly
+			// notePrefix+NoteID. So the priced form must be no larger than the unlabelled
+			// card, and strictly smaller once the id is long enough to matter. Asserting
+			// equality here is what would silently re-admit NodeID to the wire.
+			if got > plain {
+				t.Errorf("an own-note card prices at %d, MORE than the unlabelled %d: nothing "+
+					"is added to it on the wire", got, plain)
 			}
 		})
 	}

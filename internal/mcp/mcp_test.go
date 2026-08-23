@@ -166,8 +166,8 @@ func TestToolSearchFused(t *testing.T) {
 		t.Fatal("expected cards")
 	}
 	first, _ := cards[0].(map[string]any)
-	if first["NodeID"] != "note:sqlite" {
-		t.Errorf("top card = %v, want note:sqlite", first["NodeID"])
+	if first["NoteID"] != "sqlite" {
+		t.Errorf("top card = %v, want sqlite", first["NoteID"])
 	}
 }
 
@@ -197,7 +197,7 @@ func TestToolWriteBackReindexes(t *testing.T) {
 	cards, _ := out["cards"].([]any)
 	var found bool
 	for _, c := range cards {
-		if cm, _ := c.(map[string]any); cm["NodeID"] == "note:vec-extensions-unavailable" {
+		if cm, _ := c.(map[string]any); cm["NoteID"] == "vec-extensions-unavailable" {
 			found = true
 		}
 	}
@@ -311,7 +311,7 @@ func TestReindexPicksUpDirectFileEdit(t *testing.T) {
 	out := toolText(t, call(t, s, "tools/call", map[string]any{
 		"name": "mesh_search", "arguments": map[string]any{"query": "hnsw ann index"}}))
 	for _, c := range asCards(out) {
-		if c["NodeID"] == "note:hnsw" {
+		if c["NoteID"] == "hnsw" {
 			t.Fatal("server should be stale before mesh_reindex")
 		}
 	}
@@ -331,7 +331,7 @@ func TestReindexPicksUpDirectFileEdit(t *testing.T) {
 		"name": "mesh_search", "arguments": map[string]any{"query": "hnsw ann index"}}))
 	found := false
 	for _, c := range asCards(out) {
-		if c["NodeID"] == "note:hnsw" {
+		if c["NoteID"] == "hnsw" {
 			found = true
 		}
 	}

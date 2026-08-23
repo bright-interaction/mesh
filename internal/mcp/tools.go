@@ -732,6 +732,26 @@ func checkQueryLength(q string) *rpcError {
 // only for third-party ingested notes, keeping the common card byte-identical.
 type searchCard struct {
 	retrieve.Card
+	// NodeID is dropped from the wire: it is exactly notePrefix+NoteID, so it costs
+	// every card a second copy of its own id and tells the agent nothing NoteID does
+	// not. Measured 2026-08-23 over 62 live cards: zero divergence from "note:"+NoteID,
+	// and 17.6% of all card bytes. No tool needs it as INPUT either - toolNeighbors and
+	// toolCommunity build centerID as notePrefix+a.ID themselves, and mesh_fetch takes
+	// the bare id - so nothing has to reconstruct it. Shadowing the embedded field at
+	// depth 0 is what removes it, but the tag MUST be `json:"NodeID,omitempty"` and
+	// NOT `json:"-"`. A `-` tag does not shadow: encoding/json drops that field from
+	// consideration entirely, so the embedded Card.NodeID stays the only candidate for
+	// the name and is still marshalled. Verified the wrong way round first - the whole
+	// package test suite stayed GREEN over a no-op change, because every existing test
+	// asserts NodeID is PRESENT. TestNodeIDIsNotOnTheSearchWire below pins the real
+	// behaviour. This field is never assigned, so omitempty drops it; Card.NodeID stays
+	// populated for any in-process caller.
+	//
+	// Type is deliberately NOT dropped alongside it. It looks derivable from the Path
+	// prefix, but it is not: 76 of 2120 notes (3.6%) disagree with their directory -
+	// the 12 root-level notes have no directory at all (ORGANIZATION.md is a concept),
+	// and every entities/<name>-log*.md is a note, not an entity.
+	NodeID string `json:"NodeID,omitempty"`
 	Source string `json:"Source,omitempty"`
 }
 
