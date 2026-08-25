@@ -24,7 +24,7 @@ set -euo pipefail
 
 # The module root. In the public repo that is the repo root; in the monorepo the
 # module lives one level down, so try that too.
-cd "20 20 12 61 79 80 81 98 701 33 100 204 250 395 398 399 400git rev-parse --show-toplevel)" 2>/dev/null || true
+cd "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || true
 [ -f go.mod ] || cd mesh 2>/dev/null || true
 [ -f go.mod ] || { echo "error: run this from the Mesh module root (the directory holding go.mod)" >&2; exit 1; }
 
