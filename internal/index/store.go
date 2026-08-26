@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,13 @@ type Store struct {
 
 	closeOnce sync.Once // Close is idempotent: a second close(s.done) would panic
 	closeErr  error     // the first Close's result, replayed to later callers
+
+	// writeGuard is an optional live ownership check. Opportunistic MCP ownership can
+	// be preempted after this Store was opened; every transaction and checkpoint must
+	// then stop writing even though the physical write connection still exists until
+	// orderly shutdown.
+	writeGuardMu sync.RWMutex
+	writeGuard   func() bool
 
 	mu      sync.Mutex  // guards dropped + droppedSynced
 	dropped []FileError // notes dropped as unparseable by the last full reindex
@@ -189,7 +197,17 @@ func Open(vaultRoot string) (*Store, error) {
 	if err := ensureVaultMeshDir(dir); err != nil {
 		return nil, err
 	}
-	return OpenAt(vaultRoot, dir)
+	return openAt(vaultRoot, dir, true)
+}
+
+// OpenCurrent opens a writable store without replacing an existing mismatched schema.
+// Use it when a command writes auxiliary state but does not immediately rebuild notes.
+func OpenCurrent(vaultRoot string) (*Store, error) {
+	dir := filepath.Join(vaultRoot, ".mesh")
+	if err := ensureVaultMeshDir(dir); err != nil {
+		return nil, err
+	}
+	return openAt(vaultRoot, dir, false)
 }
 
 // ensureVaultMeshDir creates <vault>/.mesh at vaultMeshDirMode and, when it already
@@ -269,6 +287,15 @@ func EnsureOwnerOnlyDir(dir string) error { return ensureVaultMeshDir(dir) }
 // <vaultRoot>/.mesh. The hub uses this to index its served vault into a dir OUTSIDE
 // the git repo, so the index is never synced to clients.
 func OpenAt(vaultRoot, meshDir string) (*Store, error) {
+	return openAt(vaultRoot, meshDir, true)
+}
+
+// OpenCurrentAt is OpenCurrent with an explicit index directory.
+func OpenCurrentAt(vaultRoot, meshDir string) (*Store, error) {
+	return openAt(vaultRoot, meshDir, false)
+}
+
+func openAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) {
 	// The same 0700 treatment Open gets, because this is the OTHER entry point that
 	// creates the directory. It used to MkdirAll at 0755 and never narrow: harmless
 	// when reached via Open (which has already created the dir, making this call a
@@ -279,6 +306,11 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		return nil, err
 	}
 	dbPath := filepath.Join(meshDir, "mesh.db")
+	_, statErr := os.Stat(dbPath)
+	dbExisted := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, statErr
+	}
 	// Deferred, not straight-line: a corrupt or unreadable database returns before any
 	// later statement, and that is precisely the case where the file sits at 0644 while
 	// the operator retries. Matches OpenReadOnlyAt.
@@ -301,11 +333,14 @@ func OpenAt(vaultRoot, meshDir string) (*Store, error) {
 		return nil, err
 	}
 
-	if err := ensureSchemaChecked(writeDB); err != nil {
+	if err := ensureSchemaChecked(writeDB, allowSchemaRebuild, dbExisted); err != nil {
 		writeDB.Close()
 		readDB.Close()
 		if isUnreadableDB(err) {
 			return nil, corruptIndexError(vaultRoot, dbPath, err)
+		}
+		if errors.Is(err, ErrSchemaMismatch) && !errors.Is(err, ErrSchemaTooNew) {
+			err = fmt.Errorf("%w\n  fix: mesh index %s", err, shellpath.Quote(vaultRoot))
 		}
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
@@ -514,17 +549,36 @@ func isUnreadableDB(err error) bool {
 // it does not build indexes) instead of pattern-matching the message.
 var ErrSchemaMismatch = errors.New("index schema mismatch")
 
+// ErrSchemaTooNew marks an index written by a newer Mesh binary. Older code must leave
+// it untouched because it cannot know which non-derivable state the newer schema keeps.
+var ErrSchemaTooNew = errors.New("index schema is newer than this Mesh binary")
+
 // schemaVersionInIndex reads meta.schema_version from a read-only connection. A missing
 // meta table or missing row answers 0: that is a database this Mesh never stamped, which
 // is a mismatch, not an internal error.
 func schemaVersionInIndex(db *sql.DB) (int, error) {
-	var v int
-	err := db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&v)
+	return versionInIndex(db, "schema_version")
+}
+
+func keepShapeVersionInIndex(db *sql.DB) (int, error) {
+	return versionInIndex(db, "keep_shape_version")
+}
+
+// Parse stamps strictly in Go: SQLite considers CAST('6garbage' AS INTEGER) equal to 6.
+func versionInIndex(db *sql.DB, key string) (int, error) {
+	var raw string
+	err := db.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&raw)
 	switch {
 	case err == nil:
+		v, parseErr := strconv.Atoi(strings.TrimSpace(raw))
+		if parseErr != nil || v < 0 {
+			return -1, nil
+		}
 		return v, nil
 	case errors.Is(err, sql.ErrNoRows), strings.Contains(err.Error(), "no such table"):
 		return 0, nil
+	case strings.Contains(err.Error(), "no such column"):
+		return -1, nil
 	default:
 		return 0, err
 	}
@@ -540,8 +594,9 @@ func checkReadOnlySchemaVersion(db *sql.DB, vaultRoot, dbPath string) error {
 	if err != nil {
 		return fmt.Errorf("read index schema version: %w", err)
 	}
-	if found == SchemaVersion {
-		return nil
+	foundKeep, err := keepShapeVersionInIndex(db)
+	if err != nil {
+		return fmt.Errorf("read index kept-table shape version: %w", err)
 	}
 	abs, aerr := filepath.Abs(dbPath)
 	if aerr != nil {
@@ -551,9 +606,32 @@ func checkReadOnlySchemaVersion(db *sql.DB, vaultRoot, dbPath string) error {
 	if rerr != nil {
 		root = vaultRoot
 	}
+	if found > SchemaVersion || foundKeep > keepShapeVersion {
+		return fmt.Errorf("%w: %w: %s was written by a newer version of Mesh (index schema v%d / kept-table shape v%d; this binary supports v%d / v%d)\n"+
+			"  this binary refuses to downgrade that index because it may contain non-derivable state it does not understand\n"+
+			"  your notes are safe; leave the index untouched\n"+
+			"  fix: upgrade Mesh to the version that wrote this index (or a newer one); do not run `mesh index` with this older binary",
+			ErrSchemaMismatch, ErrSchemaTooNew, abs, found, foundKeep, SchemaVersion, keepShapeVersion)
+	}
+	if found == SchemaVersion && (foundKeep == 0 || foundKeep == keepShapeVersion) {
+		if probeErr := validateSchemaProbes(context.Background(), db, allSchemaProbes()); probeErr == nil {
+			return nil
+		} else if isUnreadableDB(probeErr) {
+			return corruptIndexError(vaultRoot, dbPath, probeErr)
+		} else if !isSchemaShapeError(probeErr) {
+			return fmt.Errorf("validate current index schema: %w", probeErr)
+		} else {
+			return fmt.Errorf("%w: %s is stamped with the current schema but its table shape does not match: %v\n"+
+				"  refusing to serve partial or mis-shaped tables\n"+
+				"  fix: mesh index %s   (rebuilds the derived index from your safe Markdown notes)",
+				ErrSchemaMismatch, abs, probeErr, shellpath.Quote(root))
+		}
+	}
 	stamped := fmt.Sprintf("v%d", found)
 	if found == 0 {
 		stamped = "unstamped"
+	} else if found < 0 {
+		stamped = "invalid"
 	}
 	return fmt.Errorf("%w: %s was written by a different version of Mesh (index schema %s, this binary expects v%d)\n"+
 		"  read-only surfaces cannot migrate it, so this one refuses to answer from a schema it does not match\n"+
@@ -623,7 +701,14 @@ func recoverCorruptIndex(dbPath string, openErr error) (bool, error) {
 func OpenRebuild(vaultRoot string) (*Store, bool, error) {
 	s, err := Open(vaultRoot)
 	if err == nil {
-		return s, false, nil
+		if integrityErr := s.CheckIntegrity(vaultRoot); integrityErr == nil {
+			return s, false, nil
+		} else {
+			err = integrityErr
+			if closeErr := s.Close(); closeErr != nil {
+				return nil, false, errors.Join(err, closeErr)
+			}
+		}
 	}
 	dbPath := filepath.Join(vaultRoot, ".mesh", "mesh.db")
 	recovered, rerr := recoverCorruptIndex(dbPath, err)
@@ -635,6 +720,24 @@ func OpenRebuild(vaultRoot string) (*Store, bool, error) {
 		return nil, false, err
 	}
 	return s, true, nil
+}
+
+// CheckIntegrity scans the whole index before a diagnostic or recovery surface claims
+// it is healthy. Only genuine SQLite corruption is wrapped with ErrIndexCorrupt; busy
+// and I/O failures never authorize deletion.
+func (s *Store) CheckIntegrity(vaultRoot string) error {
+	var result string
+	err := s.readDB.QueryRow(`PRAGMA quick_check(1)`).Scan(&result)
+	if err != nil {
+		if isUnreadableDB(err) {
+			return corruptIndexError(vaultRoot, s.dbPath, err)
+		}
+		return fmt.Errorf("check index integrity: %w", err)
+	}
+	if strings.EqualFold(strings.TrimSpace(result), "ok") {
+		return nil
+	}
+	return corruptIndexError(vaultRoot, s.dbPath, fmt.Errorf("PRAGMA quick_check: %s", result))
 }
 
 // ensureSchemaChecked is ensureSchema with an error a human can act on.
@@ -675,8 +778,8 @@ func OpenRebuild(vaultRoot string) (*Store, bool, error) {
 //
 // The message below stays regardless: the error said "database is locked" and left the
 // operator guessing, so it names the processes that plausibly hold it and what to do.
-func ensureSchemaChecked(db *sql.DB) error {
-	err := ensureSchema(db)
+func ensureSchemaChecked(db *sql.DB, allowRebuild, dbExisted bool) error {
+	err := ensureSchema(db, allowRebuild, dbExisted)
 	if !isBusy(err) {
 		return err
 	}
@@ -685,72 +788,305 @@ func ensureSchemaChecked(db *sql.DB) error {
 		"Wait a moment and retry, or stop the daemon if it persists: %w", err)
 }
 
-func ensureSchema(db *sql.DB) error {
-	var current, currentKeep int
-	// meta may not exist yet; ignore the scan error in that case.
-	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'`).Scan(&current)
-	_ = db.QueryRow(`SELECT CAST(value AS INTEGER) FROM meta WHERE key='keep_shape_version'`).Scan(&currentKeep)
-	// A zero currentKeep is a database written before keep_shape_version existed, not a
-	// shape change: adopt the current shape below rather than wiping the kept tables.
-	rebuildKept := currentKeep != 0 && currentKeep != keepShapeVersion
+type schemaConnection interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
 
-	var carried map[string]string
-	if current != 0 && current != SchemaVersion {
-		var err error
-		if carried, err = readMetaKeys(db, metaKeptWithVectors); err != nil {
-			return err
-		}
-		for _, t := range dropOnVersionChange {
-			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
-				return err
-			}
+type schemaProbe struct {
+	table string
+	query string
+}
+
+// A matching version stamp is only a claim. These zero-row queries prove that every
+// table and column this binary reads is actually present, catching interrupted/manual
+// schema edits without reading user rows.
+var derivedSchemaProbes = []schemaProbe{
+	{"notes", `SELECT id,path,type,title,retrieval_hash,frontmatter,summary_short,summary_card,mtime,updated,contributor,review_by,source,scope,local_version,hub_version FROM notes LIMIT 0`},
+	{"nodes", `SELECT id,kind,label,note_id,note_path,anchor,source_loc,community,attrs FROM nodes LIMIT 0`},
+	{"edges", `SELECT source,target,relation,confidence,confidence_score,weight,source_loc FROM edges LIMIT 0`},
+	{"search_index", `SELECT node_id,kind,anchor,title,body FROM search_index LIMIT 0`},
+	{"corpus_stats", `SELECT key,value FROM corpus_stats LIMIT 0`},
+	{"meta", `SELECT key,value FROM meta LIMIT 0`},
+	{"code_files", `SELECT path,lang,package,mtime,retrieval_hash FROM code_files LIMIT 0`},
+	{"code_symbols", `SELECT id,path,lang,name,kind,start_line,end_line,signature,doc,calls FROM code_symbols LIMIT 0`},
+	{"code_edges", `SELECT src_id,dst_id,relation FROM code_edges LIMIT 0`},
+	{"code_search", `SELECT symbol_id,lang,kind,path,start_line,name,signature,doc FROM code_search LIMIT 0`},
+	{"note_health", `SELECT id,note_id,path,issue,detail,detected_at FROM note_health LIMIT 0`},
+	{"dropped_notes", `SELECT path,err,duplicate,detected_at FROM dropped_notes LIMIT 0`},
+	{"note_code_links", `SELECT note_id,symbol_id,name FROM note_code_links LIMIT 0`},
+}
+
+var keptSchemaProbes = []schemaProbe{
+	{"vectors", `SELECT node_id,chunk_ix,model,dim,embedding,content_hash,note_hash FROM vectors LIMIT 0`},
+	{"metrics", `SELECT key,value FROM metrics LIMIT 0`},
+	{"note_reuse", `SELECT note_id,authored_at,source,reuse_count,first_reuse,last_reuse FROM note_reuse LIMIT 0`},
+	{"pending_notes", `SELECT id,type,title,do_text,dont_text,why,confidence,source,created_at FROM pending_notes LIMIT 0`},
+}
+
+func allSchemaProbes() []schemaProbe {
+	probes := make([]schemaProbe, 0, len(derivedSchemaProbes)+len(keptSchemaProbes))
+	probes = append(probes, derivedSchemaProbes...)
+	return append(probes, keptSchemaProbes...)
+}
+
+func validateSchemaProbes(ctx context.Context, db schemaConnection, probes []schemaProbe) error {
+	for _, probe := range probes {
+		if err := validateSchemaProbe(ctx, db, probe); err != nil {
+			return fmt.Errorf("table %s: %w", probe.table, err)
 		}
 	}
-	if rebuildKept {
-		for _, t := range sortedKeys(schemaKeep) {
-			if _, err := db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
-				return err
-			}
+	return nil
+}
+
+var errSchemaObjectType = errors.New("schema object is not a table")
+
+func validateSchemaProbe(ctx context.Context, db schemaConnection, probe schemaProbe) (err error) {
+	// A zero-row SELECT alone is insufficient: a view can expose the same columns and
+	// pass every read probe, then fail the first INSERT. Require the actual sqlite_schema
+	// object to be a table (virtual tables also report type=table).
+	var objectType string
+	if err := db.QueryRowContext(ctx, `SELECT type FROM sqlite_schema WHERE name=?`, probe.table).Scan(&objectType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %s is missing", errSchemaObjectType, probe.table)
 		}
-		// The vectors themselves are gone, so their descriptors must not come back:
-		// a model/dim with no rows would misreport the embedding state.
-		carried = nil
-	}
-	if _, err := db.Exec(SchemaSQL); err != nil {
 		return err
 	}
-	if rebuildKept {
-		if _, err := db.Exec(`DELETE FROM meta WHERE key IN ('vector_model','vector_dim')`); err != nil {
+	if objectType != "table" {
+		return fmt.Errorf("%w: %s is a %s", errSchemaObjectType, probe.table, objectType)
+	}
+	rows, err := db.QueryContext(ctx, probe.query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return rows.Err()
+}
+
+func isSchemaShapeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return errors.Is(err, errSchemaObjectType) || strings.Contains(msg, "no such table") || strings.Contains(msg, "no such column")
+}
+
+// invalidKeptTables returns only kept tables whose declared columns are missing. An
+// unrelated SQLite failure is returned, never converted into permission to drop data.
+func invalidKeptTables(ctx context.Context, db schemaConnection) ([]string, error) {
+	var invalid []string
+	for _, probe := range keptSchemaProbes {
+		err := validateSchemaProbes(ctx, db, []schemaProbe{probe})
+		if err == nil {
+			continue
+		}
+		if !isSchemaShapeError(err) {
+			return nil, err
+		}
+		invalid = append(invalid, probe.table)
+	}
+	return invalid, nil
+}
+
+// ensureSchema holds one IMMEDIATE transaction from the version read through the final
+// stamp. DDL used to autocommit one statement at a time, so a late failure could leave
+// half the index dropped. BEGIN IMMEDIATE also prevents two openers from both deciding
+// to migrate from the same stale version.
+func ensureSchema(db *sql.DB, allowRebuild, dbExisted bool) error {
+	return ensureSchemaSQL(db, allowRebuild, dbExisted, SchemaSQL)
+}
+
+// ensureSchemaSQL is split out so the atomicity test can append one deliberately
+// failing final statement and prove every earlier DDL statement is rolled back.
+func ensureSchemaSQL(db *sql.DB, allowRebuild, dbExisted bool, schemaSQL string) (err error) {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	if err = ensureSchemaOn(ctx, conn, allowRebuild, dbExisted, schemaSQL); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func ensureSchemaOn(ctx context.Context, db schemaConnection, allowRebuild, dbExisted bool, schemaSQL string) error {
+	// Close the tiny stat/open race: if another process created the schema after our
+	// os.Stat, sqlite_schema still makes this an existing database for safety decisions.
+	if !dbExisted {
+		var objects int
+		if err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%')`).Scan(&objects); err != nil {
+			return err
+		}
+		dbExisted = objects != 0
+	}
+	current, err := readMetaVersion(ctx, db, "schema_version")
+	if err != nil {
+		return err
+	}
+	currentKeep, err := readMetaVersion(ctx, db, "keep_shape_version")
+	if err != nil {
+		return err
+	}
+	if current > SchemaVersion || currentKeep > keepShapeVersion {
+		return fmt.Errorf("%w: %w: index schema v%d / kept-table shape v%d, but this binary supports v%d / v%d; upgrade Mesh and leave this index untouched",
+			ErrSchemaMismatch, ErrSchemaTooNew, current, currentKeep, SchemaVersion, keepShapeVersion)
+	}
+
+	var invalidKept []string
+	if dbExisted {
+		invalidKept, err = invalidKeptTables(ctx, db)
+		if err != nil {
 			return err
 		}
 	}
-	for k, v := range carried {
-		if _, err := db.Exec(
-			`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, k, v,
+	schemaMismatch := dbExisted && current != SchemaVersion
+	keptStampMismatch := currentKeep != 0 && currentKeep != keepShapeVersion
+
+	if dbExisted && current == SchemaVersion {
+		derivedErr := validateSchemaProbes(ctx, db, derivedSchemaProbes)
+		if derivedErr != nil && !isSchemaShapeError(derivedErr) {
+			return derivedErr
+		}
+		if !allowRebuild && (derivedErr != nil || len(invalidKept) != 0 || keptStampMismatch) {
+			return fmt.Errorf("%w: current version stamp covers a mismatched table shape (derived: %v; kept tables: %v)",
+				ErrSchemaMismatch, derivedErr, invalidKept)
+		}
+		schemaMismatch = derivedErr != nil
+		if derivedErr == nil && len(invalidKept) == 0 && currentKeep == keepShapeVersion {
+			return nil // exact current schema: opening it must perform no DDL
+		}
+	}
+	if !allowRebuild && (schemaMismatch || len(invalidKept) != 0 || keptStampMismatch) {
+		return fmt.Errorf("%w: index schema v%d / kept-table shape v%d does not match this binary's v%d / v%d",
+			ErrSchemaMismatch, current, currentKeep, SchemaVersion, keepShapeVersion)
+	}
+
+	var carried map[string]string
+	if allowRebuild && schemaMismatch {
+		if carried, err = readMetaKeys(ctx, db, metaKeptWithVectors); err != nil {
+			return err
+		}
+		for _, table := range dropOnVersionChange {
+			if err := dropSchemaObject(ctx, db, table); err != nil {
+				return err
+			}
+		}
+	}
+	for _, table := range invalidKept {
+		if err := dropSchemaObject(ctx, db, table); err != nil {
+			return err
+		}
+		if table == "vectors" {
+			carried = nil
+		}
+	}
+	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	if slicesContain(invalidKept, "vectors") {
+		if _, err := db.ExecContext(ctx, `DELETE FROM meta WHERE key IN ('vector_model','vector_dim')`); err != nil {
+			return err
+		}
+	}
+	for key, value := range carried {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value,
 		); err != nil {
 			return err
 		}
 	}
-	if _, err := db.Exec(
+	if _, err := db.ExecContext(ctx,
 		`INSERT INTO meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		fmt.Sprint(SchemaVersion),
 	); err != nil {
 		return err
 	}
-	_, err := db.Exec(
+	_, err = db.ExecContext(ctx,
 		`INSERT INTO meta(key,value) VALUES('keep_shape_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		fmt.Sprint(keepShapeVersion),
 	)
 	return err
 }
 
+// dropSchemaObject removes an expected schema object by the type SQLite says it has.
+// This is what lets a rebuild repair a view (or another object) installed under a table
+// name instead of failing with "use DROP VIEW to delete view" after dropping other
+// derived tables. Names come only from the static schema lists above; quoting remains
+// defense in depth.
+func dropSchemaObject(ctx context.Context, db schemaConnection, name string) error {
+	var objectType string
+	err := db.QueryRowContext(ctx, `SELECT type FROM sqlite_schema WHERE name=?`, name).Scan(&objectType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	verb := map[string]string{
+		"table":   "TABLE",
+		"view":    "VIEW",
+		"index":   "INDEX",
+		"trigger": "TRIGGER",
+	}[objectType]
+	if verb == "" {
+		return fmt.Errorf("cannot replace schema object %q of unknown type %q", name, objectType)
+	}
+	quoted := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	_, err = db.ExecContext(ctx, "DROP "+verb+" IF EXISTS "+quoted)
+	return err
+}
+
+func slicesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func readMetaVersion(ctx context.Context, db schemaConnection, key string) (int, error) {
+	var raw string
+	err := db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key=?`, key).Scan(&raw)
+	switch {
+	case err == nil:
+		v, parseErr := strconv.Atoi(strings.TrimSpace(raw))
+		if parseErr != nil || v < 0 {
+			return -1, nil
+		}
+		return v, nil
+	case errors.Is(err, sql.ErrNoRows), strings.Contains(err.Error(), "no such table"):
+		return 0, nil
+	case strings.Contains(err.Error(), "no such column"):
+		return -1, nil
+	default:
+		return 0, err
+	}
+}
+
 // readMetaKeys reads the given meta keys, tolerating a missing meta table (a brand-new
 // database) and absent keys. Returns only the keys that exist.
-func readMetaKeys(db *sql.DB, keys []string) (map[string]string, error) {
+func readMetaKeys(ctx context.Context, db schemaConnection, keys []string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, k := range keys {
 		var v string
-		err := db.QueryRow(`SELECT value FROM meta WHERE key=?`, k).Scan(&v)
+		err := db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key=?`, k).Scan(&v)
 		switch {
 		case err == sql.ErrNoRows:
 			continue
@@ -780,12 +1116,29 @@ func (s *Store) Path() string { return s.dbPath }
 // config.toml live).
 func (s *Store) MeshDir() string { return s.dir }
 
-// ReadOnly reports whether this store was opened with OpenReadOnly, so a caller can
-// take the non-writing path instead of discovering it by failing. Callers must branch
-// on THIS, not on which constructor they think ran: the per-window `mesh mcp` server
-// and the hub's own indexing server share one setup function, and the hub owns its
-// index and must keep writing to it.
-func (s *Store) ReadOnly() bool { return s.readOnly }
+// ReadOnly reports whether this store may write now. Besides stores physically opened
+// by OpenReadOnly, it covers a writable MCP store whose preemptible ownership claim was
+// taken by a declared owner. Callers must branch on this live state, not on which
+// constructor they think ran.
+func (s *Store) ReadOnly() bool { return !s.canWrite() }
+
+// SetWriteGuard installs a live authorization check for every future write. It is used
+// by an elected MCP owner whose claim is preemptible; ordinary stores leave it nil.
+func (s *Store) SetWriteGuard(guard func() bool) {
+	s.writeGuardMu.Lock()
+	s.writeGuard = guard
+	s.writeGuardMu.Unlock()
+}
+
+func (s *Store) canWrite() bool {
+	if s.readOnly {
+		return false
+	}
+	s.writeGuardMu.RLock()
+	guard := s.writeGuard
+	s.writeGuardMu.RUnlock()
+	return guard == nil || guard()
+}
 
 // NoteDate carries the lifecycle dates retrieval needs for freshness decay.
 type NoteDate struct {
@@ -834,12 +1187,17 @@ func (s *Store) writer() {
 		case j := <-s.jobs:
 			j.reply <- s.runTx(j.fn)
 		case <-telTicker.C:
-			if fn, ok := s.drainTelemetry(); ok {
+			if !s.canWrite() {
+				s.queueTelemetry()
+			} else if fn, ok := s.drainTelemetry(); ok {
 				if err := s.runTx(fn); err != nil {
 					slog.Warn("mesh: telemetry flush failed; this batch of counters is lost", "err", err)
 				}
 			}
 		case <-ticker.C:
+			if !s.canWrite() {
+				continue
+			}
 			// PASSIVE first: it returns at once and never blocks the writer on a live
 			// reader.
 			_, _ = s.writeDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
@@ -863,6 +1221,9 @@ func (s *Store) writer() {
 }
 
 func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
+	if !s.canWrite() {
+		return ErrReadOnly
+	}
 	tx, err := s.writeDB.Begin()
 	if err != nil {
 		return err
@@ -885,6 +1246,11 @@ func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
 	if err = fn(tx); err != nil {
 		return err
 	}
+	// A preemptible claim may have been taken while fn was running (a full reindex can
+	// take seconds). Roll the work back instead of committing beside the new owner.
+	if !s.canWrite() {
+		return ErrReadOnly
+	}
 	return tx.Commit()
 }
 
@@ -894,7 +1260,7 @@ func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
 // sending on a nil channel blocks forever, so this check must run BEFORE the select,
 // not be left to fall out of it.
 func (s *Store) Write(fn func(*sql.Tx) error) error {
-	if s.readOnly {
+	if !s.canWrite() {
 		return ErrReadOnly
 	}
 	reply := make(chan error, 1)
@@ -1021,7 +1387,7 @@ func (s *Store) queueTelemetry() {
 // jobs channel). Read paths never call it; the reporting surfaces do, so a dashboard or
 // a test reads a consistent picture instead of one that lags the flush ticker.
 func (s *Store) flushTelemetry() {
-	if s.readOnly {
+	if !s.canWrite() {
 		// Same intent, the only route available: hand the batch to the owning writer now
 		// rather than at the next tick. Going through Write here would fail with
 		// ErrReadOnly and log "this batch of counters is lost", which was true before the
@@ -1111,6 +1477,9 @@ func (s *Store) walBytes() int64 {
 }
 
 func (s *Store) checkpointTruncateBestEffort() {
+	if !s.canWrite() {
+		return
+	}
 	// Its OWN connection, never one out of writeDB. writeDB is capped at a single
 	// connection, so `PRAGMA busy_timeout=2000` executed on it did not end with this
 	// function: the connection went back to the pool carrying 2000 and every later write

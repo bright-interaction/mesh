@@ -259,6 +259,12 @@ func (l *OwnerLock) beat() {
 		case <-l.stop:
 			return
 		case now := <-t.C:
+			// A declared owner may have replaced this preemptible claim at the same
+			// path. Never heartbeat somebody else's lock; stop as soon as the nonce no
+			// longer names us.
+			if !l.Held() {
+				return
+			}
 			if err := os.Chtimes(l.path, now, now); err != nil {
 				// The file is gone (released, or a declared owner took over). Stop
 				// beating; Held is what the rest of the process reads anyway.

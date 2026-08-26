@@ -5,7 +5,9 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -146,6 +148,21 @@ func TestADeclaredOwnerPreemptsTheMCPClaim(t *testing.T) {
 
 	if srv.OwnsIndex() {
 		t.Fatal("the mcp server still considers itself the owner after `mesh watch` took the claim")
+	}
+	if !srv.store.ReadOnly() {
+		t.Fatal("the preempted server still advertises a writable Store")
+	}
+	if err := srv.store.Write(func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO metrics(key,value) VALUES('preempted-write',1)`)
+		return err
+	}); !errors.Is(err, index.ErrReadOnly) {
+		t.Fatalf("preempted Store.Write = %v, want ErrReadOnly", err)
+	}
+	// Telemetry runs on the Store's background writer rather than an MCP ownership
+	// branch. It must be forwarded to the new owner, not committed by the old one.
+	_ = srv.store.IncrMetric("preempted-telemetry", 1)
+	if got, err := srv.store.Metric("preempted-telemetry"); err != nil || got != 0 {
+		t.Fatalf("preempted writer committed telemetry: value=%d err=%v", got, err)
 	}
 }
 

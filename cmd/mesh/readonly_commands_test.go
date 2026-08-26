@@ -40,6 +40,11 @@ var readOnlyCommands = map[string]string{
 	"orientCmd":        "loads the graph and reads ChangedSince; it is the SessionStart hook, so it runs concurrently with every other mesh process the user has open",
 	"askCmd":           "retrieves and answers; the retriever and ask.Answer only read",
 	"structureCmd":     "analyses structure and, with --wire-orphans, writes links into the MARKDOWN, never into the index",
+	"codeSearchCmd":    "only calls store.SearchCode",
+	"codeContextCmd":   "only calls store.SearchCode + store.NotesForSymbolName",
+	"flywheelCmd":      "only calls store.FlywheelStats + store.TopReused",
+	"evalCmd":          "loads the graph and runs the retrieval benchmark",
+	"tuneCmd":          "loads the graph and sweeps retrieval parameters",
 }
 
 // writerCommands are the commands that genuinely write the index, with what they write.
@@ -66,26 +71,17 @@ var writerCommands = map[string]string{
 	"ingestSlackCmd":      "ingests Slack into the vault and reindexes it (reindexVault)",
 }
 
-// writableCommandsPendingAudit open the index writable and have NOT been through the
-// single-writer audit. Each one looks read-only from its store calls, which is a finding,
-// not an excuse: they are recorded here so the classification guard has the truth rather
-// than a comfortable label, and so the next pass has the list.
-//
-// Do NOT add a new command here. A new command has no legacy to inherit: decide whether it
-// reads or writes and put it in one of the two maps above.
-var writableCommandsPendingAudit = map[string]string{
-	"codeSearchCmd":  "only calls store.SearchCode",
-	"codeContextCmd": "only calls store.SearchCode + store.NotesForSymbolName",
-	"flywheelCmd":    "only calls store.FlywheelStats + store.TopReused",
-	"evalCmd":        "loads the graph and runs the retrieval benchmark",
-	"tuneCmd":        "loads the graph and sweeps retrieval parameters",
-}
-
-// writableOpeners are the three index constructors that take the SQLite write lock: they
+// writableOpeners are the constructors that take the SQLite write lock: they
 // apply the schema, start a writer goroutine and TRUNCATE-checkpoint on Close, and they
 // CREATE the database when it is absent. index.OpenReadOnly does neither, which is why it
 // is the only one a read-only command may call.
-var writableOpeners = map[string]bool{"Open": true, "OpenAt": true, "OpenRebuild": true}
+var writableOpeners = map[string]bool{
+	"Open":          true,
+	"OpenAt":        true,
+	"OpenCurrent":   true,
+	"OpenCurrentAt": true,
+	"OpenRebuild":   true,
+}
 
 // readOnlyOpener is the one constructor a read-only command may use.
 const readOnlyOpener = "OpenReadOnly"
@@ -205,13 +201,13 @@ func (cg *commandGraph) opensReached(root string) []openSite {
 }
 
 type openSite struct {
-	opener string // Open, OpenAt, OpenRebuild, OpenReadOnly
+	opener string // one of writableOpeners, or OpenReadOnly
 	via    string // the function the call is written in
 	pos    string
 }
 
 // TestReadOnlyCommandsDoNotTakeTheWriteLock fails if a command on readOnlyCommands can
-// reach index.Open / index.OpenAt / index.OpenRebuild.
+// reach any constructor in writableOpeners.
 //
 // AST rather than a runtime check, because the failure it guards against is not
 // observable without a second live writer: on an idle laptop a writable open succeeds
@@ -257,7 +253,7 @@ func TestEveryIndexTouchingCommandIsClassified(t *testing.T) {
 			continue // never opens the index: nothing to classify
 		}
 		buckets := 0
-		for _, m := range []map[string]string{readOnlyCommands, writerCommands, writableCommandsPendingAudit} {
+		for _, m := range []map[string]string{readOnlyCommands, writerCommands} {
 			if _, ok := m[name]; ok {
 				buckets++
 			}
@@ -273,37 +269,16 @@ func TestEveryIndexTouchingCommandIsClassified(t *testing.T) {
 				"    An unclassified command is how `mesh orient` shipped as the SessionStart hook "+
 				"holding the SQLite write lock for two pure reads.", name, describeSites(sites))
 		default:
-			t.Errorf("%s is classified in more than one of readOnlyCommands / writerCommands / "+
-				"writableCommandsPendingAudit: pick one", name)
+			t.Errorf("%s is classified in both readOnlyCommands and writerCommands: pick one", name)
 		}
 	}
 	// A renamed or deleted command must not silently drop off any list.
-	for _, m := range []map[string]string{writerCommands, writableCommandsPendingAudit} {
+	for _, m := range []map[string]string{readOnlyCommands, writerCommands} {
 		for _, name := range sortedKeys(m) {
 			if !cg.ctors[name] {
 				t.Errorf("%s is classified in this file but no function of that name builds a "+
 					"*cobra.Command in this package; rename it here or remove the entry", name)
 			}
-		}
-	}
-}
-
-// TestPendingAuditCommandsStillOpenWritable keeps the pending-audit list honest from the
-// other side: an entry that has since been moved to index.OpenReadOnly is done, and must
-// be promoted into readOnlyCommands rather than left parked here, where it would go on
-// exempting a command that no longer needs exempting.
-func TestPendingAuditCommandsStillOpenWritable(t *testing.T) {
-	cg := parseCommandGraph(t)
-	for _, name := range sortedKeys(writableCommandsPendingAudit) {
-		writable := false
-		for _, site := range cg.opensReached(name) {
-			if writableOpeners[site.opener] {
-				writable = true
-			}
-		}
-		if !writable {
-			t.Errorf("%s no longer opens the index writable, so its audit is done: move it from "+
-				"writableCommandsPendingAudit to readOnlyCommands (%s)", name, writableCommandsPendingAudit[name])
 		}
 	}
 }

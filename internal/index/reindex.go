@@ -134,7 +134,7 @@ func (s *Store) recordDropped(root string, ferrs []FileError) {
 // Best effort: a note that cannot be indexed is already the degraded case, and failing a
 // reindex over the bookkeeping about it would be a strictly worse outcome.
 func (s *Store) persistDropped(rel []FileError) {
-	if s.readOnly {
+	if s.ReadOnly() {
 		return // the owning writer records these; a read-only store only reads them back
 	}
 	at := time.Now().Unix()
@@ -232,7 +232,7 @@ func errText(err error) string {
 // dropped notes" and "could not find out" are opposite answers and only one of them is
 // good news. Every caller must surface the failure; a writable store never errors.
 func (s *Store) DroppedNotes() ([]FileError, error) {
-	if s.readOnly {
+	if s.ReadOnly() {
 		return s.droppedFromIndex()
 	}
 	s.mu.Lock()

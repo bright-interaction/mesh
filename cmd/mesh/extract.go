@@ -200,7 +200,7 @@ func runRecurring(ctx context.Context, client llm.Client, dir string, n, concurr
 // precision), i.e. the benchmark judged but production did not. The panel fails OPEN
 // (an LLM hiccup queues the candidate for the human, never silently drops knowledge).
 func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, judges []llm.Client) error {
-	store, err := index.Open(vaultRoot)
+	store, err := index.OpenCurrent(vaultRoot)
 	if err != nil {
 		return err
 	}
@@ -366,7 +366,7 @@ func runExtractBenchmark(ctx context.Context, client llm.Client, dir string, n, 
 	// restates a note already there is counted separately from genuinely fresh ones.
 	var rtr *retrieve.Retriever
 	if dedupVault != "" {
-		if vs, e := index.Open(dedupVault); e == nil {
+		if vs, e := index.OpenReadOnly(dedupVault); e == nil {
 			defer vs.Close()
 			rtr, _ = buildVaultRetriever(vs, dedupVault)
 		}

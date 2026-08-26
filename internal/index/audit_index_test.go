@@ -262,18 +262,18 @@ func TestSchemaVersionBumpKeepsVectorsReadable(t *testing.T) {
 	}
 }
 
-// F6: keepShapeVersion was declared and never read, so the documented escape hatch did
-// not exist: a column added to a schemaKeep table would never apply on an existing DB
-// and the first INSERT naming it would fail at runtime on a deployed hub. ensureSchema
-// must compare the stored keep_shape_version and rebuild the kept tables when it moves.
-func TestKeepShapeVersionRebuildsKeptTables(t *testing.T) {
+// F6: version 1 is the first stamped kept-table shape. Zero therefore means the index
+// predates the stamp and must be adopted without erasing non-derivable rows. A greater
+// value belongs to a future binary and is covered by the downgrade-refusal tests: it is
+// never permission for this older binary to erase tables it does not understand.
+func TestKeepShapeVersionAdoptsLegacyStampWithoutLosingRows(t *testing.T) {
 	cases := []struct {
 		name        string
 		storedKeep  string // meta.keep_shape_version to plant before reopening
 		wantMetrics int64  // surviving counter value
 	}{
 		{name: "unchanged shape keeps the rows", storedKeep: "", wantMetrics: 7},
-		{name: "changed shape rebuilds the kept tables", storedKeep: "99", wantMetrics: 0},
+		{name: "legacy unstamped shape adopts v1 and keeps the rows", storedKeep: "0", wantMetrics: 7},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

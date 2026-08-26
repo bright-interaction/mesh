@@ -288,6 +288,10 @@ func doctorCmd() *cobra.Command {
 			// to be mid-reconcile. Reproduced 2026-08-10 on the live vault.
 			store, err := index.OpenReadOnly(root)
 			if err != nil {
+				if errors.Is(err, index.ErrSchemaTooNew) {
+					fmt.Printf("index:  %s\n%v\nstatus: BROKEN - the index is newer than this Mesh binary\n  fix: upgrade Mesh; leave this index untouched\n", dbPath, err)
+					return fmt.Errorf("index schema is newer than this Mesh binary")
+				}
 				// An index written by an older Mesh is a diagnosis, not a crash: doctor is
 				// the command a stranger runs to find out what is wrong, and it used to
 				// print "status: OK (index fresh)" with exit 0 over exactly this, because
@@ -299,6 +303,14 @@ func doctorCmd() *cobra.Command {
 				return err
 			}
 			defer store.Close()
+			if integrityErr := store.CheckIntegrity(root); integrityErr != nil {
+				if errors.Is(integrityErr, index.ErrIndexCorrupt) {
+					fmt.Printf("index:  %s\n%v\nstatus: BROKEN - the index database is corrupt\n  fix: mesh index %s\n",
+						dbPath, integrityErr, shellpath.Quote(root))
+					return fmt.Errorf("index database is corrupt")
+				}
+				return integrityErr
+			}
 
 			notes, _ := store.Count("notes")
 			nodes, _ := store.Count("nodes")
@@ -504,7 +516,7 @@ func evalCmd() *cobra.Command {
 			if err := json.Unmarshal(raw, &cases); err != nil {
 				return fmt.Errorf("parse cases: %w", err)
 			}
-			store, err := index.Open(vaultDir)
+			store, err := index.OpenReadOnly(vaultDir)
 			if err != nil {
 				return err
 			}
@@ -598,7 +610,7 @@ func tuneCmd() *cobra.Command {
 			if len(train) == 0 || len(test) == 0 {
 				return fmt.Errorf("need non-empty train and test sets (train %d, test %d)", len(train), len(test))
 			}
-			store, err := index.Open(vaultDir)
+			store, err := index.OpenReadOnly(vaultDir)
 			if err != nil {
 				return err
 			}
@@ -682,7 +694,7 @@ func embedCmd() *cobra.Command {
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
 				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
-			store, err := index.Open(root)
+			store, err := index.OpenCurrent(root)
 			if err != nil {
 				return err
 			}
@@ -940,11 +952,26 @@ func healthCmd() *cobra.Command {
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
 				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
-			store, err := index.Open(root)
+			store, err := index.OpenCurrent(root)
 			if err != nil {
 				return err
 			}
 			defer store.Close()
+			if integrityErr := store.CheckIntegrity(root); integrityErr != nil {
+				if errors.Is(integrityErr, index.ErrIndexCorrupt) {
+					fmt.Printf("health: BROKEN - the index database is corrupt\n%v\n", integrityErr)
+				}
+				return integrityErr
+			}
+			drift, err := store.DriftReport(root)
+			if err != nil {
+				return err
+			}
+			if drift.Any() {
+				fmt.Printf("health: STALE - index does not match the Markdown vault (+%d new, ~%d changed, -%d removed)\n  fix: mesh index %s\n",
+					len(drift.Added), len(drift.Changed), len(drift.Removed), shellpath.Quote(root))
+				return fmt.Errorf("index is stale")
+			}
 			now := time.Now()
 			if _, err := store.ComputeHealth(root, now); err != nil {
 				return err
@@ -1045,7 +1072,7 @@ func flywheelCmd() *cobra.Command {
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
 				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
-			store, err := index.Open(root)
+			store, err := index.OpenReadOnly(root)
 			if err != nil {
 				return err
 			}
@@ -1275,7 +1302,7 @@ func codeReindexCmd() *cobra.Command {
 			if err := vault.RequireRoot(root); err != nil {
 				return err
 			}
-			store, err := index.Open(root)
+			store, err := index.OpenCurrent(root)
 			if err != nil {
 				return err
 			}
@@ -1347,7 +1374,7 @@ func codeSearchCmd() *cobra.Command {
 			if err := vault.RequireRoot(vaultRoot); err != nil {
 				return err
 			}
-			store, err := index.Open(vaultRoot)
+			store, err := index.OpenReadOnly(vaultRoot)
 			if err != nil {
 				return err
 			}
@@ -1386,7 +1413,7 @@ func codeContextCmd() *cobra.Command {
 			if err := vault.RequireRoot(vaultRoot); err != nil {
 				return err
 			}
-			store, err := index.Open(vaultRoot)
+			store, err := index.OpenReadOnly(vaultRoot)
 			if err != nil {
 				return err
 			}

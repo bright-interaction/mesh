@@ -108,7 +108,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_health",
-			"description": "Run the knowledge-lifecycle health check NOW and return what is rotting: notes that cite a source file no longer in the code index (dead_ref), notes past their review_by date (overdue), plus any contradiction findings. Use this to keep the vault trustworthy; fix or update the flagged notes. Returns findings grouped by issue + counts.",
+			"description": "Run the knowledge-lifecycle health check NOW and return what is rotting: notes that cite a source file no longer in the code index (dead_ref), notes past their review_by date (overdue), plus contradiction findings. A stale index is reported explicitly instead of claiming an incomplete snapshot is clean. Use this to keep the vault trustworthy; fix or update the flagged notes. Returns findings grouped by issue + counts.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{"issue": str}}),
 		},
 		{
@@ -476,6 +476,45 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 	// must not be able to drive it repeatedly.
 	if can, set := writeAllowed(ctx); set && !can {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "forbidden: your role is read-only"}
+	}
+	// Lifecycle queries touch only a few tables and can miss corruption in an unrelated
+	// b-tree page. A complete clean-vault claim requires a whole-index integrity check.
+	if err := s.store.CheckIntegrity(s.vaultRoot); err != nil {
+		if errors.Is(err, index.ErrIndexCorrupt) {
+			slog.Error("mesh mcp: health found a corrupt index", "err", err)
+			return nil, &rpcError{Code: codeInternalError, Message: "mesh_health cannot verify this vault because its derived index is corrupt. " +
+				"Your Markdown notes are safe. Run `mesh index <vault>` in a terminal to discard and rebuild the index."}
+		}
+		return nil, internalErr(err)
+	}
+	// Every lifecycle pass below starts from the notes table. If the Markdown vault has
+	// moved ahead of it, a newly-added or changed note is absent from the very rows being
+	// inspected and an empty result is not a clean bill of health. Report the operational
+	// failure first and ask for a reindex; do not persist findings computed from stale rows.
+	drift, err := s.store.DriftReport(s.vaultRoot)
+	if err != nil {
+		return nil, internalErr(err)
+	}
+	if drift.Any() {
+		counts := map[string]int{index.StaleIndexIssue: 1}
+		all := []index.HealthFinding{{
+			Issue:  index.StaleIndexIssue,
+			Detail: "the index does not match the Markdown vault, so lifecycle findings would be incomplete. Fix: call mesh_reindex now (or run `mesh index <vault>`).",
+		}}
+		if owner, missing := s.ownerFinding(); missing {
+			all = append(all, owner)
+			counts[index.NoOwnerIssue]++
+		}
+		findings := all
+		if issue := strings.TrimSpace(a.Issue); issue != "" {
+			findings = findings[:0]
+			for _, finding := range all {
+				if finding.Issue == issue {
+					findings = append(findings, finding)
+				}
+			}
+		}
+		return textResult(map[string]any{"findings": findings, "counts": counts}), nil
 	}
 	findings, counts, rerr := s.healthPass(time.Now(), strings.TrimSpace(a.Issue))
 	if rerr != nil {

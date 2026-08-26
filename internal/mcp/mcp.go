@@ -127,6 +127,10 @@ func NewOwningServer(vaultRoot, role string) (*Server, error) {
 		_ = lock.Release()
 		return nil, err
 	}
+	// The claim is preemptible after startup. Gate the Store itself, not only MCP tool
+	// branches, so background telemetry, checkpoints, and any direct Store write stop
+	// the instant a declared owner takes the lock.
+	store.SetWriteGuard(lock.Held)
 	s, err := newServerWithStore(vaultRoot, store, lock)
 	if err != nil {
 		_ = lock.Release()

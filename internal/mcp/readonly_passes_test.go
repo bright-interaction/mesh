@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // The two passes that still wrote from a read-only window (step 3 of the single-writer
@@ -79,6 +81,37 @@ func TestHealthFiltersByIssueOnAReadOnlyServer(t *testing.T) {
 	counts, _ := res["counts"].(map[string]any)
 	if counts["overdue"] != float64(2) {
 		t.Fatalf("the issue filter narrowed the COUNTS too (%v); it must only narrow the findings", counts)
+	}
+}
+
+// A lifecycle pass is only as complete as the notes table it starts from. A valid note
+// added after the last index pass used to be invisible to every check, so mesh_health
+// answered with empty findings and implicitly called the stale snapshot clean.
+func TestHealthReportsAStaleIndexInsteadOfClaimingItIsClean(t *testing.T) {
+	s := newTestServer(t)
+	writeNote(t, filepath.Join(s.vaultRoot, "decisions", "not-indexed-yet.md"), "not-indexed-yet")
+
+	out, rerr := s.toolHealth(WithLocalOperator(context.Background()), json.RawMessage(`{}`))
+	if rerr != nil {
+		t.Fatalf("mesh_health: %v", rerr)
+	}
+	res := toolJSON(t, out)
+	counts, _ := res["counts"].(map[string]any)
+	if counts[index.StaleIndexIssue] != float64(1) {
+		t.Fatalf("stale-index count = %v, want 1; response=%v", counts[index.StaleIndexIssue], res)
+	}
+	found := false
+	for _, raw := range asList(res["findings"]) {
+		finding, _ := raw.(map[string]any)
+		if finding["issue"] == index.StaleIndexIssue {
+			found = true
+			if finding["path"] != "" || finding["note_id"] != "" {
+				t.Fatalf("operational stale-index finding leaked a note locator: %v", finding)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("mesh_health omitted the stale-index finding: %v", res)
 	}
 }
 

@@ -18,6 +18,11 @@ type Drift struct {
 	Removed []string // files in the index but gone from disk
 }
 
+// StaleIndexIssue is the operational health-finding kind for an index that no longer
+// matches its Markdown source. A lifecycle pass over stale rows cannot truthfully call
+// the vault clean: it may omit a newly-added note or inspect guidance that was removed.
+const StaleIndexIssue = "stale-index"
+
 // Any reports whether the index is stale in any way.
 func (d Drift) Any() bool { return len(d.Added)+len(d.Changed)+len(d.Removed) > 0 }
 

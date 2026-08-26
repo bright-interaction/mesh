@@ -178,7 +178,7 @@ func (s *Store) OpQueued(name string) bool {
 // malformed, unknown kind) is removed and logged, so one bad file cannot block the
 // queue forever.
 func (s *Store) DrainOps() (int, error) {
-	if s.readOnly {
+	if s.ReadOnly() {
 		return 0, ErrReadOnly
 	}
 	dir := OpsDir(s.dir)
