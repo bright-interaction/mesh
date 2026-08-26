@@ -17,8 +17,8 @@ import "testing"
 // meaning if the fixture's shape changes.
 func TestTier0ReserveHoldsACompactCardInTheDegradeBand(t *testing.T) {
 	cards := tier0AtTheBottom(12)
-	full := cardTokens(cards[0])
-	small := cardTokens(compact(cards[0]))
+	full := TotalTokens([]Card{cards[0]})
+	small := TotalTokens([]Card{compact(cards[0])})
 	if small >= full {
 		t.Fatalf("precondition: the compact form must be cheaper than the full one (compact %d, full %d)", small, full)
 	}
@@ -59,8 +59,8 @@ func TestTier0ReserveHoldsACompactCardInTheDegradeBand(t *testing.T) {
 // the packer must not spend a snippet it could have kept.
 func TestReserveDoesNotDegradeWhatTheBudgetCanAfford(t *testing.T) {
 	cards := tier0AtTheBottom(12)
-	full := cardTokens(cards[0])
-	small := cardTokens(compact(cards[0]))
+	full := TotalTokens([]Card{cards[0]})
+	small := TotalTokens([]Card{compact(cards[0])})
 
 	// A budget whose fifth leaves room inside the reserve for a compact card but not
 	// a full one, while the budget itself affords the full form many times over. This

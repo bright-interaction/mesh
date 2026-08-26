@@ -110,11 +110,11 @@ type Frontmatter struct {
 	// from search and the graph entirely: `[[flare]]` stopped resolving across 88 links
 	// until the shape was moved here. An unknown key degrades to a stale finding instead.
 	ExpectDeadRefPaths StringList `yaml:"expect_dead_ref_paths,omitempty"`
-	Supersedes     StringList `yaml:"supersedes,omitempty"`
-	Severity       string     `yaml:"severity,omitempty"`
-	Role           string     `yaml:"role,omitempty"`
-	Stack          StringList `yaml:"stack,omitempty"`
-	RepoPath       string     `yaml:"repo_path,omitempty"`
+	Supersedes         StringList `yaml:"supersedes,omitempty"`
+	Severity           string     `yaml:"severity,omitempty"`
+	Role               string     `yaml:"role,omitempty"`
+	Stack              StringList `yaml:"stack,omitempty"`
+	RepoPath           string     `yaml:"repo_path,omitempty"`
 	// Provenance: who/what wrote this note, where it came from, when to recheck.
 	// Feeds the audit trail, the knowledge-lifecycle health checks, and the
 	// contributor/ROI views. All optional.
@@ -282,15 +282,27 @@ var ErrUnterminatedFrontmatter = errors.New("frontmatter opened with --- but is 
 // answered "is this block closed" independently could drift from the one that splits it.
 func splitFM(content string) (fm, body string, had, unterminated bool) {
 	lines := strings.Split(content, "\n")
-	if len(lines) == 0 || strings.TrimRight(lines[0], "\r") != "---" {
+	if len(lines) == 0 || !frontmatterDelimiter(lines[0], true) {
 		return "", content, false, false
 	}
 	for i := 1; i < len(lines); i++ {
-		if strings.TrimRight(lines[i], "\r") == "---" {
+		if frontmatterDelimiter(lines[i], false) {
 			return strings.Join(lines[1:i], "\n"), strings.Join(lines[i+1:], "\n"), true, false
 		}
 	}
 	return "", content, false, true
+}
+
+// frontmatterDelimiter accepts the byte-order mark some editors write before the
+// first UTF-8 character and harmless horizontal whitespace after the marker. It stays
+// deliberately stricter than TrimSpace: leading indentation would make --- ordinary
+// Markdown/YAML content, not a document delimiter.
+func frontmatterDelimiter(line string, opener bool) bool {
+	line = strings.TrimSuffix(line, "\r")
+	if opener {
+		line = strings.TrimPrefix(line, "\ufeff")
+	}
+	return strings.TrimRight(line, " \t") == "---"
 }
 
 // SplitFrontmatter separates a leading YAML frontmatter block from the body. It

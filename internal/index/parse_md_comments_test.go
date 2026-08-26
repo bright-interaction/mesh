@@ -126,6 +126,13 @@ func TestParseIgnoresHTMLComments(t *testing.T) {
 	}
 }
 
+func TestParseUnicodeBodyTags(t *testing.T) {
+	pn := parse(t, "tags.md", "# Tags\n#räddning #åtgärd #café #日本語\n")
+	if got := tagNames(pn); !slices.Equal(got, []string{"räddning", "åtgärd", "café", "日本語"}) {
+		t.Fatalf("Unicode tags = %q, want all four intact", got)
+	}
+}
+
 // TestParseBacktickNearACommentDoesNotSwallowTheFile pins the interaction between the
 // two strippers, which is where this whole area goes wrong. Blanking code spans in a
 // pass of their own erases the --> out of "<!-- the ` char -->" (an odd backtick blanked
@@ -169,6 +176,11 @@ func TestParseBacktickNearACommentDoesNotSwallowTheFile(t *testing.T) {
 			body:  "`[[hidden]]` and [[visible]]\n",
 			links: []string{"visible"},
 		},
+		{
+			name:  "matching double backticks hide the whole span",
+			body:  "``[[hidden]]`` and [[visible]]\n",
+			links: []string{"visible"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -186,6 +198,29 @@ func TestParseBacktickNearACommentDoesNotSwallowTheFile(t *testing.T) {
 			}
 			if len(pn.Issues) != 0 {
 				t.Errorf("unexpected issues %v (no comment here is unterminated)", pn.Issues)
+			}
+		})
+	}
+}
+
+// A backslash before Markdown punctuation escapes it. In particular, \[[note]] is a
+// syntax example, not a graph edge. Two backslashes leave the opener unescaped and the
+// wikilink real (the first backslash escapes the second).
+func TestParseHonorsEscapedWikilinkOpeners(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{name: "one backslash escapes", body: "show \\[[hidden]] then [[visible]]\n", want: []string{"visible"}},
+		{name: "two backslashes leave a link", body: "show \\\\[[visible]]\n", want: []string{"visible"}},
+		{name: "three backslashes escape", body: "show \\\\\\[[hidden]]\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pn := parse(t, "note.md", tc.body)
+			if got := linkTargets(pn); !slices.Equal(got, tc.want) {
+				t.Errorf("links = %v, want %v", got, tc.want)
 			}
 		})
 	}

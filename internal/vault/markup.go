@@ -49,6 +49,10 @@ func StripCodeSpans(line string) string {
 				i = end + 1
 				continue
 			}
+			run := backtickRun(line, i)
+			b.WriteString(line[i : i+run])
+			i += run
+			continue
 		}
 		b.WriteByte(line[i])
 		i++
@@ -98,15 +102,37 @@ func stripMarkup(body string, blankFences, blankSpans bool) (string, int) {
 func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[2]int]bool) (openLine, openCol int, atLineStart bool) {
 	var b strings.Builder
 	inFence, inComment := false, false
+	spanRun := 0
 	var fenceChar byte
-	var fenceRun int
+	var fenceRun, fenceQuoteDepth, fenceListIndent int
 	for li, line := range lines {
 		ln := li + 1
-		if !inComment {
+		if !inComment && spanRun == 0 {
 			// A fence marker inside an open comment is itself commented out, and a comment
 			// marker inside a fence is sample text, so the two states cannot toggle each
 			// other: inComment is only ever set below, where inFence is false.
-			trimmed := strings.TrimSpace(line)
+			trimmed, fenceEligible := fenceCandidate(line)
+			quoteDepth := blockquoteDepth(line)
+			// A fence nested in a blockquote ends when the quote container ends, even if
+			// the author omitted a closing marker. Carrying it into ordinary prose hid the
+			// rest of the note.
+			if inFence && fenceQuoteDepth > 0 && quoteDepth < fenceQuoteDepth {
+				inFence, fenceChar, fenceRun, fenceQuoteDepth, fenceListIndent = false, 0, 0, 0, 0
+			}
+			// A fence opened inside a list item is contained by that item. Once a
+			// non-blank line loses the item's content indentation, the list (and the
+			// unclosed fence with it) has ended; ordinary top-level prose is visible.
+			if inFence && fenceListIndent > 0 && listContainerEnded(line, fenceQuoteDepth, fenceListIndent) {
+				inFence, fenceChar, fenceRun, fenceQuoteDepth, fenceListIndent = false, 0, 0, 0, 0
+			}
+			// The list marker can make the item's content indentation wider than the
+			// three spaces allowed before a root fence (for example "10. ```"). Reuse
+			// the opener's saved container indentation when looking for its closer.
+			if inFence && fenceListIndent > 0 {
+				if candidate, ok := listContainedFenceCandidate(line, fenceQuoteDepth, fenceListIndent); ok {
+					trimmed, fenceEligible = candidate, true
+				}
+			}
 			// CommonMark: a fence closes only on the SAME character, at least as long as
 			// the opener, with no info string. Toggling on any run of three inverted the
 			// state for a nested block, so an outer ````markdown fence containing an inner
@@ -114,18 +140,15 @@ func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[
 			// documentation block was quoting became real graph content: phantom heading
 			// nodes, phantom reference edges and phantom tags built from an example. With
 			// an odd count the inverse happened and real prose below was hidden.
-			if ch, run, info := fenceMarker(trimmed); run > 0 {
+			if ch, run, info := fenceMarker(trimmed); fenceEligible && run > 0 {
 				switch {
 				case !inFence:
-					if !info { // an opener may carry an info string; a closer may not
-						inFence, fenceChar, fenceRun = true, ch, run
-					} else {
-						inFence, fenceChar, fenceRun = true, ch, run
-					}
+					inFence, fenceChar, fenceRun, fenceQuoteDepth = true, ch, run, quoteDepth
+					fenceListIndent = listFenceContentIndent(line)
 					out[li] = keepOrBlank(line, blankFences)
 					continue
 				case ch == fenceChar && run >= fenceRun && !info:
-					inFence, fenceChar, fenceRun = false, 0, 0
+					inFence, fenceChar, fenceRun, fenceQuoteDepth, fenceListIndent = false, 0, 0, 0, 0
 					out[li] = keepOrBlank(line, blankFences)
 					continue
 				default:
@@ -139,6 +162,10 @@ func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[
 				out[li] = keepOrBlank(line, blankFences)
 				continue
 			}
+			if indentedCodeLine(line) && !listContinuationLine(lines, li) {
+				out[li] = keepOrBlank(line, blankFences)
+				continue
+			}
 			if strings.IndexByte(line, '`') < 0 && !strings.Contains(line, commentOpen) {
 				out[li] = line // nothing to strip: the overwhelmingly common line
 				continue
@@ -147,6 +174,25 @@ func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[
 		b.Reset()
 		b.Grow(len(line))
 		for i := 0; i < len(line); {
+			if spanRun > 0 {
+				if line[i] == '`' && backtickRun(line, i) == spanRun {
+					if blankSpans {
+						writeSpaces(&b, spanRun)
+					} else {
+						b.WriteString(line[i : i+spanRun])
+					}
+					i += spanRun
+					spanRun = 0
+					continue
+				}
+				if blankSpans {
+					b.WriteByte(' ')
+				} else {
+					b.WriteByte(line[i])
+				}
+				i++
+				continue
+			}
 			if inComment {
 				if strings.HasPrefix(line[i:], commentClose) {
 					writeSpaces(&b, len(commentClose))
@@ -159,7 +205,7 @@ func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[
 				i++
 				continue
 			}
-			if strings.HasPrefix(line[i:], commentOpen) && !literal[[2]int{ln, i}] {
+			if strings.HasPrefix(line[i:], commentOpen) && !markdownEscapedAt(line, i) && !literal[[2]int{ln, i}] {
 				if n := abruptClose(line[i:]); n > 0 {
 					writeSpaces(&b, n)
 					i += n
@@ -176,6 +222,11 @@ func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[
 				continue
 			}
 			if line[i] == '`' {
+				if markdownEscapedAt(line, i) {
+					b.WriteByte(line[i])
+					i++
+					continue
+				}
 				if end := closingBacktick(line, i); end >= 0 {
 					if blankSpans {
 						writeSpaces(&b, end+1-i)
@@ -185,12 +236,23 @@ func stripLines(lines, out []string, blankFences, blankSpans bool, literal map[[
 					i = end + 1
 					continue
 				}
+				run := backtickRun(line, i)
+				if hasClosingBacktick(lines, li+1, run) {
+					if blankSpans {
+						writeSpaces(&b, run)
+					} else {
+						b.WriteString(line[i : i+run])
+					}
+					i += run
+					spanRun = run
+					continue
+				}
 				// An unpaired backtick is a literal character, not a code span that swallows
 				// the rest of the line: a span has to close, and CommonMark renders the
 				// leftover backtick as itself. Blanking to end of line on an odd count is
 				// what erased the --> in "<!-- the ` char -->" and hid the file below it.
-				b.WriteByte(line[i])
-				i++
+				b.WriteString(line[i : i+run])
+				i += run
 				continue
 			}
 			b.WriteByte(line[i])
@@ -217,15 +279,88 @@ func abruptClose(s string) int {
 	return 0
 }
 
-// closingBacktick returns the index of the backtick that closes the code span opened at
-// i, or -1 when the line has none. Code spans do not carry across lines here (the body
-// is scanned line by line), which is why an unpaired backtick is literal text.
+// closingBacktick returns the final index of the backtick run that closes the code span
+// opened at i, or -1 when the line has no run of exactly the same length. A shorter or
+// longer run is content inside the span under CommonMark; matching only the next single
+// backtick made a code example such as [[example]] leak a phantom graph link.
 func closingBacktick(line string, i int) int {
-	j := strings.IndexByte(line[i+1:], '`')
-	if j < 0 {
-		return -1
+	openRun := backtickRun(line, i)
+	for j := i + openRun; j < len(line); {
+		if line[j] != '`' {
+			j++
+			continue
+		}
+		closeRun := backtickRun(line, j)
+		if closeRun == openRun {
+			return j + closeRun - 1
+		}
+		j += closeRun
 	}
-	return i + 1 + j
+	return -1
+}
+
+func backtickRun(line string, i int) int {
+	j := i
+	for j < len(line) && line[j] == '`' {
+		j++
+	}
+	return j - i
+}
+
+// hasClosingBacktick reports whether a code-span delimiter continues onto a later
+// line of the same Markdown paragraph. Blank lines and block openers end a paragraph;
+// without this look-ahead an unmatched opener was treated as literal before the scanner
+// reached its valid closer, leaking wikilinks from multiline code spans.
+func hasClosingBacktick(lines []string, startLine, wantRun int) bool {
+	for li := startLine; li < len(lines); li++ {
+		line := lines[li]
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			return false
+		}
+		if strings.HasPrefix(trimmed, commentOpen) || atxHeadingLine(trimmed) {
+			return false
+		}
+		// A list marker starts a new block. A backtick left open in the previous
+		// item is literal text; it cannot turn the next item's contents into code.
+		if _, ok := listItemContent(line, 3); ok {
+			return false
+		}
+		if candidate, ok := fenceCandidate(line); ok {
+			if _, run, _ := fenceMarker(candidate); run > 0 {
+				return false
+			}
+		}
+		for i := 0; i < len(line); {
+			if line[i] != '`' {
+				i++
+				continue
+			}
+			run := backtickRun(line, i)
+			if run == wantRun {
+				return true
+			}
+			i += run
+		}
+	}
+	return false
+}
+
+func atxHeadingLine(trimmed string) bool {
+	i := 0
+	for i < len(trimmed) && trimmed[i] == '#' {
+		i++
+	}
+	return i > 0 && i <= 6 && i < len(trimmed) && trimmed[i] == ' '
+}
+
+func markdownEscapedAt(line string, pos int) bool {
+	backslashes := 0
+	for pos > 0 && line[pos-1] == '\\' {
+		backslashes++
+		pos--
+	}
+	return backslashes%2 == 1
 }
 
 func keepOrBlank(line string, blank bool) string {
@@ -256,6 +391,263 @@ func writeSpaces(b *strings.Builder, n int) {
 // dead-ref pass wants exactly this split: it lost a genuine finding (a procedure step
 // pointing at a deleted script) when it briefly used StripNonContent instead.
 func StripFencesAndComments(body string) (string, int) { return stripMarkup(body, true, false) }
+
+// fenceCandidate removes blockquote containers and the indentation CommonMark permits
+// before a fence. Four spaces (or a leading tab) form an indented code block instead;
+// treating that line as a fence can hide every real paragraph below it.
+func fenceCandidate(line string) (string, bool) {
+	rest, _, ok := stripFenceContainers(line)
+	if !ok {
+		return "", false
+	}
+	// A fenced block may open on the same line as its list marker. Continuation
+	// and closing lines are already handled by stripFenceContainers because a
+	// list item's normal content indentation is at most three spaces here.
+	if content, list := listItemContent(rest, 3); list {
+		rest = content
+	}
+	return strings.TrimSpace(rest), true
+}
+
+func blockquoteDepth(line string) int {
+	_, depth, _ := stripFenceContainers(line)
+	return depth
+}
+
+// listFenceContentIndent reports the indentation subsequent lines must keep to remain
+// inside the list item that opened a fence. Zero means the fence is not list-contained.
+func listFenceContentIndent(line string) int {
+	rest, _, ok := stripFenceContainers(line)
+	if !ok {
+		return 0
+	}
+	_, indent, ok := listItemDetails(rest, 3)
+	if !ok {
+		return 0
+	}
+	return indent
+}
+
+func listContainerEnded(line string, quoteDepth, contentIndent int) bool {
+	if strings.TrimSpace(line) == "" {
+		return false // blank lines do not themselves close a list item
+	}
+	rest, ok := lineAfterBlockquotes(line, quoteDepth)
+	return !ok || leadingIndentColumns(rest) < contentIndent
+}
+
+func listContainedFenceCandidate(line string, quoteDepth, contentIndent int) (string, bool) {
+	rest, ok := lineAfterBlockquotes(line, quoteDepth)
+	if !ok {
+		return "", false
+	}
+	i, columns := 0, 0
+	for i < len(rest) && columns < contentIndent {
+		switch rest[i] {
+		case ' ':
+			columns++
+		case '\t':
+			columns += 4 - columns%4
+		default:
+			return "", false
+		}
+		i++
+	}
+	if columns < contentIndent {
+		return "", false
+	}
+	rest = rest[i:]
+	indent := 0
+	for indent < len(rest) && rest[indent] == ' ' {
+		indent++
+	}
+	if indent > 3 || indent < len(rest) && rest[indent] == '\t' {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// lineAfterBlockquotes removes exactly depth quote containers. List indentation is
+// measured inside the quote that owns it, not after any deeper quote on the same line.
+func lineAfterBlockquotes(line string, depth int) (string, bool) {
+	rest := line
+	for d := 0; d < depth; d++ {
+		i := 0
+		for i < len(rest) && i < 4 && rest[i] == ' ' {
+			i++
+		}
+		if i > 3 || i >= len(rest) || rest[i] != '>' {
+			return rest, false
+		}
+		rest = rest[i+1:]
+		if len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+			rest = rest[1:]
+		}
+	}
+	return rest, true
+}
+
+func leadingIndentColumns(line string) int {
+	columns := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case ' ':
+			columns++
+		case '\t':
+			columns += 4 - columns%4
+		default:
+			return columns
+		}
+	}
+	return columns
+}
+
+func prefixColumns(line string) int {
+	columns := 0
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\t' {
+			columns += 4 - columns%4
+		} else {
+			columns++
+		}
+	}
+	return columns
+}
+
+func stripFenceContainers(line string) (string, int, bool) {
+	rest := line
+	depth := 0
+	for {
+		i := 0
+		for i < len(rest) && rest[i] == ' ' {
+			i++
+		}
+		if i > 3 || i < len(rest) && rest[i] == '\t' {
+			return "", depth, false
+		}
+		rest = rest[i:]
+		if len(rest) == 0 || rest[0] != '>' {
+			return rest, depth, true
+		}
+		depth++
+		rest = rest[1:]
+		if len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+			rest = rest[1:]
+		}
+	}
+}
+
+func indentedCodeLine(line string) bool {
+	rest := line
+	for {
+		spaces := 0
+		for spaces < len(rest) && rest[spaces] == ' ' {
+			spaces++
+		}
+		if spaces >= 4 || spaces < len(rest) && rest[spaces] == '\t' {
+			return true
+		}
+		rest = rest[spaces:]
+		if len(rest) == 0 || rest[0] != '>' {
+			return false
+		}
+		rest = rest[1:]
+		if len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t') {
+			rest = rest[1:]
+		}
+	}
+}
+
+// listItemContent returns the text following a CommonMark bullet or ordered-list
+// marker. maxIndent is the indentation permitted before the marker; callers use three
+// for a marker at the current container level and a larger value only when checking
+// whether an otherwise indented line is nested beneath an earlier list item.
+func listItemContent(line string, maxIndent int) (string, bool) {
+	content, _, ok := listItemDetails(line, maxIndent)
+	return content, ok
+}
+
+func listItemDetails(line string, maxIndent int) (contentText string, contentIndent int, ok bool) {
+	i := 0
+	for i < len(line) && line[i] == ' ' {
+		i++
+	}
+	if i > maxIndent || i < len(line) && line[i] == '\t' {
+		return "", 0, false
+	}
+
+	markerEnd := i
+	switch {
+	case markerEnd < len(line) && (line[markerEnd] == '-' || line[markerEnd] == '+' || line[markerEnd] == '*'):
+		markerEnd++
+	default:
+		digits := 0
+		for markerEnd < len(line) && line[markerEnd] >= '0' && line[markerEnd] <= '9' && digits < 10 {
+			markerEnd++
+			digits++
+		}
+		if digits == 0 || digits > 9 || markerEnd >= len(line) || line[markerEnd] != '.' && line[markerEnd] != ')' {
+			return "", 0, false
+		}
+		markerEnd++
+	}
+	if markerEnd >= len(line) || line[markerEnd] != ' ' && line[markerEnd] != '\t' {
+		return "", 0, false
+	}
+
+	content := markerEnd
+	for content < len(line) && (line[content] == ' ' || line[content] == '\t') {
+		content++
+	}
+	// One through four spaces after a marker are list padding. With five or more,
+	// CommonMark treats the extra four as an indented code block instead.
+	if content-markerEnd > 4 {
+		return "", 0, false
+	}
+	return line[content:], prefixColumns(line[:content]), true
+}
+
+// listContinuationLine distinguishes visible list content from root-level indented
+// code. Indented code inside a list starts four columns beyond the item's content
+// indentation; anything less remains ordinary list prose (including a nested marker).
+func listContinuationLine(lines []string, line int) bool {
+	current := lines[line]
+	quoteDepth := blockquoteDepth(current)
+	rest, ok := lineAfterBlockquotes(current, quoteDepth)
+	if !ok {
+		return false
+	}
+	indent := leadingIndentColumns(rest)
+	if indent < 4 {
+		return false
+	}
+	consecutiveBlanks := 0
+	for previous := line - 1; previous >= 0; previous-- {
+		if strings.TrimSpace(lines[previous]) == "" {
+			consecutiveBlanks++
+			if consecutiveBlanks >= 2 {
+				return false
+			}
+			continue
+		}
+		consecutiveBlanks = 0
+		if blockquoteDepth(lines[previous]) != quoteDepth {
+			return false
+		}
+		previousRest, ok := lineAfterBlockquotes(lines[previous], quoteDepth)
+		if !ok {
+			return false
+		}
+		previousIndent := leadingIndentColumns(previousRest)
+		if _, contentIndent, item := listItemDetails(previousRest, previousIndent); item {
+			return indent >= contentIndent && indent < contentIndent+4
+		}
+		if previousIndent == 0 {
+			return false
+		}
+	}
+	return false
+}
 
 // fenceMarker reports the fence character, its run length and whether an info string
 // follows, for a trimmed line. run is 0 when the line is not a fence marker at all.

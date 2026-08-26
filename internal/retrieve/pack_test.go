@@ -89,13 +89,8 @@ func TestPackToBudgetRespectsTheRealPayload(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			packed := packToBudget(tc.cards, tc.budget)
-			if len(packed) == 0 {
-				t.Fatal("packer must always return at least one card")
-			}
 			actual := wireTokens(packed)
-			// One card is always returned even if it alone busts the budget (the
-			// documented "never return empty" floor), so only check the multi-card case.
-			if len(packed) > 1 && actual > tc.budget {
+			if actual > tc.budget {
 				t.Errorf("packed payload is %d tokens, over the %d budget with %d cards", actual, tc.budget, len(packed))
 			}
 			if reported := TotalTokens(packed); reported < actual-len(packed)-2 {

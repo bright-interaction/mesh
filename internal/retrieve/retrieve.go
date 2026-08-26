@@ -14,6 +14,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,12 +81,10 @@ type Options struct {
 	NoRerank    bool // skip the cross-encoder stage even when configured (for tuning the fusion itself)
 	// AllowedScopes, when non-nil, restricts results to notes whose scope intersects
 	// the set (access control). nil = unrestricted (solo / no-ACL fast path). This is
-	// THE read boundary and it is enforced in three places, because one was not enough:
-	// in candidate generation (SearchScoped / ScoreScoped, so the per-signal limit
-	// counts only readable rows), at the expansion seeds (so an unreadable note cannot
-	// stamp its title into a neighbour's Reason or donate score to it), and at the card
-	// loop (the catch-all for the vector arm and expanded neighbours), which is still
-	// before the reranker reads any doc.
+	// THE read boundary and it is enforced throughout candidate generation: in the
+	// FTS snapshot, against current persisted metadata before graph/vector/expansion
+	// limits, again while enriching cards, and against metadata read atomically with
+	// each document before a reranker or answering model sees its body.
 	AllowedScopes map[string]bool
 	// AllowPath, when non-nil, is the FOLDER read boundary: it reports whether the
 	// caller may read the note at that vault-relative path. nil = unrestricted (no
@@ -278,6 +277,17 @@ func (r *Retriever) EnableRerank(rr rerank.Reranker) bool {
 // when no reranker is configured.
 var ErrRerankUnavailable = errors.New("rerank endpoint unavailable")
 
+// ErrEmbeddingUnavailable wraps failures from a configured semantic lane. Silently
+// falling back to lexical results makes an operator believe vector retrieval ran when
+// it did not, and turns caller cancellation into a successful but unrelated answer.
+var ErrEmbeddingUnavailable = errors.New("embedding endpoint unavailable")
+
+// ErrInvalidWeights means a retrieval could not produce a meaningful, deterministic
+// ranking because at least one configured fusion weight was negative or non-finite.
+// Weight inputs are operator/request data; rejecting them is safer than letting NaN
+// enter sort comparators (which do not define a strict order).
+var ErrInvalidWeights = errors.New("invalid retrieval weights")
+
 // rerankProbeTimeout bounds the liveness probe below. A cross-encoder scoring one short
 // sentinel document answers in well under a second; anything slower is not usable on a
 // query path either.
@@ -422,21 +432,25 @@ func (r *Retriever) resolveWeights(opt Options, vectorsActive bool) (wFTS, wGrap
 }
 
 // queryVec returns the (cached) embedding of the query, prefixed for asymmetric
-// models. Returns nil if no embedder is set or the call fails. The cache makes
-// repeated retrievals of the same query (e.g. a weight sweep) embed only once.
-func (r *Retriever) queryVec(ctx context.Context, query string) []float32 {
+// models. A configured embedder failure is returned rather than silently changing the
+// query into lexical-only retrieval. The cache makes repeated retrievals of the same
+// query (e.g. a weight sweep) embed only once.
+func (r *Retriever) queryVec(ctx context.Context, query string) ([]float32, error) {
 	if r.emb == nil {
-		return nil
+		return nil, nil
 	}
 	key := r.queryPrefix + query
 	r.qvecMu.Lock()
 	defer r.qvecMu.Unlock()
 	if v, ok := r.qvec[key]; ok {
-		return v
+		return v, nil
 	}
 	qv, err := r.emb.Embed(ctx, []string{key})
-	if err != nil || len(qv) != 1 {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("%w (embedder %s): %w", ErrEmbeddingUnavailable, r.emb.Model(), err)
+	}
+	if len(qv) != 1 {
+		return nil, fmt.Errorf("%w (embedder %s): returned %d vectors for one query", ErrEmbeddingUnavailable, r.emb.Model(), len(qv))
 	}
 	// Bound the cache: a long-lived shared Retriever (the SSH viewer builds one and
 	// never swaps it) under a high-cardinality query stream would otherwise grow this
@@ -445,7 +459,7 @@ func (r *Retriever) queryVec(ctx context.Context, query string) []float32 {
 		r.qvec = make(map[string][]float32, maxQvecEntries)
 	}
 	r.qvec[key] = qv[0]
-	return qv[0]
+	return qv[0], nil
 }
 
 // maxQvecEntries caps the per-Retriever query-embedding cache.
@@ -456,8 +470,9 @@ const maxQvecEntries = 4096
 // the stored width (homogeneity guard: vectors from a different model, or even the
 // same model name at a different dimension, are not comparable. A length mismatch
 // makes every cosine return 0, which min-max then normalizes to a uniform 1 - a
-// silent garbage signal that boosts every note equally. We fail safe to
-// lexical-only rather than emit it). storedDim is the vault's recorded width; if it
+// silent garbage signal that boosts every note equally. Activation refuses a known
+// mismatch; a mismatch discovered on the query path is returned as an error rather
+// than emitting it). storedDim is the vault's recorded width; if it
 // is 0 (old vault, pre-vector_dim) we derive it from the loaded vectors.
 func (r *Retriever) EnableVectors(e embed.Embedder, model string, storedDim int, vecs map[string][][]float32) bool {
 	if e == nil || model == "" || len(vecs) == 0 || e.Model() != model {
@@ -511,8 +526,19 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	if opt.Limit <= 0 {
 		opt.Limit = 20
 	}
+	if err := validateWeights(opt.WeightFTS, opt.WeightGraph, opt.WeightVec); err != nil {
+		return nil, err
+	}
+	if opt.WeightFTS == 0 && opt.WeightGraph == 0 && opt.WeightVec == 0 {
+		if err := validateWeights(r.defWFTS, r.defWGraph, r.defWVec); err != nil {
+			return nil, err
+		}
+	}
 	vectorsActive := r.emb != nil && len(r.vecs) > 0
 	wFTS, wGraph, wVec := r.resolveWeights(opt, vectorsActive)
+	if err := validateWeights(wFTS, wGraph, wVec); err != nil {
+		return nil, err
+	}
 
 	// Candidate generation is scope-aware: both keyword signals apply the read
 	// boundary BEFORE their own truncation, so the fetch limit counts only rows this
@@ -524,38 +550,66 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// cancelling the agent tool call or the HTTP request left the FTS read running to
 	// completion. With the deadline the store now applies, a pathological query ends in
 	// a named error instead of a process pinned at 100% CPU with nothing to cancel.
-	ftsHits, err := r.store.SearchScoped(ctx, query, fetchLimit, opt.AllowedScopes)
-	if err != nil {
-		return nil, err
-	}
-	graphHits := r.ranker.ScoreScoped(query, fetchLimit, opt.AllowedScopes)
-
 	fused := map[string]float64{}
 	snippet := map[string]string{}
 	reason := map[string]string{}
 
-	// FTS signal, min-max normalized.
-	fScores := make([]float64, len(ftsHits))
-	for i, h := range ftsHits {
-		fScores[i] = h.Score
-	}
-	fNorm := minMaxFloored(fScores)
-	for i, h := range ftsHits {
-		fused[h.NodeID] += wFTS * fNorm[i]
-		snippet[h.NodeID] = h.Snippet
-		reason[h.NodeID] = "fts"
+	// FTS signal, min-max normalized. A zero-weight arm is absent, not a source of
+	// zero-scored candidates: adding its hits to fused made explicitly vector-only
+	// searches return lexical tail cards that the caller had disabled.
+	if wFTS > 0 {
+		ftsHits, err := r.store.SearchScopedPaths(ctx, query, fetchLimit, opt.AllowedScopes, opt.AllowPath)
+		if err != nil {
+			return nil, err
+		}
+		fScores := make([]float64, len(ftsHits))
+		for i, h := range ftsHits {
+			fScores[i] = h.Score
+		}
+		fNorm := minMaxFloored(fScores)
+		for i, h := range ftsHits {
+			fused[h.NodeID] += wFTS * fNorm[i]
+			snippet[h.NodeID] = h.Snippet
+			reason[h.NodeID] = "fts"
+		}
 	}
 
-	// graph-BM25 signal, min-max normalized.
-	gScores := make([]float64, len(graphHits))
-	for i, h := range graphHits {
-		gScores[i] = h.Score
-	}
-	gNorm := minMaxFloored(gScores)
-	for i, h := range graphHits {
-		fused[h.Node.ID] += wGraph * gNorm[i]
-		if reason[h.Node.ID] == "" {
-			reason[h.Node.ID] = "graph"
+	// graph-BM25 signal, min-max normalized. As above, zero means disabled rather
+	// than "include every match with a score of zero".
+	if wGraph > 0 {
+		// The graph can lag the notes table by one watcher generation. Score the
+		// full ranked stream and apply CURRENT persisted metadata before taking the
+		// limit; deleted/stale/forbidden nodes are neither results nor allowed to
+		// consume the caller's candidate budget.
+		all := r.ranker.Score(query, 0)
+		ids := make([]string, len(all))
+		for i := range all {
+			ids[i] = all[i].Node.ID
+		}
+		readable, err := r.currentCards(ctx, ids, opt)
+		if err != nil {
+			return nil, fmt.Errorf("read current graph-candidate metadata: %w", err)
+		}
+		graphHits := make([]graph.ScoredNode, 0, fetchLimit)
+		for _, h := range all {
+			if _, ok := readable[h.Node.ID]; !ok {
+				continue
+			}
+			graphHits = append(graphHits, h)
+			if len(graphHits) >= fetchLimit {
+				break
+			}
+		}
+		gScores := make([]float64, len(graphHits))
+		for i, h := range graphHits {
+			gScores[i] = h.Score
+		}
+		gNorm := minMaxFloored(gScores)
+		for i, h := range graphHits {
+			fused[h.Node.ID] += wGraph * gNorm[i]
+			if reason[h.Node.ID] == "" {
+				reason[h.Node.ID] = "graph"
+			}
 		}
 	}
 
@@ -565,15 +619,31 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// so a long multi-topic note still surfaces on the one section that answers
 	// the query instead of being diluted by a whole-note average.
 	if vectorsActive && wVec > 0 {
+		vecIDs := make([]string, 0, len(r.vecs))
+		for id := range r.vecs {
+			vecIDs = append(vecIDs, id)
+		}
+		sort.Strings(vecIDs)
+		readableVecs, err := r.currentCards(ctx, vecIDs, opt)
+		if err != nil {
+			return nil, fmt.Errorf("read current vector-candidate metadata: %w", err)
+		}
 		// Length guard: a query embedding whose width disagrees with the stored width
 		// would make every cosine 0, which min-max turns into a uniform 1 boosting every
 		// note equally. Skip the whole vector contribution rather than emit that garbage.
 		// vecDim is always > 0 once EnableVectors succeeds, so a mismatch is a real skip.
-		if qv := r.queryVec(ctx, query); qv != nil && r.vecDim > 0 && len(qv) == r.vecDim {
+		if len(readableVecs) > 0 {
+			qv, err := r.queryVec(ctx, query)
+			if err != nil {
+				return nil, err
+			}
+			if r.vecDim <= 0 || len(qv) != r.vecDim {
+				return nil, fmt.Errorf("%w (embedder %s): query width %d does not match stored width %d", ErrEmbeddingUnavailable, r.emb.Model(), len(qv), r.vecDim)
+			}
 			// Both arms produce the same shape: the top-K chunk vectors folded to a
 			// per-note max. Keeping the ANN and brute-force candidate sets identical is
 			// what makes the two paths rank alike (see vectorCandidates).
-			ids, sims := r.vectorCandidates(qv, vecCandidateK(opt.Limit))
+			ids, sims := r.vectorCandidates(qv, vecCandidateK(opt.Limit), readableVecs)
 			for i, id := range ids {
 				// Path-independent scaling: map the cosine onto [0,1] against its own
 				// fixed range instead of min-maxing the per-request candidate set. The
@@ -595,42 +665,71 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// so an unreadable note leaked its title and steered the scoped ranking. Scanning
 	// past forbidden seeds (rather than dropping them from the top-5 slate) keeps
 	// expansion recall intact for scoped callers.
+	seedOrder := topN(fused, 0)
+	seedIDs := make([]string, len(seedOrder))
+	for i := range seedOrder {
+		seedIDs[i] = seedOrder[i].id
+	}
+	seedCards, err := r.currentCards(ctx, seedIDs, opt)
+	if err != nil {
+		return nil, fmt.Errorf("read current expansion-seed metadata: %w", err)
+	}
 	seeded := 0
-	for _, seed := range topN(fused, 0) {
+	for _, seed := range seedOrder {
 		if seeded >= expandSeeds {
 			break
 		}
-		seedCard, seedOK := r.card(seed.id)
-		if !seedOK || !scopeAllowed(seedCard.Scope, opt.AllowedScopes) || !pathAllowed(seedCard.Path, opt.AllowPath) {
+		seedCard, seedOK := seedCards[seed.id]
+		if !seedOK {
 			continue
 		}
 		seeded++
-		for _, nb := range r.strongNeighbors(seed.id, expandK) {
+		neighbors := r.strongNeighbors(seed.id, 0)
+		neighborIDs := make([]string, 0, len(neighbors))
+		for _, nb := range neighbors {
+			if _, seen := fused[nb.id]; !seen {
+				neighborIDs = append(neighborIDs, nb.id)
+			}
+		}
+		readableNeighbors, err := r.currentCards(ctx, neighborIDs, opt)
+		if err != nil {
+			return nil, fmt.Errorf("read current expansion-neighbor metadata: %w", err)
+		}
+		expanded := 0
+		for _, nb := range neighbors {
 			if _, seen := fused[nb.id]; seen {
 				continue
 			}
+			if _, ok := readableNeighbors[nb.id]; !ok {
+				continue
+			}
 			fused[nb.id] = seed.score * expandDecay * nb.weight
-			reason[nb.id] = "linked from " + r.title(seed.id)
+			reason[nb.id] = "linked from " + seedCard.Title
+			expanded++
+			if expanded >= expandK {
+				break
+			}
 		}
 	}
 
-	// Enrich into cards, apply the tier-0 boost.
+	// Enrich from CURRENT persisted metadata, not the independently refreshed graph.
+	// That prevents a fresh FTS snippet/body from being paired with a stale public path
+	// or scope, and also makes a newly indexed note actionable before the graph swap.
+	allIDs := make([]string, 0, len(fused))
+	for id := range fused {
+		allIDs = append(allIDs, id)
+	}
+	sort.Strings(allIDs)
+	current, err := r.currentCards(ctx, allIDs, opt)
+	if err != nil {
+		return nil, fmt.Errorf("read current result metadata: %w", err)
+	}
+
+	// Apply the tier-0 boost.
 	cards := make([]Card, 0, len(fused))
 	for id, score := range fused {
-		c, ok := r.card(id)
-		// The FTS index and the in-memory graph are refreshed independently, so a
-		// long-running `mesh mcp --watch` can match a note its graph has not loaded yet.
-		// Returning the shell card was worse than returning nothing: the caller got a
-		// result with no title, no path and no id, so it could not fetch or even name
-		// what matched, and it still cost budget. Observed on a live vault against a
-		// daemon that had been up 10 hours.
+		c, ok := current[id]
 		if !ok {
-			continue
-		}
-		// Read boundary: drop notes the caller may not read BEFORE they reach the head,
-		// the reranker, or the budget packer. Covers every signal at once, and both
-		// partitions, because a folder ACL can fence a note whose scope is allowed.
-		if !scopeAllowed(c.Scope, opt.AllowedScopes) || !pathAllowed(c.Path, opt.AllowPath) {
 			continue
 		}
 		c.Snippet = snippet[id]
@@ -647,7 +746,8 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// the fused order dressed up as reranked. Skipped when tuning the fusion itself
 	// (NoRerank), so the fused order is what gets measured.
 	if !opt.NoRerank {
-		if err := r.rerankHead(ctx, query, cards, fused); err != nil {
+		cards, err = r.rerankHead(ctx, query, cards, fused, opt)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -692,6 +792,9 @@ func vecCandidateK(limit int) int {
 // speeding them up. A fixed reference keeps a given cosine worth the same thing on
 // both arms. The clamp only absorbs float drift outside [-1,1].
 func cosineTo01(c float64) float64 {
+	if math.IsNaN(c) {
+		return 0
+	}
 	v := (c + 1) / 2
 	if v < 0 {
 		return 0
@@ -702,20 +805,57 @@ func cosineTo01(c float64) float64 {
 	return v
 }
 
+func validateWeights(weights ...float64) error {
+	for _, w := range weights {
+		if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 {
+			return fmt.Errorf("%w: weights must be finite and non-negative", ErrInvalidWeights)
+		}
+	}
+	return nil
+}
+
 // vectorCandidates returns the top-k chunk vectors for the query, folded to one
 // entry per note carrying that note's best chunk score, in descending score order.
 // Both arms go through here so the ANN and brute-force candidate sets have the same
 // shape and size: the ANN index is then an accelerator for the same computation,
 // not a different ranking.
-func (r *Retriever) vectorCandidates(qv []float32, k int) (ids []string, sims []float64) {
+func (r *Retriever) vectorCandidates(qv []float32, k int, allowed map[string]Card) (ids []string, sims []float64) {
 	if k <= 0 {
 		return nil, nil
 	}
 	var hits []annResult
 	if r.ann != nil {
-		hits = r.ann.Search(qv, k, 0)
+		// ANN cannot apply an arbitrary ACL predicate internally. Grow the ranked
+		// chunk pool until k current/readable chunks survive or the index is exhausted.
+		total := 0
+		for _, chunks := range r.vecs {
+			total += len(chunks)
+		}
+		probe := k
+		if probe > total {
+			probe = total
+		}
+		for probe > 0 {
+			raw := r.ann.Search(qv, probe, 0)
+			hits = hits[:0]
+			for _, h := range raw {
+				if _, ok := allowed[h.NodeID]; ok {
+					hits = append(hits, h)
+				}
+			}
+			if len(hits) >= k || probe >= total || len(raw) < probe {
+				break
+			}
+			probe *= 2
+			if probe > total {
+				probe = total
+			}
+		}
+		if len(hits) > k {
+			hits = hits[:k]
+		}
 	} else {
-		hits = r.bruteForceTopChunks(qv, k)
+		hits = r.bruteForceTopChunks(qv, k, allowed)
 	}
 	best := map[string]float64{}
 	for _, h := range hits {
@@ -739,9 +879,12 @@ func (r *Retriever) vectorCandidates(qv []float32, k int) (ids []string, sims []
 // bruteForceTopChunks scans every stored chunk vector and returns the k closest,
 // mirroring what the ANN index returns (chunks, not notes: the caller max-pools).
 // Ties break on node id then chunk index so the order is deterministic.
-func (r *Retriever) bruteForceTopChunks(qv []float32, k int) []annResult {
+func (r *Retriever) bruteForceTopChunks(qv []float32, k int, allowed map[string]Card) []annResult {
 	all := make([]annResult, 0, len(r.vecs))
 	for id, chunks := range r.vecs {
+		if _, ok := allowed[id]; !ok {
+			continue
+		}
 		for ci, v := range chunks {
 			all = append(all, annResult{NodeID: id, ChunkIx: ci, Score: embed.Cosine(qv, v)})
 		}
@@ -770,9 +913,10 @@ func sortCards(cards []Card) {
 	})
 }
 
-// rerankHead reorders the top-K cards in place using the configured
+// rerankHead returns the cards with the top-K reordered using the configured
 // cross-encoder. Reranked cards are rescored above any fused tail card so the
-// head stays on top after the final sort, with the tier-0 nudge preserved.
+// head stays on top after the final sort, with the tier-0 nudge preserved. It may
+// also drop a head card whose current body-snapshot metadata no longer clears ACLs.
 //
 // fusedRaw carries the PRE-BOOST fused score per node id (the map Retrieve built),
 // because this function ASSIGNS head[i].Score rather than adjusting it. Reading the
@@ -789,55 +933,83 @@ func sortCards(cards []Card) {
 // reached their server and nothing said so. A reranker the operator asked for and that
 // cannot be reached is an error, not a no-op. Conditions that are NOT errors (no
 // reranker configured, a head too short to reorder, a flat uninformative response) still
-// leave the fused order intact and return nil.
-func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, fusedRaw map[string]float64) error {
+// leave the fused order intact.
+func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, fusedRaw map[string]float64, opt Options) ([]Card, error) {
 	if r.rr == nil || len(cards) < 2 {
-		return nil
+		return cards, nil
 	}
 	k := rerankK
 	if k > len(cards) {
 		k = len(cards)
 	}
-	head := cards[:k]
+	candidateHead := cards[:k]
 	ids := make([]string, k)
-	for i := range head {
-		ids[i] = head[i].NodeID
+	for i := range candidateHead {
+		ids[i] = candidateHead[i].NodeID
 	}
-	docText, err := r.store.NoteDocs(ids)
+	documents, err := r.store.NoteDocuments(ctx, ids)
 	if err != nil {
-		return fmt.Errorf("rerank: reading note bodies for the head: %w", err)
+		return nil, fmt.Errorf("rerank: reading note bodies for the head: %w", err)
 	}
-	docs := make([]string, k)
-	for i, id := range ids {
-		if d := docText[id]; d != "" {
-			docs[i] = d
-		} else {
-			docs[i] = head[i].Title
+	// Re-check each candidate against metadata read in the SAME statement as its
+	// body. If a watcher tightened an ACL since card enrichment, drop it before the
+	// external reranker sees a byte. Refresh returned identity fields at the same time.
+	head := make([]Card, 0, k)
+	docs := make([]string, 0, k)
+	for _, previous := range candidateHead {
+		d, ok := documents[previous.NodeID]
+		if !ok {
+			continue
 		}
+		current, ok := cardFromMetadata(d.NoteMetadata)
+		if !ok || !scopeAllowed(current.Scope, opt.AllowedScopes) || !pathAllowed(current.Path, opt.AllowPath) {
+			continue
+		}
+		current.Snippet, current.Score, current.Reason = previous.Snippet, previous.Score, previous.Reason
+		head = append(head, current)
+		docs = append(docs, d.Text)
+	}
+	cards = append(head, cards[k:]...)
+	k = len(head)
+	if k < 2 {
+		return cards, nil
 	}
 	res, err := r.rr.Rerank(ctx, query, docs)
 	if err != nil {
-		return fmt.Errorf("%w (cross-encoder %s): %w\n  start the rerank endpoint (see tools/rerank-server), or unset MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL to search without it", ErrRerankUnavailable, r.rerankName, err)
+		return nil, fmt.Errorf("%w (cross-encoder %s): %w\n  start the rerank endpoint (see tools/rerank-server), or unset MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL to search without it", ErrRerankUnavailable, r.rerankName, err)
 	}
 	if len(res) != k {
-		return fmt.Errorf("%w (cross-encoder %s): endpoint returned %d scores for %d documents", ErrRerankUnavailable, r.rerankName, len(res), k)
+		return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned %d scores for %d documents", ErrRerankUnavailable, r.rerankName, len(res), k)
 	}
 	scores := make([]float64, k)
-	lo, hi := res[0].Score, res[0].Score
+	seen := make([]bool, k)
 	for _, x := range res {
-		scores[x.Index] = x.Score
-		if x.Score < lo {
-			lo = x.Score
+		if x.Index < 0 || x.Index >= k {
+			return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned out-of-range document index %d for %d documents", ErrRerankUnavailable, r.rerankName, x.Index, k)
 		}
-		if x.Score > hi {
-			hi = x.Score
+		if seen[x.Index] {
+			return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned duplicate document index %d", ErrRerankUnavailable, r.rerankName, x.Index)
+		}
+		if math.IsNaN(x.Score) || math.IsInf(x.Score, 0) {
+			return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned non-finite score for document index %d", ErrRerankUnavailable, r.rerankName, x.Index)
+		}
+		seen[x.Index] = true
+		scores[x.Index] = x.Score
+	}
+	lo, hi := scores[0], scores[0]
+	for _, score := range scores[1:] {
+		if score < lo {
+			lo = score
+		}
+		if score > hi {
+			hi = score
 		}
 	}
 	// A flat (uninformative) rerank response carries no ranking signal; leave the
 	// fused head order intact rather than collapsing it to alphabetical via the
 	// constant-score branch of minMax.
 	if hi == lo {
-		return nil
+		return cards, nil
 	}
 	norm := minMaxFloored(scores)
 	// The head's fused scores, normalized over the head, so the blend can give the
@@ -877,16 +1049,53 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 		}
 	}
 	sortCards(cards)
-	return nil
+	return cards, nil
+}
+
+// currentCards resolves actionable, authorized cards from the current notes-table
+// snapshot. The in-memory graph is a ranking aid only: it refreshes independently and
+// must never supply path/scope metadata for fresh indexed content.
+func (r *Retriever) currentCards(ctx context.Context, ids []string, opt Options) (map[string]Card, error) {
+	out := make(map[string]Card, len(ids))
+	metadata, err := r.store.NoteMetadataFor(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for id, m := range metadata {
+		c, ok := cardFromMetadata(m)
+		if !ok || !scopeAllowed(c.Scope, opt.AllowedScopes) || !pathAllowed(c.Path, opt.AllowPath) {
+			continue
+		}
+		out[id] = c
+	}
+	return out, nil
+}
+
+func cardFromMetadata(m index.NoteMetadata) (Card, bool) {
+	if strings.TrimSpace(m.NodeID) == "" || strings.TrimSpace(m.NoteID) == "" ||
+		strings.TrimSpace(m.Path) == "" || strings.TrimSpace(m.Title) == "" {
+		return Card{NodeID: m.NodeID}, false
+	}
+	return Card{
+		NodeID: m.NodeID,
+		NoteID: m.NoteID,
+		Title:  m.Title,
+		Path:   m.Path,
+		Type:   m.Type,
+		Scope:  m.Scope,
+		Tier0:  tier0Types[m.Type],
+	}, true
 }
 
 // card builds a Card from a node id, reading title/path/type/tier-0 from the
 // in-memory graph node. The bool is false when the node is not in the graph, in which
-// case the Card is a shell the caller must NOT return: see the drop in Retrieve.
+// case the Card is a shell. Production retrieval uses currentCards; this helper remains
+// for graph-only diagnostics and its actionability contract.
 func (r *Retriever) card(id string) (Card, bool) {
 	c := Card{NodeID: id}
 	n, ok := r.graph.Node(id)
-	if !ok {
+	if !ok || n.Kind != "note" || strings.TrimSpace(n.Label) == "" ||
+		strings.TrimSpace(n.NotePath) == "" || strings.TrimSpace(n.NoteID) == "" {
 		return c, false
 	}
 	c.Title = n.Label
@@ -911,10 +1120,9 @@ func scopeAllowed(cardScope string, allowed map[string]bool) bool {
 }
 
 // pathAllowed reports whether a card's note path clears the folder read boundary.
-// allow==nil means unrestricted (no folder ACL configured). Unlike the scope filter this
-// cannot be pushed into candidate generation (the store indexes scope, not ACL prefixes),
-// so a folder-fenced caller trades some recall for the boundary: their fetch limit is
-// spent partly on rows that are then dropped.
+// allow==nil means unrestricted (no folder ACL configured). Search consumes the ranked
+// SQL stream through this predicate; graph, vector and expansion arms apply it to current
+// persisted metadata before their limits, so fenced rows never consume readable slots.
 func pathAllowed(path string, allow func(string) bool) bool {
 	return allow == nil || allow(path)
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/llm"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // Citation is a source the answer drew on, by its [N] number in the context.
@@ -78,9 +79,10 @@ func sanitizeContent(s string) string {
 // contain it. Graph-expanded cards carry NO snippet at all (they were never an FTS
 // hit), so those arrived as a numbered source with an empty body.
 //
-// So the bodies are read from the index with Store.NoteDocs, the same call the
-// reranker uses, and packed to the token budget here. The snippet stays only as the
-// fallback for a note whose body could not be read.
+// So the bodies are read from the index with Store.NoteDocuments, the same atomic
+// body+ACL snapshot the reranker uses, and packed to the token budget here. A missing
+// or newly forbidden document drops the card; the snippet is only a fallback for an
+// authorized document whose indexed body is empty.
 const (
 	// codeLaneShare is the slice of the budget held back for the code lane, so one
 	// long note body cannot crowd every source symbol out of the context.
@@ -94,11 +96,13 @@ const (
 	truncationMarker = " ... [truncated to fit the context budget]"
 )
 
-// noteBodies reads the indexed text for the retrieved cards, keyed by node id. A read
-// failure is not fatal: an empty map sends every card down the snippet fallback.
-func noteBodies(store *index.Store, cards []retrieve.Card) map[string]string {
+// noteBodiesAuthorized reads each body together with its CURRENT path/scope in one
+// SQL snapshot, then reapplies both read boundaries before any text reaches the LLM.
+// Retrieval and grounding are separate reads, so this closes the reindex window where
+// a card that was public during retrieval becomes secret before its fresh body is read.
+func noteBodiesAuthorized(ctx context.Context, store *index.Store, cards []retrieve.Card, allowedScopes map[string]bool, allowPath func(string) bool) (map[string]index.NoteDocument, error) {
 	if store == nil || len(cards) == 0 {
-		return nil
+		return nil, nil
 	}
 	ids := make([]string, 0, len(cards))
 	for _, c := range cards {
@@ -106,15 +110,20 @@ func noteBodies(store *index.Store, cards []retrieve.Card) map[string]string {
 			ids = append(ids, c.NodeID)
 		}
 	}
-	docs, err := store.NoteDocs(ids)
+	docs, err := store.NoteDocuments(ctx, ids)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return docs
+	for id, doc := range docs {
+		if !vault.ScopeAllowsCSV(doc.Scope, allowedScopes) || (allowPath != nil && !allowPath(doc.Path)) {
+			delete(docs, id)
+		}
+	}
+	return docs, nil
 }
 
 // bodyFor returns the grounding text for one card: the note body when the index has
-// it, the FTS excerpt otherwise. NoteDocs returns "title\nbody", and the title is
+// it, the FTS excerpt otherwise. NoteDocuments returns "title\nbody", and the title is
 // already on the source header, so it is dropped here; a note whose doc is the title
 // alone therefore falls back to the snippet, which is the right call because a title
 // repeated under its own header grounds nothing.
@@ -200,14 +209,27 @@ func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, cl
 	}
 
 	if rtr != nil {
-		cards, _ := rtr.Retrieve(ctx, question, retrieve.Options{Budget: budget, AllowedScopes: allowedScopes, AllowPath: allowPath})
-		docs := noteBodies(store, cards)
+		cards, err := rtr.Retrieve(ctx, question, retrieve.Options{Budget: budget, AllowedScopes: allowedScopes, AllowPath: allowPath})
+		if err != nil {
+			return Result{}, fmt.Errorf("retrieve notes: %w", err)
+		}
+		docs, err := noteBodiesAuthorized(ctx, store, cards, allowedScopes, allowPath)
+		if err != nil {
+			return Result{}, fmt.Errorf("read note bodies: %w", err)
+		}
 		for _, c := range cards {
+			doc, ok := docs[c.NodeID]
+			if !ok {
+				// The note was deleted or stopped clearing the read boundary after
+				// retrieval. Never fall back to a stale snippet in that case.
+				continue
+			}
+			c.NoteID, c.Path, c.Type, c.Title, c.Scope = doc.NoteID, doc.Path, doc.Type, doc.Title, doc.Scope
 			// %q on the title already escapes newlines; the body is raw note text
 			// written by anyone on the team, so it goes through sanitizeContent to
 			// strip forged source headers.
 			header := fmt.Sprintf("[%d] NOTE %q (%s)\n", n+1, c.Title, c.Path)
-			body := sanitizeContent(bodyFor(c, docs))
+			body := sanitizeContent(bodyFor(c, map[string]string{c.NodeID: doc.Text}))
 			if body == "" {
 				// No body and no excerpt: skip it rather than cite a numbered source
 				// with nothing under it, which is what a graph-expanded card used to
@@ -238,19 +260,21 @@ func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, cl
 		// ctx, not a dropped context: the code FTS read now takes the caller's
 		// context and a server-side deadline, so a pathological query ends in a
 		// named error instead of a core pinned at 100% with nothing to cancel.
-		if hits, err := store.SearchCode(ctx, question, 5, nil); err == nil {
-			for _, h := range hits {
-				loc := fmt.Sprintf("%s:%d", h.Path, h.Line)
-				block := fmt.Sprintf("[%d] CODE %s %s (%s)\n%s\n\n", n+1, h.Kind, h.Name, loc, sanitizeContent(h.Signature))
-				cost := retrieve.EstimateTokens(block)
-				if used+cost > budget {
-					break
-				}
-				n++
-				used += cost
-				b.WriteString(block)
-				cites = append(cites, Citation{N: n, Kind: "code", ID: h.ID, Title: h.Name, Loc: loc})
+		hits, err := store.SearchCode(ctx, question, 5, nil)
+		if err != nil {
+			return Result{}, fmt.Errorf("search code: %w", err)
+		}
+		for _, h := range hits {
+			loc := fmt.Sprintf("%s:%d", h.Path, h.Line)
+			block := fmt.Sprintf("[%d] CODE %s %s (%s)\n%s\n\n", n+1, h.Kind, h.Name, loc, sanitizeContent(h.Signature))
+			cost := retrieve.EstimateTokens(block)
+			if used+cost > budget {
+				break
 			}
+			n++
+			used += cost
+			b.WriteString(block)
+			cites = append(cites, Citation{N: n, Kind: "code", ID: h.ID, Title: h.Name, Loc: loc})
 		}
 	}
 	if n == 0 {

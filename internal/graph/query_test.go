@@ -3,7 +3,10 @@
 
 package graph
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func note(id, label string, attrs map[string]any) *Node {
 	return &Node{ID: "note:" + id, Kind: "note", Label: label, NoteID: id, Attrs: attrs}
@@ -43,5 +46,21 @@ func TestTokenizeStopwordsAndUnicode(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Errorf("missing expected tokens: %v (got %v)", want, got)
+	}
+}
+
+func TestTokenizeNormalizesCanonicallyEquivalentUnicode(t *testing.T) {
+	for _, tc := range []struct{ composed, decomposed string }{
+		{"Åtgärd", "A\u030Atga\u0308rd"},
+		{"한글", "한글"},
+	} {
+		if got, want := Tokenize(tc.decomposed), Tokenize(tc.composed); !slices.Equal(got, want) {
+			t.Errorf("Tokenize(%q) = %q, want NFC-equivalent %q", tc.decomposed, got, want)
+		}
+		g := New()
+		g.AddNode(note("unicode", tc.composed, nil))
+		if hits := g.NewRanker().Score(tc.decomposed, 10); len(hits) != 1 || hits[0].Node.ID != "note:unicode" {
+			t.Errorf("NFD query %q did not match NFC label %q: %+v", tc.decomposed, tc.composed, hits)
+		}
 	}
 }

@@ -106,36 +106,28 @@ func TestReserveNeverStarvesOrdinaryCards(t *testing.T) {
 	}
 }
 
-// TestFallbackCardPrefersTheCompactForm is the regression for the never-return-empty
-// floor appending a full-form card with no size check, so a 10-token budget was
-// answered with the whole snippet. The floor itself is intentional (the caller still
-// learns which note answers the query, and TotalTokens reports the real cost), but
-// it must overrun by as little as it can.
-func TestFallbackCardPrefersTheCompactForm(t *testing.T) {
+// TestBudgetBelowOneCompactCardReturnsEmpty pins Budget as a hard upper bound. The
+// former never-return-empty floor deliberately exceeded small budgets, which made the
+// caller's context cap advisory rather than enforceable.
+func TestBudgetBelowOneCompactCardReturnsEmpty(t *testing.T) {
 	cards := tier0AtTheBottom(3)
-	full := cardTokens(cards[0])
+	compactCost := TotalTokens([]Card{compact(cards[0])})
 	tests := []struct {
 		name   string
 		budget int
 	}{
 		{name: "budget far under one card", budget: 10},
-		{name: "budget under one full card", budget: 50},
+		{name: "one token under compact card", budget: compactCost - 1},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if full <= tc.budget {
-				t.Skipf("precondition: a full card must not fit, costs %d for budget %d", full, tc.budget)
+			if compactCost <= tc.budget {
+				t.Skipf("precondition: a compact card must not fit, costs %d for budget %d", compactCost, tc.budget)
 			}
 			packed := packToBudget(cards, tc.budget)
-			if len(packed) != 1 {
-				t.Fatalf("want exactly the one best card, got %d", len(packed))
-			}
-			if packed[0].Snippet != "" {
-				t.Errorf("budget %d got the full-form card back (%d tokens, snippet intact) when "+
-					"the compact form was available", tc.budget, TotalTokens(packed))
-			}
-			if got := TotalTokens(packed); got >= full {
-				t.Errorf("fallback cost %d tokens, no cheaper than the full card's %d", got, full)
+			if len(packed) != 0 {
+				t.Fatalf("budget %d cannot hold the cheapest card (%d tokens), got %d cards costing %d",
+					tc.budget, compactCost, len(packed), TotalTokens(packed))
 			}
 		})
 	}

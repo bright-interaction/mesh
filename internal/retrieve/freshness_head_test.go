@@ -90,10 +90,6 @@ func TestFreshnessDecayReachesTheRerankedHead(t *testing.T) {
 // in the tier-0 flag, and everything the blend reads (the reranker's scores and the
 // pre-boost fused scores) is held identical.
 func TestRerankBlendAppliesTier0Exactly(t *testing.T) {
-	srcs := []noteSrc{
-		{"boosted.md", "---\nid: boosted\ntype: decision\nwhen: 2026-01-01\n---\n# Boosted\nstorage engine note\n"},
-		{"plain.md", "---\nid: plain\ntype: note\nwhen: 2026-01-01\n---\n# Plain\nstorage engine plainmarker\n"},
-	}
 	// The tier-0 card is BEHIND the plain card on the raw fused signal (0.47 vs 0.50)
 	// and behind it on the reranker too. Its boosted score, 0.47*1.1 = 0.517, is what
 	// put it first in the incoming order, and that is exactly the number the old code
@@ -106,6 +102,14 @@ func TestRerankBlendAppliesTier0Exactly(t *testing.T) {
 	// apart from the flag under test.
 	run := func(t *testing.T, tier0 bool) (rel float64, top string) {
 		t.Helper()
+		boostedType := "note"
+		if tier0 {
+			boostedType = "decision"
+		}
+		srcs := []noteSrc{
+			{"boosted.md", "---\nid: boosted\ntype: " + boostedType + "\nwhen: 2026-01-01\n---\n# Boosted\nstorage engine note\n"},
+			{"plain.md", "---\nid: plain\ntype: note\nwhen: 2026-01-01\n---\n# Plain\nstorage engine plainmarker\n"},
+		}
 		r := buildVaultFrom(t, srcs)
 		r.EnableRerank(fakeReranker{needle: "plainmarker"}) // the reranker prefers the PLAIN note
 		r.rerankBlend = 0.5
@@ -117,7 +121,11 @@ func TestRerankBlendAppliesTier0Exactly(t *testing.T) {
 			{NodeID: "note:boosted", NoteID: "boosted", Title: "Boosted", Type: "decision", Tier0: tier0, Score: score},
 			{NodeID: "note:plain", NoteID: "plain", Title: "Plain", Type: "note", Score: rawPlain},
 		}
-		r.rerankHead(context.Background(), "storage engine", cards, fusedRaw)
+		var err error
+		cards, err = r.rerankHead(context.Background(), "storage engine", cards, fusedRaw, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
 		// base is max(tail)+1 and the tail is empty here, so it is exactly 1.
 		for _, c := range cards {
 			if c.NodeID == "note:boosted" {

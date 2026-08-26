@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
+	"golang.org/x/text/unicode/norm"
 	"gopkg.in/yaml.v3"
 )
 
@@ -92,20 +94,21 @@ var slugFold = map[rune]string{
 	'\u00fe': "th", '\u00df': "ss", '\u0153': "oe",
 }
 
-// Slugify turns arbitrary text into a kebab-case ASCII slug. Used for ids, filenames,
-// and heading anchors. Diacritics are folded to their ASCII base (see slugFold), never
-// dropped.
+// Slugify turns arbitrary text into a kebab-case Unicode slug. Used for ids, filenames,
+// and heading anchors. Familiar Latin diacritics keep their established ASCII folds,
+// while scripts that cannot be transliterated losslessly remain addressable instead of
+// collapsing to an empty anchor.
 func Slugify(s string) string {
 	var b strings.Builder
 	prevDash := false
-	for _, r := range strings.ToLower(s) {
+	for _, r := range norm.NFC.String(strings.ToLower(s)) {
 		if folded, ok := slugFold[r]; ok {
 			b.WriteString(folded)
 			prevDash = false
 			continue
 		}
 		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case unicode.IsLetter(r), unicode.IsDigit(r), unicode.IsMark(r) && b.Len() > 0:
 			b.WriteRune(r)
 			prevDash = false
 		default:

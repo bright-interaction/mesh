@@ -71,6 +71,11 @@ func TestStripNonContent(t *testing.T) {
 			want: "run              now\n",
 		},
 		{
+			name: "a double backtick span is one code span",
+			body: "see ``[[hidden]]`` then [[visible]]\n",
+			want: "see                then [[visible]]\n",
+		},
+		{
 			name: "an unpaired backtick inside a comment cannot erase the close",
 			body: "<!-- prefer the ` char -->\n[[a]]\n",
 			want: "                          \n[[a]]\n",
@@ -89,6 +94,11 @@ func TestStripNonContent(t *testing.T) {
 			name: "a fence is blanked and its markers are inert",
 			body: "```\n<!-- [[a]]\n```\n[[b]]\n",
 			want: "   \n          \n   \n[[b]]\n",
+		},
+		{
+			name: "four-space indented backticks do not swallow later prose",
+			body: "    ```\n[[visible]]\n    ```\n[[also-visible]]\n",
+			want: "       \n[[visible]]\n       \n[[also-visible]]\n",
 		},
 	}
 	for _, tc := range tests {
@@ -193,6 +203,8 @@ func TestStripCodeSpans(t *testing.T) {
 	tests := []struct{ line, want string }{
 		{"no code here", "no code here"},
 		{"a `b` c", "a     c"},
+		{"a ``[[hidden]]`` c", "a                c"},
+		{"a ``one ` tick`` c", "a                c"},
 		{"a ` b c", "a ` b c"},
 		{"`x` and `y`", "    and    "},
 		{"## `code` heading", "##        heading"},
@@ -201,6 +213,98 @@ func TestStripCodeSpans(t *testing.T) {
 		if got := StripCodeSpans(tc.line); got != tc.want {
 			t.Errorf("StripCodeSpans(%q) = %q, want %q", tc.line, got, tc.want)
 		}
+	}
+}
+
+func TestStripNonContentAdversarialMarkdownBlocks(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		hidden     string
+		mustRemain string
+	}{
+		{
+			name:       "multiline code span",
+			body:       "before `code starts\n[[hidden-multiline]]\nand ends` after [[visible]]\n",
+			hidden:     "[[hidden-multiline]]",
+			mustRemain: "[[visible]]",
+		},
+		{
+			name:       "blockquoted fence",
+			body:       "> ```md\n> [[hidden-quote]]\n> ```\n[[visible]]\n",
+			hidden:     "[[hidden-quote]]",
+			mustRemain: "[[visible]]",
+		},
+		{
+			name:       "indented code block",
+			body:       "    [[hidden-indented]]\n\n[[visible]]\n",
+			hidden:     "[[hidden-indented]]",
+			mustRemain: "[[visible]]",
+		},
+		{
+			name:       "nested list indentation is visible content",
+			body:       "- parent\n    - [[visible-child]]\n",
+			mustRemain: "[[visible-child]]",
+		},
+		{
+			name:       "list continuation indentation is visible content",
+			body:       "- parent\n    continued [[visible-child]]\n",
+			mustRemain: "[[visible-child]]",
+		},
+		{
+			name:       "backtick fence inside a bullet list",
+			body:       "- ```md\n  [[hidden-list-fence]]\n  ```\n[[visible-after-list]]\n",
+			hidden:     "[[hidden-list-fence]]",
+			mustRemain: "[[visible-after-list]]",
+		},
+		{
+			name:       "unterminated list fence ends with its container",
+			body:       "- ```md\n  [[hidden-list-fence]]\n[[visible-after-list]]\n",
+			hidden:     "[[hidden-list-fence]]",
+			mustRemain: "[[visible-after-list]]",
+		},
+		{
+			name:       "wide ordered-list indent can close its fence",
+			body:       "10. ```md\n    [[hidden-wide-list-fence]]\n    ```\n    continuation [[visible-same-item]]\n",
+			hidden:     "[[hidden-wide-list-fence]]",
+			mustRemain: "[[visible-same-item]]",
+		},
+		{
+			name:       "tilde fence inside an ordered list",
+			body:       "1. ~~~md\n   [[hidden-ordered-fence]]\n   ~~~\n[[visible-after-ordered]]\n",
+			hidden:     "[[hidden-ordered-fence]]",
+			mustRemain: "[[visible-after-ordered]]",
+		},
+		{
+			name:       "two blank lines end list continuation context",
+			body:       "- parent\n\n\n    [[hidden-root-code]]\n[[visible-after-code]]\n",
+			hidden:     "[[hidden-root-code]]",
+			mustRemain: "[[visible-after-code]]",
+		},
+		{
+			name:       "an unmatched code tick cannot span two list items",
+			body:       "- `literal opener\n- [[visible-next-item]]`\n",
+			mustRemain: "[[visible-next-item]]",
+		},
+		{
+			name:       "escaped HTML comment opener is visible",
+			body:       "\\<!-- literal [[visible]] -->\n",
+			mustRemain: "[[visible]]",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := StripNonContent(tc.body)
+			if tc.hidden != "" && strings.Contains(got, tc.hidden) {
+				t.Errorf("hidden markup leaked through: %q", got)
+			}
+			if !strings.Contains(got, tc.mustRemain) {
+				t.Errorf("visible content was hidden: %q", got)
+			}
+			if len(got) != len(tc.body) || strings.Count(got, "\n") != strings.Count(tc.body, "\n") {
+				t.Errorf("layout changed: got %d bytes/%d lines, want %d/%d", len(got), strings.Count(got, "\n"), len(tc.body), strings.Count(tc.body, "\n"))
+			}
+		})
 	}
 }
 
@@ -253,4 +357,43 @@ func TestRelatedLinksReadsOnlyVisibleLinks(t *testing.T) {
 			}
 		})
 	}
+}
+
+// FuzzStripMarkupPreservesLayout exercises arbitrary combinations of fences,
+// comments, escapes, backtick runs, Unicode, and malformed bytes. All scanners
+// deliberately blank bytes rather than delete them because graph source locations
+// are measured against their output.
+func FuzzStripMarkupPreservesLayout(f *testing.F) {
+	for _, seed := range []string{
+		"plain [[note]]\n",
+		"<!-- open\nsecret\n",
+		"> ```md\n> `code` <!-- comment -->\n> ```\n",
+		"before ``code ` ticks`` after\n",
+		"\\<!-- literal --> and \\\\`code`\n",
+		"# Räksmörgås 東京\n",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, body string) {
+		for name, strip := range map[string]func(string) (string, int){
+			"non-content": StripNonContent,
+			"comments":    StripComments,
+		} {
+			got, _ := strip(body)
+			if len(got) != len(body) {
+				t.Fatalf("%s changed byte length from %d to %d", name, len(body), len(got))
+			}
+			if strings.Count(got, "\n") != strings.Count(body, "\n") {
+				t.Fatalf("%s changed newline count", name)
+			}
+		}
+		// StripCodeSpans is explicitly a single-line helper; exercise each line
+		// independently so a backtick on one line cannot treat a later line as its
+		// closer (the document scanner above owns multiline spans).
+		for _, line := range strings.Split(body, "\n") {
+			if got := StripCodeSpans(line); len(got) != len(line) {
+				t.Fatalf("code-span stripper changed line length")
+			}
+		}
+	})
 }

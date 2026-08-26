@@ -58,3 +58,41 @@ func TestEveryReturnedCardIsActionable(t *testing.T) {
 		}
 	}
 }
+
+// A graph lookup succeeding is not enough to make a search card resolvable. During a
+// partial graph refresh, malformed/stale note nodes can exist without one of the three
+// identity fields an agent needs to name and fetch the note. Those nodes must be
+// treated exactly like a missing graph node.
+func TestCardRejectsGraphNodesWithoutActionableIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		node *graph.Node
+	}{
+		{
+			name: "missing stable note id",
+			node: &graph.Node{ID: "note:no-id", Kind: "note", Label: "No ID", NotePath: "notes/no-id.md"},
+		},
+		{
+			name: "missing path",
+			node: &graph.Node{ID: "note:no-path", Kind: "note", Label: "No Path", NoteID: "no-path"},
+		},
+		{
+			name: "missing title",
+			node: &graph.Node{ID: "note:no-title", Kind: "note", NoteID: "no-title", NotePath: "notes/no-title.md"},
+		},
+		{
+			name: "not a note node",
+			node: &graph.Node{ID: "tag:deploy", Kind: "tag", Label: "deploy", NoteID: "deploy", NotePath: "notes/deploy.md"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := graph.NewSized(1)
+			g.AddNode(tc.node)
+			r := &Retriever{graph: g}
+			if c, ok := r.card(tc.node.ID); ok {
+				t.Errorf("unresolvable graph node was accepted as a usable card: %+v", c)
+			}
+		})
+	}
+}

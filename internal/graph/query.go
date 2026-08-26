@@ -10,6 +10,7 @@ import (
 	"unicode"
 
 	"github.com/bright-interaction/mesh/internal/vault"
+	"golang.org/x/text/unicode/norm"
 )
 
 // BM25 parameters. labelWeight repeats
@@ -177,7 +178,7 @@ func Tokenize(s string) []string {
 			cur.Reset()
 		}
 	}
-	for _, r := range strings.ToLower(s) {
+	for _, r := range strings.ToLower(norm.NFC.String(s)) {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			cur.WriteRune(r)
 			continue

@@ -32,8 +32,9 @@ func ChunkText(pn *ParsedNote) []string {
 	// the note, so "TODO" three times over dragged unfilled notes together in vector space
 	// and diluted their real content.
 	for _, v := range []string{pn.FM.Do, pn.FM.Dont, pn.FM.Why} {
-		if !vault.Unfilled(v) {
-			header += "\n" + v
+		clean, _ := vault.StripComments(v)
+		if !vault.Unfilled(clean) {
+			header += "\n" + clean
 		}
 	}
 	if len(pn.FM.Tags) > 0 {

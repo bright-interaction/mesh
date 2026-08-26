@@ -72,21 +72,53 @@ func cardTokensNoMarshal(c Card) int {
 	return n
 }
 
-// TotalTokens sums the estimated cost of a set of cards.
+// TotalTokens reports the token cost of the JSON array callers actually receive,
+// including its brackets and separators.
 func TotalTokens(cards []Card) int { return TotalTokensFunc(cards, nil) }
 
-// TotalTokensFunc sums a card set priced by cost (nil = cardTokens). A surface that
-// packs with its own CardCost must report with the same one, otherwise the number it
-// hands the caller is not the number it packed to.
+// TotalTokensFunc prices a card set using cost (nil = the exact Card JSON array). A
+// custom per-card cost cannot expose its bytes, so its total conservatively adds the
+// independently-tokenized JSON array brackets and separators. A surface that packs
+// with its own CardCost must report with the same one, otherwise the number it hands
+// the caller is not the number it packed to.
 func TotalTokensFunc(cards []Card, cost CardCost) int {
+	return payloadTokens(cards, cost)
+}
+
+// payloadTokens is the one budget predicate used for both selection and reporting.
+// Keeping the full-payload cost here closes two gaps at once: an individually-priced
+// card set omitted JSON array framing, and selection/reporting could drift.
+func payloadTokens(cards []Card, cost CardCost) int {
 	if cost == nil {
+		safe := make([]Card, len(cards))
+		copy(safe, cards)
+		for i := range safe {
+			if math.IsNaN(safe[i].Score) || math.IsInf(safe[i].Score, 0) {
+				safe[i].Score = 0
+			}
+		}
+		b, err := json.Marshal(safe)
+		if err == nil {
+			return estimateTokens(string(b))
+		}
 		cost = cardTokens
 	}
-	n := 0
+
+	// Custom costs price one object at a time. Charge framing independently instead
+	// of pretending concatenating N object prices produces the cost of a JSON array.
+	// Independent tokenization is conservative at these punctuation boundaries.
+	n := arrayFramingTokens(len(cards))
 	for _, c := range cards {
 		n += cost(c)
 	}
 	return n
+}
+
+func arrayFramingTokens(n int) int {
+	if n == 0 {
+		return estimateTokens("[]")
+	}
+	return estimateTokens("[") + estimateTokens("]") + (n-1)*estimateTokens(",")
 }
 
 // tier0Reserve is the slice of the budget pass A may spend on institutional-memory
@@ -150,9 +182,9 @@ func tier0Reserve(cards []Card, budget int, cost CardCost) int {
 		// fit at all. Price the full form first and fall back to the compact one, which
 		// is what pass A will place when the full form overruns the whole budget. A
 		// card whose compact form still does not fit cannot be reserved for at all.
-		n := cost(c)
+		n := payloadTokens([]Card{c}, cost)
 		if n > budget {
-			n = cost(compact(c))
+			n = payloadTokens([]Card{compact(c)}, cost)
 			if n > budget {
 				continue
 			}
@@ -194,19 +226,13 @@ func packToBudget(cards []Card, budget int) []Card { return PackToBudget(cards, 
 // Input is assumed sorted by score desc; output preserves that order.
 // cost prices a card (nil = cardTokens); see CardCost.
 func PackToBudget(cards []Card, budget int, cost CardCost) []Card {
-	if cost == nil {
-		cost = cardTokens
-	}
 	if budget <= 0 {
 		return cards
 	}
 	reserve := tier0Reserve(cards, budget, cost)
-	used := 0
 	picked := make([]Card, len(cards))
 	taken := make([]bool, len(cards))
 
-	// cost marshals the card, so each call is a real BPE tokenization. Measure each
-	// form once and reuse the number instead of re-counting it.
 	// Pass A: reserve room for the best tier-0 cards. Full form first; when the full
 	// form does not fit the whole BUDGET, fall back to the compact one, matching what
 	// pass B would emit. The budget test is what keeps this from costing snippets: a
@@ -216,21 +242,20 @@ func PackToBudget(cards []Card, budget int, cost CardCost) []Card {
 		if !c.Tier0 {
 			continue
 		}
-		n := cost(c)
-		if used+n <= reserve {
+		candidate := withCandidate(cards, picked, taken, i, c)
+		if n := payloadTokens(candidate, cost); n <= reserve {
 			picked[i] = c
 			taken[i] = true
-			used += n
 			continue
 		}
-		if n <= budget {
+		if payloadTokens([]Card{c}, cost) <= budget {
 			continue
 		}
 		cc := compact(c)
-		if cn := cost(cc); used+cn <= reserve {
+		candidate = withCandidate(cards, picked, taken, i, cc)
+		if cn := payloadTokens(candidate, cost); cn <= reserve {
 			picked[i] = cc
 			taken[i] = true
-			used += cn
 		}
 	}
 	// Pass B: fill the rest by score. When a full card will not fit, degrade it
@@ -240,17 +265,17 @@ func PackToBudget(cards []Card, budget int, cost CardCost) []Card {
 		if taken[i] {
 			continue
 		}
-		if n := cost(c); used+n <= budget {
+		candidate := withCandidate(cards, picked, taken, i, c)
+		if n := payloadTokens(candidate, cost); n <= budget {
 			picked[i] = c
 			taken[i] = true
-			used += n
 			continue
 		}
 		cc := compact(c)
-		if n := cost(cc); used+n <= budget {
+		candidate = withCandidate(cards, picked, taken, i, cc)
+		if n := payloadTokens(candidate, cost); n <= budget {
 			picked[i] = cc
 			taken[i] = true
-			used += n
 		}
 	}
 
@@ -260,17 +285,21 @@ func PackToBudget(cards []Card, budget int, cost CardCost) []Card {
 			out = append(out, picked[i])
 		}
 	}
-	// Never return empty when a relevant note exists: hand back the best card. The
-	// floor is deliberate (a caller with a 10-token budget still learns which note
-	// answers the query, and TotalTokens reports the real cost), but the full form
-	// overran the budget by the whole snippet for nothing. Degrade to the compact
-	// form the passes above already prefer whenever the full one does not fit.
-	if len(out) == 0 && len(cards) > 0 {
-		best := cards[0]
-		if cost(best) > budget {
-			best = compact(best)
+	return out
+}
+
+// withCandidate returns the picked set in the original ranked order with one proposed
+// addition/replacement. Budgets are small, bounded result sets; recomputing the exact
+// wire cost is preferable to an additive estimate that can cross a hard limit.
+func withCandidate(cards, picked []Card, taken []bool, candidateIndex int, candidate Card) []Card {
+	out := make([]Card, 0, len(cards))
+	for i := range cards {
+		switch {
+		case i == candidateIndex:
+			out = append(out, candidate)
+		case taken[i]:
+			out = append(out, picked[i])
 		}
-		out = append(out, best)
 	}
 	return out
 }

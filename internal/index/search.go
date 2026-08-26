@@ -79,6 +79,16 @@ func (s *Store) Search(ctx context.Context, query string, limit int) ([]SearchHi
 // caller down to zero hits even though readable matches existed. Filtering here
 // means the limit counts only rows the caller may actually read.
 func (s *Store) SearchScoped(ctx context.Context, query string, limit int, allowed map[string]bool) ([]SearchHit, error) {
+	return s.SearchScopedPaths(ctx, query, limit, allowed, nil)
+}
+
+// SearchScopedPaths applies both the scope predicate and an optional vault-path read
+// predicate while consuming the ranked result stream. The path rule is a callback and
+// cannot be represented safely as SQL, so the query is left unbounded and scanning
+// stops as soon as limit readable rows have been found. Applying it after SQL LIMIT
+// lets stronger fenced rows consume the whole candidate budget and starve readable
+// matches. Each hit's path and body still come from the same SQLite snapshot.
+func (s *Store) SearchScopedPaths(ctx context.Context, query string, limit int, allowed map[string]bool, allowPath func(string) bool) ([]SearchHit, error) {
 	terms := graph.TokenizeQuery(query)
 	match := fts5Match(terms)
 	if match == "" {
@@ -105,12 +115,15 @@ SELECT si.node_id, si.title,
 FROM search_index si
 LEFT JOIN notes n ON n.id = substr(si.node_id, 6)
 WHERE search_index MATCH ?` + scopeSQL + `
-ORDER BY bm25(search_index)
-LIMIT ?`
+ORDER BY bm25(search_index), si.node_id`
 	args := make([]any, 0, len(scopeArgs)+2)
 	args = append(args, match)
 	args = append(args, scopeArgs...)
-	args = append(args, limit)
+	if allowPath == nil {
+		q += `
+LIMIT ?`
+		args = append(args, limit)
+	}
 
 	ctx, cancel := withSearchDeadline(ctx)
 	defer cancel()
@@ -128,11 +141,17 @@ LIMIT ?`
 		if err := rows.Scan(&h.NodeID, &h.Title, &h.Path, &body, &rank); err != nil {
 			return nil, searchErr(ctx, err)
 		}
+		if allowPath != nil && (h.Path == "" || !allowPath(h.Path)) {
+			continue
+		}
 		h.Snippet = buildExcerpt(body, terms, searchExcerptTokens)
 		// FTS5 bm25 returns lower-is-better; negate so the fuser (M1 step 3)
 		// can treat all signals as higher-is-better.
 		h.Score = -rank
 		out = append(out, h)
+		if allowPath != nil && len(out) >= limit {
+			break
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, searchErr(ctx, err)

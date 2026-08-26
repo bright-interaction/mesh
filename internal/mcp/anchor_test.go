@@ -59,3 +59,41 @@ func TestAnchorsOfIgnoresFencedCode(t *testing.T) {
 		t.Fatalf("got %v, want the two real headings", anchorsOf(doc))
 	}
 }
+
+// Fetch anchors must be derived from the same visible Markdown the graph indexes.
+// Otherwise a commented-out or backticked heading is advertised by mesh_fetch even
+// though no corresponding heading node exists.
+func TestAnchorLookupIgnoresAllNonContent(t *testing.T) {
+	doc := "# Real\n\n<!--\n## Commented Out\n-->\n\n## `Code` Visible\n\nbody\n"
+	got := anchorsOf(doc)
+	if strings.Join(got, ",") != "real,code-visible" {
+		t.Fatalf("anchorsOf = %v, want [real code-visible]", got)
+	}
+	if _, ok := sectionByAnchor(doc, "commented-out"); ok {
+		t.Fatal("sectionByAnchor resolved a heading hidden inside an HTML comment")
+	}
+	sec, ok := sectionByAnchor(doc, "code-visible")
+	if !ok || !strings.Contains(sec, "body") {
+		t.Fatalf("visible section did not resolve: ok=%v section=%q", ok, sec)
+	}
+}
+
+func TestAnchorLookupKeepsVisibleInlineCodeText(t *testing.T) {
+	doc := "## Use `mesh index`\n\nbody\n"
+	if got := anchorsOf(doc); len(got) != 1 || got[0] != "use-mesh-index" {
+		t.Fatalf("anchorsOf = %v, want [use-mesh-index]", got)
+	}
+	if _, ok := sectionByAnchor(doc, "use-mesh-index"); !ok {
+		t.Fatal("visible inline code text disappeared from the fetch anchor")
+	}
+}
+
+func TestAnchorLookupNeverTreatsFrontmatterAsSections(t *testing.T) {
+	doc := "---\n# Internal Metadata Heading\nid: n\ntype: note\n---\n# Real\n\nbody\n"
+	if got := anchorsOf(doc); len(got) != 1 || got[0] != "real" {
+		t.Fatalf("anchorsOf exposed frontmatter headings: %v", got)
+	}
+	if _, ok := sectionByAnchor(doc, "internal-metadata-heading"); ok {
+		t.Fatal("sectionByAnchor exposed YAML frontmatter through an anchor fetch")
+	}
+}

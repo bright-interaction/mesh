@@ -30,6 +30,10 @@ func TestUnterminatedFrontmatter(t *testing.T) {
 		{"body contains --- but no opener", "# Title\n\n---\n\nbody\n", false},
 		{"CRLF line endings, closed", "---\r\nid: x\r\n---\r\n\r\nbody\r\n", false},
 		{"CRLF line endings, unterminated", "---\r\nid: x\r\n", true},
+		{"UTF-8 BOM before opener, closed", "\ufeff---\nid: x\n---\nbody\n", false},
+		{"UTF-8 BOM before opener, unterminated", "\ufeff---\nid: x\n", true},
+		{"delimiter trailing horizontal whitespace, closed", "--- \t\nid: x\n---\t \nbody\n", false},
+		{"spaced opener, unterminated", "--- \t\nid: x\n", true},
 		{"empty file", "", false},
 		{"a horizontal rule below a closed block does not reopen one", "---\nid: x\n---\n\ntext\n\n---\n\nmore\n", false},
 	}
@@ -44,6 +48,16 @@ func TestUnterminatedFrontmatter(t *testing.T) {
 				t.Fatal("SplitFrontmatter reported a block present for content that is unterminated")
 			}
 		})
+	}
+}
+
+func TestSplitFrontmatterAcceptsBOMAndDelimiterWhitespace(t *testing.T) {
+	fm, body, had := SplitFrontmatter("\ufeff--- \t\nid: unicode\ntype: note\n---\t \n# Body\n")
+	if !had {
+		t.Fatal("frontmatter with BOM/delimiter whitespace was not detected")
+	}
+	if !strings.Contains(fm, "id: unicode") || body != "# Body\n" {
+		t.Fatalf("split fm=%q body=%q", fm, body)
 	}
 }
 

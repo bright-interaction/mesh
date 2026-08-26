@@ -1662,6 +1662,11 @@ check that cannot fail meaningfully is worse than no check.`,
 				return err
 			}
 			notes, ferrs := index.ParseFiles(files, 0)
+			for _, pn := range notes {
+				if rel, rerr := filepath.Rel(root, pn.Path); rerr == nil {
+					pn.Path = rel
+				}
+			}
 			_, issues := index.BuildGraph(notes)
 
 			type item struct{ where, what string }

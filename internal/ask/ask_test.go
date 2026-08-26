@@ -5,6 +5,7 @@ package ask
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -240,13 +241,11 @@ func TestAnswerCodeLaneHonoursCallerCancellation(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	got, err := Answer(cancelled, rtr, store, stub, question, 0, nil, nil)
-	if err != nil {
-		t.Fatalf("Answer with a cancelled context returned an error: %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Answer with a cancelled context returned (%+v, %v), want context.Canceled", got, err)
 	}
-	for _, c := range got.Citations {
-		if c.Kind == "code" {
-			t.Fatalf("the code lane ran after the caller cancelled: it dropped ctx and read with a background context instead; citations = %+v", got.Citations)
-		}
+	if len(got.Citations) != 0 {
+		t.Fatalf("the cancelled answer returned citations: %+v", got.Citations)
 	}
 }
 
@@ -317,5 +316,69 @@ func TestAnswerPromptDelimitsUntrustedContext(t *testing.T) {
 func TestEmptyQuestion(t *testing.T) {
 	if _, err := Answer(context.Background(), nil, nil, llm.Func(func(context.Context, string, string) (string, error) { return "", nil }), "  ", 0, nil, nil); err == nil {
 		t.Error("empty question must error")
+	}
+}
+
+// A failed retrieval is not the same answer as an empty vault. Returning the
+// canned "nothing found" response hid closed/corrupt index failures from agents.
+func TestAnswerPropagatesRetrievalFailure(t *testing.T) {
+	store, rtr := openVault(t, sentinelVault(t))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stub := llm.Func(func(context.Context, string, string) (string, error) {
+		t.Fatal("LLM must not run after a retrieval failure")
+		return "", nil
+	})
+	if _, err := Answer(context.Background(), rtr, store, stub, question, 0, nil, nil); err == nil {
+		t.Fatal("Answer returned success for a closed retrieval store")
+	}
+}
+
+// The optional code lane is still part of the configured answer. Its storage
+// failure must be surfaced instead of being rewritten as "nothing found".
+func TestAnswerPropagatesCodeSearchFailure(t *testing.T) {
+	store, _ := openVault(t, sentinelVault(t))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stub := llm.Func(func(context.Context, string, string) (string, error) {
+		t.Fatal("LLM must not run after a code search failure")
+		return "", nil
+	})
+	if _, err := Answer(context.Background(), nil, store, stub, question, 0, nil, nil); err == nil {
+		t.Fatal("Answer returned success for a closed code-search store")
+	}
+}
+
+// Retrieval and grounding are separate reads. If a watcher tightens a note's
+// path between them, the body read must re-check the metadata from the SAME
+// database snapshot as the body before it reaches the model.
+func TestNoteBodiesRecheckCurrentPathACL(t *testing.T) {
+	pn, err := index.Parse("secret/a.md", []byte("---\nid: a\ntype: note\ntitle: Secret A\n---\n# Secret A\nclassified payload\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, issues := index.BuildGraph([]*index.ParsedNote{pn})
+	if len(issues) != 0 {
+		t.Fatalf("graph issues: %+v", issues)
+	}
+	store, err := index.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.IndexVault([]*index.ParsedNote{pn}, g); err != nil {
+		t.Fatal(err)
+	}
+
+	stalePublicCard := retrieve.Card{NodeID: "note:a", NoteID: "a", Path: "public/a.md", Title: "Old public A"}
+	docs, err := noteBodiesAuthorized(context.Background(), store, []retrieve.Card{stalePublicCard}, nil,
+		func(path string) bool { return strings.HasPrefix(path, "public/") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 0 {
+		t.Fatalf("secret body cleared a stale public card: %+v", docs)
 	}
 }

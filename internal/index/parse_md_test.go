@@ -154,11 +154,27 @@ func TestLinkKeyTrimsEscapedBracket(t *testing.T) {
 		{`plain-note`, "plain-note"},
 		{`Spaced Note `, "spaced note"},
 		{`note.md`, "note"},
+		{`Note.MD`, "note"},
 		{`note#section`, "note"},
 	}
 	for _, tc := range tests {
 		if got := linkKey(tc.in); got != tc.want {
 			t.Errorf("linkKey(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestBuildGraphResolvesCaseInsensitiveMarkdownExtensions(t *testing.T) {
+	target := parse(t, "Folder/Note.MD", "---\nid: target\ntype: note\nwhen: 2026-01-01\n---\n# Target\n")
+	source := parse(t, "source.md", "---\nid: source\ntype: note\nwhen: 2026-01-01\n---\n# Source\n[[Note.MD]] and [[Folder/Note.MD]]\n")
+
+	g, issues := BuildGraph([]*ParsedNote{source, target})
+	for _, issue := range issues {
+		if issue.Kind == "broken-link" {
+			t.Errorf("a .MD link to an indexed .MD note was reported broken: %+v", issue)
+		}
+	}
+	if !hasEdge(g.Neighbors("note:source"), "note:target", "references") {
+		t.Fatal("case-insensitive .MD links did not resolve to the target note")
 	}
 }

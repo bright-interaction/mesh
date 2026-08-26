@@ -20,6 +20,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/relate"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/vault"
+	"golang.org/x/text/unicode/norm"
 )
 
 func obj(m map[string]any) map[string]any { return m }
@@ -1340,43 +1341,25 @@ const flywheelReuseGap = 600 // seconds (10 min)
 // narrowing function, and returning its unnarrowed input turned one wrong character in an
 // anchor into a multi-megabyte reply that no caller asked for and none can afford.
 func sectionByAnchor(body, anchor string) (string, bool) {
-	lines := strings.Split(body, "\n")
-	start, level := -1, 0
-	inFence := false
-	for i, ln := range lines {
-		if isCodeFence(ln) {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
-			continue // a '#' line inside a code block is not a heading
-		}
-		h := strings.TrimLeft(ln, "#")
-		lvl := len(ln) - len(h)
-		if lvl >= 1 && lvl <= 6 && strings.HasPrefix(h, " ") {
-			if anchorMatches(strings.TrimSpace(h), anchor) {
-				start, level = i, lvl
-				break
-			}
-		}
+	lines, markerLines, headingLines := anchorDocumentLines(body)
+	anchor = norm.NFC.String(anchor)
+	if anchor == "" {
+		return "", false
+	}
+
+	// Search every current anchor before accepting a legacy alias. Otherwise the legacy
+	// slug of an earlier Unicode heading can shadow the exact current slug of a later
+	// heading, returning a valid but entirely wrong section.
+	start, level := findAnchorHeading(markerLines, headingLines, anchor, false)
+	if start < 0 {
+		start, level = findAnchorHeading(markerLines, headingLines, anchor, true)
 	}
 	if start < 0 {
 		return "", false
 	}
 	end := len(lines)
-	inFence = false
-	for i := start + 1; i < len(lines); i++ {
-		ln := lines[i]
-		if isCodeFence(ln) {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
-			continue // do not let a '#' inside a fenced block end the section early
-		}
-		h := strings.TrimLeft(ln, "#")
-		lvl := len(ln) - len(h)
-		if lvl >= 1 && lvl <= level && strings.HasPrefix(h, " ") {
+	for i := start + 1; i < len(markerLines); i++ {
+		if h, ok := vault.ParseATXHeading(markerLines[i], headingLines[i]); ok && h.Level <= level {
 			end = i
 			break
 		}
@@ -1389,43 +1372,41 @@ func sectionByAnchor(body, anchor string) (string, bool) {
 // uses to build heading nodes, so what it lists is exactly what resolves.
 func anchorsOf(body string) []string {
 	var out []string
-	inFence := false
-	for _, ln := range strings.Split(body, "\n") {
-		if isCodeFence(ln) {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
-			continue
-		}
-		h := strings.TrimLeft(ln, "#")
-		if lvl := len(ln) - len(h); lvl >= 1 && lvl <= 6 && strings.HasPrefix(h, " ") {
-			if s := vault.Slugify(strings.TrimSpace(h)); s != "" {
-				out = append(out, s)
-			}
+	_, markerLines, headingLines := anchorDocumentLines(body)
+	for i := range markerLines {
+		if heading, ok := vault.ParseATXHeading(markerLines[i], headingLines[i]); ok && heading.Anchor != "" {
+			out = append(out, heading.Anchor)
 		}
 	}
 	return out
 }
 
-// isCodeFence reports whether a line opens or closes a fenced code block (``` / ~~~).
-func isCodeFence(ln string) bool {
-	t := strings.TrimLeft(ln, " \t")
-	return strings.HasPrefix(t, "```") || strings.HasPrefix(t, "~~~")
+// anchorDocumentLines drops YAML frontmatter, then builds two length-preserving views:
+// markerLines hides code as well as comments/fences so a heading marker inside code is
+// inert; headingLines keeps visible inline-code text so "## Use `mesh index`" has the
+// same use-mesh-index anchor a Markdown reader sees.
+func anchorDocumentLines(doc string) (original, markerLines, headingLines []string) {
+	_, body, _ := vault.SplitFrontmatter(doc)
+	markers, _ := vault.StripNonContent(body)
+	headings, _ := vault.StripFencesAndComments(body)
+	return strings.Split(body, "\n"), strings.Split(markers, "\n"), strings.Split(headings, "\n")
 }
 
-// anchorMatches reports whether a heading answers to the given anchor. It accepts the
-// CURRENT slug (vault.Slugify, which folds diacritics) and the legacy ASCII-only one,
-// because for a while both were minted for the same heading and the old ones are still
-// in circulation: the index stores a heading node per anchor and only refreshes it on
-// reindex, so between a binary upgrade and the next reindex a caller can be holding
-// "tg-rder" for a heading that now slugs to "atgarder". Accepting both costs one string
-// compare on the miss path and keeps those fetches working.
-func anchorMatches(heading, anchor string) bool {
-	if anchor == "" {
-		return false
+func findAnchorHeading(markerLines, headingLines []string, anchor string, legacy bool) (start, level int) {
+	for i := range markerLines {
+		heading, ok := vault.ParseATXHeading(markerLines[i], headingLines[i])
+		if !ok {
+			continue
+		}
+		candidate := heading.Anchor
+		if legacy {
+			candidate = slugifyLegacy(heading.VisibleText)
+		}
+		if candidate == anchor {
+			return i, heading.Level
+		}
 	}
-	return vault.Slugify(heading) == anchor || slugifyLegacy(heading) == anchor
+	return -1, 0
 }
 
 // slugifyLegacy reproduces the slug Mesh emitted before vault.Slugify learned to fold

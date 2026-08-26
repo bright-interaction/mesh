@@ -10,9 +10,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/vault"
+	"golang.org/x/text/unicode/norm"
 )
 
 type Heading struct {
@@ -53,14 +55,18 @@ type ParsedNote struct {
 // Issue is a non-fatal problem found while parsing or building the graph.
 type Issue struct {
 	Path string
-	Kind string // missing-id|duplicate-id|broken-link|ambiguous-link-key|ambiguous-link|unterminated-comment
+	Kind string // missing-id|duplicate-id|broken-link|broken-anchor|duplicate-anchor|ambiguous-id-key|ambiguous-path-key|ambiguous-link-key|ambiguous-link|unterminated-comment
 	Msg  string
 }
 
 func noteKey(path string) string {
 	b := filepath.Base(path)
 	b = strings.TrimSuffix(b, filepath.Ext(b))
-	return strings.ToLower(b)
+	return canonicalLinkText(b)
+}
+
+func canonicalLinkText(s string) string {
+	return norm.NFC.String(strings.ToLower(strings.TrimSpace(s)))
 }
 
 // linkKey normalizes a wikilink target to its lookup key: strips [[ ]], a .md
@@ -77,8 +83,9 @@ func linkKey(target string) string {
 	if i := strings.IndexByte(t, '#'); i >= 0 {
 		t = t[:i]
 	}
+	t = canonicalLinkText(t)
 	t = strings.TrimSuffix(t, ".md")
-	return strings.ToLower(strings.TrimSpace(t))
+	return strings.TrimSpace(t)
 }
 
 // pathLinkKey normalizes a note's vault-relative path into the key a slash-bearing
@@ -86,8 +93,9 @@ func linkKey(target string) string {
 // linkKey so [[decisions/deploy]] and decisions/deploy.md meet on the same string.
 func pathLinkKey(p string) string {
 	p = strings.ReplaceAll(p, `\`, "/")
+	p = canonicalLinkText(p)
 	p = strings.TrimSuffix(p, ".md")
-	return strings.ToLower(strings.TrimSpace(p))
+	return p
 }
 
 func ParseFile(path string) (*ParsedNote, error) {
@@ -128,6 +136,9 @@ func Parse(path string, data []byte) (*ParsedNote, error) {
 	if err != nil {
 		return nil, err
 	}
+	if strings.ContainsRune(fm.ID, '#') {
+		return nil, fmt.Errorf("frontmatter: invalid id %q: # is reserved for heading anchors", fm.ID)
+	}
 	pn := &ParsedNote{Path: path, Key: noteKey(path), FM: fm, Raw: raw, Body: body}
 
 	// An HTML comment is not content: what it hides is invisible to every reader, so the
@@ -136,6 +147,7 @@ func Parse(path string, data []byte) (*ParsedNote, error) {
 	// together, and the same pass feeds the FTS body, the embedding chunks and migrate,
 	// so every part of Mesh agrees on what a note says.
 	clean, openComment := vault.StripNonContent(body)
+	headingText, _ := vault.StripFencesAndComments(body)
 	if openComment > 0 {
 		// Everything below an unterminated marker drops out of the graph AND out of
 		// search. That used to happen silently, which is the worst version of it: the note
@@ -143,9 +155,22 @@ func Parse(path string, data []byte) (*ParsedNote, error) {
 		pn.Issues = append(pn.Issues, Issue{path, "unterminated-comment",
 			"<!-- on line " + strconv.Itoa(openComment) + " is never closed, so the rest of the note is hidden from the graph and from search; close it with -->"})
 	}
-	for i, line := range strings.Split(clean, "\n") {
+	for _, field := range []struct {
+		name, text string
+	}{{"do", fm.Do}, {"dont", fm.Dont}, {"why", fm.Why}} {
+		if field.text == "" {
+			continue
+		}
+		if _, open := vault.StripNonContent(field.text); open > 0 {
+			pn.Issues = append(pn.Issues, Issue{path, "unterminated-comment",
+				"<!-- in frontmatter " + field.name + " is never closed, so the rest of that field is hidden from the graph and from search; close it with -->"})
+		}
+	}
+	cleanLines := strings.Split(clean, "\n")
+	headingLines := strings.Split(headingText, "\n")
+	for i, line := range cleanLines {
 		ln := i + 1
-		if h, ok := parseHeading(line); ok {
+		if h, ok := parseHeadingViews(line, headingLines[i]); ok {
 			h.Line = ln
 			pn.Headings = append(pn.Headings, h)
 			pn.appendLinks(line, ln)
@@ -158,16 +183,22 @@ func Parse(path string, data []byte) (*ParsedNote, error) {
 }
 
 func (pn *ParsedNote) appendLinks(line string, ln int) {
-	for {
-		open := strings.Index(line, "[[")
-		if open < 0 {
+	for searchFrom := 0; searchFrom < len(line); {
+		relOpen := strings.Index(line[searchFrom:], "[[")
+		if relOpen < 0 {
 			return
 		}
-		close := strings.Index(line[open:], "]]")
-		if close < 0 {
+		open := searchFrom + relOpen
+		if markdownEscaped(line, open) {
+			searchFrom = open + 2
+			continue
+		}
+		relClose := strings.Index(line[open+2:], "]]")
+		if relClose < 0 {
 			return
 		}
-		inner := line[open+2 : open+close]
+		close := open + 2 + relClose
+		inner := line[open+2 : close]
 		target, alias := inner, ""
 		if p := strings.IndexByte(inner, '|'); p >= 0 {
 			target, alias = inner[:p], inner[p+1:]
@@ -175,8 +206,20 @@ func (pn *ParsedNote) appendLinks(line string, ln int) {
 		if t := strings.TrimSpace(target); t != "" {
 			pn.Links = append(pn.Links, Link{Target: t, Alias: strings.TrimSpace(alias), Line: ln})
 		}
-		line = line[open+close+2:]
+		searchFrom = close + 2
 	}
+}
+
+// markdownEscaped reports whether the punctuation at pos is preceded by an odd run of
+// backslashes. Markdown consumes backslash escapes in pairs: \[[x]] is literal syntax,
+// while \\[[x]] leaves one literal backslash followed by a real wikilink.
+func markdownEscaped(line string, pos int) bool {
+	backslashes := 0
+	for pos > 0 && line[pos-1] == '\\' {
+		backslashes++
+		pos--
+	}
+	return backslashes%2 == 1
 }
 
 func (pn *ParsedNote) appendTags(line string, ln int) {
@@ -193,31 +236,28 @@ func (pn *ParsedNote) appendTags(line string, ln int) {
 			j++
 		}
 		if j > i+1 && isLetter(runes[i+1]) {
-			pn.Tags = append(pn.Tags, Tag{Name: strings.ToLower(string(runes[i+1 : j])), Line: ln})
+			pn.Tags = append(pn.Tags, Tag{Name: canonicalLinkText(string(runes[i+1 : j])), Line: ln})
 		}
 		i = j
 	}
 }
 
 func parseHeading(line string) (Heading, bool) {
-	i := 0
-	for i < len(line) && line[i] == '#' {
-		i++
-	}
-	if i == 0 || i > 6 || i >= len(line) || line[i] != ' ' {
-		return Heading{}, false
-	}
-	text := strings.TrimSpace(strings.TrimRight(line[i:], "# "))
-	if text == "" {
-		return Heading{}, false
-	}
-	return Heading{Level: i, Text: text, Anchor: vault.Slugify(text)}, true
+	return parseHeadingViews(line, line)
 }
 
-func isSpace(r rune) bool  { return r == ' ' || r == '\t' }
-func isLetter(r rune) bool { return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' }
+func parseHeadingViews(markerLine, textLine string) (Heading, bool) {
+	h, ok := vault.ParseATXHeading(markerLine, textLine)
+	if !ok {
+		return Heading{}, false
+	}
+	return Heading{Level: h.Level, Text: h.Text, Anchor: h.Anchor}, true
+}
+
+func isSpace(r rune) bool  { return unicode.IsSpace(r) }
+func isLetter(r rune) bool { return unicode.IsLetter(r) }
 func isTagRune(r rune) bool {
-	return isLetter(r) || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '/'
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || r == '-' || r == '_' || r == '/'
 }
 
 // BuildGraph resolves a set of parsed notes into the in-memory graph. Node
@@ -229,6 +269,10 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	var issues []Issue
 
 	idByKey := make(map[string]string, len(notes))
+	// A note's frontmatter id is the stable fallback when its basename changes. The
+	// normal basename/path lookup still wins, preserving wikilink semantics; the id
+	// fallback is what makes already-resolved citations survive a rename as promised.
+	idByStableKey := make(map[string]string, len(notes))
 	pathByID := make(map[string]string, len(notes))
 	// A wikilink key is the lowercased basename, so two notes in different folders that
 	// share a basename (with distinct frontmatter ids) collide on it. A plain
@@ -239,12 +283,18 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	// rather than resolved to an arbitrary winner.
 	pathByKey := make(map[string]string, len(notes))
 	ambiguousKeys := map[string][]string{}
+	pathByStableKey := make(map[string]string, len(notes))
+	ambiguousStableKeys := map[string][]string{}
+	anchorsByID := make(map[string]map[string]bool, len(notes))
 	// idByPath resolves a wikilink that names a path (contains a slash): the author has
 	// disambiguated explicitly, so an exact vault-relative path match wins over the
 	// basename key. This is also the escape hatch out of an ambiguous key.
 	idByPath := make(map[string]string, len(notes))
+	pathByPathKey := make(map[string]string, len(notes))
+	ambiguousPathKeys := map[string][]string{}
 	for _, n := range notes {
 		id := effectiveID(n)
+		stableKey := canonicalLinkText(id)
 		issues = append(issues, n.Issues...) // what Parse found in the file itself
 		if n.FM.ID == "" {
 			issues = append(issues, Issue{n.Path, "missing-id", "no frontmatter id; using filename (run mesh migrate)"})
@@ -263,10 +313,43 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			issues = append(issues, Issue{n.Path, "ambiguous-link-key",
 				"[[" + n.Key + "]] matches both " + pathByKey[n.Key] + " and " + n.Path + "; links using this name resolve to neither"})
 		}
+		if prevID, ok := idByStableKey[stableKey]; ok && prevID != id {
+			if len(ambiguousStableKeys[stableKey]) == 0 {
+				ambiguousStableKeys[stableKey] = []string{pathByStableKey[stableKey]}
+			}
+			ambiguousStableKeys[stableKey] = append(ambiguousStableKeys[stableKey], n.Path)
+			delete(idByStableKey, stableKey)
+			issues = append(issues, Issue{n.Path, "ambiguous-id-key",
+				"ids " + prevID + " and " + id + " differ only by case or Unicode normalization; stable-id links using this name resolve to neither"})
+		} else if len(ambiguousStableKeys[stableKey]) == 0 {
+			idByStableKey[stableKey] = id
+			pathByStableKey[stableKey] = n.Path
+		}
+		anchors := make(map[string]bool, len(n.Headings))
+		for _, h := range n.Headings {
+			if h.Anchor != "" {
+				anchors[h.Anchor] = true
+			}
+		}
+		anchorsByID[id] = anchors
 		pathByID[id] = n.Path
 		pathByKey[n.Key] = n.Path
 		idByKey[n.Key] = id
-		idByPath[pathLinkKey(n.Path)] = id
+		pathKey := pathLinkKey(n.Path)
+		switch {
+		case len(ambiguousPathKeys[pathKey]) > 0:
+			ambiguousPathKeys[pathKey] = append(ambiguousPathKeys[pathKey], n.Path)
+			issues = append(issues, Issue{n.Path, "ambiguous-path-key",
+				"path " + n.Path + " differs from another note path only by case or Unicode normalization; qualified links using this path resolve to neither"})
+		case idByPath[pathKey] != "" && idByPath[pathKey] != id:
+			ambiguousPathKeys[pathKey] = []string{pathByPathKey[pathKey], n.Path}
+			delete(idByPath, pathKey)
+			issues = append(issues, Issue{n.Path, "ambiguous-path-key",
+				"paths " + pathByPathKey[pathKey] + " and " + n.Path + " differ only by case or Unicode normalization; qualified links using this path resolve to neither"})
+		default:
+			idByPath[pathKey] = id
+			pathByPathKey[pathKey] = n.Path
+		}
 	}
 
 	for _, n := range notes {
@@ -277,17 +360,30 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			title = n.Key
 		}
 		attrs := map[string]any{"type": string(n.FM.Type), "scope": strings.Join(n.FM.EffectiveScopes(), ",")}
-		for k, v := range map[string]string{"when": n.FM.When, "do": n.FM.Do, "dont": n.FM.Dont, "why": n.FM.Why} {
-			if v != "" {
-				attrs[k] = v
+		if n.FM.When != "" {
+			attrs["when"] = n.FM.When
+		}
+		for k, v := range map[string]string{"do": n.FM.Do, "dont": n.FM.Dont, "why": n.FM.Why} {
+			clean, _ := vault.StripComments(v)
+			clean = strings.TrimSpace(clean)
+			if !vault.Unfilled(clean) {
+				attrs[k] = clean
 			}
 		}
 		g.AddNode(&graph.Node{ID: noteNode, Kind: "note", Label: title, NoteID: id, NotePath: n.Path, Attrs: attrs})
 
+		seenHeading := map[string]int{}
 		for _, h := range n.Headings {
 			if h.Anchor == "" {
 				continue
 			}
+			if firstLine, exists := seenHeading[h.Anchor]; exists {
+				issues = append(issues, Issue{n.Path, "duplicate-anchor",
+					"heading anchor #" + h.Anchor + " on line " + strconv.Itoa(h.Line) +
+						" duplicates line " + strconv.Itoa(firstLine) + "; rename one heading so both sections are addressable"})
+				continue
+			}
+			seenHeading[h.Anchor] = h.Line
 			hid := noteNode + "#" + h.Anchor
 			g.AddNode(&graph.Node{ID: hid, Kind: "heading", Label: h.Text, NoteID: id, NotePath: n.Path, Anchor: h.Anchor, SourceLoc: locStr(h.Line)})
 			g.AddEdge(graph.Edge{Source: noteNode, Target: hid, Relation: "contains", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1})
@@ -295,7 +391,7 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 
 		seenTag := map[string]bool{}
 		addTag := func(name string) {
-			name = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(name, "#")))
+			name = canonicalLinkText(strings.TrimPrefix(name, "#"))
 			if name == "" || seenTag[name] {
 				return
 			}
@@ -312,16 +408,44 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		}
 
 		addRef := func(rawTarget string, line int) {
-			key := linkKey(rawTarget)
-			if key == "" {
+			displayTarget := strings.TrimSpace(rawTarget)
+			target, anchor := displayTarget, ""
+			if hash := strings.IndexByte(target, '#'); hash >= 0 {
+				anchor = strings.TrimSpace(target[hash+1:])
+				target = target[:hash]
+			}
+			key := linkKey(target)
+			if key == "" && anchor == "" {
 				return
+			}
+			tid, resolved := "", false
+			if key == "" {
+				// [[#heading]] is a local section link.
+				tid, resolved = id, true
 			}
 			// A slash in the target means the author named a path, so resolve it exactly
 			// first: that is both the normal folder-qualified link and the way out of an
 			// ambiguous basename below.
-			if strings.Contains(key, "/") {
-				if tid, ok := idByPath[key]; ok {
-					g.AddEdge(graph.Edge{Source: noteNode, Target: "note:" + tid, Relation: "references", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1, SourceLoc: locStr(line)})
+			if !resolved && strings.Contains(key, "/") {
+				if owners, amb := ambiguousPathKeys[key]; amb {
+					issues = append(issues, Issue{n.Path, "ambiguous-link",
+						"[[" + displayTarget + "]] matches normalized paths " + strings.Join(owners, " and ") + "; rename one path so it is unique"})
+					return
+				}
+				if pathID, ok := idByPath[key]; ok {
+					tid, resolved = pathID, true
+				}
+			}
+			// Basename and stable id share the same shorthand namespace. After a stable
+			// id's file is renamed, a new file can claim its old basename; choosing either
+			// silently retargets somebody's link. Refuse the shorthand and make the author
+			// use one of the distinct vault paths.
+			if !resolved {
+				basenameID, hasBasename := idByKey[key]
+				stableID, hasStable := idByStableKey[key]
+				if hasBasename && hasStable && basenameID != stableID {
+					issues = append(issues, Issue{n.Path, "ambiguous-link",
+						"[[" + displayTarget + "]] matches note " + basenameID + " by filename and note " + stableID + " by stable id; use the exact vault path"})
 					return
 				}
 			}
@@ -329,16 +453,39 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			// wrong edge (backlinks that cited one note landed on another) which is worse
 			// than no edge, and reported nothing. Report it so mesh lint / mesh structure
 			// / mesh_health can surface it and the author can qualify the link by path.
-			if owners, amb := ambiguousKeys[key]; amb {
-				issues = append(issues, Issue{n.Path, "ambiguous-link",
-					"[[" + strings.TrimSpace(rawTarget) + "]] matches " + strings.Join(owners, " and ") + "; qualify it with the folder path"})
+			if !resolved {
+				if owners, amb := ambiguousKeys[key]; amb {
+					issues = append(issues, Issue{n.Path, "ambiguous-link",
+						"[[" + displayTarget + "]] matches " + strings.Join(owners, " and ") + "; qualify it with the folder path"})
+					return
+				}
+			}
+			if !resolved {
+				if keyID, ok := idByKey[key]; ok {
+					tid, resolved = keyID, true
+				}
+			}
+			if !resolved {
+				if owners, amb := ambiguousStableKeys[key]; amb {
+					issues = append(issues, Issue{n.Path, "ambiguous-link",
+						"[[" + displayTarget + "]] matches stable ids in " + strings.Join(owners, " and ") + "; use the exact vault path"})
+					return
+				}
+				if stableID, ok := idByStableKey[key]; ok {
+					tid, resolved = stableID, true
+				}
+			}
+			if !resolved {
+				issues = append(issues, Issue{n.Path, "broken-link",
+					"[[" + displayTarget + "]] " + brokenLinkReason(displayTarget)})
 				return
 			}
-			tid, ok := idByKey[key]
-			if !ok {
-				issues = append(issues, Issue{n.Path, "broken-link",
-					"[[" + strings.TrimSpace(rawTarget) + "]] " + brokenLinkReason(strings.TrimSpace(rawTarget))})
-				return
+			if anchor != "" {
+				anchorKey := vault.Slugify(anchor)
+				if anchorKey == "" || !anchorsByID[tid][anchorKey] {
+					issues = append(issues, Issue{n.Path, "broken-anchor",
+						"[[" + displayTarget + "]] names missing heading #" + anchor + " in note " + tid})
+				}
 			}
 			g.AddEdge(graph.Edge{Source: noteNode, Target: "note:" + tid, Relation: "references", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1, SourceLoc: locStr(line)})
 		}

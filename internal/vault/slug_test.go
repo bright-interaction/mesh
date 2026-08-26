@@ -65,6 +65,18 @@ func TestSlugifyIsUnchangedForASCII(t *testing.T) {
 	}
 }
 
+func TestSlugifyKeepsNonLatinHeadingsAddressable(t *testing.T) {
+	tests := map[string]string{
+		"日本語":        "日本語",
+		"Привет мир": "привет-мир",
+	}
+	for in, want := range tests {
+		if got := Slugify(in); got != want {
+			t.Errorf("Slugify(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestCreateNoteRefusesOverlongTitle pins the fix for the leak on mesh_append_note's
 // error path. A title that slugs past NAME_MAX used to reach os.OpenFile and come back
 // as "open /srv/hub/vault/gotchas/<slug>.md: file name too long", handing the caller

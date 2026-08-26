@@ -30,8 +30,9 @@ func searchText(pn *ParsedNote) string {
 	// indexing it made 77 notes in one vault match a search for "TODO" with their own
 	// placeholder as the excerpt. An unfilled field must contribute nothing.
 	for _, v := range []string{pn.FM.Do, pn.FM.Dont, pn.FM.Why} {
-		if !vault.Unfilled(v) {
-			parts = append(parts, v)
+		clean, _ := vault.StripComments(v)
+		if !vault.Unfilled(clean) {
+			parts = append(parts, clean)
 		}
 	}
 	parts = append(parts, pn.FM.Tags...)
