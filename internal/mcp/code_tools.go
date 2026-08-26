@@ -67,7 +67,9 @@ func (s *Server) toolCodeSearch(ctx context.Context, raw json.RawMessage) (any, 
 	a.Limit = clampLimit(a.Limit, codeSearchLimitDefault, codeSearchLimitMax)
 	hits, err := s.store.SearchCode(ctx, a.Query, a.Limit, a.Languages)
 	if err != nil {
-		return nil, internalErr(err)
+		// SearchCode runs under withSearchDeadline, so it has the same timeout mode as
+		// mesh_search and must not report it as an empty code index.
+		return nil, retrievalErr(err)
 	}
 	cards := make([]map[string]any, 0, len(hits))
 	for _, h := range hits {
@@ -144,7 +146,8 @@ func (s *Server) toolCodeContext(ctx context.Context, raw json.RawMessage) (any,
 	}
 	hits, err := s.store.SearchCode(ctx, a.Query, limit, nil)
 	if err != nil {
-		return nil, internalErr(err)
+		// Same deadline path as mesh_code_search above.
+		return nil, retrievalErr(err)
 	}
 	sf := scopeFromCtx(ctx)
 	readable := func(noteID string) bool {

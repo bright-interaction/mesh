@@ -118,6 +118,26 @@ func (g *Graph) AddNode(n *Node) {
 	g.nodes[n.ID] = n
 }
 
+// SetNodeAttr sets one attribute on an existing node under the write lock, and
+// reports whether the node was there. Node() hands back the live *Node, so mutating
+// its Attrs map from the caller writes shared state while only a read lock was ever
+// held; this keeps every mutation on the same lock as AddNode/AddEdge. Returns false
+// rather than creating the node, so a write aimed at an id that does not exist is a
+// caller bug the caller gets to see.
+func (g *Graph) SetNodeAttr(id, key string, val any) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n, ok := g.nodes[id]
+	if !ok {
+		return false
+	}
+	if n.Attrs == nil {
+		n.Attrs = map[string]any{}
+	}
+	n.Attrs[key] = val
+	return true
+}
+
 // AddEdge inserts a unique (source, target, relation) edge and bumps the degree
 // of whichever endpoints already exist.
 func (g *Graph) AddEdge(e Edge) {

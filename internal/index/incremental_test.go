@@ -113,6 +113,22 @@ func TestIncrementalMatchesFullReindex(t *testing.T) {
 			// (it must not keep serving the stale cached note).
 			write(t, dir, "b.md", "---\nid: [unterminated\ntype: gotcha\n---\n# B\nbroken\n")
 		}},
+		{"many-to-one supersede", func(t *testing.T, dir string) {
+			// Five notes all supersede c. The scalar superseded_by attr stamped on c can
+			// only name one of them, and the winner must be the SAME one whether it is
+			// computed from a full reindex (a sorted disk walk) or from
+			// ReconcileIncremental, which rebuilds from NoteCache.Snapshot() - a range
+			// over a Go map with no defined order. Before the fix at the supersedes stamp
+			// in parse_md.go, this fixture made the two paths disagree on roughly 17 of
+			// every 30 runs; nothing in this oracle exercised the many-to-one case until
+			// this fixture was added.
+			for i := 1; i <= 5; i++ {
+				id := fmt.Sprintf("fix-%d", i)
+				write(t, dir, id+".md", fmt.Sprintf(
+					"---\nid: %s\ntype: gotcha\nwhen: 2026-01-02\ndo: x\ndont: y\nwhy: z\nsupersedes: [c]\n---\n# %s\nbody\n",
+					id, id))
+			}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

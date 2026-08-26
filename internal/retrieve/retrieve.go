@@ -31,10 +31,22 @@ const (
 	// results so institutional memory surfaces, but as a small multiplier (not the
 	// old +0.5 additive, which could override a much stronger content match and
 	// flip the top-1 pick to a wrong tier-0 note - the Gate-1 answer@1 regression).
-	tier0Mult   = 1.1
-	expandSeeds = 5   // expand from the top-N fused notes
-	expandK     = 3   // pull at most K strong note-neighbors per seed
-	expandDecay = 0.4 // a neighbor inherits this fraction of the seed's score
+	tier0Mult = 1.1
+	// supersededMult demotes a note another note formally retired via `supersedes:`.
+	//
+	// DEMOTE, not hide. The superseded note is usually the only record of what was tried
+	// and ruled out, and burying it invites the next session to re-derive the same wrong
+	// answer - which is the exact failure this whole mechanism exists to stop. It also
+	// has to survive being wrong: a mistaken supersedes must cost rank, not erase a note.
+	//
+	// 0.5 is chosen to lose to the tier-0 nudge decisively (0.5 vs 1.1 is a 2.2x gap, so a
+	// superseded note cannot outrank its own replacement on a tie) while still beating a
+	// genuinely weak match, so the correction wins the top slot and the history stays
+	// reachable a few rows down.
+	supersededMult = 0.5
+	expandSeeds    = 5   // expand from the top-N fused notes
+	expandK        = 3   // pull at most K strong note-neighbors per seed
+	expandDecay    = 0.4 // a neighbor inherits this fraction of the seed's score
 	// godDegree: skip expansion into hub notes above this KNOWLEDGE degree (distinct
 	// other notes linked in or out). Measured on raw fan-out it also skipped any note
 	// with enough headings, so a 25-section runbook was passed over for a two-line stub.
@@ -65,6 +77,13 @@ type Card struct {
 	Score   float64
 	Tier0   bool
 	Reason  string
+	// SupersededBy is the id of the note that formally retired this one, empty when
+	// nothing has. Carried on the card (not just applied to the score) so the agent can
+	// see WHICH note to read instead: a demoted note that still surfaces is useful, a
+	// demoted note that surfaces unlabelled is a trap.
+	// omitempty because this is empty on the overwhelming majority of cards and every
+	// card is priced against the caller's token budget.
+	SupersededBy string `json:",omitempty"`
 }
 
 // Options tunes a retrieval. Zero values get sensible defaults.
@@ -961,8 +980,8 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 		if !ok {
 			continue
 		}
-		current, ok := cardFromMetadata(d.NoteMetadata)
-		if !ok || !scopeAllowed(current.Scope, opt.AllowedScopes) || !pathAllowed(current.Path, opt.AllowPath) {
+		current, ok := currentCardFromMetadata(d.NoteMetadata, opt)
+		if !ok {
 			continue
 		}
 		current.Snippet, current.Score, current.Reason = previous.Snippet, previous.Score, previous.Reason
@@ -1062,13 +1081,30 @@ func (r *Retriever) currentCards(ctx context.Context, ids []string, opt Options)
 		return nil, err
 	}
 	for id, m := range metadata {
-		c, ok := cardFromMetadata(m)
-		if !ok || !scopeAllowed(c.Scope, opt.AllowedScopes) || !pathAllowed(c.Path, opt.AllowPath) {
-			continue
+		if c, ok := currentCardFromMetadata(m, opt); ok {
+			out[id] = c
 		}
-		out[id] = c
 	}
 	return out, nil
+}
+
+// currentCardFromMetadata applies both current read boundaries to the target and its
+// optional superseder. SupersededBy affects both bytes and rank, so missing, deleted,
+// or unreadable superseder metadata must leave the card completely undemoted.
+func currentCardFromMetadata(m index.NoteMetadata, opt Options) (Card, bool) {
+	c, ok := cardFromMetadata(m)
+	if !ok || !scopeAllowed(c.Scope, opt.AllowedScopes) || !pathAllowed(c.Path, opt.AllowPath) {
+		return Card{}, false
+	}
+	// NoteMetadataFor and NoteDocuments read this relation plus the superseding note's
+	// CURRENT path/scope in the same statement. A stale in-memory graph can therefore
+	// neither leak an old id nor acknowledge a newly fenced/deleted replacement.
+	if m.SupersededBy != "" && m.SupersederPath != "" &&
+		scopeAllowed(m.SupersederScope, opt.AllowedScopes) &&
+		pathAllowed(m.SupersederPath, opt.AllowPath) {
+		c.SupersededBy = m.SupersededBy
+	}
+	return c, true
 }
 
 func cardFromMetadata(m index.NoteMetadata) (Card, bool) {
@@ -1166,6 +1202,9 @@ func (r *Retriever) boostMult(c Card) float64 {
 	m := 1.0
 	if c.Tier0 {
 		m *= tier0Mult
+	}
+	if c.SupersededBy != "" {
+		m *= supersededMult
 	}
 	if r.freshHalfLife > 0 {
 		m *= r.freshnessMult(c)

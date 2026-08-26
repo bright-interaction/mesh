@@ -828,7 +828,9 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	// above, so the unpacked set is bounded, and searchCardTokens packs it below.
 	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: limit, AllowedScopes: allowed})
 	if err != nil {
-		return nil, internalErr(err)
+		// retrievalErr, not internalErr: a timed-out search and a vault with nothing on
+		// the topic must not look the same to the agent. See retrievalUnavailableMsg.
+		return nil, retrievalErr(err)
 	}
 	cards = retrieve.PackToBudget(cards, budget, searchCardTokens)
 	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)

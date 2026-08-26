@@ -151,6 +151,11 @@ func TestCountersAgreeOnWhatACardCosts(t *testing.T) {
 		card Card
 	}{
 		{name: "full production-shaped card", card: full},
+		{name: "superseded card includes optional receipt", card: func() Card {
+			c := full
+			c.SupersededBy = "replacement-with-a-long-stable-id"
+			return c
+		}()},
 		{name: "compact card with no snippet", card: compact(full)},
 		{name: "empty card is all structure", card: Card{}},
 	}

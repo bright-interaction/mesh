@@ -79,14 +79,15 @@ type reuseEvent struct {
 	at     int64
 }
 
-// SchemaVersion bumps whenever schema.sql changes shape. The index is a derived,
-// deletable artifact (the markdown vault is the source of truth), so a version
-// mismatch drops and rebuilds rather than running a migration. This is why Mesh
-// uses no goose/golang-migrate: there is no irreplaceable data to migrate.
+// SchemaVersion bumps whenever schema.sql changes shape OR derived-index semantics
+// change in a way ordinary drift detection cannot observe. The index is a derived,
+// deletable artifact (the markdown vault is the source of truth), so a version mismatch
+// drops and rebuilds rather than running a migration. This is why Mesh uses no
+// goose/golang-migrate: there is no irreplaceable data to migrate.
 // Note: the source-code tables (code_files/code_symbols/code_edges/code_search)
 // were added additively via CREATE TABLE IF NOT EXISTS, so they appear on existing
-// databases without a destructive rebuild and the version stays 2. Bump this only
-// for a shape change to an existing table, which requires the drop+rebuild below.
+// databases without a destructive rebuild and the version stays 2. Shape changes to
+// existing tables and undetectable changes to derived rows require the drop+rebuild below.
 // v3: notes gained review_by + source columns (provenance / lifecycle, Phase A).
 // v4: notes gained a scope column (access-control partition; absent = dev).
 // v5: no column changed, but retrievalHash gained scope/updated/when/review_by/source,
@@ -102,7 +103,11 @@ type reuseEvent struct {
 // Nothing rebuilt it, because only the writable Open compares versions and the shipped
 // per-window setup is read-only. The bump is what makes those databases identifiable, and
 // OpenReadOnlyAt now refuses them by version instead of querying a table that is not there.
-const SchemaVersion = 6
+// v7: BuildGraph began deriving supersedes edges plus a superseded_by node attribute.
+// `supersedes` was already retrieval-hashed, so a v6 index over unchanged Markdown looks
+// perfectly current to DriftReport even though it lacks that derived state. The semantic
+// bump forces one graph rebuild; kept vectors and their model metadata survive it.
+const SchemaVersion = 7
 
 type job struct {
 	fn    func(*sql.Tx) error

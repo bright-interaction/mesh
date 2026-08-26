@@ -155,7 +155,15 @@ func nodeText(n *Node) []string {
 	for i := 0; i < labelWeight; i++ {
 		toks = append(toks, lbl...)
 	}
-	for _, v := range n.Attrs {
+	for key, v := range n.Attrs {
+		// superseded_by is a relationship/receipt field, not searchable prose. If a
+		// secret-scoped correction retires a public note, indexing its id into the
+		// public target lets a scoped caller search that id and observe a graph hit even
+		// though it cannot read the correction. Retrieval exposes and scores this field
+		// only after checking the superseding note's current read boundaries.
+		if key == "superseded_by" {
+			continue
+		}
 		if s, ok := v.(string); ok {
 			toks = append(toks, Tokenize(s)...)
 		}

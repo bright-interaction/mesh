@@ -69,6 +69,14 @@ func cardTokensNoMarshal(c Card) int {
 	if b, err := json.Marshal(Card{}); err == nil { // the ten field names, the separators, Score, Tier0
 		n += estimateTokens(string(b))
 	}
+	// SupersededBy is omitempty, so Card{} above prices neither its key nor value.
+	// Charge both only when the field is actually present on the wire.
+	if c.SupersededBy != "" {
+		n += estimateTokens(`,"SupersededBy":`)
+		if b, err := json.Marshal(c.SupersededBy); err == nil {
+			n += estimateTokens(string(b))
+		}
+	}
 	return n
 }
 

@@ -19,12 +19,15 @@ const maxDocChars = 2000
 // one watcher generation behind the notes/search tables. Anything used for access
 // control or returned to a caller must therefore come from this current snapshot.
 type NoteMetadata struct {
-	NodeID string
-	NoteID string
-	Path   string
-	Type   string
-	Title  string
-	Scope  string
+	NodeID          string
+	NoteID          string
+	Path            string
+	Type            string
+	Title           string
+	Scope           string
+	SupersededBy    string
+	SupersederPath  string
+	SupersederScope string
 }
 
 // NoteDocument pairs rerankable text with the note metadata read in the SAME SQL
@@ -36,7 +39,9 @@ type NoteDocument struct {
 }
 
 // NoteMetadataFor returns current persisted metadata for the requested note node
-// ids, keyed by node id. Missing/deleted ids are absent.
+// ids, keyed by node id. Missing/deleted ids are absent. Supersession fields come
+// from the target graph row joined to the CURRENT superseding note in the same SQL
+// statement, so callers never combine a stale relation with old scope/path metadata.
 func (s *Store) NoteMetadataFor(ctx context.Context, ids []string) (map[string]NoteMetadata, error) {
 	out := make(map[string]NoteMetadata, len(ids))
 	// Keep comfortably below SQLite's host-parameter ceiling. Graph/vector candidate
@@ -57,16 +62,25 @@ func (s *Store) NoteMetadataFor(ctx context.Context, ids []string) (map[string]N
 func (s *Store) noteMetadataBatch(ctx context.Context, ids []string, out map[string]NoteMetadata) error {
 	placeholders, args := noteIDArgs(ids)
 	rows, err := s.readDB.QueryContext(ctx, `
-SELECT 'note:' || id, id, path, type, title, scope
-FROM notes
-WHERE 'note:' || id IN (`+placeholders+`)`, args...)
+SELECT 'note:' || n.id, n.id, n.path, n.type, n.title, n.scope,
+       COALESCE(sup.id, ''), COALESCE(sup.path, ''), COALESCE(sup.scope, '')
+FROM notes n
+LEFT JOIN nodes gn ON gn.id = 'note:' || n.id
+LEFT JOIN notes sup ON sup.id = CASE
+  WHEN json_valid(gn.attrs) THEN json_extract(gn.attrs, '$.superseded_by')
+  ELSE NULL
+END
+WHERE 'note:' || n.id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var m NoteMetadata
-		if err := rows.Scan(&m.NodeID, &m.NoteID, &m.Path, &m.Type, &m.Title, &m.Scope); err != nil {
+		if err := rows.Scan(
+			&m.NodeID, &m.NoteID, &m.Path, &m.Type, &m.Title, &m.Scope,
+			&m.SupersededBy, &m.SupersederPath, &m.SupersederScope,
+		); err != nil {
 			return err
 		}
 		out[m.NodeID] = m
@@ -83,9 +97,16 @@ func (s *Store) NoteDocuments(ctx context.Context, ids []string) (map[string]Not
 	}
 	placeholders, args := noteIDArgs(ids)
 	rows, err := s.readDB.QueryContext(ctx, `
-SELECT si.node_id, n.id, n.path, n.type, n.title, n.scope, si.body
+SELECT si.node_id, n.id, n.path, n.type, n.title, n.scope,
+       COALESCE(sup.id, ''), COALESCE(sup.path, ''), COALESCE(sup.scope, ''),
+       si.body
 FROM search_index si
 JOIN notes n ON si.node_id = 'note:' || n.id
+LEFT JOIN nodes gn ON gn.id = si.node_id
+LEFT JOIN notes sup ON sup.id = CASE
+  WHEN json_valid(gn.attrs) THEN json_extract(gn.attrs, '$.superseded_by')
+  ELSE NULL
+END
 WHERE si.node_id IN (`+placeholders+`)`, args...)
 	if err != nil {
 		return nil, err
@@ -94,7 +115,11 @@ WHERE si.node_id IN (`+placeholders+`)`, args...)
 	for rows.Next() {
 		var d NoteDocument
 		var body string
-		if err := rows.Scan(&d.NodeID, &d.NoteID, &d.Path, &d.Type, &d.Title, &d.Scope, &body); err != nil {
+		if err := rows.Scan(
+			&d.NodeID, &d.NoteID, &d.Path, &d.Type, &d.Title, &d.Scope,
+			&d.SupersededBy, &d.SupersederPath, &d.SupersederScope,
+			&body,
+		); err != nil {
 			return nil, err
 		}
 		d.Text = boundedDocument(d.Title, body)

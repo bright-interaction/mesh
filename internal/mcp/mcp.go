@@ -1007,6 +1007,56 @@ func internalErr(err error) *rpcError {
 	return &rpcError{Code: codeInternalError, Message: "internal error"}
 }
 
+// retrievalUnavailableMsg is the one thing an agent whose search failed most needs to
+// know, and the thing the opaque form never said: this is NOT an empty result set. A
+// retrieval tool that fails silently is worse than one that is down, because "the index
+// refused to answer" and "the vault holds nothing on this" are the same observation to
+// the caller, and the caller's next move differs completely. Measured on this vault
+// 2026-08-26: 296 timeouts over four days, every one of them reaching the agent as
+// "internal error", while the same queries answered from a fresh CLI connection in
+// ~1.5s. Agents read that as "no prior knowledge" and re-derived from source, which is
+// how a 2300-note vault stops preventing repeat work.
+const retrievalUnavailableMsg = "retrieval unavailable: the index did not answer in time. " +
+	"This is NOT an empty result: prior knowledge may exist and was NOT searched. " +
+	"Do not conclude the vault is silent on your topic. Retry once with fewer, more " +
+	"specific words; if it repeats, the mesh MCP daemon is degraded and needs a restart."
+
+// retrievalErr is internalErr for the READ path. It keeps internalErr's security
+// property (sqlite driver text and absolute filesystem paths never reach the agent)
+// while separating the one failure mode the agent can reason about from the ones it
+// cannot. Only operator-authored, path-free text is surfaced; anything unrecognised
+// still degrades to the opaque form.
+//
+// Data carries machine-readable fields so a client can branch without parsing prose,
+// and retryable distinguishes "ask again" from "this call will never work".
+func retrievalErr(err error) *rpcError {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		slog.Error("mesh mcp retrieval timed out", "err", err)
+		return &rpcError{
+			Code:    codeInternalError,
+			Message: retrievalUnavailableMsg,
+			Data: map[string]any{
+				"reason":    "search_timeout",
+				"retryable": true,
+				"empty":     false,
+			},
+		}
+	case errors.Is(err, context.Canceled):
+		slog.Error("mesh mcp retrieval cancelled", "err", err)
+		return &rpcError{
+			Code:    codeInternalError,
+			Message: "retrieval cancelled before it completed. This is NOT an empty result: prior knowledge may exist and was NOT searched.",
+			Data: map[string]any{
+				"reason":    "search_cancelled",
+				"retryable": true,
+				"empty":     false,
+			},
+		}
+	}
+	return internalErr(err)
+}
+
 // textResult wraps a value as an MCP text content block, JSON-encoding it so the
 // agent gets terse structured data, not chatty prose.
 func textResult(v any) any {

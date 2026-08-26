@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -57,6 +58,14 @@ type Issue struct {
 	Path string
 	Kind string // missing-id|duplicate-id|broken-link|broken-anchor|duplicate-anchor|ambiguous-id-key|ambiguous-path-key|ambiguous-link-key|ambiguous-link|unterminated-comment
 	Msg  string
+}
+
+// supersedeClaim is one source note's bid to be recorded as the superseded_by
+// winner on a target that more than one note supersedes. See the resolution pass
+// in BuildGraph for how ties are broken.
+type supersedeClaim struct {
+	srcID string
+	when  string
 }
 
 func noteKey(path string) string {
@@ -352,6 +361,46 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		}
 	}
 
+	// resolveTarget is the one note-target namespace for wikilinks, related, and
+	// supersedes. Keeping this lookup shared is load-bearing: a stable frontmatter id
+	// can differ from the filename after a rename, and case/Unicode aliases can make
+	// basenames, stable ids, or qualified paths ambiguous. A second, narrower resolver
+	// for supersedes could silently retire a different note than [[the same target]].
+	// problem is empty only for an ordinary not-found result; a non-empty value is an
+	// ambiguity explanation that the caller prefixes with its own field syntax.
+	resolveTarget := func(key string) (id, problem string, ok bool) {
+		if strings.Contains(key, "/") {
+			if owners, amb := ambiguousPathKeys[key]; amb {
+				return "", "matches normalized paths " + strings.Join(owners, " and ") + "; rename one path so it is unique", false
+			}
+			if pathID, found := idByPath[key]; found {
+				return pathID, "", true
+			}
+		}
+
+		// Basename and stable id share the shorthand namespace. After a stable id's
+		// file is renamed, a new file can claim its old basename; choosing either
+		// silently retargets the relation.
+		basenameID, hasBasename := idByKey[key]
+		stableID, hasStable := idByStableKey[key]
+		if hasBasename && hasStable && basenameID != stableID {
+			return "", "matches note " + basenameID + " by filename and note " + stableID + " by stable id; use the exact vault path", false
+		}
+		if owners, amb := ambiguousKeys[key]; amb {
+			return "", "matches " + strings.Join(owners, " and ") + "; qualify it with the folder path", false
+		}
+		if hasBasename {
+			return basenameID, "", true
+		}
+		if owners, amb := ambiguousStableKeys[key]; amb {
+			return "", "matches stable ids in " + strings.Join(owners, " and ") + "; use the exact vault path", false
+		}
+		if hasStable {
+			return stableID, "", true
+		}
+		return "", "", false
+	}
+
 	for _, n := range notes {
 		id := effectiveID(n)
 		noteNode := "note:" + id
@@ -423,56 +472,12 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 				// [[#heading]] is a local section link.
 				tid, resolved = id, true
 			}
-			// A slash in the target means the author named a path, so resolve it exactly
-			// first: that is both the normal folder-qualified link and the way out of an
-			// ambiguous basename below.
-			if !resolved && strings.Contains(key, "/") {
-				if owners, amb := ambiguousPathKeys[key]; amb {
-					issues = append(issues, Issue{n.Path, "ambiguous-link",
-						"[[" + displayTarget + "]] matches normalized paths " + strings.Join(owners, " and ") + "; rename one path so it is unique"})
-					return
-				}
-				if pathID, ok := idByPath[key]; ok {
-					tid, resolved = pathID, true
-				}
-			}
-			// Basename and stable id share the same shorthand namespace. After a stable
-			// id's file is renamed, a new file can claim its old basename; choosing either
-			// silently retargets somebody's link. Refuse the shorthand and make the author
-			// use one of the distinct vault paths.
 			if !resolved {
-				basenameID, hasBasename := idByKey[key]
-				stableID, hasStable := idByStableKey[key]
-				if hasBasename && hasStable && basenameID != stableID {
-					issues = append(issues, Issue{n.Path, "ambiguous-link",
-						"[[" + displayTarget + "]] matches note " + basenameID + " by filename and note " + stableID + " by stable id; use the exact vault path"})
+				var problem string
+				tid, problem, resolved = resolveTarget(key)
+				if problem != "" {
+					issues = append(issues, Issue{n.Path, "ambiguous-link", "[[" + displayTarget + "]] " + problem})
 					return
-				}
-			}
-			// Refuse to bind an ambiguous key to an arbitrary winner: guessing produced a
-			// wrong edge (backlinks that cited one note landed on another) which is worse
-			// than no edge, and reported nothing. Report it so mesh lint / mesh structure
-			// / mesh_health can surface it and the author can qualify the link by path.
-			if !resolved {
-				if owners, amb := ambiguousKeys[key]; amb {
-					issues = append(issues, Issue{n.Path, "ambiguous-link",
-						"[[" + displayTarget + "]] matches " + strings.Join(owners, " and ") + "; qualify it with the folder path"})
-					return
-				}
-			}
-			if !resolved {
-				if keyID, ok := idByKey[key]; ok {
-					tid, resolved = keyID, true
-				}
-			}
-			if !resolved {
-				if owners, amb := ambiguousStableKeys[key]; amb {
-					issues = append(issues, Issue{n.Path, "ambiguous-link",
-						"[[" + displayTarget + "]] matches stable ids in " + strings.Join(owners, " and ") + "; use the exact vault path"})
-					return
-				}
-				if stableID, ok := idByStableKey[key]; ok {
-					tid, resolved = stableID, true
 				}
 			}
 			if !resolved {
@@ -514,6 +519,93 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 				addRef(l.Target, 0)
 			}
 		}
+	}
+	// supersedes: the note-level UPDATE path. Until this pass existed the field was
+	// parsed and hashed as "retrieval-critical" and then consumed by nothing, so a
+	// corrected diagnosis became a NEW note while the one it corrected kept its rank and
+	// kept being retrieved first. Authors had been hand-encoding the relation into
+	// filenames instead ("correction-...", "root-cause-found-...", "supersedes-the-..."),
+	// which reads to a human and is invisible to ranking.
+	//
+	// A SECOND PASS, deliberately: the attr has to land on the TARGET node, and the
+	// target may be any note in the corpus, including one built after the superseding
+	// note in the loop above. Resolving here also means every id/key/path is already
+	// registered, so a forward reference resolves exactly like a backward one.
+	//
+	// A target can be claimed by more than one source (two authors independently
+	// correct the same wrong diagnosis), and superseded_by is a scalar, so only one
+	// claim can win the attr. The naive "last SetNodeAttr call wins" made the winner a
+	// function of `notes` order, which ReconcileIncremental does NOT hold constant: it
+	// rebuilds from NoteCache.Snapshot(), which ranges a Go map, so the winner could
+	// re-flip on every unrelated incremental edit for the life of the watcher process.
+	// Collect every claim per target here and resolve the winner in one deterministic
+	// pass below, once every note has been walked.
+	claims := map[string][]supersedeClaim{}
+	for _, n := range notes {
+		if len(n.FM.Supersedes) == 0 {
+			continue
+		}
+		srcID := effectiveID(n)
+		for _, raw := range n.FM.Supersedes {
+			key := linkKey(raw)
+			if key == "" {
+				continue
+			}
+			tid, problem, ok := resolveTarget(key)
+			if problem != "" {
+				// Same refusal-to-guess rule as references: binding an ambiguous name to
+				// an arbitrary winner would retire the wrong note, which is strictly worse
+				// than retiring none.
+				issues = append(issues, Issue{n.Path, "ambiguous-link",
+					"supersedes: " + strings.TrimSpace(raw) + " " + problem})
+				continue
+			}
+			if !ok {
+				issues = append(issues, Issue{n.Path, "broken-link",
+					"supersedes: " + strings.TrimSpace(raw) + " " + brokenLinkReason(strings.TrimSpace(raw))})
+				continue
+			}
+			// A note superseding itself would demote the very note the author is trying to
+			// promote, and it is always a typo (usually a copied id).
+			if tid == srcID {
+				issues = append(issues, Issue{n.Path, "broken-link",
+					"supersedes: " + strings.TrimSpace(raw) + " is this note itself"})
+				continue
+			}
+			g.AddEdge(graph.Edge{Source: "note:" + srcID, Target: "note:" + tid, Relation: "supersedes", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1})
+			// The edge above is recorded regardless of whether the target node exists (an
+			// edge to a bare reference node is still useful), but the attr write below
+			// needs a real node, so check that here and queue the claim rather than
+			// stamping immediately: the winner is picked once, after every note has been
+			// walked, not by whichever claim happens to run first.
+			if _, ok := g.Node("note:" + tid); !ok {
+				issues = append(issues, Issue{n.Path, "broken-link",
+					"supersedes: " + strings.TrimSpace(raw) + " resolved to " + tid + " but that note has no graph node"})
+				continue
+			}
+			claims[tid] = append(claims[tid], supersedeClaim{srcID: srcID, when: n.FM.When})
+		}
+	}
+	// Resolve one winner per contested target: most recent `when` first, ties broken
+	// by id (lexicographically greater), so the result is a TOTAL order over the
+	// claimants themselves and never depends on the order claims arrived in. This is
+	// the mirror image of the ambiguous-TARGET refusal above, and deliberately does NOT
+	// refuse the way that one does: binding an ambiguous NAME to a node risks retiring
+	// the wrong note entirely, a mistake nothing else in the graph can catch. Here every
+	// claimant already resolved to a real, distinct edge, so picking a SOURCE winner
+	// only decides which one gets to be the headline "read this instead" on the demoted
+	// card; a reader who wants the full picture still has every supersedes edge to walk,
+	// so an arbitrary-but-stable pick costs a hint, not an unrecoverable retraction. A
+	// note with no `when` sorts as older than any dated claimant, since a dateless
+	// correction cannot out-rank one an author bothered to date.
+	for tid, claimants := range claims {
+		sort.Slice(claimants, func(i, j int) bool {
+			if claimants[i].when != claimants[j].when {
+				return claimants[i].when > claimants[j].when
+			}
+			return claimants[i].srcID > claimants[j].srcID
+		})
+		g.SetNodeAttr("note:"+tid, "superseded_by", claimants[0].srcID)
 	}
 	// Degrees are computed in a final pass so they do not depend on the interleaved
 	// AddNode/AddEdge order above (an edge to a later note would otherwise undercount

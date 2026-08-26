@@ -43,12 +43,30 @@ func withSearchDeadline(ctx context.Context) (context.Context, context.CancelFun
 // "context deadline exceeded" tells a user nothing about what to do next, and the
 // driver reports an interrupted statement rather than the context error, so the
 // context is consulted as well as the error.
+//
+// The guard below is a disjunction over (err, ctx.Err()), but downstream callers
+// (retrievalErr in internal/mcp) classify purely via errors.Is against the context
+// sentinels. Wrapping only err with %w is correct when err itself already carries
+// the sentinel, but when the match comes ONLY from ctx.Err() - exactly the case
+// this function's comment above describes, a driver that reports its own
+// "interrupted" error rather than surfacing the context error - that same wrap
+// would drop the sentinel from the returned chain and the caller would fall
+// through to an opaque error. So that branch wraps the sentinel itself instead,
+// and keeps the driver error visible alongside it with %v for operators reading
+// logs: informative, but deliberately not part of the Unwrap chain a caller could
+// accidentally match on instead of the sentinel.
 func searchErr(ctx context.Context, err error) error {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return fmt.Errorf("search timed out after %s: use fewer, more specific words, or split your largest note files into smaller ones: %w", SearchTimeout, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("search timed out after %s: use fewer, more specific words, or split your largest note files into smaller ones: %w", SearchTimeout, err)
+		}
+		return fmt.Errorf("search timed out after %s: use fewer, more specific words, or split your largest note files into smaller ones: %w (driver: %v)", SearchTimeout, context.DeadlineExceeded, err)
 	case errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled):
-		return fmt.Errorf("search cancelled: %w", err)
+		if errors.Is(err, context.Canceled) {
+			return fmt.Errorf("search cancelled: %w", err)
+		}
+		return fmt.Errorf("search cancelled: %w (driver: %v)", context.Canceled, err)
 	}
 	return err
 }
