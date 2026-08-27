@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -32,10 +33,32 @@ var ErrDuplicateNoteID = errors.New("duplicate note id")
 //
 // workers <= 0 means runtime.NumCPU().
 func ParseFiles(paths []string, workers int) ([]*ParsedNote, []FileError) {
+	notes, errs, _ := ParseFilesContext(context.Background(), paths, workers)
+	return notes, errs
+}
+
+// ParseFilesContext is ParseFiles with caller-controlled cancellation. It stops
+// scheduling new files as soon as ctx is cancelled and joins the worker pool before it
+// returns. An underlying filesystem read that the OS cannot interrupt may finish later,
+// but its result is isolated in a private buffered channel and cannot mutate this pass's
+// results. A cancelled pass returns no partial note set.
+func ParseFilesContext(ctx context.Context, paths []string, workers int) ([]*ParsedNote, []FileError, error) {
+	return parseFilesContext(ctx, paths, workers, func(path string) (*ParsedNote, error) {
+		return ParseFileContext(ctx, path)
+	})
+}
+
+func parseFilesContext(ctx context.Context, paths []string, workers int, parseFile func(string) (*ParsedNote, error)) ([]*ParsedNote, []FileError, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if len(paths) == 0 {
+		return nil, nil, nil
+	}
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	if len(paths) > 0 && workers > len(paths) {
+	if workers > len(paths) {
 		workers = len(paths)
 	}
 
@@ -43,32 +66,65 @@ func ParseFiles(paths []string, workers int) ([]*ParsedNote, []FileError) {
 		pn  *ParsedNote
 		err error
 	}
-	// Each goroutine owns a disjoint slot, so there is no shared mutable state
-	// and no lock: the only synchronization is the WaitGroup and the semaphore.
+	// Each worker writes only the slot named by its job. The WaitGroup joins every
+	// worker before collection, so the disjoint writes need no lock and cannot race
+	// the ordered read below.
 	results := make([]result, len(paths))
 
-	sem := make(chan struct{}, workers)
+	jobs := make(chan int)
 	var wg sync.WaitGroup
-	for i := range paths {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(i int) {
+	wg.Add(workers)
+	for range workers {
+		go func() {
 			defer wg.Done()
-			defer func() { <-sem }()
-			pn, err := ParseFile(paths[i])
-			results[i] = result{pn: pn, err: err}
-		}(i)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case i, ok := <-jobs:
+					if !ok {
+						return
+					}
+					// A send and cancellation can become ready together. Refuse the job
+					// after receipt as well, so no new file starts after cancellation.
+					if ctx.Err() != nil {
+						return
+					}
+					pn, err := parseFile(paths[i])
+					results[i] = result{pn: pn, err: err}
+				}
+			}
+		}()
 	}
+
+schedule:
+	for i := range paths {
+		select {
+		case <-ctx.Done():
+			break schedule
+		case jobs <- i:
+		}
+	}
+	close(jobs)
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 
 	notes := make([]*ParsedNote, 0, len(paths))
 	var errs []FileError
 	for i, r := range results {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		if r.err != nil {
 			errs = append(errs, FileError{Path: paths[i], Err: r.err})
 			continue
 		}
 		notes = append(notes, r.pn)
 	}
-	return notes, errs
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return notes, errs, nil
 }

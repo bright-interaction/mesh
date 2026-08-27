@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -142,11 +143,46 @@ const maxSlugLen = 247
 // type's subdirectory, with a type-specific body skeleton. The author only fills
 // the judgment fields. Returns the path and any flywheel fields still to fill.
 func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
+	return CreateNoteContext(context.Background(), root, spec)
+}
+
+// CreateNoteContext is CreateNote with caller-controlled cancellation for the
+// pre-publication work. In particular, the vault-global id scan can be expensive in a
+// large vault, so it observes ctx while walking and reading note heads.
+//
+// The successful O_EXCL open below is the publication boundary. Once a path has been
+// claimed, cancellation is deliberately not consulted until that attempt has either
+// durably completed or removed its claim: returning early in between would strand an
+// empty or partially-written markdown file that the indexer could mistake for a note.
+func CreateNoteContext(ctx context.Context, root string, spec NewNoteSpec) (*CreateResult, error) {
+	return createNoteContext(ctx, root, spec, ClaimedIDsContext, os.OpenFile)
+}
+
+// createNoteContext keeps the two filesystem boundaries injectable without mutable
+// package globals. Production always supplies the real scanner and O_EXCL open above;
+// focused tests can cancel on either side of publication deterministically, including
+// under the race detector.
+func createNoteContext(
+	ctx context.Context,
+	root string,
+	spec NewNoteSpec,
+	claimedIDs func(context.Context, string) (map[string]string, error),
+	openFile func(string, int, os.FileMode) (*os.File, error),
+) (*CreateResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// The vault has to be there already. MkdirAll below invents every missing parent,
 	// so without this a typo in --vault produced a whole new vault plus a note nobody
 	// would ever look at, and exit 0. Checked here rather than only in the CLI because
 	// the MCP write-back tool and the web pending API reach this same writer.
 	if err := RequireRoot(root); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if !spec.Type.Valid() {
@@ -165,9 +201,6 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 			ErrInvalidSpec, len(base), maxSlugLen, len(base)-maxSlugLen)
 	}
 	dir := filepath.Join(root, DirForType(spec.Type))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
 	date := Now().Format("2006-01-02")
 
 	fm := &Frontmatter{
@@ -201,8 +234,19 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	// dir, so on its own it proves nothing about the other type directories: a gotcha and
 	// a decision with the same title both got `id: <slug>`, both got a success receipt,
 	// and one of the two was silently unretrievable from that moment on.
-	claimed, err := ClaimedIDs(root)
+	claimed, err := claimedIDs(ctx, root)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Do not create even an empty type directory until the cancellable whole-vault
+	// scan has completed. That keeps pre-publication cancellation side-effect free.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -215,6 +259,9 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	// any concurrent caller (mesh mcp --http, the hub's /mcp, internal/web/pending_api).
 	// O_EXCL makes the claim atomic, so a loser sees ErrExist and takes the next suffix.
 	for n := 1; n <= maxIDAttempts; n++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// Shared with the in-place rewriter in IDClaims.Claim: the two writers must mint
 		// the same candidate sequence or each reads the ids the other reserved as free.
 		id := candidateID(base, n)
@@ -236,8 +283,13 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		if err := validateRoundTrip(content, id); err != nil {
 			return nil, err
 		}
+		// Last cancellation point before publication. After OpenFile succeeds, this
+		// attempt owns a visible path and must finish or remove it before returning.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		f, err := openFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if errors.Is(err, os.ErrExist) {
 			continue // taken, by an earlier note or by a concurrent writer
 		}
@@ -245,9 +297,8 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 			return nil, err
 		}
 		if _, err := f.Write([]byte(content)); err != nil {
-			f.Close()
-			os.Remove(path)
-			return nil, err
+			closeErr := f.Close()
+			return nil, errors.Join(err, closeErr, removeNoteClaim(path, dir))
 		}
 		// Flush the note's bytes to the device before this returns a CreateResult naming
 		// it. Everything downstream treats that receipt as "the note exists": the index
@@ -265,13 +316,11 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		// of it. A failed write or fsync releases the claim rather than leaving a
 		// half-written note behind at an id the caller was told nothing about.
 		if err := f.Sync(); err != nil {
-			f.Close()
-			os.Remove(path)
-			return nil, err
+			closeErr := f.Close()
+			return nil, errors.Join(err, closeErr, removeNoteClaim(path, dir))
 		}
 		if err := f.Close(); err != nil {
-			os.Remove(path)
-			return nil, err
+			return nil, errors.Join(err, removeNoteClaim(path, dir))
 		}
 		// The note is a NEW directory entry, so the data fsync alone does not make it
 		// reachable after a power cut. Fsync the directory too, after the file.
@@ -290,8 +339,17 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 		// suffix and the loop is bounded); it needs the two creates to land inside the
 		// microseconds between the other's create and its stat scan, and every retry
 		// re-rolls that timing.
-		if other := otherFileNamedForID(root, id, path); other != "" {
-			os.Remove(path)
+		other, checkErr := otherFileNamedForIDContext(ctx, root, id, path)
+		if checkErr != nil {
+			// Cancellation after publication cannot return while our visible path is
+			// unresolved. The file is already closed and valid; remove it synchronously
+			// before surfacing cancellation, so no writer continues after this call.
+			return nil, errors.Join(checkErr, removeNoteClaim(path, dir))
+		}
+		if other != "" {
+			if err := removeNoteClaim(path, dir); err != nil {
+				return nil, err
+			}
 			claimed[id] = other
 			continue
 		}
@@ -299,6 +357,22 @@ func CreateNote(root string, spec NewNoteSpec) (*CreateResult, error) {
 	}
 	return nil, fmt.Errorf("%w: could not claim a free note id for %q after %d attempts; %d notes in this vault already hold ids starting with that slug, so give this note a more specific title",
 		ErrInvalidSpec, base, maxIDAttempts, maxIDAttempts)
+}
+
+// removeNoteClaim withdraws an O_EXCL publication only after its file has been closed.
+// Callers never continue after a failed removal: doing so would leave a note holding an
+// id for which no success receipt was returned. The directory sync mirrors publication's
+// sync and makes the removal durable before cancellation reaches the caller.
+func removeNoteClaim(path, dir string) error {
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove unpublished note claim: %w", err)
+	}
+	syncDir(dir)
+	return nil
 }
 
 // maxIDAttempts bounds the suffix search so a pathological directory cannot spin forever.

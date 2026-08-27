@@ -4,7 +4,14 @@
 package index
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 )
@@ -34,6 +41,60 @@ func parse(t *testing.T, path, body string) *ParsedNote {
 		t.Fatalf("Parse(%s): %v", path, err)
 	}
 	return pn
+}
+
+type buildCancelAfterChecksContext struct {
+	remaining int
+	cause     error
+	done      chan struct{}
+}
+
+func newBuildCancelAfterChecksContext(checks int, cause error) *buildCancelAfterChecksContext {
+	return &buildCancelAfterChecksContext{remaining: checks, cause: cause, done: make(chan struct{})}
+}
+
+func (*buildCancelAfterChecksContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *buildCancelAfterChecksContext) Done() <-chan struct{} {
+	if c.remaining > 0 {
+		c.remaining--
+		if c.remaining == 0 {
+			close(c.done)
+		}
+	}
+	return c.done
+}
+func (c *buildCancelAfterChecksContext) Err() error {
+	select {
+	case <-c.done:
+		return c.cause
+	default:
+		return nil
+	}
+}
+func (*buildCancelAfterChecksContext) Value(any) any { return nil }
+
+func graphFingerprint(g *graph.Graph) []string {
+	nodes := g.Nodes()
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	out := make([]string, 0, len(nodes)+g.EdgeCount())
+	for _, n := range nodes {
+		attrs, _ := json.Marshal(n.Attrs)
+		out = append(out, fmt.Sprintf("node|%s|%s|%s|%s|%s|%s|%s|%d|%d|%d|%s",
+			n.ID, n.Kind, n.Label, n.NoteID, n.NotePath, n.Anchor, n.SourceLoc,
+			n.Community, n.Degree, n.KnowledgeDegree, attrs))
+		edges := g.Neighbors(n.ID)
+		sort.Slice(edges, func(i, j int) bool {
+			if edges[i].Target != edges[j].Target {
+				return edges[i].Target < edges[j].Target
+			}
+			return edges[i].Relation < edges[j].Relation
+		})
+		for _, e := range edges {
+			out = append(out, fmt.Sprintf("edge|%s|%s|%s|%s|%g|%g|%s",
+				e.Source, e.Target, e.Relation, e.Confidence, e.ConfidenceScore, e.Weight, e.SourceLoc))
+		}
+	}
+	return out
 }
 
 func TestParseExtractsStructure(t *testing.T) {
@@ -101,6 +162,42 @@ func TestBuildGraphResolvesAndFlags(t *testing.T) {
 	}
 	if broken != 1 {
 		t.Errorf("expected 1 broken link (missing-note), got %d: %v", broken, issues)
+	}
+}
+
+func TestBuildGraphContextMatchesWrapper(t *testing.T) {
+	notes := []*ParsedNote{
+		parse(t, "mesh.md", sample),
+		parse(t, "codeindex.md", "---\nid: codeindex\ntype: entity\nwhen: 2026-01-01\n---\n# Codeindex\n"),
+		parse(t, "platform.md", "---\nid: platform\ntype: entity\nwhen: 2026-01-01\n---\n# Platform\n"),
+	}
+	wrapperGraph, wrapperIssues := BuildGraph(notes)
+	contextGraph, contextIssues, err := BuildGraphContext(context.Background(), notes)
+	if err != nil {
+		t.Fatalf("BuildGraphContext: %v", err)
+	}
+	if !reflect.DeepEqual(contextIssues, wrapperIssues) {
+		t.Fatalf("issues differ:\ncontext: %#v\nwrapper: %#v", contextIssues, wrapperIssues)
+	}
+	if got, want := graphFingerprint(contextGraph), graphFingerprint(wrapperGraph); !reflect.DeepEqual(got, want) {
+		t.Fatalf("graphs differ:\ncontext: %v\nwrapper: %v", got, want)
+	}
+}
+
+func TestBuildGraphContextCancellationReturnsCauseAndNoPartialGraph(t *testing.T) {
+	notes := []*ParsedNote{
+		parse(t, "mesh.md", sample),
+		parse(t, "codeindex.md", "---\nid: codeindex\ntype: entity\nwhen: 2026-01-01\n---\n# Codeindex\n"),
+		parse(t, "platform.md", "---\nid: platform\ntype: entity\nwhen: 2026-01-01\n---\n# Platform\n"),
+	}
+	cause := errors.New("stop graph build")
+	ctx := newBuildCancelAfterChecksContext(25, cause)
+	g, issues, err := BuildGraphContext(ctx, notes)
+	if !errors.Is(err, cause) {
+		t.Fatalf("BuildGraphContext error = %v, want cause %v", err, cause)
+	}
+	if g != nil || issues != nil {
+		t.Fatalf("cancelled build exposed partial output: graph=%v issues=%v", g, issues)
 	}
 }
 

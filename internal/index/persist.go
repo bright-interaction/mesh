@@ -4,11 +4,13 @@
 package index
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/vault"
@@ -45,12 +47,28 @@ func searchText(pn *ParsedNote) string {
 // in a single transaction (M0: wipe + insert; incremental upsert lands with the
 // watcher). Returns the number of notes written.
 func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
+	return s.IndexVaultContext(context.Background(), notes, g)
+}
+
+// IndexVaultContext is IndexVault with cooperative cancellation. The full rewrite is
+// still one transaction, so cancellation leaves the previously committed index intact.
+func (s *Store) IndexVaultContext(ctx context.Context, notes []*ParsedNote, g *graph.Graph) (int, error) {
+	return s.indexVaultContext(ctx, notes, g, nil, false)
+}
+
+func (s *Store) indexVaultContext(ctx context.Context, notes []*ParsedNote, g *graph.Graph, dropped []FileError, replaceDropped bool) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	count := 0
-	err := s.Write(func(tx *sql.Tx) error {
+	err := s.WriteContext(ctx, func(tx *sql.Tx) error {
 		// Note + FTS get a full wipe here; nodes/edges are wiped+rewritten by
 		// writeGraphTables below.
 		for _, t := range []string{"notes", "search_index"} {
-			if _, err := tx.Exec("DELETE FROM " + t); err != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, "DELETE FROM "+t); err != nil {
 				return err
 			}
 		}
@@ -70,12 +88,12 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 		// run ClaimUniqueIDs first, which picks one owner per id (the incumbent, else walk
 		// order, the same rule DriftDeltaReport uses) and reports the rest through
 		// RecordDropped. BuildGraph still raises its duplicate-id Issue for lint.
-		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+		insNote, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
 		defer insNote.Close()
-		insFTS, err := tx.Prepare(`INSERT INTO search_index(node_id,kind,anchor,title,body) VALUES(?,?,?,?,?)`)
+		insFTS, err := tx.PrepareContext(ctx, `INSERT INTO search_index(node_id,kind,anchor,title,body) VALUES(?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
@@ -83,6 +101,9 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 
 		seen := make(map[string]bool, len(notes))
 		for _, pn := range notes {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			id, title, fmJSON, updated, reviewBy, source, scope, mtime, err := noteRowValues(pn)
 			if err != nil {
 				return err
@@ -91,25 +112,31 @@ func (s *Store) IndexVault(notes []*ParsedNote, g *graph.Graph) (int, error) {
 			// written for this node (FTS5 has no PK upsert) so we never leave two FTS
 			// rows for one node; only count distinct notes.
 			if seen[id] {
-				if _, err := tx.Exec(`DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
 					return err
 				}
 			} else {
 				seen[id] = true
 				count++
 			}
-			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source, scope); err != nil {
+			if _, err := insNote.ExecContext(ctx, id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source, scope); err != nil {
 				return err
 			}
-			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
+			if _, err := insFTS.ExecContext(ctx, "note:"+id, "note", "", title, searchText(pn)); err != nil {
 				return err
 			}
 		}
 
-		if err := writeGraphTables(tx, g); err != nil {
+		if err := writeGraphTablesContext(ctx, tx, g); err != nil {
 			return err
 		}
-		return pruneOrphanVectors(tx)
+		if err := pruneOrphanVectorsContext(ctx, tx); err != nil {
+			return err
+		}
+		if replaceDropped {
+			return writeDroppedRowsContext(ctx, tx, dropped, time.Now().Unix())
+		}
+		return nil
 	})
 	return count, err
 }
@@ -197,24 +224,31 @@ func noteRowValues(pn *ParsedNote) (id, title, fmJSON, updated, reviewBy, source
 // (global), so the graph is rebuilt whole in memory either way, and dumping it to
 // two small tables is cheap relative to parsing the vault.
 func writeGraphTables(tx *sql.Tx, g *graph.Graph) error {
-	if _, err := tx.Exec(`DELETE FROM nodes`); err != nil {
+	return writeGraphTablesContext(context.Background(), tx, g)
+}
+
+func writeGraphTablesContext(ctx context.Context, tx *sql.Tx, g *graph.Graph) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM edges`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges`); err != nil {
 		return err
 	}
-	insNode, err := tx.Prepare(`INSERT OR REPLACE INTO nodes(id,kind,label,note_id,note_path,anchor,source_loc,community,attrs) VALUES(?,?,?,?,?,?,?,?,?)`)
+	insNode, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO nodes(id,kind,label,note_id,note_path,anchor,source_loc,community,attrs) VALUES(?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer insNode.Close()
-	insEdge, err := tx.Prepare(`INSERT OR IGNORE INTO edges(source,target,relation,confidence,confidence_score,weight,source_loc) VALUES(?,?,?,?,?,?,?)`)
+	insEdge, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO edges(source,target,relation,confidence,confidence_score,weight,source_loc) VALUES(?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer insEdge.Close()
 
 	for _, nd := range g.Nodes() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		attrs := "null"
 		if nd.Attrs != nil {
 			b, err := json.Marshal(nd.Attrs)
@@ -223,11 +257,14 @@ func writeGraphTables(tx *sql.Tx, g *graph.Graph) error {
 			}
 			attrs = string(b)
 		}
-		if _, err := insNode.Exec(nd.ID, nd.Kind, nd.Label, nd.NoteID, nd.NotePath, nd.Anchor, nd.SourceLoc, nd.Community, attrs); err != nil {
+		if _, err := insNode.ExecContext(ctx, nd.ID, nd.Kind, nd.Label, nd.NoteID, nd.NotePath, nd.Anchor, nd.SourceLoc, nd.Community, attrs); err != nil {
 			return err
 		}
 		for _, e := range g.Neighbors(nd.ID) {
-			if _, err := insEdge.Exec(e.Source, e.Target, e.Relation, e.Confidence, e.ConfidenceScore, e.Weight, e.SourceLoc); err != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := insEdge.ExecContext(ctx, e.Source, e.Target, e.Relation, e.Confidence, e.ConfidenceScore, e.Weight, e.SourceLoc); err != nil {
 				return err
 			}
 		}
@@ -252,7 +289,11 @@ func writeGraphTables(tx *sql.Tx, g *graph.Graph) error {
 // reader never observes a half-written note. If you are here because you lost embeddings,
 // look for a NON-atomic writer, do not weaken this prune.
 func pruneOrphanVectors(tx *sql.Tx) error {
-	_, err := tx.Exec(`DELETE FROM vectors WHERE node_id NOT IN (SELECT 'note:' || id FROM notes)`)
+	return pruneOrphanVectorsContext(context.Background(), tx)
+}
+
+func pruneOrphanVectorsContext(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM vectors WHERE node_id NOT IN (SELECT 'note:' || id FROM notes)`)
 	return err
 }
 

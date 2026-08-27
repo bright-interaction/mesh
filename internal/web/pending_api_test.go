@@ -4,6 +4,8 @@
 package web
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +15,104 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/index"
 )
+
+func TestPendingPromoteFinishesIndexingAfterClientCancellation(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "seed.md"), []byte("---\nid: seed\ntype: note\nwhen: 2026-01-01\n---\n# Seed\nx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lifetime, stop := context.WithCancel(context.Background())
+	defer stop()
+	s, err := NewOwningServerContext(lifetime, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p := index.PendingNote{Type: "gotcha", Title: "Finish after disconnect", Do: "keep indexing"}
+	if err := s.store.AddPending(p); err != nil {
+		t.Fatal(err)
+	}
+	id := index.PendingID(p.Type, p.Title)
+
+	requestCtx, disconnect := context.WithCancel(context.Background())
+	disconnect()
+	req := httptest.NewRequest(http.MethodPost, "/api/pending/promote",
+		strings.NewReader(`{"id":"`+id+`"}`)).WithContext(requestCtx)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("promote after client cancellation = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.ID == "" {
+		t.Fatalf("promote response: id=%q err=%v body=%s", out.ID, err, rec.Body.String())
+	}
+	if _, err := s.store.NotePath(out.ID); err != nil {
+		t.Fatalf("durable note was not indexed after disconnect: %v", err)
+	}
+	s.mu.RLock()
+	_, inLiveGraph := s.graph.Node("note:" + out.ID)
+	s.mu.RUnlock()
+	if !inLiveGraph {
+		t.Fatal("durable note reached SQLite but not the owning UI's live graph")
+	}
+	if _, err := s.store.GetPending(id); err == nil {
+		t.Fatal("promoted candidate remained in the queue after disconnect")
+	}
+}
+
+func TestPendingPromoteQueuesCleanupWhenShutdownFollowsFileCreation(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "seed.md"), []byte("---\nid: seed\ntype: note\nwhen: 2026-01-01\n---\n# Seed\nx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lifetime, stop := context.WithCancel(context.Background())
+	s, err := NewOwningServerContext(lifetime, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := index.PendingNote{Type: "gotcha", Title: "Clean up after shutdown", Do: "do not duplicate"}
+	if err := s.store.AddPending(p); err != nil {
+		t.Fatal(err)
+	}
+	pendingID := index.PendingID(p.Type, p.Title)
+	// Cancel at the exact durable boundary: the note file exists, but none of its
+	// SQLite bookkeeping or the owning reindex has begun. The replacement must drain
+	// the queued compensation and index that published file.
+	s.afterPendingFilePublished = stop
+	req := httptest.NewRequest(http.MethodPost, "/api/pending/promote",
+		strings.NewReader(`{"id":"`+pendingID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("promote during shutdown = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || out.ID == "" {
+		t.Fatalf("promote response: id=%q err=%v body=%s", out.ID, err, rec.Body.String())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close old owner: %v", err)
+	}
+
+	replacement, err := NewOwningServer(dir)
+	if err != nil {
+		t.Fatalf("start replacement owner: %v", err)
+	}
+	defer replacement.Close()
+	if _, err := replacement.store.GetPending(pendingID); err == nil {
+		t.Fatal("replacement left the promoted candidate queued for duplicate promotion")
+	}
+	if _, err := replacement.store.NotePath(out.ID); err != nil {
+		t.Fatalf("replacement did not index the note published during shutdown: %v", err)
+	}
+}
 
 func postJSON(t *testing.T, ts *httptest.Server, path, body string) (int, string) {
 	t.Helper()

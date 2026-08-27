@@ -4,6 +4,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,8 +55,11 @@ var envFor = map[string]string{
 	"secret_bridge.agent_id": "MESH_SECRET_BRIDGE_AGENT_ID",
 }
 
-func (s *Server) effectiveConfig() []cfgField {
-	c, _ := meshcfg.LoadConfig(s.store.MeshDir())
+func (s *Server) effectiveConfig(ctx context.Context) ([]cfgField, error) {
+	c, err := meshcfg.LoadConfigContext(ctx, s.store.MeshDir())
+	if err != nil {
+		return nil, err
+	}
 	e, rv, sb := c.Embedding, c.Retrieval, c.SecretBridge
 	num := func(f float64) string {
 		if f == 0 {
@@ -106,7 +110,7 @@ func (s *Server) effectiveConfig() []cfgField {
 		}
 		out = append(out, f)
 	}
-	return out
+	return out, nil
 }
 
 // checkKeyEnv validates a *.key_env value against the closed allow-list in
@@ -181,7 +185,12 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
-	writeJSON(w, map[string]any{"fields": s.effectiveConfig()})
+	fields, err := s.effectiveConfig(r.Context())
+	if err != nil {
+		http.Error(w, "config unavailable", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"fields": fields})
 }
 
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
@@ -197,13 +206,23 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// Serialize the whole load-modify-save: it is a read-modify-write of one file, so
 	// two concurrent PUTs (member mode shares one .mesh dir) would otherwise each load
-	// the same base and the second SaveConfig would clobber the first's field.
-	s.configMu.Lock()
-	defer s.configMu.Unlock()
+	// the same base and the second SaveConfig would clobber the first's field. A token
+	// channel keeps that wait request-cancellable during shutdown.
+	releaseConfig, err := s.acquireConfigUpdate(r.Context())
+	if err != nil {
+		http.Error(w, "request canceled", http.StatusInternalServerError)
+		return
+	}
+	defer releaseConfig()
 	// editable set, so an env-overridden field is rejected (writing the file would
 	// have no effect while the env var is set).
 	editable := map[string]bool{}
-	for _, f := range s.effectiveConfig() {
+	fields, err := s.effectiveConfig(r.Context())
+	if err != nil {
+		http.Error(w, "config unavailable", http.StatusInternalServerError)
+		return
+	}
+	for _, f := range fields {
 		editable[f.Key] = f.Editable
 	}
 	// This is a read-modify-WRITE of the whole file: the load supplies every field the
@@ -213,7 +232,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	// the file could not be read. A missing file is not an error (LoadConfig returns the
 	// zero Config for it), so anything that does come back here means the base is unknown
 	// and the write has to be refused.
-	cfg, err := meshcfg.LoadConfig(s.store.MeshDir())
+	cfg, err := meshcfg.LoadConfigContext(r.Context(), s.store.MeshDir())
 	if err != nil {
 		slog.Error("mesh ui: refusing a config write, the current config could not be read", "dir", s.store.MeshDir(), "error", err)
 		http.Error(w, "config unreadable, refusing to overwrite it", http.StatusInternalServerError)
@@ -239,14 +258,40 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := meshcfg.SaveConfig(s.store.MeshDir(), cfg); err != nil {
+	if err := meshcfg.SaveConfigContext(r.Context(), s.store.MeshDir(), cfg); err != nil {
 		http.Error(w, "save failed", http.StatusInternalServerError)
 		return
 	}
 	// Retrieval weights / embedding endpoint may have changed; drop the cached
 	// retriever so the next search reflects the new config.
 	s.invalidateRetriever()
-	writeJSON(w, map[string]any{"fields": s.effectiveConfig(), "saved": true})
+	fields, err = s.effectiveConfig(r.Context())
+	if err != nil {
+		// SaveConfigContext has already crossed its publication boundary and completed
+		// durability. If the client or server went away afterward, do not turn that
+		// successful commit into a misleading 500 (or invite a retry).
+		if r.Context().Err() != nil {
+			return
+		}
+		http.Error(w, "config unavailable", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"fields": fields, "saved": true})
+}
+
+func (s *Server) acquireConfigUpdate(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.configGate:
+		return func() { s.configGate <- struct{}{} }, nil
+	}
 }
 
 // applyConfigField sets one validated field on the Config.
@@ -379,7 +424,7 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "reindex failed", http.StatusInternalServerError)
 			return
 		}
-		if err := s.refresh(); err != nil {
+		if err := s.refreshContext(r.Context()); err != nil {
 			slog.Error("mesh ui: reloading the graph failed", "error", err)
 			http.Error(w, "reindex failed", http.StatusInternalServerError)
 			return
@@ -390,26 +435,16 @@ func (s *Server) handleReindex(w http.ResponseWriter, r *http.Request) {
 			out["warning"] = ownerDownNote
 		}
 	} else {
-		// This server owns the index: apply anything a reader queued, then reindex.
-		if _, err := s.store.DrainOps(); err != nil {
-			slog.Warn("mesh ui: could not drain the owner op queue", "error", err)
-		}
-		g, err := index.Reindex(s.store, s.vaultRoot)
-		if err != nil {
+		// This server owns the index: apply anything a reader queued, then serialize
+		// the complete rebuild through publication of its in-memory graph.
+		if err := s.reindexAndPublish(r.Context(), true); err != nil {
 			http.Error(w, "reindex failed", http.StatusInternalServerError)
 			return
 		}
-		// Swap the graph and drop the cached retriever in ONE exclusive critical section,
-		// so a retriever build that is in flight cannot publish a retriever over the old
-		// graph after we cleared the cache (see Server.retriever).
-		s.mu.Lock()
-		s.graph = g
-		s.cachedRetriever.Store(nil) // rebuild over the fresh graph on the next search
-		s.mu.Unlock()
 	}
-	notes, _ := s.store.Count("notes")
-	nodes, _ := s.store.Count("nodes")
-	edges, _ := s.store.Count("edges")
+	notes, _ := s.store.CountContext(r.Context(), "notes")
+	nodes, _ := s.store.CountContext(r.Context(), "nodes")
+	edges, _ := s.store.CountContext(r.Context(), "edges")
 	out["counts"] = map[string]int{"notes": notes, "nodes": nodes, "edges": edges}
 	writeJSON(w, out)
 }

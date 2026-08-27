@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"sort"
 	"time"
@@ -20,12 +21,20 @@ import (
 // measured. Idempotent: re-writing the same id keeps the original authored_at (the
 // flywheel cares about when the knowledge first existed). Best-effort at call sites.
 func (s *Store) RecordWriteback(noteID, source string) error {
+	return s.RecordWritebackContext(context.Background(), noteID, source)
+}
+
+// RecordWritebackContext is RecordWriteback with a caller-owned transaction lifetime.
+func (s *Store) RecordWritebackContext(ctx context.Context, noteID, source string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if noteID == "" {
 		return nil
 	}
 	now := time.Now().Unix()
-	return s.Write(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
+	return s.WriteContext(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
 			`INSERT INTO note_reuse(note_id, authored_at, source) VALUES(?,?,?)
 			 ON CONFLICT(note_id) DO NOTHING`,
 			noteID, now, source)
@@ -39,9 +48,15 @@ func (s *Store) RecordWriteback(noteID, source string) error {
 // note's mtime as authoring time, which makes any later fetch of an old note count as
 // genuine cross-session reuse. Returns the number of notes newly tracked.
 func (s *Store) BackfillWritebacks() (int, error) {
+	return s.BackfillWritebacksContext(context.Background())
+}
+
+// BackfillWritebacksContext is BackfillWritebacks with a caller-owned transaction
+// lifetime.
+func (s *Store) BackfillWritebacksContext(ctx context.Context) (int, error) {
 	var n int
-	err := s.Write(func(tx *sql.Tx) error {
-		res, e := tx.Exec(
+	err := s.WriteContext(ctx, func(tx *sql.Tx) error {
+		res, e := tx.ExecContext(ctx,
 			`INSERT INTO note_reuse(note_id, authored_at, source)
 			   SELECT id, mtime, source FROM notes WHERE source = 'agent'
 			 ON CONFLICT(note_id) DO NOTHING`)
@@ -113,9 +128,17 @@ type FlywheelStats struct {
 
 // FlywheelStats computes the reuse picture from note_reuse plus the usage counters.
 func (s *Store) FlywheelStats() (FlywheelStats, error) {
+	return s.FlywheelStatsContext(context.Background())
+}
+
+// FlywheelStatsContext is FlywheelStats with caller-controlled cancellation.
+func (s *Store) FlywheelStatsContext(ctx context.Context) (FlywheelStats, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var st FlywheelStats
-	s.flushTelemetry() // reporting surface: include reuse events not yet flushed
-	if err := s.readDB.QueryRow(
+	s.flushReportingTelemetryContext(ctx) // reporting surface: include reuse events not yet flushed
+	if err := s.readDB.QueryRowContext(ctx,
 		`SELECT count(*),
 		        count(first_reuse),
 		        COALESCE(sum(reuse_count),0)
@@ -127,7 +150,7 @@ func (s *Store) FlywheelStats() (FlywheelStats, error) {
 	}
 
 	// Median time-to-first-reuse, in hours, over the notes that were reused.
-	rows, err := s.readDB.Query(
+	rows, err := s.readDB.QueryContext(ctx,
 		`SELECT (first_reuse - authored_at) FROM note_reuse
 		  WHERE first_reuse IS NOT NULL AND first_reuse >= authored_at`)
 	if err != nil {
@@ -156,9 +179,18 @@ func (s *Store) FlywheelStats() (FlywheelStats, error) {
 
 	// Input health: write-backs per 100 reads (queries + fetches). A flywheel with a
 	// healthy reuse rate but near-zero input is still starved.
-	q, _ := s.Metric("queries")
-	f, _ := s.Metric("fetches")
-	wr, _ := s.Metric("writes")
+	q, _ := s.MetricContext(ctx, "queries")
+	if err := ctx.Err(); err != nil {
+		return st, err
+	}
+	f, _ := s.MetricContext(ctx, "fetches")
+	if err := ctx.Err(); err != nil {
+		return st, err
+	}
+	wr, _ := s.MetricContext(ctx, "writes")
+	if err := ctx.Err(); err != nil {
+		return st, err
+	}
 	if reads := q + f; reads > 0 {
 		st.WritesPer100Reads = float64(wr) / float64(reads) * 100
 	}

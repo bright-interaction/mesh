@@ -37,6 +37,10 @@ type Store struct {
 	done     chan struct{}
 	wg       sync.WaitGroup // tracks the writer goroutine so Close can join it
 	readOnly bool           // true for OpenReadOnly: no writer goroutine, Write always fails
+	// opsDrainGate serializes queue consumers without making cancellation wait behind a
+	// filesystem/SQLite drain already in progress. DrainOpsContext holds the sole token
+	// from listing the queue through effect commit and file removal.
+	opsDrainGate chan struct{}
 
 	closeOnce sync.Once // Close is idempotent: a second close(s.done) would panic
 	closeErr  error     // the first Close's result, replayed to later callers
@@ -110,6 +114,7 @@ type reuseEvent struct {
 const SchemaVersion = 7
 
 type job struct {
+	ctx   context.Context
 	fn    func(*sql.Tx) error
 	reply chan error
 }
@@ -140,6 +145,10 @@ const (
 	// never meaningfully behind, long enough that a burst of fetches costs one write
 	// instead of three per request.
 	telemetryFlushInterval = 2 * time.Second
+	// Telemetry is explicitly best-effort. A periodic or final flush must not keep the
+	// writer (and therefore Store.Close) behind a contended SQLite writer for the normal
+	// 30-second transaction patience.
+	telemetryFlushTimeout = time.Second
 )
 
 const (
@@ -148,6 +157,12 @@ const (
 	// is a whole-vault write transaction (nodes + edges + note_code_links are rewritten
 	// wholesale even for one edited note), so seconds of waiting is normal and correct.
 	busyTimeoutMS = 30000
+	// writeBusyPollMS slices schema and write-transaction lock waits so a canceled owning
+	// server does not inherit the full 30-second SQLite busy handler. modernc SQLite does
+	// not interrupt an active busy handler when ExecContext/BeginTx's context is canceled;
+	// one 100ms attempt followed by a ctx check is the bounded substitute. Background
+	// callers retry for busyTimeoutMS in total, preserving the legacy patience.
+	writeBusyPollMS = 100
 	// checkpointBusyTimeoutMS is the patience of the best-effort TRUNCATE checkpoint,
 	// and of nothing else. Short on purpose so a contended vault costs one skipped tick
 	// instead of stalling the writer. It is applied on the checkpoint's OWN connection;
@@ -165,6 +180,11 @@ const (
 )
 
 func dsn(path string) string { return dsnBusy(path, busyTimeoutMS) }
+
+// dsnWrite reserves SQLite's write lock when BeginTx starts, before a transaction
+// callback is invoked. A busy result is therefore safe to retry: no callback state or
+// SQL work has run yet. Its short busy handler is paired with runTxContext's retry loop.
+func dsnWrite(path string) string { return dsnBusy(path, writeBusyPollMS) + "&_txlock=immediate" }
 
 // dsnBusy is dsn with an explicit busy_timeout, so a connection that wants a different
 // patience gets it in its DSN rather than by running a PRAGMA on a shared pool.
@@ -209,21 +229,45 @@ func Open(vaultRoot string) (*Store, error) {
 // OpenOwned holds owner's cross-process lease across writable Open and installs the
 // same lease on every later Store transaction before takeover can proceed.
 func OpenOwned(vaultRoot string, owner *OwnerLock) (*Store, error) {
-	return openOwnedWithHook(vaultRoot, owner, nil)
+	return OpenOwnedContext(context.Background(), vaultRoot, owner)
+}
+
+// OpenOwnedContext is OpenOwned with a caller-owned schema-open lifetime. It is the
+// startup path for declared long-lived owners: cancellation interrupts SQLite's
+// BEGIN IMMEDIATE/busy wait instead of inheriting the DSN's 30-second timeout after the
+// owner claim has already been published.
+func OpenOwnedContext(ctx context.Context, vaultRoot string, owner *OwnerLock) (*Store, error) {
+	return openOwnedWithHookContext(ctx, vaultRoot, owner, nil)
 }
 
 // openOwnedWithHook is OpenOwned with a deterministic test seam after the lease is
 // acquired and before schema open begins.
 func openOwnedWithHook(vaultRoot string, owner *OwnerLock, afterLease func()) (*Store, error) {
+	return openOwnedWithHookContext(context.Background(), vaultRoot, owner, afterLease)
+}
+
+func openOwnedWithHookContext(ctx context.Context, vaultRoot string, owner *OwnerLock, afterLease func()) (*Store, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	release, ok := owner.acquireLease()
 	if !ok {
 		return nil, ErrReadOnly
 	}
 	defer release()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if afterLease != nil {
 		afterLease()
 	}
-	store, err := openAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"), true)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	store, err := openAtContext(ctx, vaultRoot, filepath.Join(vaultRoot, ".mesh"), true)
 	if err != nil {
 		return nil, err
 	}
@@ -374,6 +418,16 @@ func openUnownedAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, 
 }
 
 func openAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) {
+	return openAtContext(context.Background(), vaultRoot, meshDir, allowSchemaRebuild)
+}
+
+func openAtContext(ctx context.Context, vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// The same 0700 treatment Open gets, because this is the OTHER entry point that
 	// creates the directory. It used to MkdirAll at 0755 and never narrow: harmless
 	// when reached via Open (which has already created the dir, making this call a
@@ -381,6 +435,9 @@ func openAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) 
 	// hub indexing the served vault. That index holds the full text of every note in
 	// the team vault, so on a shared box it was world-traversable.
 	if err := ensureVaultMeshDir(meshDir); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	dbPath := filepath.Join(meshDir, "mesh.db")
@@ -399,7 +456,7 @@ func openAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) 
 		_ = ensureVaultMeshDir(meshDir)
 	}
 
-	writeDB, err := sql.Open("sqlite", dsn(dbPath))
+	writeDB, err := sql.Open("sqlite", dsnWrite(dbPath))
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +468,7 @@ func openAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) 
 		return nil, err
 	}
 
-	if err := ensureSchemaChecked(writeDB, allowSchemaRebuild, dbExisted); err != nil {
+	if err := ensureSchemaCheckedContext(ctx, writeDB, allowSchemaRebuild, dbExisted); err != nil {
 		writeDB.Close()
 		readDB.Close()
 		if isUnreadableDB(err) {
@@ -424,12 +481,13 @@ func openAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) 
 	}
 
 	s := &Store{
-		dir:     meshDir,
-		dbPath:  dbPath,
-		writeDB: writeDB,
-		readDB:  readDB,
-		jobs:    make(chan job),
-		done:    make(chan struct{}),
+		dir:          meshDir,
+		dbPath:       dbPath,
+		writeDB:      writeDB,
+		readDB:       readDB,
+		jobs:         make(chan job),
+		done:         make(chan struct{}),
+		opsDrainGate: newOpsDrainGate(),
 	}
 	s.wg.Add(1)
 	go s.writer()
@@ -518,11 +576,12 @@ func OpenReadOnlyAt(vaultRoot, meshDir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:      meshDir,
-		dbPath:   dbPath,
-		readDB:   readDB,
-		readOnly: true,
-		done:     make(chan struct{}),
+		dir:          meshDir,
+		dbPath:       dbPath,
+		readDB:       readDB,
+		readOnly:     true,
+		done:         make(chan struct{}),
+		opsDrainGate: newOpsDrainGate(),
 	}
 	// Usage counters still have to reach the index. They are the flywheel measurement
 	// (queries, fetches, note reuse), and after the single-writer split the only
@@ -892,7 +951,11 @@ func (s *Store) CheckIntegrity(vaultRoot string) error {
 // The message below stays regardless: the error said "database is locked" and left the
 // operator guessing, so it names the processes that plausibly hold it and what to do.
 func ensureSchemaChecked(db *sql.DB, allowRebuild, dbExisted bool) error {
-	err := ensureSchema(db, allowRebuild, dbExisted)
+	return ensureSchemaCheckedContext(context.Background(), db, allowRebuild, dbExisted)
+}
+
+func ensureSchemaCheckedContext(ctx context.Context, db *sql.DB, allowRebuild, dbExisted bool) error {
+	err := ensureSchemaContext(ctx, db, allowRebuild, dbExisted)
 	if !isBusy(err) {
 		return err
 	}
@@ -1007,18 +1070,67 @@ func invalidKeptTables(ctx context.Context, db schemaConnection) ([]string, erro
 // half the index dropped. BEGIN IMMEDIATE also prevents two openers from both deciding
 // to migrate from the same stale version.
 func ensureSchema(db *sql.DB, allowRebuild, dbExisted bool) error {
-	return ensureSchemaSQL(db, allowRebuild, dbExisted, SchemaSQL)
+	return ensureSchemaContext(context.Background(), db, allowRebuild, dbExisted)
+}
+
+func ensureSchemaContext(ctx context.Context, db *sql.DB, allowRebuild, dbExisted bool) error {
+	return ensureSchemaSQLContext(ctx, db, allowRebuild, dbExisted, SchemaSQL)
 }
 
 // ensureSchemaSQL is split out so the atomicity test can append one deliberately
 // failing final statement and prove every earlier DDL statement is rolled back.
 func ensureSchemaSQL(db *sql.DB, allowRebuild, dbExisted bool, schemaSQL string) (err error) {
-	ctx := context.Background()
+	return ensureSchemaSQLContext(context.Background(), db, allowRebuild, dbExisted, schemaSQL)
+}
+
+func ensureSchemaSQLContext(ctx context.Context, db *sql.DB, allowRebuild, dbExisted bool, schemaSQL string) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	// A long SQLite busy handler ignores context cancellation in modernc SQLite. Override
+	// it on this dedicated connection while schema work runs, then restore whatever the
+	// pool configured before returning the connection. openAt's writer already uses the
+	// short value; standalone schema tests and legacy callers can still use a 30s DSN.
+	var originalBusyMS int
+	if err = conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&originalBusyMS); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", writeBusyPollMS)); err != nil {
+		return err
+	}
+	defer func() {
+		_, resetErr := conn.ExecContext(context.Background(), fmt.Sprintf("PRAGMA busy_timeout=%d", originalBusyMS))
+		if resetErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore schema busy timeout: %w", resetErr))
+		}
+	}()
+
+	busyDeadline := time.Now().Add(time.Duration(busyTimeoutMS) * time.Millisecond)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err = ensureSchemaAttempt(ctx, conn, allowRebuild, dbExisted, schemaSQL)
+		if err == nil || !isBusy(err) {
+			return err
+		}
+		if time.Now().After(busyDeadline) {
+			return err
+		}
+	}
+}
+
+// ensureSchemaAttempt performs one atomic schema transaction. A busy result is safe to
+// retry because every unsuccessful attempt rolls back before returning.
+func ensureSchemaAttempt(ctx context.Context, conn *sql.Conn, allowRebuild, dbExisted bool, schemaSQL string) (err error) {
 	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
@@ -1317,14 +1429,19 @@ func (s *Store) writer() {
 		case <-s.done:
 			return
 		case j := <-s.jobs:
-			j.reply <- s.runTx(j.fn)
+			j.reply <- s.runTxContext(j.ctx, j.fn)
 		case <-telTicker.C:
 			if !s.canWrite() {
 				s.queueTelemetry()
-			} else if fn, ok := s.drainTelemetry(); ok {
-				if err := s.runTx(fn); err != nil {
-					slog.Warn("mesh: telemetry flush failed; this batch of counters is lost", "err", err)
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
+				fn, ok := s.drainTelemetryContext(ctx)
+				if ok {
+					if err := s.runTxContext(ctx, fn); err != nil {
+						slog.Warn("mesh: telemetry flush failed; this batch of counters is lost", "err", err)
+					}
 				}
+				cancel()
 			}
 		case <-ticker.C:
 			release, ok, _ := s.acquireWriteAuthorization()
@@ -1354,13 +1471,27 @@ func (s *Store) writer() {
 	}
 }
 
-func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
+func (s *Store) runTx(fn func(*sql.Tx) error) error {
+	return s.runTxContext(context.Background(), fn)
+}
+
+// runTxContext is runTx with a caller-owned lifetime. BeginTx ties the transaction
+// to ctx, so cancellation rolls it back even after the writer goroutine accepted the
+// job. The callback should still use the context-aware SQL methods for prompt
+// interruption of a statement that is already running.
+func (s *Store) runTxContext(ctx context.Context, fn func(*sql.Tx) error) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	release, ok, linearized := s.acquireWriteAuthorization()
 	if !ok {
 		return ErrReadOnly
 	}
 	defer release()
-	tx, err := s.writeDB.Begin()
+	tx, err := s.beginWriteTxContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -1382,6 +1513,9 @@ func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
 	if err = fn(tx); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// A preemptible claim may have been taken while fn was running (a full reindex can
 	// take seconds). Roll the work back instead of committing beside the new owner.
 	if !linearized && !s.canWrite() {
@@ -1390,19 +1524,65 @@ func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
 	return tx.Commit()
 }
 
+// beginWriteTxContext acquires SQLite's write reservation in short, cancelable slices.
+// writeDB uses _txlock=immediate, so BeginTx either owns the write lock or returns busy
+// before fn runs. Retrying is therefore side-effect free. Background wrappers retain
+// the historical aggregate patience; request contexts can stop between slices.
+func (s *Store) beginWriteTxContext(ctx context.Context) (*sql.Tx, error) {
+	deadline := time.Now().Add(time.Duration(busyTimeoutMS) * time.Millisecond)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		tx, err := s.writeDB.BeginTx(ctx, nil)
+		if err == nil {
+			return tx, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if !isBusy(err) || !time.Now().Before(deadline) {
+			return nil, err
+		}
+	}
+}
+
 // Write runs fn inside a transaction on the single writer goroutine. On a Store opened
 // with OpenReadOnly this fails loudly with ErrReadOnly instead of blocking: s.jobs is
 // nil on a read-only store (there is no writer goroutine to receive from it), and
 // sending on a nil channel blocks forever, so this check must run BEFORE the select,
 // not be left to fall out of it.
 func (s *Store) Write(fn func(*sql.Tx) error) error {
-	if !s.canWrite() {
+	return s.WriteContext(context.Background(), fn)
+}
+
+// WriteContext runs fn on the single writer with a caller-owned lifetime. It can be
+// canceled while waiting to hand the job to the writer. Once the writer accepts a job,
+// this method joins its callback and returns the transaction's actual result. The
+// context is bound to BeginTx, so cancellation rolls the transaction back promptly;
+// joining is load-bearing because callers commonly capture result counters in fn, and
+// returning while fn can still mutate them would be a data race.
+func (s *Store) WriteContext(ctx context.Context, fn func(*sql.Tx) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// A physically read-only store has no writer goroutine and a nil jobs channel, so it
+	// must fail before the select. A writable-but-preempted store still has a writer;
+	// let runTxContext perform the live ownership check there. Calling canWrite here
+	// would wait on the ownership lease held by an in-flight transaction and make ctx
+	// unable to cancel a queued write.
+	if s.readOnly {
 		return ErrReadOnly
 	}
 	reply := make(chan error, 1)
 	select {
-	case s.jobs <- job{fn: fn, reply: reply}:
+	case s.jobs <- job{ctx: ctx, fn: fn, reply: reply}:
 		return <-reply
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.done:
 		return fmt.Errorf("store is closed")
 	}
@@ -1432,6 +1612,10 @@ func (s *Store) recordTelemetry(key string, n int64, reuse *reuseEvent) {
 // the trade is that a failed flush loses that batch, which is acceptable for counters
 // that are best-effort at every call site anyway.
 func (s *Store) drainTelemetry() (func(*sql.Tx) error, bool) {
+	return s.drainTelemetryContext(context.Background())
+}
+
+func (s *Store) drainTelemetryContext(ctx context.Context) (func(*sql.Tx) error, bool) {
 	s.telMu.Lock()
 	counts, reuses := s.telCount, s.telReuse
 	s.telCount, s.telReuse = nil, nil
@@ -1446,7 +1630,7 @@ func (s *Store) drainTelemetry() (func(*sql.Tx) error, bool) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return telemetryTx(keys, counts, reuses), true
+	return telemetryTxContext(ctx, keys, counts, reuses), true
 }
 
 // telemetryTx is the transaction that applies one batch of counters. Factored out
@@ -1455,16 +1639,26 @@ func (s *Store) drainTelemetry() (func(*sql.Tx) error, bool) {
 // apply identically, or the same fetch would count differently depending on which
 // process observed it.
 func telemetryTx(keys []string, counts map[string]int64, reuses []reuseEvent) func(*sql.Tx) error {
+	return telemetryTxContext(context.Background(), keys, counts, reuses)
+}
+
+func telemetryTxContext(ctx context.Context, keys []string, counts map[string]int64, reuses []reuseEvent) func(*sql.Tx) error {
 	return func(tx *sql.Tx) error {
 		for _, k := range keys {
-			if _, err := tx.Exec(
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO metrics(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=value+excluded.value`,
 				k, counts[k]); err != nil {
 				return err
 			}
 		}
 		for _, r := range reuses {
-			if _, err := tx.Exec(
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
 				`UPDATE note_reuse
 				    SET reuse_count = reuse_count + 1,
 				        first_reuse = COALESCE(first_reuse, ?),
@@ -1519,10 +1713,23 @@ func (s *Store) queueTelemetry() {
 	}
 }
 
-// flushTelemetry writes any pending counters now, from the CALLER's goroutine (via the
-// jobs channel). Read paths never call it; the reporting surfaces do, so a dashboard or
-// a test reads a consistent picture instead of one that lags the flush ticker.
+// flushTelemetry writes pending counters from the CALLER's goroutine (via the jobs
+// channel), but only within telemetryFlushTimeout. Reporting surfaces prefer a current
+// picture; best-effort counters never justify pinning an admitted request or shutdown
+// behind SQLite's ordinary 30-second write patience.
 func (s *Store) flushTelemetry() {
+	ctx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
+	defer cancel()
+	s.flushTelemetryContext(ctx)
+}
+
+func (s *Store) flushTelemetryContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	if !s.canWrite() {
 		// Same intent, the only route available: hand the batch to the owning writer now
 		// rather than at the next tick. Going through Write here would fail with
@@ -1531,11 +1738,11 @@ func (s *Store) flushTelemetry() {
 		s.queueTelemetry()
 		return
 	}
-	fn, ok := s.drainTelemetry()
+	fn, ok := s.drainTelemetryContext(ctx)
 	if !ok {
 		return
 	}
-	if err := s.Write(fn); err != nil {
+	if err := s.WriteContext(ctx, fn); err != nil {
 		slog.Warn("mesh: telemetry flush failed; this batch of counters is lost", "err", err)
 	}
 }
@@ -1543,8 +1750,16 @@ func (s *Store) flushTelemetry() {
 // Count returns the row count of a table (read pool). The table name is a fixed
 // internal identifier, never user input.
 func (s *Store) Count(table string) (int, error) {
+	return s.CountContext(context.Background(), table)
+}
+
+// CountContext is Count with caller-controlled cancellation.
+func (s *Store) CountContext(ctx context.Context, table string) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var n int
-	err := s.readDB.QueryRow("SELECT count(*) FROM " + table).Scan(&n)
+	err := s.readDB.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&n)
 	return n, err
 }
 
@@ -1577,7 +1792,9 @@ func (s *Store) shutdown() error {
 	}
 	// Land the last batch of in-memory telemetry while the writer is still serving:
 	// after close(s.done) every Write returns "store is closed".
-	s.flushTelemetry()
+	telemetryCtx, cancelTelemetry := context.WithTimeout(context.Background(), telemetryFlushTimeout)
+	s.flushTelemetryContext(telemetryCtx)
+	cancelTelemetry()
 	close(s.done)
 	s.wg.Wait()
 	// The writer has drained, so a clean shutdown is the safe moment to TRUNCATE the WAL

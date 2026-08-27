@@ -3,7 +3,10 @@
 
 package graph
 
-import "sort"
+import (
+	"context"
+	"sort"
+)
 
 // resolution is the modularity resolution parameter. 1.0 is standard modularity;
 // higher values bias toward smaller communities. It is the principled knob for the
@@ -21,6 +24,18 @@ const resolution = 1.0
 // improve. maxRounds caps the local-moving passes per level (default 20). Returns
 // the number of communities.
 func (g *Graph) DetectCommunities(maxRounds int) int {
+	n, _ := g.DetectCommunitiesContext(context.Background(), maxRounds)
+	return n
+}
+
+// DetectCommunitiesContext is DetectCommunities with cooperative cancellation. The
+// Louvain pass builds its result in private slices; node community values are published
+// only after the full partition and heading inheritance have completed, so an error
+// leaves the graph exactly as it was at entry.
+func (g *Graph) DetectCommunitiesContext(ctx context.Context, maxRounds int) (int, error) {
+	if err := contextCause(ctx); err != nil {
+		return 0, err
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if maxRounds <= 0 {
@@ -37,27 +52,42 @@ func (g *Graph) DetectCommunities(maxRounds int) int {
 	ids := make([]string, 0, len(g.nodes))
 	var headings []*Node
 	for id, n := range g.nodes {
+		if err := contextCause(ctx); err != nil {
+			return 0, err
+		}
 		if n.Kind == "heading" {
 			headings = append(headings, n)
 			continue
 		}
 		ids = append(ids, id)
 	}
+	if err := contextCause(ctx); err != nil {
+		return 0, err
+	}
 	sort.Strings(ids)
 	// Sort headings too: the orphan fallback below assigns ids in slice order, and
 	// the slice was built from a map range (random order), so without this two
 	// orphan headings could swap community ids across runs (breaks determinism).
 	sort.Slice(headings, func(i, j int) bool { return headings[i].ID < headings[j].ID })
+	if err := contextCause(ctx); err != nil {
+		return 0, err
+	}
 	if len(ids) == 0 {
 		// Unreachable via the real parse pipeline: a heading is only ever added after
 		// its parent note (a cluster node), so a non-empty graph always has >=1
 		// cluster node. Only a hand-built all-headings graph hits this; such headings
 		// keep Community 0, which no consumer reads (all exclude headings).
-		return 0
+		return 0, nil
 	}
 
-	a := g.buildAdjacency(ids)
-	comm := a.louvain(maxRounds)
+	a, err := g.buildAdjacencyContext(ctx, ids)
+	if err != nil {
+		return 0, err
+	}
+	comm, err := a.louvainContext(ctx, maxRounds)
+	if err != nil {
+		return 0, err
+	}
 
 	// Renumber to contiguous ids ordered by each community's smallest member id.
 	// ids is sorted, so index order is smallest-id order: the first index seen for
@@ -65,26 +95,69 @@ func (g *Graph) DetectCommunities(maxRounds int) int {
 	remap := make(map[int]int, len(ids))
 	next := 0
 	for i := range ids {
+		if err := contextCause(ctx); err != nil {
+			return 0, err
+		}
 		if _, ok := remap[comm[i]]; !ok {
 			remap[comm[i]] = next
 			next++
 		}
 	}
-	for i, id := range ids {
-		g.nodes[id].Community = remap[comm[i]]
-	}
 
 	// Headings inherit their parent note's community; an orphan heading (parent not
 	// in the graph) gets its own community so it is never silently lumped into 0.
+	type communityUpdate struct {
+		n            *Node
+		oldCommunity int
+		newCommunity int
+	}
+	updates := make([]communityUpdate, 0, len(ids)+len(headings))
+	communityByID := make(map[string]int, len(ids))
+	for i, id := range ids {
+		if err := contextCause(ctx); err != nil {
+			return 0, err
+		}
+		community := remap[comm[i]]
+		communityByID[id] = community
+		updates = append(updates, communityUpdate{
+			n: g.nodes[id], oldCommunity: g.nodes[id].Community, newCommunity: community,
+		})
+	}
 	for _, h := range headings {
+		if err := contextCause(ctx); err != nil {
+			return 0, err
+		}
 		if parent, ok := g.nodes["note:"+h.NoteID]; ok {
-			h.Community = parent.Community
+			community, found := communityByID[parent.ID]
+			if !found {
+				community = parent.Community
+			}
+			updates = append(updates, communityUpdate{n: h, oldCommunity: h.Community, newCommunity: community})
 		} else {
-			h.Community = next
+			updates = append(updates, communityUpdate{n: h, oldCommunity: h.Community, newCommunity: next})
 			next++
 		}
 	}
-	return next
+	if err := contextCause(ctx); err != nil {
+		return 0, err
+	}
+	rollback := func(n int) {
+		for i := 0; i < n; i++ {
+			updates[i].n.Community = updates[i].oldCommunity
+		}
+	}
+	for i, update := range updates {
+		if err := contextCause(ctx); err != nil {
+			rollback(i)
+			return 0, err
+		}
+		update.n.Community = update.newCommunity
+	}
+	if err := contextCause(ctx); err != nil {
+		rollback(len(updates))
+		return 0, err
+	}
+	return next, nil
 }
 
 // adjacency is an undirected, weighted view of the graph keyed by a dense node
@@ -101,8 +174,19 @@ type adjacency struct {
 }
 
 func (g *Graph) buildAdjacency(ids []string) *adjacency {
+	a, _ := g.buildAdjacencyContext(context.Background(), ids)
+	return a
+}
+
+func (g *Graph) buildAdjacencyContext(ctx context.Context, ids []string) (*adjacency, error) {
+	if err := contextCause(ctx); err != nil {
+		return nil, err
+	}
 	idx := make(map[string]int, len(ids))
 	for i, id := range ids {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		idx[id] = i
 	}
 	a := &adjacency{
@@ -112,13 +196,22 @@ func (g *Graph) buildAdjacency(ids []string) *adjacency {
 		k:    make([]float64, len(ids)),
 	}
 	for i := range a.adj {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		a.adj[i] = map[int]float64{}
 	}
 	// Each directed edge is stored once in g.adj[source], so iterating it visits
 	// every edge exactly once; fold it into the symmetric undirected weight.
 	for _, src := range ids {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		u := idx[src]
 		for _, e := range g.adj[src] {
+			if err := contextCause(ctx); err != nil {
+				return nil, err
+			}
 			v, ok := idx[e.Target]
 			if !ok {
 				continue // edge to a node not in the set (defensive)
@@ -136,31 +229,54 @@ func (g *Graph) buildAdjacency(ids []string) *adjacency {
 		}
 	}
 	for i := 0; i < a.n; i++ {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		sum := 2 * a.self[i]
 		for _, w := range a.adj[i] {
+			if err := contextCause(ctx); err != nil {
+				return nil, err
+			}
 			sum += w
 		}
 		a.k[i] = sum
 		a.twoM += sum
 	}
-	return a
+	return a, nil
 }
 
 // louvain returns a community label per node index. It runs local moving then
 // aggregation, repeating across levels until a level merges nothing.
 func (a *adjacency) louvain(maxRounds int) []int {
+	comm, _ := a.louvainContext(context.Background(), maxRounds)
+	return comm
+}
+
+func (a *adjacency) louvainContext(ctx context.Context, maxRounds int) ([]int, error) {
+	if err := contextCause(ctx); err != nil {
+		return nil, err
+	}
 	// orig2node maps an original node index to its node in the current (possibly
 	// aggregated) level graph; comm accumulates the final community per orig node.
 	orig2node := make([]int, a.n)
 	for i := range orig2node {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		orig2node[i] = i
 	}
 	level := a
 	for {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		if level.twoM == 0 {
 			break // no edges: every node stays in its own community
 		}
-		comm, merged := level.localMoving(maxRounds)
+		comm, merged, err := level.localMovingContext(ctx, maxRounds)
+		if err != nil {
+			return nil, err
+		}
 		if !merged {
 			break
 		}
@@ -169,42 +285,66 @@ func (a *adjacency) louvain(maxRounds int) []int {
 		relabel := map[int]int{}
 		next := 0
 		for _, c := range comm {
+			if err := contextCause(ctx); err != nil {
+				return nil, err
+			}
 			if _, ok := relabel[c]; !ok {
 				relabel[c] = next
 				next++
 			}
 		}
 		for i := range orig2node {
+			if err := contextCause(ctx); err != nil {
+				return nil, err
+			}
 			orig2node[i] = relabel[comm[orig2node[i]]]
 		}
 		if next == level.n {
 			break // no reduction; converged
 		}
-		level = level.aggregate(comm, relabel, next)
+		level, err = level.aggregateContext(ctx, comm, relabel, next)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return orig2node
+	return orig2node, nil
 }
 
 // localMoving runs the greedy phase: each node (in index order) is moved to the
 // neighbor community that most increases modularity, until a pass moves nothing.
 // Returns the per-node community and whether any node ended up merged with another.
-func (a *adjacency) localMoving(maxRounds int) (comm []int, merged bool) {
+func (a *adjacency) localMovingContext(ctx context.Context, maxRounds int) (comm []int, merged bool, err error) {
+	if err := contextCause(ctx); err != nil {
+		return nil, false, err
+	}
 	comm = make([]int, a.n)
 	commTot := make([]float64, a.n) // Sigma-tot per community (indexed by community id)
 	for i := 0; i < a.n; i++ {
+		if err := contextCause(ctx); err != nil {
+			return nil, false, err
+		}
 		comm[i] = i
 		commTot[i] = a.k[i]
 	}
 	const eps = 1e-12
 	for round := 0; round < maxRounds; round++ {
+		if err := contextCause(ctx); err != nil {
+			return nil, false, err
+		}
 		moved := false
 		for i := 0; i < a.n; i++ {
+			if err := contextCause(ctx); err != nil {
+				return nil, false, err
+			}
 			ci := comm[i]
 			commTot[ci] -= a.k[i] // remove i from its community
 
 			// Sum edge weight from i into each neighbor community.
 			into := map[int]float64{}
 			for j, w := range a.adj[i] {
+				if err := contextCause(ctx); err != nil {
+					return nil, false, err
+				}
 				into[comm[j]] += w
 			}
 			// Candidate order is deterministic; start by staying in ci, and only a
@@ -213,10 +353,19 @@ func (a *adjacency) localMoving(maxRounds int) (comm []int, merged bool) {
 			bestGain := into[ci] - resolution*commTot[ci]*a.k[i]/a.twoM
 			cands := make([]int, 0, len(into))
 			for c := range into {
+				if err := contextCause(ctx); err != nil {
+					return nil, false, err
+				}
 				cands = append(cands, c)
 			}
 			sort.Ints(cands)
+			if err := contextCause(ctx); err != nil {
+				return nil, false, err
+			}
 			for _, c := range cands {
+				if err := contextCause(ctx); err != nil {
+					return nil, false, err
+				}
 				gain := into[c] - resolution*commTot[c]*a.k[i]/a.twoM
 				if gain > bestGain+eps {
 					best, bestGain = c, gain
@@ -234,13 +383,16 @@ func (a *adjacency) localMoving(maxRounds int) (comm []int, merged bool) {
 			break
 		}
 	}
-	return comm, merged
+	return comm, merged, nil
 }
 
 // aggregate builds the level-up graph: one super-node per community (already
 // compacted to 0..count-1 by relabel), with edges summed and intra-community
 // weight folded into super self-loops.
-func (a *adjacency) aggregate(comm []int, relabel map[int]int, count int) *adjacency {
+func (a *adjacency) aggregateContext(ctx context.Context, comm []int, relabel map[int]int, count int) (*adjacency, error) {
+	if err := contextCause(ctx); err != nil {
+		return nil, err
+	}
 	super := &adjacency{
 		n:    count,
 		adj:  make([]map[int]float64, count),
@@ -249,12 +401,21 @@ func (a *adjacency) aggregate(comm []int, relabel map[int]int, count int) *adjac
 		twoM: a.twoM, // total weight is invariant under aggregation
 	}
 	for i := range super.adj {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		super.adj[i] = map[int]float64{}
 	}
 	for i := 0; i < a.n; i++ {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		ci := relabel[comm[i]]
 		super.self[ci] += a.self[i]
 		for j, w := range a.adj[i] {
+			if err := contextCause(ctx); err != nil {
+				return nil, err
+			}
 			cj := relabel[comm[j]]
 			if ci == cj {
 				// Intra-community edge: each unordered pair is seen twice (i->j and
@@ -266,13 +427,19 @@ func (a *adjacency) aggregate(comm []int, relabel map[int]int, count int) *adjac
 		}
 	}
 	for i := 0; i < super.n; i++ {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		sum := 2 * super.self[i]
 		for _, w := range super.adj[i] {
+			if err := contextCause(ctx); err != nil {
+				return nil, err
+			}
 			sum += w
 		}
 		super.k[i] = sum
 	}
-	return super
+	return super, nil
 }
 
 // modularity returns the modularity Q of a partition (community label per node

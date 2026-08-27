@@ -143,7 +143,20 @@ type Retriever struct {
 }
 
 func New(store *index.Store, g *graph.Graph) *Retriever {
-	return &Retriever{store: store, graph: g, ranker: g.NewRanker(), rerankBlend: rerankBlendDefault, qvec: map[string][]float32{}}
+	r, _ := NewContext(context.Background(), store, g)
+	return r
+}
+
+// NewContext is New with cooperative cancellation of the graph ranker build.
+func NewContext(ctx context.Context, store *index.Store, g *graph.Graph) (*Retriever, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ranker, err := g.NewRankerContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &Retriever{store: store, graph: g, ranker: ranker, rerankBlend: rerankBlendDefault, qvec: map[string][]float32{}}, nil
 }
 
 // SetWeights sets the fusion-weight defaults used when a retrieval does not pass
@@ -163,12 +176,40 @@ func (r *Retriever) Weights() (fts, graph, vec float64) {
 // both, or neither can be on. Falls back silently to lexical-only when nothing
 // is configured.
 func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
-	r := New(store, g)
-	cfg, _ := meshcfg.LoadConfig(store.MeshDir())
-	r.enableVectors(cfg.Embedding, cfg.Retrieval)
+	r, _ := NewFromEnvContext(context.Background(), store, g)
+	return r
+}
+
+// NewFromEnvContext is NewFromEnv with cancellation threaded through every
+// potentially slow construction stage: ranker statistics, config I/O, vector
+// loading, the embedding dimension probe, and the optional pro HNSW build.
+func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) (*Retriever, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r, err := NewContext(ctx, store, g)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := meshcfg.LoadConfigContext(ctx, store.MeshDir())
+	if err != nil {
+		if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
+			return nil, ctxErr
+		}
+		cfg = meshcfg.Config{} // preserve the legacy lexical-only config fallback
+	}
+	if err := r.enableVectorsContext(ctx, cfg.Embedding, cfg.Retrieval); err != nil {
+		return nil, err
+	}
+	if err := retrieveContextErr(ctx); err != nil {
+		return nil, err
+	}
 	r.enableRerank(cfg.Retrieval)
 	r.loadWeights(cfg.Retrieval)
-	return r
+	if err := retrieveContextErr(ctx); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // loadWeights applies fusion weights, env-first then the solo config file (0 means
@@ -200,16 +241,26 @@ func (r *Retriever) loadWeights(rv meshcfg.Retrieval) {
 // env-first, then the solo .mesh/config.toml (written by `mesh embed`), so a solo
 // dev does not re-export env vars every session. Env always wins.
 func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
+	_ = r.enableVectorsContext(context.Background(), emb, rv)
+}
+
+func (r *Retriever) enableVectorsContext(ctx context.Context, emb meshcfg.Embedding, rv meshcfg.Retrieval) error {
+	if err := retrieveContextErr(ctx); err != nil {
+		return err
+	}
 	endpoint, fromEnv := envOrFile("MESH_EMBED_ENDPOINT", emb.Endpoint)
 	model := envOr("MESH_EMBED_MODEL", emb.Model)
 	if endpoint == "" || model == "" {
-		return
+		return nil
 	}
-	vm, dim, vecs, err := r.store.LoadVectors()
+	vm, dim, vecs, err := r.store.LoadVectorsContext(ctx)
 	if err != nil || len(vecs) == 0 {
-		return
+		if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
+			return ctxErr
+		}
+		return nil
 	}
-	r.queryPrefix = envOr("MESH_EMBED_QUERY_PREFIX", emb.QueryPrefix)
+	queryPrefix := envOr("MESH_EMBED_QUERY_PREFIX", emb.QueryPrefix)
 	// key_env is a POINTER to a process secret, so it is resolved through the closed
 	// allow-list rather than read verbatim: a hand-edited config.toml that never passed
 	// through the web config API must not be able to aim this at MESH_UI_TOKEN and have
@@ -217,10 +268,11 @@ func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
 	keyEnv := meshcfg.ResolveKeyEnv("embedding.key_env", emb.KeyEnv, "MESH_EMBED_KEY")
 	// Optional ANN: build an HNSW index past the threshold (0/unset = brute force,
 	// the default; sub-5ms well past v1 scale). Env wins, then the config file.
+	hnswGate := 0
 	if v, err := strconv.Atoi(os.Getenv("MESH_HNSW_THRESHOLD")); err == nil && v > 0 {
-		r.hnswGate = v
+		hnswGate = v
 	} else if rv.HNSWThreshold > 0 {
-		r.hnswGate = rv.HNSWThreshold
+		hnswGate = rv.HNSWThreshold
 	}
 	// The endpoint's SOURCE picks the HTTP client. From the process environment it is
 	// operator input and may point at a local model server; from config.toml it is
@@ -229,7 +281,15 @@ func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
 	if fromEnv {
 		newEmbedder = embed.NewOperatorHTTP
 	}
-	r.EnableVectors(newEmbedder(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs)
+	ok, err := r.enableVectorsWithGateContext(ctx, newEmbedder(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs, hnswGate)
+	if err != nil {
+		return err
+	}
+	if ok {
+		r.queryPrefix = queryPrefix
+		r.hnswGate = hnswGate
+	}
+	return nil
 }
 
 // envOr returns the env var if set (non-empty), else the fallback.
@@ -426,7 +486,7 @@ type annSearcher interface {
 // buildANN constructs the ANN index from the per-node vectors. nil in the open
 // core (brute-force always); set by the pro build. On any error the caller keeps
 // the brute-force scan, so the ANN path can only speed up, never break, retrieval.
-var buildANN func(byNode map[string][][]float32) (annSearcher, error)
+var buildANN func(context.Context, map[string][][]float32) (annSearcher, error)
 
 // resolveWeights picks the fusion weights: explicit Options weights win; else the
 // learned/operator defaults (SetWeights / env); else the built-in defaults. The
@@ -494,8 +554,30 @@ const maxQvecEntries = 4096
 // than emitting it). storedDim is the vault's recorded width; if it
 // is 0 (old vault, pre-vector_dim) we derive it from the loaded vectors.
 func (r *Retriever) EnableVectors(e embed.Embedder, model string, storedDim int, vecs map[string][][]float32) bool {
+	ok, _ := r.EnableVectorsContext(context.Background(), e, model, storedDim, vecs)
+	return ok
+}
+
+// EnableVectorsContext is EnableVectors with cancellation of dimension probing
+// and optional ANN construction. Receiver fields are published only after the
+// complete activation succeeds.
+func (r *Retriever) EnableVectorsContext(ctx context.Context, e embed.Embedder, model string, storedDim int, vecs map[string][][]float32) (bool, error) {
+	return r.enableVectorsWithGateContext(ctx, e, model, storedDim, vecs, r.hnswGate)
+}
+
+type contextDimmer interface {
+	DimContext(context.Context) (int, error)
+}
+
+func (r *Retriever) enableVectorsWithGateContext(ctx context.Context, e embed.Embedder, model string, storedDim int, vecs map[string][][]float32, hnswGate int) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := retrieveContextErr(ctx); err != nil {
+		return false, err
+	}
 	if e == nil || model == "" || len(vecs) == 0 || e.Model() != model {
-		return false
+		return false, nil
 	}
 	dim := storedDim
 	if dim == 0 {
@@ -511,32 +593,73 @@ func (r *Retriever) EnableVectors(e embed.Embedder, model string, storedDim int,
 	// with vecDim==0, which would disable the per-query length guard and let a
 	// uniform-garbage signal through.
 	if dim == 0 {
-		return false
+		return false, nil
 	}
 	// If the embedder reports a width and it disagrees with the stored width, refuse.
 	// A 0 from Dim() means the probe failed (endpoint down); allow activation and let
 	// the per-query length guard in Retrieve catch any mismatch at retrieval time.
-	if ed := e.Dim(); ed != 0 && ed != dim {
-		return false
+	ed := 0
+	if d, ok := e.(contextDimmer); ok {
+		var err error
+		ed, err = d.DimContext(ctx)
+		if err != nil {
+			if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
+				return false, ctxErr
+			}
+			ed = 0 // legacy behavior: a failed probe activates and fails honestly on query
+		}
+	} else {
+		ed = e.Dim()
 	}
-	r.emb, r.vecModel, r.vecDim, r.vecs = e, model, dim, vecs
+	if err := retrieveContextErr(ctx); err != nil {
+		return false, err
+	}
+	if ed != 0 && ed != dim {
+		return false, nil
+	}
+	var ann annSearcher
 	// Optional ANN index for large vaults (pro build only). Off unless hnswGate is
 	// set AND a buildANN implementation is wired; on any build error the brute-force
 	// scan stays (r.ann nil), so this can only speed up, never break, retrieval.
 	// Built from the same vecs map, so the vectors are identical. In the open core
 	// buildANN is nil, so retrieval is always brute-force cosine.
-	if r.hnswGate > 0 && buildANN != nil {
+	if hnswGate > 0 && buildANN != nil {
 		total := 0
 		for _, chunks := range vecs {
+			if err := retrieveContextErr(ctx); err != nil {
+				return false, err
+			}
 			total += len(chunks)
 		}
-		if total >= r.hnswGate {
-			if ix, err := buildANN(vecs); err == nil {
-				r.ann = ix
+		if total >= hnswGate {
+			ix, err := buildANN(ctx, vecs)
+			if err == nil {
+				ann = ix
+			} else if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
+				return false, ctxErr
 			}
 		}
 	}
-	return true
+	if err := retrieveContextErr(ctx); err != nil {
+		return false, err
+	}
+	r.emb, r.vecModel, r.vecDim, r.vecs, r.ann = e, model, dim, vecs, ann
+	return true, nil
+}
+
+func retrieveContextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 // Retrieve runs the full pipeline and returns ranked (and optionally

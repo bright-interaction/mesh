@@ -3,7 +3,11 @@
 
 package graph
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+)
 
 // A note's connectedness must be its LINKS, not its length. Raw Degree counts every
 // edge on the node, and a note owns one "contains" edge per heading plus one "tagged"
@@ -97,6 +101,58 @@ func TestRecomputeDegreesIsOrderIndependent(t *testing.T) {
 		}
 		if x.KnowledgeDegree != 1 {
 			t.Fatalf("%s knows exactly one note, got %d", id, x.KnowledgeDegree)
+		}
+	}
+}
+
+func TestRecomputeDegreesContextMatchesWrapper(t *testing.T) {
+	build := func() *Graph {
+		g := New()
+		for _, id := range []string{"a", "b", "c"} {
+			g.AddNode(&Node{ID: NotePrefix + id, Kind: "note", NoteID: id})
+		}
+		g.AddEdge(Edge{Source: NotePrefix + "a", Target: NotePrefix + "b", Relation: RelReferences})
+		g.AddEdge(Edge{Source: NotePrefix + "b", Target: NotePrefix + "a", Relation: RelReferences})
+		g.AddEdge(Edge{Source: NotePrefix + "b", Target: NotePrefix + "c", Relation: RelReferences})
+		return g
+	}
+	wrapper, contextual := build(), build()
+	wrapper.RecomputeDegrees()
+	if err := contextual.RecomputeDegreesContext(context.Background()); err != nil {
+		t.Fatalf("RecomputeDegreesContext: %v", err)
+	}
+	for _, id := range []string{NotePrefix + "a", NotePrefix + "b", NotePrefix + "c"} {
+		want, _ := wrapper.Node(id)
+		got, _ := contextual.Node(id)
+		if got.Degree != want.Degree || got.KnowledgeDegree != want.KnowledgeDegree {
+			t.Fatalf("%s context degrees=%d/%d wrapper=%d/%d", id,
+				got.Degree, got.KnowledgeDegree, want.Degree, want.KnowledgeDegree)
+		}
+	}
+}
+
+func TestRecomputeDegreesContextCancellationDoesNotPublishPartialDegrees(t *testing.T) {
+	g := New()
+	for _, id := range []string{"a", "b", "c", "d"} {
+		g.AddNode(&Node{ID: NotePrefix + id, Kind: "note", NoteID: id, Degree: 91, KnowledgeDegree: 92})
+	}
+	for _, target := range []string{"b", "c", "d"} {
+		g.AddEdge(Edge{Source: NotePrefix + "a", Target: NotePrefix + target, Relation: RelReferences})
+	}
+	// Restore the sentinel values after AddEdge's insertion-time Degree bumps.
+	for _, id := range []string{"a", "b", "c", "d"} {
+		n, _ := g.Node(NotePrefix + id)
+		n.Degree, n.KnowledgeDegree = 91, 92
+	}
+	cause := errors.New("stop degree pass")
+	ctx := newCancelAfterChecksContext(7, cause)
+	if err := g.RecomputeDegreesContext(ctx); !errors.Is(err, cause) {
+		t.Fatalf("RecomputeDegreesContext error = %v, want cause %v", err, cause)
+	}
+	for _, id := range []string{"a", "b", "c", "d"} {
+		n, _ := g.Node(NotePrefix + id)
+		if n.Degree != 91 || n.KnowledgeDegree != 92 {
+			t.Fatalf("cancellation published partial degrees for %s: %d/%d", id, n.Degree, n.KnowledgeDegree)
 		}
 	}
 }

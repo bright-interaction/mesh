@@ -231,8 +231,8 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 	//
 	// The last entry is the config writer, not a note writer. It is here because every
 	// other writer in the module is pinned by name either in this list or in
-	// unguardedWriters, and SaveConfig just left unguardedWriters, so without an entry it
-	// would be the one writer nothing names. The gap is not hypothetical for this one:
+	// unguardedWriters, and the config writer left unguardedWriters, so without an entry
+	// it would be the one writer nothing names. The gap is not hypothetical for this one:
 	// its ONLY discovery signal is the temp+rename shape (its destination expression says
 	// meshDir, and it carries no .md literal and no frontmatter), so a refactor back to a
 	// plain os.WriteFile drops it out of the census entirely. Measured: rewritten that
@@ -245,8 +245,8 @@ func TestEveryNoteByteWriterFsyncs(t *testing.T) {
 		"cmd/mesh/main.go:writeStarterIndex",
 		"internal/curator/merge_note.go:writeAtomic",
 		"internal/vault/migrate.go:WriteNoteAtomic",
-		"internal/vault/scaffold.go:CreateNote",
-		"internal/meshcfg/config.go:SaveConfig",
+		"internal/vault/scaffold.go:createNoteContext",
+		"internal/meshcfg/config.go:saveConfigContextWith",
 	} {
 		if knownWriterStripped(root, key) {
 			continue
@@ -315,6 +315,21 @@ func findNoteByteWriters(t *testing.T, root string) []noteByteWriter {
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
+					return true
+				}
+				// CreateNote's context tests inject the O_EXCL opener as openFile. It is
+				// still the byte-publication call in production, and allowing that narrow
+				// spelling keeps the census from losing the primary note writer merely
+				// because its filesystem boundary became testable.
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "openFile" {
+					if len(call.Args) > 0 {
+						txt, err := exprText(fset, call.Args[0])
+						if err != nil {
+							ierr = err
+							return false
+						}
+						w.dests = append(w.dests, txt)
+					}
 					return true
 				}
 				sel, ok := call.Fun.(*ast.SelectorExpr)

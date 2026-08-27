@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
@@ -59,11 +60,30 @@ func encodeVec(v []float32) []byte {
 }
 
 func decodeVec(b []byte) []float32 {
+	v, _ := decodeVecContext(context.Background(), b)
+	return v
+}
+
+func decodeVecContext(ctx context.Context, b []byte) ([]float32, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	v := make([]float32, len(b)/4)
 	for i := range v {
+		if i&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
 	}
-	return v
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 // ReplaceVectors wipes the vectors table and stores the given chunk embeddings
@@ -118,12 +138,62 @@ func (s *Store) ReplaceVectors(model string, rows []VectorRow) error {
 // deleted note never contributes a stale semantic signal; it simply falls back to
 // the lexical + graph signals until the next `mesh embed` refreshes its vector.
 func (s *Store) LoadVectors() (model string, dim int, byNode map[string][][]float32, err error) {
-	_ = s.readDB.QueryRow(`SELECT value FROM meta WHERE key='vector_model'`).Scan(&model)
+	return s.LoadVectorsContext(context.Background())
+}
+
+// LoadVectorsContext is LoadVectors with cancellation applied to every SQLite
+// operation and to vector decoding. A canceled load never exposes its partial map.
+func (s *Store) LoadVectorsContext(ctx context.Context) (model string, dim int, byNode map[string][][]float32, err error) {
+	return s.loadVectorsSnapshotContext(ctx, nil)
+}
+
+// loadVectorsSnapshotContext keeps canonical model metadata and vector rows on one
+// SQLite read snapshot. The hook is a deterministic test seam after the metadata reads
+// have established that snapshot.
+func (s *Store) loadVectorsSnapshotContext(ctx context.Context, afterMeta func()) (model string, dim int, byNode map[string][][]float32, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, nil, err
+	}
+	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return "", 0, nil, err
+	}
+	defer tx.Rollback()
+	model, dim, byNode, err = loadVectorsContext(ctx, tx, afterMeta)
+	if err != nil {
+		return model, dim, byNode, err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", 0, nil, err
+	}
+	return model, dim, byNode, nil
+}
+
+type vectorQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func loadVectorsContext(ctx context.Context, q vectorQueryer, afterMeta func()) (model string, dim int, byNode map[string][][]float32, err error) {
+	if err := q.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='vector_model'`).Scan(&model); err != nil && err != sql.ErrNoRows {
+		return "", 0, nil, err
+	}
 	var dimStr string
-	_ = s.readDB.QueryRow(`SELECT value FROM meta WHERE key='vector_dim'`).Scan(&dimStr)
+	if err := q.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='vector_dim'`).Scan(&dimStr); err != nil && err != sql.ErrNoRows {
+		return "", 0, nil, err
+	}
 	dim, _ = strconv.Atoi(dimStr)
+	if afterMeta != nil {
+		afterMeta()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, nil, err
+	}
 	byNode = map[string][][]float32{}
-	rows, err := s.readDB.Query(`
+	rows, err := q.QueryContext(ctx, `
 		SELECT v.node_id, v.embedding
 		FROM vectors v
 		JOIN notes n ON v.node_id = 'note:' || n.id
@@ -138,14 +208,27 @@ func (s *Store) LoadVectors() (model string, dim int, byNode map[string][][]floa
 	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
 	defer rows.Close()
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return model, dim, nil, err
+		}
 		var id string
 		var blob []byte
 		if err := rows.Scan(&id, &blob); err != nil {
 			return model, dim, byNode, err
 		}
-		byNode[id] = append(byNode[id], decodeVec(blob))
+		vec, err := decodeVecContext(ctx, blob)
+		if err != nil {
+			return model, dim, nil, err
+		}
+		byNode[id] = append(byNode[id], vec)
 	}
-	return model, dim, byNode, rows.Err()
+	if err := rows.Err(); err != nil {
+		return model, dim, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return model, dim, nil, err
+	}
+	return model, dim, byNode, nil
 }
 
 // VectorMeta returns the stored canonical model and dim from meta. It is

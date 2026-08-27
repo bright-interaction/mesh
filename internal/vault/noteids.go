@@ -4,10 +4,9 @@
 package vault
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -45,20 +44,35 @@ func NoteIDForFile(path string) string {
 // a declared id and a fallback id land on the same string, the declarer is the holder and
 // the fallback is what has to yield, regardless of walk order.
 func noteIDForFile(path string) (id string, declared bool) {
+	id, declared, _ = noteIDForFileContext(context.Background(), path)
+	return id, declared
+}
+
+// noteIDForFileContext is noteIDForFile with cancellation threaded through the bounded
+// head read. Ordinary read failures retain noteIDForFile's conservative filename
+// fallback; cancellation is different because silently falling back would let an
+// expensive whole-vault scan continue after its caller has shut down.
+func noteIDForFileContext(ctx context.Context, path string) (id string, declared bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
-	f, err := os.Open(path)
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	head, err := ReadFileHeadContext(ctx, path, idScanBytes)
 	if err != nil {
-		return key, false
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", false, ctxErr
+		}
+		return key, false, nil
 	}
-	defer f.Close()
-	head := make([]byte, idScanBytes)
-	n, err := io.ReadFull(f, head)
-	if n == 0 && err != nil {
-		return key, false
+	if err := ctx.Err(); err != nil {
+		return "", false, err
 	}
-	fmText, _, had := SplitFrontmatter(string(head[:n]))
+	fmText, _, had := SplitFrontmatter(string(head))
 	if !had {
-		return key, false
+		return key, false, nil
 	}
 	// Only the id is decoded. A note with, say, an unquoted colon in `updated:` fails to
 	// unmarshal as a whole, and asking for the full Frontmatter would throw away the id
@@ -67,39 +81,62 @@ func noteIDForFile(path string) (id string, declared bool) {
 		ID string `yaml:"id"`
 	}
 	if err := yaml.Unmarshal([]byte(fmText), &probe); err != nil {
-		return key, false
+		return key, false, nil
 	}
 	if id := strings.TrimSpace(probe.ID); id != "" {
-		return id, true
+		return id, true, nil
 	}
-	return key, false
+	return key, false, nil
 }
 
-// otherFileNamedForID returns the vault-relative path of a file <id>.md that sits
-// somewhere in the vault OTHER than ownPath, or "" when ownPath is the only one. It is
-// the post-create check that closes the window ClaimedIDs alone cannot: a second
-// CreateNote in a DIFFERENT type directory that made its own scan before this one created
-// its file. Every note CreateNote writes is named <id>.md, so a stat per vault directory
-// finds any such racer, and a handful of stats keeps the check cheap enough to run on the
-// authoring hot path.
+// createNoteDirs is the complete, fixed set of destinations in which CreateNote can
+// publish. The pre-publication ClaimedIDs scan already catches notes in every custom
+// vault folder; the post-publication check only has to find another CreateNote that raced
+// that scan, and such a racer can appear only in one of these seven directories.
+var createNoteDirs = [...]string{
+	"decisions",
+	"gotchas",
+	"post-mortems",
+	"entities",
+	"concepts",
+	"maps",
+	"notes",
+}
+
+// otherFileNamedForID retains the non-context compatibility surface used by existing
+// package callers.
 func otherFileNamedForID(root, id, ownPath string) string {
-	dirs, err := Dirs(root)
-	if err != nil {
-		return ""
+	other, _ := otherFileNamedForIDContext(context.Background(), root, id, ownPath)
+	return other
+}
+
+// otherFileNamedForIDContext returns the vault-relative path of a regular <id>.md
+// published by a concurrent CreateNote in another type directory, or "" when ownPath is
+// the only one. It deliberately performs at most seven Lstat calls instead of a second
+// full-vault traversal after O_EXCL. Each stat is isolated so a cancelled caller does not
+// wait on a stalled FUSE/network filesystem; the goroutine is read-only and publishes
+// only to its private buffered channel, so it can never mutate the vault after return.
+func otherFileNamedForIDContext(ctx context.Context, root, id, ownPath string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	for _, d := range dirs {
-		p := filepath.Join(d, id+".md")
+	for _, dir := range createNoteDirs {
+		p := filepath.Join(root, dir, id+".md")
 		if p == ownPath {
 			continue
 		}
-		if _, err := os.Stat(p); err == nil {
+		info, err := LstatContext(ctx, p)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		if err == nil && info.Mode().IsRegular() {
 			if rel, rerr := filepath.Rel(root, p); rerr == nil {
-				return rel
+				return rel, nil
 			}
-			return p
+			return p, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // candidateID renders the n-th id in the sequence base, base-2, base-3 ... that every
@@ -221,19 +258,97 @@ type idHolder struct {
 // itself is written atomically either way, and a duplicate that slips through an
 // unreadable corner is still caught and quarantined by the indexer.
 func ClaimedIDs(root string) (map[string]string, error) {
-	holders, err := claimedIDHolders(root)
+	return ClaimedIDsContext(context.Background(), root)
+}
+
+// ClaimedIDsContext is ClaimedIDs with cancellation checked during traversal and each
+// bounded note-head read. On cancellation it returns no partial claim set: treating a
+// prefix of the vault as complete could let a writer publish a duplicate id.
+func ClaimedIDsContext(ctx context.Context, root string) (map[string]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	holders, err := claimedIDHoldersContext(ctx, root)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	out := make(map[string]string, len(holders))
 	for id, h := range holders {
 		out[id] = h.path
 	}
+	// Preserve ClaimedIDs' historical partial-map behavior for ordinary traversal
+	// errors. Cancellation alone suppresses the partial set, because publishing from
+	// one would be unsafe.
 	return out, err
 }
 
 // claimedIDHolders is ClaimedIDs keeping the declared/fallback distinction its callers in
 // this package need to decide which of two files holding one id is the one that must move.
 func claimedIDHolders(root string) (map[string]idHolder, error) {
+	return claimedIDHoldersContext(context.Background(), root)
+}
+
+func claimedIDHoldersContext(ctx context.Context, root string) (map[string]idHolder, error) {
+	return claimedIDHoldersWith(ctx, root, filepath.WalkDir, noteIDForFileContext)
+}
+
+type idHoldersResult struct {
+	holders map[string]idHolder
+	err     error
+}
+
+func claimedIDHoldersWith(
+	ctx context.Context,
+	root string,
+	walkDir func(string, fs.WalkDirFunc) error,
+	readID func(context.Context, string) (string, bool, error),
+) (map[string]idHolder, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// WalkDir itself has no context and may block between callbacks while reading an
+	// unhealthy FUSE/network directory. Keep the complete scan and its partial map in a
+	// read-only worker so cancellation can stop the caller's wait. The buffered result
+	// lets that worker exit later without publishing into caller-owned state.
+	if ctx.Done() == nil {
+		return scanClaimedIDHolders(ctx, root, walkDir, readID)
+	}
+	result := make(chan idHoldersResult, 1)
+	go func() {
+		holders, err := scanClaimedIDHolders(ctx, root, walkDir, readID)
+		result <- idHoldersResult{holders: holders, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case got := <-result:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return got.holders, got.err
+	}
+}
+
+func scanClaimedIDHolders(
+	ctx context.Context,
+	root string,
+	walkDir func(string, fs.WalkDirFunc) error,
+	readID func(context.Context, string) (string, bool, error),
+) (map[string]idHolder, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	out := map[string]idHolder{}
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err := walkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			// Unreadable directory or vanished entry: skip it, keep scanning.
 			if d != nil && d.IsDir() {
@@ -250,7 +365,17 @@ func claimedIDHolders(root string) (map[string]idHolder, error) {
 		if !strings.EqualFold(filepath.Ext(path), ".md") || IsConflictSibling(d.Name()) {
 			return nil
 		}
-		id, declared := noteIDForFile(path)
+		// WalkDir also reports symlinks, sockets, and named pipes as non-directories.
+		// Type uses the directory entry Mesh already has and cannot add a blocking stat;
+		// a zero/unknown type proceeds to the isolated cancellable head read, while every
+		// definitely non-regular entry is skipped without opening it.
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		id, declared, readErr := readID(ctx, path)
+		if readErr != nil {
+			return readErr
+		}
 		if id == "" {
 			return nil
 		}
@@ -271,6 +396,9 @@ func claimedIDHolders(root string) (map[string]idHolder, error) {
 		}
 		return nil
 	})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		return out, err
 	}

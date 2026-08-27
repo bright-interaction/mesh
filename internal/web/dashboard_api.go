@@ -21,10 +21,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
-	queries, _ := s.store.Metric("queries")
-	fetches, _ := s.store.Metric("fetches")
-	writes, _ := s.store.Metric("writes")
-	notes, _ := s.store.Count("notes")
+	ctx := r.Context()
+	queries, _ := s.store.MetricContext(ctx, "queries")
+	fetches, _ := s.store.MetricContext(ctx, "fetches")
+	writes, _ := s.store.MetricContext(ctx, "writes")
+	notes, _ := s.store.CountContext(ctx, "notes")
 
 	// Estimated tokens saved vs a naive whole-file RAG dump. Mesh returns budgeted
 	// cards (~1.9x fewer tokens per the 2026-07-02 benchmark, a median saving of
@@ -33,14 +34,14 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	const tokensSavedPerQuery = 1800
 	estTokensSaved := queries * tokensSavedPerQuery
 
-	byType, _ := s.store.NotesByType()
-	top, _ := s.store.TopFetched(8)
-	health, _ := s.store.HealthCounts()
-	flywheel, _ := s.store.FlywheelStats()
-	pending, _ := s.store.PendingCount()
+	byType, _ := s.store.NotesByTypeContext(ctx)
+	top, _ := s.store.TopFetchedContext(ctx, 8)
+	health, _ := s.store.HealthCountsContext(ctx)
+	flywheel, _ := s.store.FlywheelStatsContext(ctx)
+	pending, _ := s.store.PendingCountContext(ctx)
 
 	// Contributor leaderboard (top 8 by authored notes).
-	contribMap, _ := s.store.ContributorCounts()
+	contribMap, _ := s.store.ContributorCountsContext(ctx)
 	type kv struct {
 		Name  string `json:"name"`
 		Count int    `json:"count"`

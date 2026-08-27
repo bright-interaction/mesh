@@ -3,7 +3,10 @@
 
 package index
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // Two files that resolve to the same effective note id are a data error the schema
 // cannot represent: notes.id is the PRIMARY KEY, and the graph keys a note node on
@@ -95,7 +98,15 @@ func ClaimUniqueIDs(notes []*ParsedNote, incumbent map[string]string) (kept []*P
 // IDOwners maps every indexed note id to the vault-relative path that currently owns it.
 // It is the incumbent set ClaimUniqueIDs and the drift reports resolve ties against.
 func (s *Store) IDOwners() (map[string]string, error) {
-	rows, err := s.readDB.Query(`SELECT id, path FROM notes`)
+	return s.IDOwnersContext(context.Background())
+}
+
+// IDOwnersContext is IDOwners with a caller-owned SQL scan lifetime.
+func (s *Store) IDOwnersContext(ctx context.Context) (map[string]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id, path FROM notes`)
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +115,9 @@ func (s *Store) IDOwners() (map[string]string, error) {
 	defer rows.Close()
 	out := map[string]string{}
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var id, path string
 		if err := rows.Scan(&id, &path); err != nil {
 			return nil, err

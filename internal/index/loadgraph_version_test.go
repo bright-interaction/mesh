@@ -4,11 +4,68 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func replaceGraphSnapshot(t *testing.T, s *Store, left, right string) {
+	t.Helper()
+	if err := s.Write(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM edges`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM nodes`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO nodes(id,kind,label) VALUES(?, 'note', ?), (?, 'note', ?)`, left, left, right, right); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO edges(source,target,relation,confidence,confidence_score,weight) VALUES(?,?,'references','EXTRACTED',1,1)`, left, right)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadGraphContextUsesOneSnapshotAcrossNodesAndEdges(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	replaceGraphSnapshot(t, s, "old-left", "old-right")
+
+	g, err := s.loadGraphSnapshotContext(context.Background(), func() {
+		// WAL permits this commit while the read transaction retains its earlier snapshot.
+		// Without one transaction around both scans, the result combines old nodes with
+		// this new edge set.
+		replaceGraphSnapshot(t, s, "new-left", "new-right")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := g.Node("old-left"); !ok {
+		t.Fatal("graph lost the node snapshot read before the concurrent commit")
+	}
+	if _, ok := g.Node("new-left"); ok {
+		t.Fatal("graph mixed nodes from the post-snapshot commit")
+	}
+	neighbors := g.Neighbors("old-left")
+	if len(neighbors) != 1 || neighbors[0].Target != "old-right" {
+		t.Fatalf("graph mixed edge versions: old-left neighbors = %+v", neighbors)
+	}
+
+	current, err := s.LoadGraph()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := current.Node("new-left"); !ok {
+		t.Fatal("test turnover did not commit the new graph snapshot")
+	}
+}
 
 func TestExpectedNoteVersionAndLoadedGraphShareOneSnapshot(t *testing.T) {
 	root := t.TempDir()

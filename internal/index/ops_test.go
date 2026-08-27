@@ -6,6 +6,7 @@ package index
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -274,4 +275,317 @@ func padded(i int) string {
 		s += string(rune('0' + c))
 	}
 	return s
+}
+
+func TestOpFilesContextCancellationDoesNotWaitForStalledReadDir(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	workerExited := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		names, err := opFilesContextWith(ctx, "/stalled/ops", func(string) ([]os.DirEntry, error) {
+			close(started)
+			<-release
+			close(workerExited)
+			return nil, nil
+		})
+		if names != nil {
+			done <- errors.New("cancelled listing returned partial names")
+			return
+		}
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("op directory listing did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("opFilesContextWith returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled op listing waited for stalled ReadDir")
+	}
+
+	close(release)
+	select {
+	case <-workerExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late read-only ReadDir worker did not exit")
+	}
+}
+
+func TestDrainOpsContextCancellationBeforeApplyLeavesOpAndDatabaseUntouched(t *testing.T) {
+	dir := opsVault(t)
+	owner, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	pending := PendingNote{Type: "gotcha", Title: "Keep after cancellation"}
+	if err := owner.AddPending(pending); err != nil {
+		t.Fatal(err)
+	}
+	id := PendingID(pending.Type, pending.Title)
+	body, err := json.Marshal(Op{Kind: OpDeletePending, ID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	removed := false
+	applied, err := owner.drainOpsContext(ctx,
+		func(context.Context, string) ([]string, error) { return []string{"0001.json"}, nil },
+		func(context.Context, string) ([]byte, error) {
+			cancel() // the bytes arrived as shutdown began; they must never be applied
+			return body, nil
+		},
+		func(string) error {
+			removed = true
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DrainOpsContext returned %v, want context.Canceled", err)
+	}
+	if applied != 0 {
+		t.Fatalf("DrainOpsContext applied %d ops after cancellation, want 0", applied)
+	}
+	if removed {
+		t.Fatal("DrainOpsContext removed the queued op after cancellation")
+	}
+	if _, err := owner.GetPending(id); err != nil {
+		t.Fatalf("canceled drain mutated the pending row: %v", err)
+	}
+}
+
+type observedDoneContext struct {
+	context.Context
+	observed chan<- struct{}
+}
+
+func (c observedDoneContext) Done() <-chan struct{} {
+	select {
+	case c.observed <- struct{}{}:
+	default:
+	}
+	return c.Context.Done()
+}
+
+func TestDrainOpsContextCancellationWhileAnotherDrainOwnsGate(t *testing.T) {
+	dir := opsVault(t)
+	owner, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, drainErr := owner.drainOpsContext(context.Background(),
+			func(context.Context, string) ([]string, error) {
+				close(firstEntered)
+				<-releaseFirst
+				return nil, nil
+			},
+			func(context.Context, string) ([]byte, error) { return nil, nil },
+			os.Remove,
+		)
+		firstDone <- drainErr
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first drain did not acquire the serialization gate")
+	}
+
+	baseCtx, cancel := context.WithCancel(context.Background())
+	gateWaitObserved := make(chan struct{}, 1)
+	ctx := observedDoneContext{Context: baseCtx, observed: gateWaitObserved}
+	secondListed := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		_, drainErr := owner.drainOpsContext(ctx,
+			func(context.Context, string) ([]string, error) {
+				close(secondListed)
+				return nil, nil
+			},
+			func(context.Context, string) ([]byte, error) { return nil, nil },
+			os.Remove,
+		)
+		secondDone <- drainErr
+	}()
+	select {
+	case <-gateWaitObserved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second drain did not begin its cancellable gate wait")
+	}
+	cancel()
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("second drain returned %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled drain waited for the active drain to release its gate")
+	}
+	select {
+	case <-secondListed:
+		t.Fatal("second drain listed the queue while the first drain still owned it")
+	default:
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first drain: %v", err)
+	}
+}
+
+func readOpFileForTest(_ context.Context, path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
+func TestTelemetryCancellationAfterUnlinkCannotReplay(t *testing.T) {
+	dir := opsVault(t)
+	owner, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	name, err := owner.EnqueueOp(Op{Kind: OpTelemetry, Counts: map[string]int64{"claimed-cancel": 5}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	applied, err := owner.drainOpsContext(ctx, opFilesContext, readOpFileForTest, func(path string) error {
+		removeErr := os.Remove(path)
+		if removeErr == nil {
+			cancel() // cancellation lands after the at-most-once claim
+		}
+		return removeErr
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("drain returned %v, want context.Canceled after telemetry claim", err)
+	}
+	if applied != 0 {
+		t.Fatalf("drain reported %d applied ops after post-claim cancellation", applied)
+	}
+	if owner.OpQueued(name) {
+		t.Fatal("claimed telemetry file survived cancellation and can replay")
+	}
+	if got, err := owner.Metric("claimed-cancel"); err != nil || got != 0 {
+		t.Fatalf("canceled claimed telemetry mutated the counter: got=%d err=%v", got, err)
+	}
+	if n, err := owner.DrainOps(); err != nil || n != 0 {
+		t.Fatalf("replacement drain found canceled telemetry again: n=%d err=%v", n, err)
+	}
+}
+
+func TestTelemetryAmbiguousApplyFailureCannotDoubleIncrement(t *testing.T) {
+	dir := opsVault(t)
+	owner, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	name, err := owner.EnqueueOp(Op{Kind: OpTelemetry, Counts: map[string]int64{"ambiguous-apply": 7}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ambiguous := errors.New("synthetic error after telemetry commit")
+	applied, err := owner.drainOpsContextWithTelemetry(
+		context.Background(), opFilesContext, readOpFileForTest, os.Remove,
+		func(ctx context.Context, op Op) error {
+			if err := owner.applyTelemetryOpContext(ctx, op); err != nil {
+				return err
+			}
+			return ambiguous // effect committed, but the caller cannot prove that from error
+		},
+	)
+	if !errors.Is(err, ambiguous) {
+		t.Fatalf("drain returned %v, want synthetic ambiguous apply error", err)
+	}
+	if applied != 0 {
+		t.Fatalf("ambiguous drain reported %d unambiguous applications", applied)
+	}
+	if owner.OpQueued(name) {
+		t.Fatal("telemetry file survived an ambiguous apply and can double-increment")
+	}
+	if got, err := owner.Metric("ambiguous-apply"); err != nil || got != 7 {
+		t.Fatalf("synthetic committed apply = %d, err=%v; want exactly 7", got, err)
+	}
+	if n, err := owner.DrainOps(); err != nil || n != 0 {
+		t.Fatalf("replacement drain found ambiguous telemetry again: n=%d err=%v", n, err)
+	}
+	if got, err := owner.Metric("ambiguous-apply"); err != nil || got != 7 {
+		t.Fatalf("telemetry replayed after ambiguous apply: got=%d err=%v, want 7", got, err)
+	}
+}
+
+func TestTelemetryIsNeverAppliedWithoutWinningUnlink(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		remove     func(string) error
+		wantErr    bool
+		wantQueued bool
+	}{
+		{
+			name:       "unlink failure",
+			remove:     func(string) error { return errors.New("synthetic unlink failure") },
+			wantErr:    true,
+			wantQueued: true,
+		},
+		{
+			name: "another drainer removed it",
+			remove: func(path string) error {
+				if err := os.Remove(path); err != nil {
+					return err
+				}
+				return os.ErrNotExist
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := opsVault(t)
+			owner, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer owner.Close()
+			name, err := owner.EnqueueOp(Op{Kind: OpTelemetry, Counts: map[string]int64{"lost-claim": 11}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyCalled := false
+			applied, drainErr := owner.drainOpsContextWithTelemetry(
+				context.Background(), opFilesContext, readOpFileForTest, tc.remove,
+				func(context.Context, Op) error {
+					applyCalled = true
+					return nil
+				},
+			)
+			if (drainErr != nil) != tc.wantErr {
+				t.Fatalf("drain error = %v, wantErr=%v", drainErr, tc.wantErr)
+			}
+			if applied != 0 || applyCalled {
+				t.Fatalf("telemetry applied without owning its unlink: applied=%d called=%v", applied, applyCalled)
+			}
+			if queued := owner.OpQueued(name); queued != tc.wantQueued {
+				t.Fatalf("queued=%v, want %v", queued, tc.wantQueued)
+			}
+			if got, err := owner.Metric("lost-claim"); err != nil || got != 0 {
+				t.Fatalf("counter changed without unlink ownership: got=%d err=%v", got, err)
+			}
+		})
+	}
 }

@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io/fs"
@@ -350,7 +351,15 @@ func (s *Store) ListHealth(issue string) ([]HealthFinding, error) {
 
 // HealthCounts returns issue -> count for the dashboard.
 func (s *Store) HealthCounts() (map[string]int, error) {
-	rows, err := s.readDB.Query(`SELECT issue, count(*) FROM note_health GROUP BY issue`)
+	return s.HealthCountsContext(context.Background())
+}
+
+// HealthCountsContext is HealthCounts with caller-controlled cancellation.
+func (s *Store) HealthCountsContext(ctx context.Context) (map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.readDB.QueryContext(ctx, `SELECT issue, count(*) FROM note_health GROUP BY issue`)
 	if err != nil {
 		return nil, err
 	}

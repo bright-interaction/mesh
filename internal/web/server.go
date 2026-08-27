@@ -11,12 +11,15 @@ import (
 	"fmt"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/buildinfo"
@@ -37,6 +40,7 @@ type Server struct {
 	ownerOpCancel context.CancelFunc
 	ownerOpDone   chan struct{}
 	ownerOpWake   chan struct{} // deterministic test wake; ticker is the cross-process path
+	lifetimeCtx   context.Context
 	auth          authConfig
 	basePath      string // "" for root, or "/app" when served under a path
 
@@ -59,10 +63,18 @@ type Server struct {
 	// cachedRetriever is built lazily over graph; nil = rebuild needed. It is an atomic
 	// pointer rather than a field of the graph lock so the (slow) build never has to
 	// take s.mu exclusively, see retriever().
-	cachedRetriever atomic.Pointer[retrieve.Retriever]
-	buildMu         sync.Mutex // serializes retriever builds; NOT held while s.mu is held
+	cachedRetriever     atomic.Pointer[retrieve.Retriever]
+	buildGate           chan struct{} // one token; unlike a mutex, waiting is request-cancellable
+	buildRetriever      retrieverBuildFunc
+	retrieverGeneration uint64        // guarded by mu; config invalidation can keep the same graph pointer
+	graphUpdateGate     chan struct{} // one token; spans rebuild/load through graph publication
+	reindexStore        owningReindexFunc
 
-	configMu sync.Mutex // serializes config.toml read-modify-write (PUT /api/config)
+	// afterPendingFilePublished is a deterministic test seam at the durable boundary of
+	// a pending promotion. Production leaves it nil.
+	afterPendingFilePublished func()
+
+	configGate chan struct{} // one token; serializes config.toml PUTs with cancellable waits
 
 	// ownerWait bounds how long a read-only viewer waits for the owning writer to apply
 	// what it queued. A field rather than a bare const so a test can shorten it without
@@ -75,6 +87,8 @@ type Server struct {
 	askSlots chan struct{} // bounded in-flight LLM subprocesses/calls for POST /api/ask
 }
 
+type retrieverBuildFunc func(context.Context, *index.Store, *graph.Graph) (*retrieve.Retriever, error)
+
 // retriever returns a fused retriever over the current graph, building it lazily and
 // caching it. Previously every /api/search rebuilt the retriever (LoadVectors from
 // disk + an ANN rebuild in pro) per request: a latency cliff and a DoS amplifier.
@@ -85,38 +99,99 @@ type Server struct {
 // the ANN index (pro) and probes the embedding endpoint over the network, so holding
 // the exclusive graph lock across it froze /graph.json, every other search and the
 // pending API for as long as that probe took (up to the HTTP client timeout) whenever
-// the endpoint was unreachable. buildMu serialises the build itself so N concurrent
+// the endpoint was unreachable. buildGate serialises the build itself so N concurrent
 // searches cause one build, not N, and the result is only published if the graph it
 // was built over is still the current one, so a reindex that lands mid-build wins.
 // Same shape as mcp.Server.swap.
 func (s *Server) retriever() *retrieve.Retriever {
+	rt, _ := s.retrieverContext(context.Background())
+	return rt
+}
+
+// retrieverContext returns the cached retriever or builds one while honoring the
+// caller's cancellation both during construction and while waiting behind another
+// build. A canceled or failed build is never published.
+func (s *Server) retrieverContext(ctx context.Context) (*retrieve.Retriever, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := webContextErr(ctx); err != nil {
+		return nil, err
+	}
 	if rt := s.cachedRetriever.Load(); rt != nil {
-		return rt
+		return rt, nil
 	}
-	s.buildMu.Lock()
-	defer s.buildMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, webContextErr(ctx)
+	case <-s.buildGate:
+	}
+	defer func() { s.buildGate <- struct{}{} }()
+	if err := webContextErr(ctx); err != nil {
+		return nil, err
+	}
 	if rt := s.cachedRetriever.Load(); rt != nil {
-		return rt // another caller built it while we waited
+		return rt, nil // another caller built it while we waited
 	}
-	s.mu.RLock()
-	g := s.graph
-	s.mu.RUnlock()
-	built := retrieve.NewFromEnv(s.store, g)
-	// Publish under the read lock: a graph swap (reindex, pending promote) takes the
-	// write lock to set s.graph and clear the cache in one critical section, so this
-	// compare-and-store cannot interleave with it and resurrect a stale retriever.
-	s.mu.RLock()
-	if s.graph == g {
-		s.cachedRetriever.Store(built)
+	for {
+		s.mu.RLock()
+		g := s.graph
+		generation := s.retrieverGeneration
+		s.mu.RUnlock()
+		builder := s.buildRetriever
+		if builder == nil {
+			builder = retrieve.NewFromEnvContext
+		}
+		built, err := builder(ctx, s.store, g)
+		if err != nil {
+			return nil, err
+		}
+		if built == nil {
+			return nil, errors.New("retriever build returned nil")
+		}
+		if err := webContextErr(ctx); err != nil {
+			return nil, err
+		}
+		// Publish under the read lock: a graph swap (reindex, pending promote) takes
+		// the write lock to set s.graph and clear the cache in one critical section.
+		// If either the graph or config changed during the slow build, discard it and
+		// rebuild while retaining the gate. Returning the discarded retriever would let
+		// this request search a deleted note or use the pre-save embedding config even
+		// though the newer state had already published.
+		s.mu.RLock()
+		current := s.graph == g && s.retrieverGeneration == generation
+		if current && webContextErr(ctx) == nil {
+			s.cachedRetriever.Store(built)
+		}
+		s.mu.RUnlock()
+		if err := webContextErr(ctx); err != nil {
+			return nil, err
+		}
+		if current {
+			return built, nil
+		}
 	}
-	s.mu.RUnlock()
-	return built
+}
+
+func webContextErr(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 // invalidateRetriever drops the cached retriever so the next search rebuilds it
 // (after a config change).
 func (s *Server) invalidateRetriever() {
+	s.mu.Lock()
+	s.retrieverGeneration++
 	s.cachedRetriever.Store(nil)
+	s.mu.Unlock()
 }
 
 // allowedScopes returns the caller's readable-scope set (nil = unrestricted).
@@ -171,16 +246,40 @@ func (s *Server) baseHref() string {
 // The write features still work; they route through the owner. See handleReindex and the
 // pending queue in pending_api.go.
 func NewServer(vaultRoot string) (*Server, error) {
+	return NewServerContext(context.Background(), vaultRoot)
+}
+
+// NewServerContext is NewServer with caller-controlled cancellation for the graph
+// load. The read-only store is closed before a cancellation is returned.
+func NewServerContext(ctx context.Context, vaultRoot string) (*Server, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	store, err := index.OpenReadOnly(vaultRoot)
 	if err != nil {
 		return nil, err
 	}
-	g, err := store.LoadGraph()
+	g, err := store.LoadGraphContext(ctx)
 	if err != nil {
-		store.Close()
-		return nil, err
+		return nil, startupFailure(ctx, err, store.Close())
 	}
-	return newServer(vaultRoot, store, g), nil
+	return newServerContext(ctx, vaultRoot, store, g), nil
+}
+
+func startupFailure(ctx context.Context, startupErr, cleanupErr error) error {
+	// Context cancellation is an expected shutdown result. Preserve cleanup failures
+	// instead of hiding them inside the expected context error; ServeContext suppresses
+	// only a clean cancellation.
+	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(startupErr, ctxErr) {
+		if cleanupErr != nil {
+			return cleanupErr
+		}
+		return ctxErr
+	}
+	return errors.Join(startupErr, cleanupErr)
 }
 
 // NewOwningServer opens the index WRITABLE and owns it: it reindexes at startup and
@@ -190,33 +289,68 @@ func NewServer(vaultRoot string) (*Server, error) {
 // nobody ever updates. Same split as internal/mcp: NewServer is the per-window reader,
 // NewServerAt is the hub that owns what it serves.
 func NewOwningServer(vaultRoot string) (*Server, error) {
+	return NewOwningServerContext(context.Background(), vaultRoot)
+}
+
+type owningReindexFunc func(context.Context, *index.Store, string) (*graph.Graph, error)
+
+// NewOwningServerContext is NewOwningServer with cancellation spanning every expensive
+// startup phase. On cancellation it closes SQLite and releases owner.lock before it
+// returns, so an orchestrator can start the replacement immediately rather than waiting
+// for the stale-owner window. The small reindex seam keeps that lifecycle deterministic
+// under test without a mutable package-global hook.
+func NewOwningServerContext(ctx context.Context, vaultRoot string) (*Server, error) {
+	return newOwningServerContext(ctx, vaultRoot, index.ReindexContext)
+}
+
+func newOwningServerContext(ctx context.Context, vaultRoot string, reindex owningReindexFunc) (*Server, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	owner, err := index.AcquireOwnerLock(filepath.Join(vaultRoot, ".mesh"), "mesh ui --own-index", false)
 	if err != nil {
 		return nil, err
 	}
-	store, err := index.OpenOwned(vaultRoot, owner)
-	if err != nil {
-		_ = owner.Release()
-		return nil, err
+	if err := ctx.Err(); err != nil {
+		return nil, startupFailure(ctx, err, owner.Release())
 	}
-	g, err := index.Reindex(store, vaultRoot)
+	store, err := index.OpenOwnedContext(ctx, vaultRoot, owner)
 	if err != nil {
-		_ = store.Close()
-		_ = owner.Release()
-		return nil, err
+		return nil, startupFailure(ctx, err, owner.Release())
+	}
+	cleanup := func(startupErr error) error {
+		return startupFailure(ctx, startupErr, errors.Join(store.Close(), owner.Release()))
+	}
+	g, err := reindex(ctx, store, vaultRoot)
+	if err != nil {
+		return nil, cleanup(err)
 	}
 	// Apply anything a reader queued for an owner before this process started. Normally
 	// empty: it matters when a vault is served read-only for a while and then owned.
-	if _, err := store.DrainOps(); err != nil {
+	if _, err := store.DrainOpsContext(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, cleanup(err)
+		}
 		slog.Warn("mesh ui: could not drain the owner op queue at startup", "error", err)
 	}
 	// Seed the flywheel measurement from the existing agent-authored corpus once, so the
 	// Dashboard shows a real reuse number immediately even if no mesh mcp ran (idempotent).
-	_, _ = store.BackfillWritebacks()
-	_, _ = store.LinkNotesToCode(vaultRoot) // build the note<->code bridge if a code index exists
-	s := newServer(vaultRoot, store, g)
+	if _, err := store.BackfillWritebacksContext(ctx); err != nil && ctx.Err() != nil {
+		return nil, cleanup(err)
+	}
+	// Build the note<->code bridge if a code index exists.
+	if _, err := store.LinkNotesToCodeContext(ctx, vaultRoot); err != nil && ctx.Err() != nil {
+		return nil, cleanup(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, cleanup(err)
+	}
+	s := newServerContext(ctx, vaultRoot, store, g)
 	s.owner = owner
-	opCtx, opCancel := context.WithCancel(context.Background())
+	opCtx, opCancel := context.WithCancel(s.lifetimeContext())
 	s.ownerOpCancel = opCancel
 	s.ownerOpDone = make(chan struct{})
 	s.ownerOpWake = make(chan struct{}, 1)
@@ -225,10 +359,29 @@ func NewOwningServer(vaultRoot string) (*Server, error) {
 }
 
 func newServer(vaultRoot string, store *index.Store, g *graph.Graph) *Server {
+	return newServerContext(context.Background(), vaultRoot, store, g)
+}
+
+func newServerContext(ctx context.Context, vaultRoot string, store *index.Store, g *graph.Graph) *Server {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	buildGate := make(chan struct{}, 1)
+	buildGate <- struct{}{}
+	graphUpdateGate := make(chan struct{}, 1)
+	graphUpdateGate <- struct{}{}
+	configGate := make(chan struct{}, 1)
+	configGate <- struct{}{}
 	return &Server{
-		vaultRoot: vaultRoot,
-		store:     store,
-		graph:     g,
+		vaultRoot:       vaultRoot,
+		store:           store,
+		graph:           g,
+		lifetimeCtx:     ctx,
+		buildGate:       buildGate,
+		buildRetriever:  retrieve.NewFromEnvContext,
+		graphUpdateGate: graphUpdateGate,
+		reindexStore:    index.ReindexContext,
+		configGate:      configGate,
 		// POST /api/login is the one unauthenticated path that validates a secret, so it
 		// is a guessing oracle for the shared admin token and every member client token.
 		// 5 attempts per minute per peer, burst 5.
@@ -239,6 +392,13 @@ func newServer(vaultRoot string, store *index.Store, g *graph.Graph) *Server {
 		askSlots:  make(chan struct{}, askMaxInFlight),
 		ownerWait: index.OwnerIndexBound,
 	}
+}
+
+func (s *Server) lifetimeContext() context.Context {
+	if s.lifetimeCtx == nil {
+		return context.Background()
+	}
+	return s.lifetimeCtx
 }
 
 func (s *Server) Close() error {
@@ -270,7 +430,10 @@ func (s *Server) pollOwnerOps(ctx context.Context) {
 		case <-ticker.C:
 		case <-s.ownerOpWake:
 		}
-		if n, err := s.store.DrainOps(); err != nil {
+		if n, err := s.store.DrainOpsContext(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			slog.Warn("mesh ui: owner op queue remains pending", "error", err)
 		} else if n > 0 {
 			slog.Debug("mesh ui: applied queued owner ops", "count", n)
@@ -283,17 +446,75 @@ func (s *Server) pollOwnerOps(ctx context.Context) {
 // writer has indexed since, and it is the read-only counterpart of the graph swap the
 // writable paths do after their own reindex.
 func (s *Server) refresh() error {
-	g, err := s.store.LoadGraph()
+	return s.refreshContext(context.Background())
+}
+
+func (s *Server) refreshContext(ctx context.Context) error {
+	release, err := s.acquireGraphUpdate(ctx)
 	if err != nil {
 		return err
 	}
+	defer release()
+	g, err := s.store.LoadGraphContext(ctx)
+	if err != nil {
+		return err
+	}
+	s.publishGraph(g)
+	return nil
+}
+
+// reindexAndPublish serializes a complete owning rebuild through publication. SQLite
+// serializes commits, but it cannot stop an older request that paused after commit from
+// publishing its stale in-memory graph after a newer request. The token covers both.
+func (s *Server) reindexAndPublish(ctx context.Context, drainOps bool) error {
+	release, err := s.acquireGraphUpdate(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if drainOps {
+		if _, drainErr := s.store.DrainOpsContext(ctx); drainErr != nil {
+			if ctxErr := webContextErr(ctx); ctxErr != nil {
+				return ctxErr
+			}
+			slog.Warn("mesh ui: could not drain the owner op queue", "error", drainErr)
+		}
+	}
+	reindex := s.reindexStore
+	if reindex == nil {
+		reindex = index.ReindexContext
+	}
+	g, err := reindex(ctx, s.store, s.vaultRoot)
+	if err != nil {
+		return err
+	}
+	s.publishGraph(g)
+	return nil
+}
+
+func (s *Server) acquireGraphUpdate(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := webContextErr(ctx); err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, webContextErr(ctx)
+	case <-s.graphUpdateGate:
+		return func() { s.graphUpdateGate <- struct{}{} }, nil
+	}
+}
+
+func (s *Server) publishGraph(g *graph.Graph) {
 	// One exclusive critical section for the swap + invalidation, so an in-flight
 	// retriever build cannot publish over the old graph (see Server.retriever).
 	s.mu.Lock()
 	s.graph = g
+	s.retrieverGeneration++
 	s.cachedRetriever.Store(nil)
 	s.mu.Unlock()
-	return nil
 }
 
 // ownerDownNote is what every surface here says when the owning writer did not apply a
@@ -315,7 +536,27 @@ const ownerDownNote = "This took effect on disk but the index has NOT caught up:
 // up retrying and doing it twice.
 func (s *Server) resolveIndexWrites(ctx context.Context, direct func() error, ops ...index.Op) (ownerDown bool, err error) {
 	if !s.store.ReadOnly() {
-		return false, direct()
+		if directErr := direct(); directErr == nil {
+			return false, nil
+		} else {
+			// The durable artifact may already exist (pending promotion is the important
+			// case). If the owning transaction is canceled during shutdown, persist the
+			// idempotent follow-through in the same filesystem queue readers use. The
+			// replacement owner drains it at startup, so the review row cannot survive and
+			// be promoted into a duplicate later.
+			for _, op := range ops {
+				if _, queueErr := s.store.EnqueueOp(op); queueErr != nil {
+					return false, errors.Join(directErr, fmt.Errorf("queue owner follow-through: %w", queueErr))
+				}
+			}
+			if s.ownerOpWake != nil {
+				select {
+				case s.ownerOpWake <- struct{}{}:
+				default:
+				}
+			}
+			return true, nil
+		}
 	}
 	var last string
 	for _, op := range ops {
@@ -517,10 +758,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		// to show the "this vault is empty" overlay, so leaving it at zero here put a
 		// full vault behind an empty-state card for exactly the people who can see all
 		// of it.
-		notes, _ = s.store.Count("notes")
-		nodes, _ = s.store.Count("nodes")
-		edges, _ = s.store.Count("edges")
-		vectors, _ = s.store.Count("vectors")
+		notes, _ = s.store.CountContext(r.Context(), "notes")
+		nodes, _ = s.store.CountContext(r.Context(), "nodes")
+		edges, _ = s.store.CountContext(r.Context(), "edges")
+		vectors, _ = s.store.CountContext(r.Context(), "vectors")
 	}
 	writeJSON(w, map[string]any{
 		"vault":  s.exposedVaultRoot(),
@@ -582,18 +823,94 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// Serve builds the server and listens on addr (e.g. 127.0.0.1:7474), printing the
-// URL. A loopback bind needs no auth; binding beyond loopback is fail-closed and
-// requires a token (see newAuthConfig).
-// Serve builds the server and listens. When verify != nil the app runs in per-member
-// mode (each request authenticates as a hub client and is scoped to them); member auth
-// is then the fail-closed gate, so the single-token requirement is skipped. Otherwise
-// it is the standalone single-token viewer (loopback needs no token).
+// requestDrain closes the gap left by http.Server.Close: Close tears down sockets but
+// explicitly does not wait for handler goroutines. An owning UI must not release its
+// Store/owner.lock while an old handler can still write through that Store, so shutdown
+// first refuses new handler entries and then waits for every admitted handler to leave.
+type requestDrain struct {
+	mu         sync.Mutex
+	active     int
+	stopping   bool
+	idle       chan struct{}
+	idleClosed bool
+}
+
+func newRequestDrain() *requestDrain { return &requestDrain{idle: make(chan struct{})} }
+
+func (d *requestDrain) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d.mu.Lock()
+		if d.stopping {
+			d.mu.Unlock()
+			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		d.active++
+		d.mu.Unlock()
+
+		defer func() {
+			d.mu.Lock()
+			d.active--
+			if d.stopping && d.active == 0 && !d.idleClosed {
+				close(d.idle)
+				d.idleClosed = true
+			}
+			d.mu.Unlock()
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// stop refuses future entries and returns a channel closed after every handler already
+// admitted by wrap has returned. Waiting is intentionally unbounded after the HTTP
+// shutdown timeout: Docker may SIGKILL at its outer grace limit (leaving owner.lock for
+// stale recovery), but this process will never knowingly admit a second writer early.
+func (d *requestDrain) stop() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stopping = true
+	if d.active == 0 && !d.idleClosed {
+		close(d.idle)
+		d.idleClosed = true
+	}
+	return d.idle
+}
+
+// Serve builds the server and listens on addr (e.g. 127.0.0.1:7474). A loopback bind
+// needs no auth; binding beyond loopback is fail-closed and requires a token (see
+// newAuthConfig). SIGINT/SIGTERM become a graceful shutdown so deferred cleanup runs --
+// in particular, an owning UI removes owner.lock before its replacement starts. Go's
+// default SIGTERM exits without running defers, which made every container recreate
+// wait out the stale-owner window.
+func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool)) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return ServeContext(ctx, vaultRoot, addr, token, basePath, ownIndex, verify, scopesFor, pathsFor, roleFor)
+}
+
+// ServeContext is Serve with caller-controlled shutdown. When verify != nil the app
+// runs in per-member mode (each request authenticates as a hub client and is scoped to
+// them); member auth is then the fail-closed gate, so the single-token requirement is
+// skipped. Otherwise it is the standalone single-token viewer (loopback needs no token).
 // ownIndex=true makes this process the OWNING WRITER of the vault's index instead of a
 // reader of it. Only correct where nothing else writes that index (the mesh-ui
 // container); beside a `mesh watch` / `mesh sync --watch` it reintroduces the second
 // long-lived writer this whole split removed.
-func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool)) error {
+func ServeContext(ctx context.Context, vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool)) (retErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+	// The server lifetime follows the caller, but is also canceled when Serve itself
+	// fails. Accepted pending promotions deliberately detach from a browser disconnect;
+	// without this child context an unexpected listener failure could leave one running
+	// while requestDrain waits for it, preventing Close and owner-lock release forever.
+	lifetimeCtx, cancelLifetime := context.WithCancel(ctx)
+	defer cancelLifetime()
 	memberMode := verify != nil
 	var auth authConfig
 	if !memberMode {
@@ -603,15 +920,20 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 		}
 		auth = a
 	}
-	newSrv := NewServer
+	var s *Server
+	var err error
 	if ownIndex {
 		// NewOwningServer acquires and retains the declared owner lease for the whole
 		// server lifetime. Keeping acquisition in the constructor also protects direct
 		// embedders and tests, rather than only this HTTP wrapper.
-		newSrv = NewOwningServer
+		s, err = NewOwningServerContext(lifetimeCtx, vaultRoot)
+	} else {
+		s, err = NewServerContext(lifetimeCtx, vaultRoot)
 	}
-	s, err := newSrv(vaultRoot)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+			return nil
+		}
 		// The read-only open refuses a vault with no index, which is right (an empty graph
 		// served as if it were the vault is worse), but its advice is written for the MCP.
 		// Say the part that is specific to being the viewer.
@@ -622,7 +944,15 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 		}
 		return err
 	}
-	defer s.Close()
+	// Close stops and joins the owner op poller, closes SQLite, then releases the owner
+	// lock last. Surface any failure: a silent lock-release error recreates the exact
+	// restart loop graceful shutdown exists to prevent.
+	defer func() { retErr = errors.Join(retErr, s.Close()) }()
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
 	s.auth = auth
 	s.basePath = normalizeBasePath(basePath)
 	if memberMode {
@@ -636,22 +966,70 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 	} else if auth.authRequired() {
 		fmt.Printf("auth: token required (Authorization: Bearer ...)\n")
 	}
-	fmt.Printf("serving at http://%s%s  (Ctrl-C to stop)\n", addr, s.baseHref())
 	// Explicit timeouts, matching the hub's. The zero-value http.Server has none, so a
 	// client that opens a connection and never finishes its headers (or never reads its
 	// response) pins a goroutine, an fd and a connection forever. In prod this port sits
 	// behind a buffering proxy, but anything else on the docker network can reach it
 	// directly, and `mesh ui --token` on a public bind has no proxy at all.
+	requestCtx, cancelRequests := context.WithCancel(lifetimeCtx)
+	defer cancelRequests()
+	requests := newRequestDrain()
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           s.Handler(),
+		Handler:           requests.wrap(s.Handler()),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      askMaxDuration + 30*time.Second, // /api/ask is the long pole
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 16,
+		BaseContext:       func(net.Listener) context.Context { return requestCtx },
 	}
-	return srv.ListenAndServe()
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("serving at http://%s%s  (Ctrl-C to stop)\n", listener.Addr(), s.baseHref())
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(listener) }()
+
+	select {
+	case err := <-errCh:
+		idle := requests.stop()
+		cancelLifetime()
+		cancelRequests()
+		closeErr := srv.Close()
+		<-idle
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		return errors.Join(err, closeErr)
+	case <-lifetimeCtx.Done():
+		// Shutdown does not cancel handler contexts itself. Cancel first so long-running
+		// ask/export requests can drain, then leave enough margin inside Compose's explicit
+		// stop_grace_period for deferred ownership and SQLite cleanup to finish.
+		idle := requests.stop()
+		cancelRequests()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownErr := srv.Shutdown(shutdownCtx)
+		cancel()
+		if shutdownErr != nil {
+			// The UI has no hijacked connections. Force-close the remaining HTTP connections,
+			// then still wait for their handlers below: Close alone does not join them.
+			closeErr := srv.Close()
+			serveErr := <-errCh
+			<-idle
+			if errors.Is(serveErr, http.ErrServerClosed) {
+				serveErr = nil
+			}
+			return errors.Join(fmt.Errorf("mesh ui graceful shutdown: %w", shutdownErr), closeErr, serveErr)
+		}
+		serveErr := <-errCh
+		<-idle
+		if errors.Is(serveErr, http.ErrServerClosed) {
+			return nil
+		}
+		return serveErr
+	}
 }
 
 // indexOwnershipLine is the `mesh ui` startup line about who indexes this vault.

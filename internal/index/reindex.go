@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -22,12 +23,38 @@ import (
 // NOT re-read the graph from the DB: the returned graph is the one just built, so a
 // caller that already holds the graph in memory skips the LoadGraph round-trip.
 func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
-	files, err := vault.Walk(root)
+	return ReindexFullContext(context.Background(), s, root)
+}
+
+// ReindexFullContext is ReindexFull with cooperative cancellation across every
+// expensive phase. Cancellation before the single persist transaction commits leaves
+// the previously committed index authoritative.
+func ReindexFullContext(ctx context.Context, s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
+	return reindexFullContext(ctx, s, root, nil)
+}
+
+// reindexFullContext's onPersisted hook marks the one-way publication boundary. It is
+// nil in production and lets tests cancel at that exact boundary without racing a
+// polling goroutine against the best-effort post-commit work.
+func reindexFullContext(ctx context.Context, s *Store, root string, onPersisted func()) (*graph.Graph, []*ParsedNote, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	files, err := vault.WalkContext(ctx, root)
 	if err != nil {
 		return nil, nil, err
 	}
-	notes, ferrs := ParseFiles(files, 0)
+	notes, ferrs, err := ParseFilesContext(ctx, files, 0)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, pn := range notes {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		if rel, err := filepath.Rel(root, pn.Path); err == nil {
 			pn.Path = rel
 		}
@@ -39,25 +66,52 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 	// paired one file's path with the other file's snippet. The loser also had no notes
 	// row, which every later DriftReport read as Added, so `mesh doctor` printed STALE
 	// forever over an index that was already byte-identical to a fresh one.
-	incumbent, ierr := s.IDOwners()
+	incumbent, ierr := s.IDOwnersContext(ctx)
 	if ierr != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		// A cold or unreadable index is not a reason to fail the pass: with no incumbent
 		// the tie falls back to walk order, which is the same rule a first index uses.
 		incumbent = nil
 	}
 	notes, dups := ClaimUniqueIDs(notes, incumbent)
-	s.recordDropped(root, append(ferrs, dups...))
-	g, _ := BuildGraph(notes)
-	g.DetectCommunities(0)
-	if _, err := s.IndexVault(notes, g); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
+	dropped, err := relativeDroppedContext(ctx, root, append(ferrs, dups...))
+	if err != nil {
+		return nil, nil, err
+	}
+	g, _, err := BuildGraphContext(ctx, notes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := g.DetectCommunitiesContext(ctx, 0); err != nil {
+		return nil, nil, err
+	}
+	if _, err := s.indexVaultContext(ctx, notes, g, dropped, true); err != nil {
+		return nil, nil, err
+	}
+	if onPersisted != nil {
+		onPersisted()
+	}
+	// The durable dropped set committed atomically with notes/graph above. Publish the
+	// same set in memory only after that commit, so cancellation can never pair an old
+	// note snapshot with a freshly-cleared dropped_notes table (or vice versa).
+	s.publishDropped(root, dropped)
 	// Refresh the note<->code bridge. note_code_links was written ONLY by the code-index
 	// commands, never by a note reindex, so a note written after startup never linked to
 	// any symbol and a deleted note left its rows behind. Best-effort and cheap when
 	// there is no code index: LinkNotesToCode returns immediately if code_symbols is
 	// empty, so a vault with the code index disabled pays nothing.
-	_, _ = s.LinkNotesToCode(root)
+	if ctx.Err() == nil {
+		_, _ = s.LinkNotesToCodeContext(ctx, root)
+	}
+	// Persist is the point of no return: once the new snapshot commits, the caller must
+	// receive its graph even if its context is canceled during the best-effort bridge
+	// refresh. Returning a cancellation here would leave a long-running caller serving
+	// the old in-memory graph over the newly committed database indefinitely.
 	return g, notes, nil
 }
 
@@ -82,8 +136,31 @@ func ReindexFull(s *Store, root string) (*graph.Graph, []*ParsedNote, error) {
 func (s *Store) RecordDropped(root string, ferrs []FileError) { s.recordDropped(root, ferrs) }
 
 func (s *Store) recordDropped(root string, ferrs []FileError) {
+	_ = s.recordDroppedContext(context.Background(), root, ferrs)
+}
+
+func (s *Store) recordDroppedContext(ctx context.Context, root string, ferrs []FileError) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rel, err := relativeDroppedContext(ctx, root, ferrs)
+	if err != nil {
+		return err
+	}
+	if s.publishDropped(root, rel) {
+		if err := s.persistDroppedContext(ctx, rel); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func relativeDroppedContext(ctx context.Context, root string, ferrs []FileError) ([]FileError, error) {
 	rel := make([]FileError, 0, len(ferrs))
 	for _, fe := range ferrs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		p := fe.Path
 		// Relativize only a path that really is under root. Callers hand this a MIX:
 		// parse failures carry the walked path (usually absolute) while a duplicate-id
@@ -95,7 +172,13 @@ func (s *Store) recordDropped(root string, ferrs []FileError) {
 		}
 		rel = append(rel, FileError{Path: p, Err: fe.Err})
 	}
+	return rel, ctx.Err()
+}
 
+// publishDropped updates the writable Store's in-memory view and emits new findings.
+// It returns whether a caller that has not already persisted rel must replace the
+// dropped_notes table.
+func (s *Store) publishDropped(root string, rel []FileError) bool {
 	s.mu.Lock()
 	prev := make(map[string]string, len(s.dropped))
 	for _, fe := range s.dropped {
@@ -120,9 +203,7 @@ func (s *Store) recordDropped(root string, ferrs []FileError) {
 	}
 	// A shorter set with no new entries (someone fixed a note) is a change too, and it
 	// must reach the table or the fixed note stays flagged forever.
-	if firstPass || fresh > 0 || len(rel) != len(prev) {
-		s.persistDropped(rel)
-	}
+	return firstPass || fresh > 0 || len(rel) != len(prev)
 }
 
 // persistDropped mirrors the dropped set into the index so a reader in ANOTHER process
@@ -134,33 +215,48 @@ func (s *Store) recordDropped(root string, ferrs []FileError) {
 // Best effort: a note that cannot be indexed is already the degraded case, and failing a
 // reindex over the bookkeeping about it would be a strictly worse outcome.
 func (s *Store) persistDropped(rel []FileError) {
+	_ = s.persistDroppedContext(context.Background(), rel)
+}
+
+func (s *Store) persistDroppedContext(ctx context.Context, rel []FileError) error {
 	if s.ReadOnly() {
-		return // the owning writer records these; a read-only store only reads them back
+		return nil // the owning writer records these; a read-only store only reads them back
 	}
 	at := time.Now().Unix()
-	err := s.Write(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM dropped_notes`); err != nil {
-			return err
-		}
-		ins, err := tx.Prepare(`INSERT OR REPLACE INTO dropped_notes(path,err,duplicate,detected_at) VALUES(?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer ins.Close()
-		for _, fe := range rel {
-			dup := 0
-			if errors.Is(fe.Err, ErrDuplicateNoteID) {
-				dup = 1
-			}
-			if _, err := ins.Exec(fe.Path, errText(fe.Err), dup, at); err != nil {
-				return err
-			}
-		}
-		return nil
+	err := s.WriteContext(ctx, func(tx *sql.Tx) error {
+		return writeDroppedRowsContext(ctx, tx, rel, at)
 	})
 	if err != nil {
 		slog.Warn("mesh: could not record dropped notes in the index", "err", err, "dropped", len(rel))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 	}
+	return nil
+}
+
+func writeDroppedRowsContext(ctx context.Context, tx *sql.Tx, rel []FileError, at int64) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dropped_notes`); err != nil {
+		return err
+	}
+	ins, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO dropped_notes(path,err,duplicate,detected_at) VALUES(?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer ins.Close()
+	for _, fe := range rel {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dup := 0
+		if errors.Is(fe.Err, ErrDuplicateNoteID) {
+			dup = 1
+		}
+		if _, err := ins.ExecContext(ctx, fe.Path, errText(fe.Err), dup, at); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // persistedDropErr rehydrates a dropped-note error read back out of the index. The
@@ -190,7 +286,17 @@ func (e *persistedDropErr) Unwrap() error {
 // missing table here means something dropped it underneath a live store: still an error,
 // never an empty answer that reads as good news.
 func (s *Store) droppedFromIndex() ([]FileError, error) {
-	rows, err := s.readDB.Query(`SELECT path, err, duplicate FROM dropped_notes ORDER BY path`)
+	return s.droppedFromIndexContext(context.Background())
+}
+
+func (s *Store) droppedFromIndexContext(ctx context.Context) ([]FileError, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rows, err := s.readDB.QueryContext(ctx, `SELECT path, err, duplicate FROM dropped_notes ORDER BY path`)
 	if err != nil {
 		slog.Warn("mesh: could not read dropped notes from the index", "err", err)
 		return nil, fmt.Errorf("read dropped notes from the index at %s: %w\n"+
@@ -199,6 +305,9 @@ func (s *Store) droppedFromIndex() ([]FileError, error) {
 	defer rows.Close()
 	var out []FileError
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var path, msg string
 		var dup int
 		if err := rows.Scan(&path, &msg, &dup); err != nil {
@@ -232,13 +341,28 @@ func errText(err error) string {
 // dropped notes" and "could not find out" are opposite answers and only one of them is
 // good news. Every caller must surface the failure; a writable store never errors.
 func (s *Store) DroppedNotes() ([]FileError, error) {
+	return s.DroppedNotesContext(context.Background())
+}
+
+// DroppedNotesContext is DroppedNotes with caller-controlled cancellation for the
+// cross-process read used by read-only stores.
+func (s *Store) DroppedNotesContext(ctx context.Context) ([]FileError, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.ReadOnly() {
-		return s.droppedFromIndex()
+		return s.droppedFromIndexContext(ctx)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]FileError, len(s.dropped))
 	copy(out, s.dropped)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -246,10 +370,33 @@ func (s *Store) DroppedNotes() ([]FileError, error) {
 // everything, and returns the freshly DB-loaded in-memory graph. Used by the CLI
 // index path; long-running watchers use ReindexFull + ReconcileIncremental instead.
 func Reindex(s *Store, root string) (*graph.Graph, error) {
-	if _, _, err := ReindexFull(s, root); err != nil {
+	return ReindexContext(context.Background(), s, root)
+}
+
+// ReindexContext is Reindex with a caller-owned lifetime.
+func ReindexContext(ctx context.Context, s *Store, root string) (*graph.Graph, error) {
+	return reindexContext(ctx, s, root, nil)
+}
+
+func reindexContext(ctx context.Context, s *Store, root string, onPersisted func()) (*graph.Graph, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	g, _, err := reindexFullContext(ctx, s, root, onPersisted)
+	if err != nil {
 		return nil, err
 	}
-	return s.LoadGraph()
+	loaded, err := s.LoadGraphContext(ctx)
+	if err != nil {
+		// ReindexFullContext has committed at this point. If the caller disappeared
+		// during the DB reload, publish the equivalent graph already built for that
+		// commit instead of reporting cancellation and stranding the live graph.
+		if ctx.Err() != nil {
+			return g, nil
+		}
+		return nil, err
+	}
+	return loaded, nil
 }
 
 // NoteRef is a lightweight note descriptor for delta/listing queries.
@@ -281,8 +428,16 @@ func (s *Store) ChangedSince(since int64) ([]NoteRef, error) {
 
 // NotePath resolves a note id to its vault-relative path (read pool).
 func (s *Store) NotePath(id string) (string, error) {
+	return s.NotePathContext(context.Background(), id)
+}
+
+// NotePathContext is NotePath with caller-controlled cancellation.
+func (s *Store) NotePathContext(ctx context.Context, id string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var p string
-	err := s.readDB.QueryRow(`SELECT path FROM notes WHERE id = ?`, id).Scan(&p)
+	err := s.readDB.QueryRowContext(ctx, `SELECT path FROM notes WHERE id = ?`, id).Scan(&p)
 	return p, err
 }
 
@@ -290,8 +445,16 @@ func (s *Store) NotePath(id string) (string, error) {
 // fetch (which resolves id -> path -> file, bypassing the retriever's card filter).
 // A missing scope falls back to the fail-safe default (dev-only).
 func (s *Store) NoteScope(id string) ([]string, error) {
+	return s.NoteScopeContext(context.Background(), id)
+}
+
+// NoteScopeContext is NoteScope with caller-controlled cancellation.
+func (s *Store) NoteScopeContext(ctx context.Context, id string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var sc string
-	err := s.readDB.QueryRow(`SELECT scope FROM notes WHERE id = ?`, id).Scan(&sc)
+	err := s.readDB.QueryRowContext(ctx, `SELECT scope FROM notes WHERE id = ?`, id).Scan(&sc)
 	if err != nil {
 		return nil, err
 	}

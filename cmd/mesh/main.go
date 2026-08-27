@@ -2424,9 +2424,11 @@ func uiCmd() *cobra.Command {
 			if !ownIndex {
 				ownIndex = os.Getenv("MESH_UI_OWN_INDEX") == "1"
 			}
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
 			// Standalone single-token mode.
 			if hubDB == "" {
-				return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, nil, nil, nil, nil)
+				return web.ServeContext(ctx, vaultArg(args), addr, token, basePath, ownIndex, nil, nil, nil, nil)
 			}
 			// Per-member team mode: resolve each request against the hub's client
 			// store and scope reads to the signed-in member. The hub store is the
@@ -2439,7 +2441,7 @@ func uiCmd() *cobra.Command {
 				return err
 			}
 			defer closeHub()
-			return web.Serve(vaultArg(args), addr, token, basePath, ownIndex, verify, scopesFor, pathsFor, roleFor)
+			return web.ServeContext(ctx, vaultArg(args), addr, token, basePath, ownIndex, verify, scopesFor, pathsFor, roleFor)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")

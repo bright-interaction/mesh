@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // The owner-routed op queue.
@@ -34,9 +37,11 @@ import (
 // bound, and reports the same loud owner_down when the owner is not running.
 //
 // Ordering is by filename, which is nanosecond-stamped, so a promote's writeback stamp
-// cannot be applied before the note it refers to was created. Nothing here is
-// re-derivable from the vault, so an op file is only removed once its effect is
-// committed.
+// cannot be applied before the note it refers to was created. Durable bookkeeping ops
+// are removed only after their effect commits. Telemetry is the deliberate exception:
+// additive counters are best-effort and non-idempotent, so their file is unlinked and
+// the directory fsynced BEFORE apply. A crash may lose that batch, but can never replay
+// it and double-count it.
 
 // Op is one queued index mutation. Kept deliberately small: this is a queue for
 // bookkeeping a reader could not do itself, not a general RPC channel.
@@ -148,25 +153,28 @@ func (s *Store) EnqueueOp(op Op) (string, error) {
 	// that it survives when the process that queued it does not, and a queued promote's
 	// bookkeeping that evaporates on a power cut leaves a note in the vault that is
 	// forever also in the review queue.
-	syncDir(dir)
+	_ = syncDir(dir)
 	return name, nil
 }
 
-// syncDir fsyncs a directory so a rename into it survives a power loss. Best effort:
-// some filesystems refuse to open a directory for sync, and failing the enqueue over it
-// would be worse than the risk it covers.
-func syncDir(dir string) {
+// syncDir fsyncs a directory so a rename/unlink in it survives a power loss. Enqueue is
+// deliberately best-effort when a filesystem refuses directory sync; the telemetry
+// at-most-once claim is not, because applying after a failed unlink sync could replay an
+// additive increment after reboot.
+func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return
+		return err
 	}
-	defer d.Close()
-	_ = d.Sync()
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
-// OpQueued reports whether a queued op file is still waiting to be applied. This is the
-// readiness signal a read-only caller polls, the exact counterpart of polling NotePath
-// for a written note: the file is removed only after its effect is committed.
+// OpQueued reports whether a queued op file is still waiting to be consumed. This is the
+// readiness signal a read-only bookkeeping caller polls, the exact counterpart of
+// polling NotePath for a written note. Durable bookkeeping files disappear after commit;
+// best-effort telemetry disappears when it is claimed, before its additive transaction.
 func (s *Store) OpQueued(name string) bool {
 	if name == "" {
 		return false
@@ -175,69 +183,164 @@ func (s *Store) OpQueued(name string) bool {
 	return err == nil
 }
 
-// DrainOps applies every queued op, oldest first, and removes each file once its effect
-// is committed. Only the owning writer may call it; a read-only store refuses, because
-// silently doing nothing here would look exactly like a healthy drain.
+// DrainOps consumes every queued op, oldest first. Only the owning writer may call it;
+// a read-only store refuses, because silently doing nothing here would look exactly like
+// a healthy drain.
 //
-// An op whose apply FAILS is left in place for the next pass (a transient DB error must
-// not lose a promoted note's bookkeeping). An op that can never succeed (unreadable,
-// malformed, unknown kind) is removed and logged, so one bad file cannot block the
-// queue forever.
+// A durable bookkeeping op whose apply FAILS is left in place for the next pass (a
+// transient DB error must not lose a promoted note's bookkeeping). Telemetry is claimed
+// by unlinking before apply because its increments are non-idempotent and explicitly
+// best-effort. An op that can never succeed (unreadable, malformed, unknown kind) is
+// removed and logged, so one bad file cannot block the queue forever.
 func (s *Store) DrainOps() (int, error) {
+	return s.DrainOpsContext(context.Background())
+}
+
+// DrainOpsContext is DrainOps with cooperative cancellation between op files and a
+// context-bound transaction for each applied effect. Interrupted durable bookkeeping
+// stays on disk; telemetry already claimed at-most-once may be dropped.
+func (s *Store) DrainOpsContext(ctx context.Context) (int, error) {
+	return s.drainOpsContext(ctx, opFilesContext, vault.ReadFileContext, os.Remove)
+}
+
+type listOpFilesFunc func(context.Context, string) ([]string, error)
+type readOpFileFunc func(context.Context, string) ([]byte, error)
+
+// drainOpsContext keeps the filesystem boundaries injectable so cancellation can be
+// proved without relying on a particular FUSE/network filesystem. Directory listing
+// and file reads may finish late only in read-only workers; removal and every database
+// mutation remain synchronous and are never started after cancellation.
+func (s *Store) drainOpsContext(ctx context.Context, listFiles listOpFilesFunc, readFile readOpFileFunc, removeFile func(string) error) (int, error) {
+	return s.drainOpsContextWithTelemetry(ctx, listFiles, readFile, removeFile, s.applyTelemetryOpContext)
+}
+
+type applyTelemetryOpFunc func(context.Context, Op) error
+
+func (s *Store) drainOpsContextWithTelemetry(ctx context.Context, listFiles listOpFilesFunc, readFile readOpFileFunc, removeFile func(string) error, applyTelemetry applyTelemetryOpFunc) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if s.ReadOnly() {
 		return 0, ErrReadOnly
 	}
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-s.opsDrainGate:
+	}
+	defer func() { s.opsDrainGate <- struct{}{} }()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	dir := OpsDir(s.dir)
-	names, err := opFiles(dir)
+	names, err := listFiles(ctx, dir)
 	if err != nil || len(names) == 0 {
 		return 0, err
 	}
 	applied := 0
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return applied, err
+		}
 		path := filepath.Join(dir, name)
-		b, err := os.ReadFile(path)
+		b, err := readFile(ctx, path)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return applied, ctxErr
+			}
 			if os.IsNotExist(err) {
 				continue // another pass took it
 			}
 			slog.Warn("mesh: dropping an unreadable op file", "file", name, "err", err)
-			_ = os.Remove(path)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return applied, ctxErr
+			}
+			_ = removeFile(path)
 			continue
 		}
 		var op Op
 		if err := json.Unmarshal(b, &op); err != nil {
 			slog.Warn("mesh: dropping a malformed op file", "file", name, "err", err)
-			_ = os.Remove(path)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return applied, ctxErr
+			}
+			_ = removeFile(path)
 			continue
+		}
+		telemetryClaimed := false
+		if op.Kind == OpTelemetry {
+			// Telemetry applies additive increments, so commit-then-unlink can replay a
+			// committed batch after an unlink failure or crash. Claim it at-most-once by
+			// durably removing the queue entry first. If another drainer won the unlink,
+			// it alone owns the batch; this drainer must never apply it.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return applied, ctxErr
+			}
+			if err := removeFile(path); err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return applied, fmt.Errorf("claiming telemetry op %s: %w", name, err)
+			}
+			if err := syncDir(dir); err != nil {
+				// The file is already unlinked, so this best-effort batch is lost. Do not
+				// apply without proving that unlink durable: a reboot could resurrect the
+				// file beside a surviving SQLite increment and double-count it.
+				return applied, fmt.Errorf("sync claimed telemetry op %s: %w", name, err)
+			}
+			telemetryClaimed = true
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return applied, ctxErr
+			}
 		}
 		switch op.Kind {
 		case OpDeletePending:
-			err = s.DeletePending(op.ID)
+			err = s.DeletePendingContext(ctx, op.ID)
 		case OpRecordWriteback:
-			err = s.RecordWriteback(op.NoteID, op.Source)
+			err = s.RecordWritebackContext(ctx, op.NoteID, op.Source)
 		case OpTelemetry:
-			err = s.applyTelemetryOp(op)
+			err = applyTelemetry(ctx, op)
 		case OpAddPending:
 			if op.Pending == nil {
 				slog.Warn("mesh: dropping an add-pending op with no payload", "file", name)
-				_ = os.Remove(path)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return applied, ctxErr
+				}
+				_ = removeFile(path)
 				continue
 			}
-			err = s.AddPending(*op.Pending)
+			err = s.AddPendingContext(ctx, *op.Pending)
 		default:
 			slog.Warn("mesh: dropping an op of unknown kind", "file", name, "kind", op.Kind)
-			_ = os.Remove(path)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return applied, ctxErr
+			}
+			_ = removeFile(path)
 			continue
 		}
 		if err != nil {
-			// Leave the file: the effect has NOT landed, and the caller may still be
-			// waiting on it. Reporting the error stops the pass from claiming success.
+			// Durable bookkeeping stays queued because its effect has not landed. A
+			// telemetry file was already durably claimed: losing a best-effort batch is
+			// preferable to replaying an ambiguous additive transaction.
 			return applied, fmt.Errorf("applying op %s (%s): %w", name, op.Kind, err)
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			// The effect landed but the file survives, so the next pass would replay it.
-			// Both ops are idempotent (a DELETE of a gone row, an INSERT ... DO NOTHING),
-			// so a replay is harmless; say so rather than failing the drain.
+		if telemetryClaimed {
+			applied++
+			continue
+		}
+		// The transaction above may have committed just as shutdown arrived. Leave the
+		// remaining idempotent bookkeeping op in place for the replacement owner rather
+		// than beginning a new filesystem mutation after cancellation.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return applied, ctxErr
+		}
+		if err := removeFile(path); err != nil && !os.IsNotExist(err) {
+			// The effect landed but the file survives, so the next pass will replay it.
+			// Every kind that reaches this path is idempotent (DELETE, INSERT ... DO
+			// NOTHING, or a stable-id upsert), so replay is harmless.
 			slog.Warn("mesh: applied an op but could not remove its file; it will replay",
 				"file", name, "err", err)
 		}
@@ -246,10 +349,20 @@ func (s *Store) DrainOps() (int, error) {
 	return applied, nil
 }
 
+func newOpsDrainGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}
+
 // applyTelemetryOp applies a forwarded batch of usage counters through the exact
 // transaction the writable store's own flush uses, so a fetch counts the same whether
 // the process that saw it owned the index or not.
 func (s *Store) applyTelemetryOp(op Op) error {
+	return s.applyTelemetryOpContext(context.Background(), op)
+}
+
+func (s *Store) applyTelemetryOpContext(ctx context.Context, op Op) error {
 	keys := make([]string, 0, len(op.Counts))
 	for k := range op.Counts {
 		keys = append(keys, k)
@@ -262,13 +375,54 @@ func (s *Store) applyTelemetryOp(op Op) error {
 	if len(keys) == 0 && len(reuses) == 0 {
 		return nil
 	}
-	return s.Write(telemetryTx(keys, op.Counts, reuses))
+	return s.WriteContext(ctx, telemetryTxContext(ctx, keys, op.Counts, reuses))
 }
 
 // opFiles lists the queue's op files, oldest first. Temp files (.op-*) are skipped:
 // they are in-flight writes, not published ops.
 func opFiles(dir string) ([]string, error) {
-	ents, err := os.ReadDir(dir)
+	return opFilesContext(context.Background(), dir)
+}
+
+type readDirResult struct {
+	entries []os.DirEntry
+	err     error
+}
+
+// opFilesContext is opFiles with a caller-owned wait around os.ReadDir. ReadDir itself
+// has no context and can block on an unhealthy mount, so a cancellable caller runs it in
+// a read-only worker whose only publication is this private buffered result.
+func opFilesContext(ctx context.Context, dir string) ([]string, error) {
+	return opFilesContextWith(ctx, dir, os.ReadDir)
+}
+
+func opFilesContextWith(ctx context.Context, dir string, readDir func(string) ([]os.DirEntry, error)) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var ents []os.DirEntry
+	var err error
+	if ctx.Done() == nil {
+		ents, err = readDir(dir)
+	} else {
+		result := make(chan readDirResult, 1)
+		go func() {
+			entries, readErr := readDir(dir)
+			result <- readDirResult{entries: entries, err: readErr}
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case got := <-result:
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			ents, err = got.entries, got.err
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil // no queue yet is not an error
@@ -277,12 +431,18 @@ func opFiles(dir string) ([]string, error) {
 	}
 	var names []string
 	for _, e := range ents {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		names = append(names, e.Name())
 	}
 	sort.Strings(names) // nanosecond-prefixed, so lexical == chronological
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return names, nil
 }
 

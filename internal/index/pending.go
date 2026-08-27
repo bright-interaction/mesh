@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -44,6 +45,14 @@ const pendingQueueCap = 200
 // extraction updates the existing row rather than piling up review items. The queue is
 // capped at pendingQueueCap; older items beyond the cap are pruned in the same tx.
 func (s *Store) AddPending(p PendingNote) error {
+	return s.AddPendingContext(context.Background(), p)
+}
+
+// AddPendingContext is AddPending with a caller-owned transaction lifetime.
+func (s *Store) AddPendingContext(ctx context.Context, p PendingNote) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.TrimSpace(p.Title) == "" || strings.TrimSpace(p.Type) == "" {
 		return nil
 	}
@@ -53,8 +62,8 @@ func (s *Store) AddPending(p PendingNote) error {
 	if p.CreatedAt == 0 {
 		p.CreatedAt = time.Now().Unix()
 	}
-	return s.Write(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(
+	return s.WriteContext(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO pending_notes(id,type,title,do_text,dont_text,why,confidence,source,created_at)
 			 VALUES(?,?,?,?,?,?,?,?,?)
 			 ON CONFLICT(id) DO UPDATE SET
@@ -64,7 +73,7 @@ func (s *Store) AddPending(p PendingNote) error {
 			return err
 		}
 		// Cap the queue: keep only the newest pendingQueueCap rows.
-		_, err := tx.Exec(
+		_, err := tx.ExecContext(ctx,
 			`DELETE FROM pending_notes WHERE id NOT IN (
 			   SELECT id FROM pending_notes ORDER BY created_at DESC, id DESC LIMIT ?)`,
 			pendingQueueCap)
@@ -74,7 +83,15 @@ func (s *Store) AddPending(p PendingNote) error {
 
 // ListPending returns review items, newest first.
 func (s *Store) ListPending() ([]PendingNote, error) {
-	rows, err := s.readDB.Query(
+	return s.ListPendingContext(context.Background())
+}
+
+// ListPendingContext is ListPending with caller-controlled cancellation.
+func (s *Store) ListPendingContext(ctx context.Context) ([]PendingNote, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.readDB.QueryContext(ctx,
 		`SELECT id,type,title,COALESCE(do_text,''),COALESCE(dont_text,''),COALESCE(why,''),
 		        COALESCE(confidence,''),COALESCE(source,''),created_at
 		   FROM pending_notes ORDER BY created_at DESC`)
@@ -95,8 +112,16 @@ func (s *Store) ListPending() ([]PendingNote, error) {
 
 // GetPending fetches one review item by id.
 func (s *Store) GetPending(id string) (PendingNote, error) {
+	return s.GetPendingContext(context.Background(), id)
+}
+
+// GetPendingContext is GetPending with caller-controlled cancellation.
+func (s *Store) GetPendingContext(ctx context.Context, id string) (PendingNote, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var p PendingNote
-	err := s.readDB.QueryRow(
+	err := s.readDB.QueryRowContext(ctx,
 		`SELECT id,type,title,COALESCE(do_text,''),COALESCE(dont_text,''),COALESCE(why,''),
 		        COALESCE(confidence,''),COALESCE(source,''),created_at
 		   FROM pending_notes WHERE id=?`, id).
@@ -106,15 +131,31 @@ func (s *Store) GetPending(id string) (PendingNote, error) {
 
 // DeletePending removes a review item (on promote or discard).
 func (s *Store) DeletePending(id string) error {
-	return s.Write(func(tx *sql.Tx) error {
-		_, err := tx.Exec(`DELETE FROM pending_notes WHERE id=?`, id)
+	return s.DeletePendingContext(context.Background(), id)
+}
+
+// DeletePendingContext is DeletePending with a caller-owned transaction lifetime.
+func (s *Store) DeletePendingContext(ctx context.Context, id string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.WriteContext(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM pending_notes WHERE id=?`, id)
 		return err
 	})
 }
 
 // PendingCount returns the number of review items (for the dashboard badge).
 func (s *Store) PendingCount() (int, error) {
+	return s.PendingCountContext(context.Background())
+}
+
+// PendingCountContext is PendingCount with caller-controlled cancellation.
+func (s *Store) PendingCountContext(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var n int
-	err := s.readDB.QueryRow(`SELECT count(*) FROM pending_notes`).Scan(&n)
+	err := s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM pending_notes`).Scan(&n)
 	return n, err
 }

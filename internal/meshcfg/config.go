@@ -11,12 +11,17 @@
 package meshcfg
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // Embedding is the [embedding] section of a solo config.toml.
@@ -87,14 +92,22 @@ const configName = "config.toml"
 // Load reads <meshDir>/config.toml. A missing file is not an error: it returns a
 // zero Embedding so callers can treat "no config" and "empty config" the same.
 func Load(meshDir string) (Embedding, error) {
-	b, err := os.ReadFile(filepath.Join(meshDir, configName))
+	return LoadContext(context.Background(), meshDir)
+}
+
+// LoadContext is Load with caller-controlled cancellation of the config read.
+func LoadContext(ctx context.Context, meshDir string) (Embedding, error) {
+	b, err := vault.ReadFileContext(ctx, filepath.Join(meshDir, configName))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Embedding{}, nil
 		}
 		return Embedding{}, err
 	}
-	body := string(b)
+	return parseEmbedding(string(b)), nil
+}
+
+func parseEmbedding(body string) Embedding {
 	e := Embedding{
 		Endpoint:    sectionString(body, "embedding", "endpoint"),
 		Model:       sectionString(body, "embedding", "model"),
@@ -105,25 +118,28 @@ func Load(meshDir string) (Embedding, error) {
 	if d := sectionString(body, "embedding", "dim"); d != "" {
 		e.Dim, _ = strconv.Atoi(d)
 	}
-	return e, nil
+	return e
 }
 
 // LoadConfig reads the full config.toml (embedding + retrieval). A missing file
 // returns a zero Config, like Load.
 func LoadConfig(meshDir string) (Config, error) {
-	emb, err := Load(meshDir)
-	if err != nil {
-		return Config{}, err
-	}
-	c := Config{Embedding: emb}
-	b, err := os.ReadFile(filepath.Join(meshDir, configName))
+	return LoadConfigContext(context.Background(), meshDir)
+}
+
+// LoadConfigContext is LoadConfig with caller-controlled cancellation. It reads
+// config.toml once, so one request cannot observe two different versions of the
+// embedding and retrieval sections during a concurrent atomic config update.
+func LoadConfigContext(ctx context.Context, meshDir string) (Config, error) {
+	b, err := vault.ReadFileContext(ctx, filepath.Join(meshDir, configName))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return c, nil
+			return Config{}, nil
 		}
 		return Config{}, err
 	}
 	body := string(b)
+	c := Config{Embedding: parseEmbedding(body)}
 	c.Retrieval = Retrieval{
 		WeightFTS:             sectionFloat(body, "retrieval", "weight_fts"),
 		WeightGraph:           sectionFloat(body, "retrieval", "weight_graph"),
@@ -238,6 +254,38 @@ func Save(meshDir string, e Embedding) error {
 // the next single-field edit persists the zeroes and the operator's setup is gone for
 // good with nothing having reported an error.
 func SaveConfig(meshDir string, c Config) error {
+	return SaveConfigContext(context.Background(), meshDir, c)
+}
+
+// SaveConfigContext is SaveConfig with cooperative cancellation before publication.
+// Filesystem mutations remain synchronous: abandoning a blocked write/sync worker could
+// let it mutate or strand a temp file after this function returned. Cancellation is
+// checked between every pre-publication syscall and every bounded write chunk instead.
+// The final check is immediately before rename. Once rename publishes config.toml, the
+// directory fsync is completed synchronously and cancellation no longer changes the
+// committed result.
+func SaveConfigContext(ctx context.Context, meshDir string, c Config) error {
+	return saveConfigContextWith(ctx, meshDir, c, nil)
+}
+
+// configSaveHooks is a narrow deterministic test seam around the two publication
+// boundaries. Injected operations are still called synchronously, so the safety
+// property under test is the same one production relies on: no mutating worker can
+// outlive SaveConfigContext.
+type configSaveHooks struct {
+	write        func(*os.File, []byte) (int, error)
+	beforeRename func()
+	rename       func(string, string) error
+	syncDir      func(string)
+}
+
+func saveConfigContextWith(ctx context.Context, meshDir string, c Config, hooks *configSaveHooks) (retErr error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// key_env vars are NAMES of env vars, never secrets, and the set of names they may
 	// point at is closed (see keyenv.go). Anything outside the allow-list is reset to the
 	// field's default rather than persisted, so SaveConfig can never write a config.toml
@@ -263,42 +311,120 @@ func SaveConfig(meshDir string, c Config) error {
 		c.Code.Index, strings.Join(c.Code.Roots, ","), strings.Join(c.Code.Languages, ","),
 		c.SecretBridge.BaseURL, c.SecretBridge.KeyEnv, c.SecretBridge.AgentID,
 	)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(meshDir, ".config-*.toml")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
-	if _, err := tmp.WriteString(body); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+	closed := false
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		// Every pre-publication exit removes the private name. Cleanup is joined before
+		// return rather than delegated, so neither the descriptor nor a remover can race
+		// a replacement process after shutdown.
+		if !closed {
+			if err := tmp.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close config temp file: %w", err))
+			}
+			closed = true
+		}
+		if err := os.Remove(tmpName); err != nil && !os.IsNotExist(err) {
+			retErr = errors.Join(retErr, fmt.Errorf("remove config temp file: %w", err))
+		}
+	}()
+	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	// Bound the amount of work between cancellation points. A single filesystem Write
+	// can itself block and cannot safely be detached because it mutates the temp file;
+	// once that syscall returns, cancellation wins before another chunk is attempted.
+	data := []byte(body)
+	const writeChunkSize = 32 << 10
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := data
+		if len(chunk) > writeChunkSize {
+			chunk = chunk[:writeChunkSize]
+		}
+		var n int
+		if hooks != nil && hooks.write != nil {
+			n, err = hooks.write(tmp, chunk)
+		} else {
+			n, err = tmp.Write(chunk)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err != nil {
+			return err
+		}
+		if n != len(chunk) {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
 	}
 	// os.CreateTemp makes its file 0600 and a rename installs that mode over the
 	// destination, so the chmod is what keeps config.toml at the 0644 it has always
 	// landed with. It runs BEFORE the fsync so the mode is part of what gets flushed,
 	// and the mode itself is deliberately unchanged by this durability fix: a fix that
 	// quietly narrows a file is worse than the gap it closes.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	// Flush the data to the device BEFORE the rename publishes the name; a rename can
 	// otherwise publish blocks that were never written.
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		closed = true
 		return err
 	}
-	if err := os.Rename(tmpName, filepath.Join(meshDir, configName)); err != nil {
-		os.Remove(tmpName)
+	closed = true
+	if hooks != nil && hooks.beforeRename != nil {
+		hooks.beforeRename()
+	}
+	// This is the publication linearization point. If cancellation wins here, the old
+	// config remains in place and the deferred cleanup removes the temp file. If rename
+	// starts, its result decides whether the new config was committed.
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	syncDir(meshDir)
+	dst := filepath.Join(meshDir, configName)
+	if hooks != nil && hooks.rename != nil {
+		err = hooks.rename(tmpName, dst)
+	} else {
+		err = os.Rename(tmpName, dst)
+	}
+	if err != nil {
+		return err
+	}
+	published = true
+	// Publication succeeded. Finish durability synchronously even if shutdown arrives
+	// now; returning context.Canceled would falsely imply that the update did not land.
+	if hooks != nil && hooks.syncDir != nil {
+		hooks.syncDir(meshDir)
+	} else {
+		syncDir(meshDir)
+	}
 	return nil
 }
 

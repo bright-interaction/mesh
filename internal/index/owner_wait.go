@@ -7,7 +7,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // Waiting for the single owning writer.
@@ -68,8 +72,8 @@ const (
 // the note row a valid readiness signal for the graph: if NotePath sees it, LoadGraph
 // will too.
 func (s *Store) AwaitNoteIndexed(ctx context.Context, noteID string, timeout time.Duration) error {
-	return s.awaitOwner(ctx, timeout, func() (bool, error) {
-		_, err := s.NotePath(noteID)
+	return s.awaitOwner(ctx, timeout, func(probeCtx context.Context) (bool, error) {
+		_, err := s.NotePathContext(probeCtx, noteID)
 		switch {
 		case err == nil:
 			return true, nil
@@ -88,8 +92,9 @@ func (s *Store) AwaitOpApplied(ctx context.Context, opName string, timeout time.
 	if opName == "" {
 		return nil
 	}
-	return s.awaitOwner(ctx, timeout, func() (bool, error) {
-		return !s.OpQueued(opName), nil
+	return s.awaitOwner(ctx, timeout, func(probeCtx context.Context) (bool, error) {
+		queued, err := s.OpQueuedContext(probeCtx, opName)
+		return !queued, err
 	})
 }
 
@@ -98,8 +103,8 @@ func (s *Store) AwaitOpApplied(ctx context.Context, opName string, timeout time.
 // the bound, so a caller can report the index as behind instead of claiming a reindex it
 // never performed.
 func (s *Store) AwaitOwnerCaughtUp(ctx context.Context, vaultRoot string, timeout time.Duration) error {
-	return s.awaitOwner(ctx, timeout, func() (bool, error) {
-		d, err := s.PendingDrift(vaultRoot)
+	return s.awaitOwner(ctx, timeout, func(probeCtx context.Context) (bool, error) {
+		d, err := s.PendingDriftContext(probeCtx, vaultRoot)
 		if err != nil {
 			return false, err
 		}
@@ -110,64 +115,86 @@ func (s *Store) AwaitOwnerCaughtUp(ctx context.Context, vaultRoot string, timeou
 // awaitOwner polls done until it reports true, the deadline passes (ErrOwnerNotIndexing)
 // or ctx is cancelled. The first check happens BEFORE any sleep, so an already-satisfied
 // wait costs one query rather than a poll interval.
-func (s *Store) awaitOwner(ctx context.Context, timeout time.Duration, done func() (bool, error)) error {
+func (s *Store) awaitOwner(ctx context.Context, timeout time.Duration, done func(context.Context) (bool, error)) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if timeout <= 0 {
 		timeout = OwnerIndexBound
 	}
-	deadline := time.Now().Add(timeout)
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	probeErr := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if probeCtx.Err() != nil {
+			return ErrOwnerNotIndexing
+		}
+		return nil
+	}
 	for {
-		ok, err := done()
+		if err := probeErr(); err != nil {
+			return err
+		}
+		ok, err := done(probeCtx)
+		if waitErr := probeErr(); waitErr != nil {
+			return waitErr
+		}
 		if err != nil {
 			return err
 		}
 		if ok {
 			return nil
 		}
-		if time.Now().After(deadline) {
-			return ErrOwnerNotIndexing
-		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-probeCtx.Done():
+			return probeErr()
 		case <-time.After(OwnerIndexPollInterval):
 		}
 	}
 }
 
+// OpQueuedContext is the context-aware readiness probe used by read-only callers that
+// queued bookkeeping for the owner. Stat has no context in the standard library, so the
+// read-only result is isolated by vault.StatContext and may finish late only in its
+// private worker.
+func (s *Store) OpQueuedContext(ctx context.Context, name string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if name == "" {
+		return false, nil
+	}
+	_, err := vault.StatContext(ctx, filepath.Join(OpsDir(s.dir), name))
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // PendingDrift is the part of the vault the owning writer has not absorbed yet and
 // still can: notes added, changed or removed on disk that the index does not reflect.
-//
-// Files the owner recorded as DROPPED are excluded. A quarantined duplicate id parses
-// fine but is deliberately absent from the notes table, so DriftReport calls it Added
-// forever; counting it would make every wait on a vault with one such note run out the
-// whole bound and then report a perfectly healthy owner as down. (An unparseable note
-// never reaches the drift lists at all, so it needs no exclusion.) Both kinds are still
-// reported, by mesh_health, which is where a note that needs a human belongs.
+// DriftReport resolves duplicate-id ownership and skips currently unparseable files,
+// so the resulting set already excludes notes an index pass would deliberately drop.
+// It must not consult the previous pass's dropped-note record: that record has no
+// content fingerprint and would hide a formerly broken note after the user fixed it.
 func (s *Store) PendingDrift(vaultRoot string) (Drift, error) {
-	d, err := s.DriftReport(vaultRoot)
-	if err != nil {
-		return Drift{}, err
-	}
-	known, err := s.DroppedNotes()
-	if err != nil {
-		return Drift{}, err
-	}
-	dropped := map[string]bool{}
-	for _, fe := range known {
-		dropped[fe.Path] = true
-	}
-	if len(dropped) == 0 {
-		return d, nil
-	}
-	keep := func(paths []string) []string {
-		out := paths[:0]
-		for _, p := range paths {
-			if !dropped[p] {
-				out = append(out, p)
-			}
-		}
-		return out
-	}
-	d.Added, d.Changed, d.Removed = keep(d.Added), keep(d.Changed), keep(d.Removed)
-	return d, nil
+	return s.PendingDriftContext(context.Background(), vaultRoot)
+}
+
+// PendingDriftContext is PendingDrift with cancellation across the vault scan and note
+// reads.
+func (s *Store) PendingDriftContext(ctx context.Context, vaultRoot string) (Drift, error) {
+	return s.DriftReportContext(ctx, vaultRoot)
 }

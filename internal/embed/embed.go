@@ -101,25 +101,49 @@ func (h *HTTP) Model() string { return h.ModelID }
 // so an unreachable endpoint costs one short timeout for the life of the client instead
 // of stalling every caller that asks. Callers wanting to retry build a new HTTP.
 func (h *HTTP) Dim() int {
+	d, _ := h.DimContext(context.Background())
+	return d
+}
+
+// DimContext is Dim with caller-controlled cancellation. A caller cancellation
+// is not remembered as a probe failure: a later request may use the same client
+// successfully. Endpoint failures and the probe's own five-second timeout keep
+// the legacy one-shot failure cache.
+func (h *HTTP) DimContext(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	h.mu.Lock()
 	d, failed := h.dim, h.probeFail
 	h.mu.Unlock()
 	if d > 0 {
-		return d
+		return d, nil
 	}
 	if failed {
-		return 0 // already probed and the endpoint did not answer; do not pay again
+		return 0, nil // already probed and the endpoint did not answer; do not pay again
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), dimProbeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, dimProbeTimeout)
 	defer cancel()
-	vecs, err := h.Embed(ctx, []string{"dim probe"})
+	vecs, err := h.Embed(probeCtx, []string{"dim probe"})
 	if err != nil || len(vecs) == 0 {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
 		h.mu.Lock()
 		h.probeFail = true
 		h.mu.Unlock()
-		return 0
+		if err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("embed: dim probe returned no vectors")
 	}
-	return len(vecs[0]) // Embed recorded h.dim
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return len(vecs[0]), nil // Embed recorded h.dim
 }
 
 func (h *HTTP) Embed(ctx context.Context, texts []string) ([][]float32, error) {
@@ -199,6 +223,17 @@ func (s Stub) Dim() int {
 		return s.D
 	}
 	return 64
+}
+
+// DimContext is the cancellable dimension probe supported by built-in embedders.
+func (s Stub) DimContext(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return s.Dim(), nil
 }
 
 func (s Stub) Embed(_ context.Context, texts []string) ([][]float32, error) {

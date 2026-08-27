@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -16,17 +17,61 @@ import (
 // tables. The CLI uses this for retrieval without re-parsing the vault; the
 // long-running daemon (MCP) keeps the graph in memory instead.
 func (s *Store) LoadGraph() (*graph.Graph, error) {
-	return loadGraph(s.readDB)
+	return s.LoadGraphContext(context.Background())
+}
+
+// LoadGraphContext reconstructs the graph while honoring cancellation during both SQL
+// scans and the final degree pass.
+func (s *Store) LoadGraphContext(ctx context.Context) (*graph.Graph, error) {
+	return s.loadGraphSnapshotContext(ctx, nil)
+}
+
+// loadGraphSnapshotContext keeps nodes and edges on one SQLite read snapshot. The hook
+// is a deterministic test seam after the node scan has established that snapshot.
+func (s *Store) loadGraphSnapshotContext(ctx context.Context, afterNodes func()) (*graph.Graph, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	g, err := loadGraphContextAfterNodes(ctx, tx, afterNodes)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return g, nil
 }
 
 type graphQueryer interface {
-	Query(string, ...any) (*sql.Rows, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 func loadGraph(q graphQueryer) (*graph.Graph, error) {
+	return loadGraphContext(context.Background(), q)
+}
+
+func loadGraphContext(ctx context.Context, q graphQueryer) (*graph.Graph, error) {
+	return loadGraphContextAfterNodes(ctx, q, nil)
+}
+
+func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes func()) (*graph.Graph, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	g := graph.New()
 
-	nrows, err := q.Query(`SELECT id, kind, label, COALESCE(note_id,''), COALESCE(note_path,''), COALESCE(anchor,''), COALESCE(source_loc,''), COALESCE(community,0), COALESCE(attrs,'') FROM nodes`)
+	nrows, err := q.QueryContext(ctx, `SELECT id, kind, label, COALESCE(note_id,''), COALESCE(note_path,''), COALESCE(anchor,''), COALESCE(source_loc,''), COALESCE(community,0), COALESCE(attrs,'') FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -35,6 +80,10 @@ func loadGraph(q graphQueryer) (*graph.Graph, error) {
 	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
 	defer nrows.Close()
 	for nrows.Next() {
+		if err := ctx.Err(); err != nil {
+			nrows.Close()
+			return nil, err
+		}
 		n := &graph.Node{}
 		var attrs string
 		if err := nrows.Scan(&n.ID, &n.Kind, &n.Label, &n.NoteID, &n.NotePath, &n.Anchor, &n.SourceLoc, &n.Community, &attrs); err != nil {
@@ -51,13 +100,22 @@ func loadGraph(q graphQueryer) (*graph.Graph, error) {
 		return nil, err
 	}
 	nrows.Close()
+	if afterNodes != nil {
+		afterNodes()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	erows, err := q.Query(`SELECT source, target, relation, confidence, confidence_score, weight, COALESCE(source_loc,'') FROM edges`)
+	erows, err := q.QueryContext(ctx, `SELECT source, target, relation, confidence, confidence_score, weight, COALESCE(source_loc,'') FROM edges`)
 	if err != nil {
 		return nil, err
 	}
 	defer erows.Close()
 	for erows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var e graph.Edge
 		if err := erows.Scan(&e.Source, &e.Target, &e.Relation, &e.Confidence, &e.ConfidenceScore, &e.Weight, &e.SourceLoc); err != nil {
 			return nil, err
@@ -65,7 +123,9 @@ func loadGraph(q graphQueryer) (*graph.Graph, error) {
 		g.AddEdge(e)
 	}
 	// Match BuildGraph: recompute degrees in a final pass so both paths agree exactly.
-	g.RecomputeDegrees()
+	if err := g.RecomputeDegreesContext(ctx); err != nil {
+		return nil, err
+	}
 	return g, erows.Err()
 }
 

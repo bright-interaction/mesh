@@ -4,6 +4,7 @@
 package graph
 
 import (
+	"context"
 	"math"
 	"sort"
 	"strings"
@@ -40,6 +41,20 @@ type Ranker struct {
 
 // NewRanker builds the inverted statistics over every note node's label+attrs.
 func (g *Graph) NewRanker() *Ranker {
+	r, _ := g.NewRankerContext(context.Background())
+	return r
+}
+
+// NewRankerContext is NewRanker with cooperative cancellation. The ranker's
+// corpus maps remain private until the whole pass succeeds, so a caller can
+// never observe partially built statistics.
+func (g *Graph) NewRankerContext(ctx context.Context) (*Ranker, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := contextCause(ctx); err != nil {
+		return nil, err
+	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	r := &Ranker{
@@ -50,6 +65,9 @@ func (g *Graph) NewRanker() *Ranker {
 	}
 	total := 0
 	for id, nd := range g.nodes {
+		if err := contextCause(ctx); err != nil {
+			return nil, err
+		}
 		if nd.Kind != "note" {
 			continue
 		}
@@ -60,6 +78,9 @@ func (g *Graph) NewRanker() *Ranker {
 		r.docLen[id] = len(toks)
 		total += len(toks)
 		for term := range tf {
+			if err := contextCause(ctx); err != nil {
+				return nil, err
+			}
 			r.df[term]++
 		}
 		r.n++
@@ -70,7 +91,10 @@ func (g *Graph) NewRanker() *Ranker {
 	if r.avgLen == 0 {
 		r.avgLen = 1
 	}
-	return r
+	if err := contextCause(ctx); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // Score ranks note nodes against the query by BM25 over label+attrs. Returns

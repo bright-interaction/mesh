@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,13 +54,35 @@ func (s *Store) NoteHashes() (map[string]string, error) {
 }
 
 func (s *Store) DriftReport(root string) (Drift, error) {
+	return s.DriftReportContext(context.Background(), root)
+}
+
+// DriftReportContext is DriftReport with caller-controlled cancellation across the
+// database snapshot, vault walk, and per-note reads. A cancelled report never returns a
+// partial drift set that a caller could mistake for the owner's current backlog.
+func (s *Store) DriftReportContext(ctx context.Context, root string) (Drift, error) {
+	return s.driftReportContext(ctx, root, vault.WalkContext, ParseFileContext)
+}
+
+type walkVaultContextFunc func(context.Context, string) ([]string, error)
+type parseNoteContextFunc func(context.Context, string) (*ParsedNote, error)
+
+// driftReportContext keeps the filesystem phases injectable so cancellation during a
+// walk or note read can be proved without depending on a particular FUSE/network mount.
+func (s *Store) driftReportContext(ctx context.Context, root string, walk walkVaultContextFunc, parse parseNoteContextFunc) (Drift, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Drift{}, err
+	}
 	// id comes back alongside the hash so incumbent can be built from the SAME rows: the
 	// drift check has to resolve a duplicate id exactly as the indexer does. Without the
 	// incumbent, drift disagreed with the indexer about which of two colliding files
 	// belongs in the index, and the file the indexer had deliberately quarantined came
 	// back as Added on every single run, so `mesh doctor` said STALE and exited 1 forever
 	// while `mesh index` kept producing a byte-identical index.
-	rows, err := s.readDB.Query(`SELECT path, id, retrieval_hash FROM notes`)
+	rows, err := s.readDB.QueryContext(ctx, `SELECT path, id, retrieval_hash FROM notes`)
 	if err != nil {
 		return Drift{}, err
 	}
@@ -70,6 +93,9 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 	dbHash := map[string]string{}
 	incumbent := map[string]string{}
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return Drift{}, err
+		}
 		var p, id, h string
 		if err := rows.Scan(&p, &id, &h); err != nil {
 			rows.Close()
@@ -79,8 +105,14 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 		incumbent[id] = p
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Drift{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Drift{}, err
+	}
 
-	files, err := vault.Walk(root)
+	files, err := walk(ctx, root)
 	if err != nil {
 		return Drift{}, err
 	}
@@ -95,13 +127,19 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 	parsedFiles := make([]parsedFile, 0, len(files))
 	claims := make([]idClaim, 0, len(files))
 	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return Drift{}, err
+		}
 		rel, err := filepath.Rel(root, f)
 		if err != nil {
 			rel = f
 		}
 		seen[rel] = true
-		pn, err := ParseFile(f)
+		pn, err := parse(ctx, f)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Drift{}, ctxErr
+			}
 			// A file that no longer parses but is in the index must be reported as
 			// drift (a full reindex would drop it), not silently skipped.
 			if _, ok := dbHash[rel]; ok {
@@ -113,8 +151,14 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 		parsedFiles = append(parsedFiles, parsedFile{rel: rel, pn: pn})
 		claims = append(claims, idClaim{ID: effectiveID(pn), Path: rel})
 	}
+	if err := ctx.Err(); err != nil {
+		return Drift{}, err
+	}
 	owner := resolveIDOwners(claims, incumbent)
 	for _, pf := range parsedFiles {
+		if err := ctx.Err(); err != nil {
+			return Drift{}, err
+		}
 		if o, ok := owner[effectiveID(pf.pn)]; ok && o != pf.rel {
 			// Quarantined: an index pass will not hold this file, so its absence is not
 			// drift. If it still has a stale row (its id changed into a collision) that
@@ -132,6 +176,9 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 		}
 	}
 	for p := range dbHash {
+		if err := ctx.Err(); err != nil {
+			return Drift{}, err
+		}
 		if !seen[p] {
 			d.Removed = append(d.Removed, p)
 		}
@@ -139,6 +186,9 @@ func (s *Store) DriftReport(root string) (Drift, error) {
 	sort.Strings(d.Added)
 	sort.Strings(d.Changed)
 	sort.Strings(d.Removed)
+	if err := ctx.Err(); err != nil {
+		return Drift{}, err
+	}
 	return d, nil
 }
 

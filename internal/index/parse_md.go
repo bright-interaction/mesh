@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -112,19 +113,63 @@ func ParseFile(path string) (*ParsedNote, error) {
 	if err != nil {
 		return nil, err
 	}
-	pn, err := Parse(path, data)
+	pn, err := parseFileData(path, data)
 	if err != nil {
 		return nil, err
 	}
+	setParsedNoteMtime(pn, statFile(path))
+	return pn, nil
+}
+
+// ParseFileContext is ParseFile with a caller-owned filesystem wait. The parsing work
+// is local and deterministic; cancellation is checked again before and after it so a
+// cancelled indexing pass never receives a partially parsed note.
+func ParseFileContext(ctx context.Context, path string) (*ParsedNote, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	data, err := vault.ReadFileContext(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	pn, err := parseFileData(path, data)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	info, statErr := vault.StatContext(ctx, path)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if statErr == nil {
+		pn.Mtime = info.ModTime().Unix()
+	}
+	return pn, nil
+}
+
+func parseFileData(path string, data []byte) (*ParsedNote, error) {
+	return Parse(path, data)
+}
+
+func statFile(path string) os.FileInfo {
+	info, _ := os.Stat(path)
+	return info
+}
+
+func setParsedNoteMtime(pn *ParsedNote, info os.FileInfo) {
 	// Capture mtime from the file we just read (path is the real, usually absolute,
 	// path here), so the stored mtime is correct regardless of the process CWD. The
 	// old fileMtime(pn.Path) stat'd the vault-relative path and returned 0 whenever
 	// mesh ran outside the vault root - which is the normal MCP case (an agent spawns
 	// `mesh mcp --vault <abs>` from its own dir) - silently breaking mesh_changed_since.
-	if fi, err := os.Stat(path); err == nil {
-		pn.Mtime = fi.ModTime().Unix()
+	if info != nil {
+		pn.Mtime = info.ModTime().Unix()
 	}
-	return pn, nil
 }
 
 // Parse extracts the deterministic structure of a markdown document. Wikilinks
@@ -274,6 +319,17 @@ func isTagRune(r rune) bool {
 // raised so `mesh migrate` can fix it). Wikilinks resolve by basename to the
 // target note's id, so edges survive a file rename (spec section 3.6).
 func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
+	g, issues, _ := BuildGraphContext(context.Background(), notes)
+	return g, issues
+}
+
+// BuildGraphContext is BuildGraph with cooperative cancellation. The graph remains
+// private until this function returns, so cancellation discards it rather than exposing
+// a partially-resolved graph to a caller that might persist or serve it.
+func BuildGraphContext(ctx context.Context, notes []*ParsedNote) (*graph.Graph, []Issue, error) {
+	if err := buildGraphContextCause(ctx); err != nil {
+		return nil, nil, err
+	}
 	g := graph.NewSized(len(notes))
 	var issues []Issue
 
@@ -302,6 +358,9 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	pathByPathKey := make(map[string]string, len(notes))
 	ambiguousPathKeys := map[string][]string{}
 	for _, n := range notes {
+		if err := buildGraphContextCause(ctx); err != nil {
+			return nil, nil, err
+		}
 		id := effectiveID(n)
 		stableKey := canonicalLinkText(id)
 		issues = append(issues, n.Issues...) // what Parse found in the file itself
@@ -336,6 +395,9 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		}
 		anchors := make(map[string]bool, len(n.Headings))
 		for _, h := range n.Headings {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			if h.Anchor != "" {
 				anchors[h.Anchor] = true
 			}
@@ -402,6 +464,9 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	}
 
 	for _, n := range notes {
+		if err := buildGraphContextCause(ctx); err != nil {
+			return nil, nil, err
+		}
 		id := effectiveID(n)
 		noteNode := "note:" + id
 		title := n.FM.Title
@@ -413,6 +478,9 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			attrs["when"] = n.FM.When
 		}
 		for k, v := range map[string]string{"do": n.FM.Do, "dont": n.FM.Dont, "why": n.FM.Why} {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			clean, _ := vault.StripComments(v)
 			clean = strings.TrimSpace(clean)
 			if !vault.Unfilled(clean) {
@@ -423,6 +491,9 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 
 		seenHeading := map[string]int{}
 		for _, h := range n.Headings {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			if h.Anchor == "" {
 				continue
 			}
@@ -450,9 +521,15 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			g.AddEdge(graph.Edge{Source: noteNode, Target: tid, Relation: "tagged", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1})
 		}
 		for _, t := range n.Tags {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			addTag(t.Name)
 		}
 		for _, t := range n.FM.Tags {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			addTag(t)
 		}
 
@@ -495,9 +572,15 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 			g.AddEdge(graph.Edge{Source: noteNode, Target: "note:" + tid, Relation: "references", Confidence: graph.ConfExtracted, ConfidenceScore: 1, Weight: 1, SourceLoc: locStr(line)})
 		}
 		for _, l := range n.Links {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			addRef(l.Target, l.Line)
 		}
 		for _, r := range n.FM.Related {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			addRef(r, 0)
 		}
 		// do/dont/why are prose, and they are the prose a search card actually shows, so
@@ -507,15 +590,24 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 		// so neither the author nor the graph got anything. Read through the same markup
 		// scanner as the body, so a backticked `[[note-id]]` stays the syntax example it is.
 		for _, field := range []string{n.FM.Do, n.FM.Dont, n.FM.Why} {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			if field == "" {
 				continue
 			}
 			clean, _ := vault.StripNonContent(field)
 			p := &ParsedNote{}
 			for _, line := range strings.Split(clean, "\n") {
+				if err := buildGraphContextCause(ctx); err != nil {
+					return nil, nil, err
+				}
 				p.appendLinks(line, 0)
 			}
 			for _, l := range p.Links {
+				if err := buildGraphContextCause(ctx); err != nil {
+					return nil, nil, err
+				}
 				addRef(l.Target, 0)
 			}
 		}
@@ -542,11 +634,17 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	// pass below, once every note has been walked.
 	claims := map[string][]supersedeClaim{}
 	for _, n := range notes {
+		if err := buildGraphContextCause(ctx); err != nil {
+			return nil, nil, err
+		}
 		if len(n.FM.Supersedes) == 0 {
 			continue
 		}
 		srcID := effectiveID(n)
 		for _, raw := range n.FM.Supersedes {
+			if err := buildGraphContextCause(ctx); err != nil {
+				return nil, nil, err
+			}
 			key := linkKey(raw)
 			if key == "" {
 				continue
@@ -599,20 +697,46 @@ func BuildGraph(notes []*ParsedNote) (*graph.Graph, []Issue) {
 	// note with no `when` sorts as older than any dated claimant, since a dateless
 	// correction cannot out-rank one an author bothered to date.
 	for tid, claimants := range claims {
+		if err := buildGraphContextCause(ctx); err != nil {
+			return nil, nil, err
+		}
 		sort.Slice(claimants, func(i, j int) bool {
 			if claimants[i].when != claimants[j].when {
 				return claimants[i].when > claimants[j].when
 			}
 			return claimants[i].srcID > claimants[j].srcID
 		})
+		if err := buildGraphContextCause(ctx); err != nil {
+			return nil, nil, err
+		}
 		g.SetNodeAttr("note:"+tid, "superseded_by", claimants[0].srcID)
 	}
 	// Degrees are computed in a final pass so they do not depend on the interleaved
 	// AddNode/AddEdge order above (an edge to a later note would otherwise undercount
 	// that note's inbound degree). This keeps BuildGraph's degrees identical to
 	// LoadGraph's, so the MCP (BuildGraph) and CLI (LoadGraph) retrieval paths agree.
-	g.RecomputeDegrees()
-	return g, issues
+	if err := g.RecomputeDegreesContext(ctx); err != nil {
+		return nil, nil, err
+	}
+	if err := buildGraphContextCause(ctx); err != nil {
+		return nil, nil, err
+	}
+	return g, issues, nil
+}
+
+// buildGraphContextCause is the cheap cancellation probe for graph assembly. Cause
+// preserves a caller-supplied WithCancelCause error rather than reducing it to the
+// generic context.Canceled sentinel.
+func buildGraphContextCause(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 // foreignStoreID matches the filename shape of a Claude MEMORY file: a type prefix,

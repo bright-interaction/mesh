@@ -8,6 +8,7 @@
 package graph
 
 import (
+	"context"
 	"strings"
 	"sync"
 )
@@ -166,11 +167,30 @@ func (g *Graph) AddEdge(e Edge) {
 // built nodes-first (LoadGraph). Call this once after the graph is fully assembled so
 // both paths agree, and so KnowledgeDegree is populated at all.
 func (g *Graph) RecomputeDegrees() {
+	_ = g.RecomputeDegreesContext(context.Background())
+}
+
+// RecomputeDegreesContext is RecomputeDegrees with cooperative cancellation. Degree
+// values are computed into a private slice and published only after the whole pass has
+// completed, so cancellation never leaves a graph with a mixture of old and new values.
+func (g *Graph) RecomputeDegreesContext(ctx context.Context) error {
+	if err := contextCause(ctx); err != nil {
+		return err
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	type degreeUpdate struct {
+		n                          *Node
+		oldDegree, oldKnowledgeDeg int
+		newDegree, newKnowledgeDeg int
+	}
+	updates := make([]degreeUpdate, 0, len(g.nodes))
 	seen := make(map[string]bool)
 	for id, n := range g.nodes {
-		n.Degree = len(g.adj[id]) + len(g.rev[id])
+		if err := contextCause(ctx); err != nil {
+			return err
+		}
+		degree := len(g.adj[id]) + len(g.rev[id])
 
 		// Knowledge degree: distinct OTHER notes reached over "references" edges, in
 		// either direction. Heading/tag scaffolding never counts, and two notes that
@@ -187,16 +207,62 @@ func (g *Graph) RecomputeDegrees() {
 			k++
 		}
 		for _, e := range g.adj[id] {
+			if err := contextCause(ctx); err != nil {
+				return err
+			}
 			if e.Relation == RelReferences {
 				count(e.Target)
 			}
 		}
 		for _, e := range g.rev[id] {
+			if err := contextCause(ctx); err != nil {
+				return err
+			}
 			if e.Relation == RelReferences {
 				count(e.Source)
 			}
 		}
-		n.KnowledgeDegree = k
+		updates = append(updates, degreeUpdate{
+			n: n, oldDegree: n.Degree, oldKnowledgeDeg: n.KnowledgeDegree,
+			newDegree: degree, newKnowledgeDeg: k,
+		})
+	}
+	if err := contextCause(ctx); err != nil {
+		return err
+	}
+	rollback := func(n int) {
+		for i := 0; i < n; i++ {
+			updates[i].n.Degree = updates[i].oldDegree
+			updates[i].n.KnowledgeDegree = updates[i].oldKnowledgeDeg
+		}
+	}
+	for i, update := range updates {
+		if err := contextCause(ctx); err != nil {
+			rollback(i)
+			return err
+		}
+		update.n.Degree = update.newDegree
+		update.n.KnowledgeDegree = update.newKnowledgeDeg
+	}
+	if err := contextCause(ctx); err != nil {
+		rollback(len(updates))
+		return err
+	}
+	return nil
+}
+
+// contextCause is the cheap cancellation probe shared by the graph's context-aware
+// passes. Cause preserves a caller-supplied WithCancelCause error instead of rounding it
+// down to context.Canceled.
+func contextCause(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		return ctx.Err()
+	default:
+		return nil
 	}
 }
 

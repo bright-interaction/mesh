@@ -4,6 +4,7 @@
 package vault
 
 import (
+	"context"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -27,8 +28,57 @@ func skipDir(path, root, name string) bool {
 // Walk returns every markdown file under root, skipping noise and hidden dirs.
 // This is the M0 walker; .meshignore support lands with the index step.
 func Walk(root string) ([]string, error) {
+	return WalkContext(context.Background(), root)
+}
+
+// WalkContext is Walk with caller-controlled cancellation. Cancellation is checked at
+// every visited entry and after the traversal, and a cancelled walk never returns a
+// partial file set that a caller could mistake for the whole vault.
+func WalkContext(ctx context.Context, root string) ([]string, error) {
+	return walkContext(ctx, root, filepath.WalkDir)
+}
+
+func walkContext(ctx context.Context, root string, walkDir func(string, fs.WalkDirFunc) error) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// filepath.WalkDir has no context and may stall between callbacks while reading an
+	// unhealthy FUSE/network directory. Keep the traversal and its partial slice private
+	// to a read-only worker so a cancellable owner can stop waiting and release its lock.
+	// The callback below observes ctx once the filesystem returns; the buffered result
+	// lets that late worker exit without touching caller-owned state.
+	if ctx.Done() == nil {
+		return scanWalkContext(ctx, root, walkDir)
+	}
+	type result struct {
+		paths []string
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		paths, err := scanWalkContext(ctx, root, walkDir)
+		done <- result{paths: paths, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case got := <-done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return got.paths, got.err
+	}
+}
+
+func scanWalkContext(ctx context.Context, root string, walkDir func(string, fs.WalkDirFunc) error) ([]string, error) {
 	var out []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err := walkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return err
 		}
@@ -39,11 +89,24 @@ func Walk(root string) ([]string, error) {
 			return nil
 		}
 		if strings.EqualFold(filepath.Ext(path), ".md") && !IsConflictSibling(d.Name()) {
-			out = append(out, path)
+			// A markdown-shaped directory entry is not necessarily a note. Known FIFOs,
+			// symlinks, sockets, and devices are excluded without calling Info: Info is a
+			// separate filesystem operation that can itself block on an unhealthy mount.
+			// Type()==0 also represents "unknown" on some filesystems; those entries are
+			// admitted here and protected by the indexer's isolated cancellable read.
+			if d.Type().IsRegular() {
+				out = append(out, path)
+			}
 		}
 		return nil
 	})
-	return out, err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // IsConflictSibling reports whether a filename is a sync-conflict artifact

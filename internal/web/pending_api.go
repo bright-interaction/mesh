@@ -27,7 +27,7 @@ func (s *Server) handlePendingList(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) { // extraction candidates are dev-scoped review content
 		return
 	}
-	items, err := s.store.ListPending()
+	items, err := s.store.ListPendingContext(r.Context())
 	if err != nil {
 		http.Error(w, "list failed", http.StatusInternalServerError)
 		return
@@ -49,12 +49,19 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	p, err := s.store.GetPending(req.ID)
+	// A syntactically valid promotion request is accepted here. From this point on a
+	// browser disconnect must not abandon it, while process shutdown must still cancel
+	// pre-publication work and let the durable compensation path take over afterward.
+	durableCtx := s.lifetimeContext()
+	p, err := s.store.GetPendingContext(durableCtx, req.ID)
 	if err != nil {
 		http.Error(w, "unknown pending id", http.StatusNotFound)
 		return
 	}
-	res, err := vault.CreateNote(s.vaultRoot, vault.NewNoteSpec{
+	// Process shutdown must be able to stop the pre-publication whole-vault id scan.
+	// CreateNoteContext deliberately finishes or removes its O_EXCL claim after the
+	// publication boundary, so using the server lifetime here is safe on both sides.
+	res, err := vault.CreateNoteContext(durableCtx, s.vaultRoot, vault.NewNoteSpec{
 		Type:       vault.NoteType(p.Type),
 		Title:      noDash(p.Title),
 		Do:         noDash(p.Do),
@@ -77,6 +84,9 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "create note failed: "+mcp.ScrubPathsUnder(err.Error(), s.vaultRoot), http.StatusInternalServerError)
 		return
 	}
+	if s.afterPendingFilePublished != nil {
+		s.afterPendingFilePublished()
+	}
 	// The note file is now on disk, which is the durable part and the part that matters:
 	// everything below is bookkeeping and indexing, and none of it can un-create it. So
 	// from here on a failure downgrades the RESPONSE, never the outcome.
@@ -86,13 +96,16 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 	// without it the authored count only caught promoted notes at the next backfill. And
 	// the candidate is now a real note, so it leaves the review queue. A read-only viewer
 	// owns neither table, so both go to the owning writer as ops and this waits for them.
-	ownerDown, err := s.resolveIndexWrites(r.Context(),
+	// This work follows an already-durable file creation. A browser disconnect must not
+	// strand that file outside the long-lived server's graph, so use the server lifetime
+	// (canceled by SIGTERM), not the request lifetime, for the required follow-through.
+	ownerDown, err := s.resolveIndexWrites(durableCtx,
 		func() error {
-			_ = s.store.RecordWriteback(res.ID, "agent")
-			return s.store.DeletePending(req.ID)
+			_ = s.store.RecordWritebackContext(durableCtx, res.ID, "agent")
+			return s.store.DeletePendingContext(durableCtx, req.ID)
 		},
-		index.Op{Kind: index.OpRecordWriteback, NoteID: res.ID, Source: "agent"},
 		index.Op{Kind: index.OpDeletePending, ID: req.ID},
+		index.Op{Kind: index.OpRecordWriteback, NoteID: res.ID, Source: "agent"},
 	)
 	if err != nil {
 		slog.Error("mesh ui: promoted a note but could not settle its bookkeeping", "id", req.ID, "note", res.ID, "error", err)
@@ -101,19 +114,17 @@ func (s *Server) handlePendingPromote(w http.ResponseWriter, r *http.Request) {
 	// Make it searchable. The owner of the index reindexes; a reader waits for the owning
 	// writer to have indexed the new note and then re-reads.
 	if s.store.ReadOnly() {
-		if werr := s.store.AwaitNoteIndexed(r.Context(), res.ID, s.ownerWait); werr != nil {
+		if werr := s.store.AwaitNoteIndexed(durableCtx, res.ID, s.ownerWait); werr != nil {
 			ownerDown = true
 		}
-		if rerr := s.refresh(); rerr != nil {
+		if rerr := s.refreshContext(durableCtx); rerr != nil {
 			slog.Error("mesh ui: reloading the graph after a promote failed", "error", rerr)
 		}
-	} else if g, e := index.Reindex(s.store, s.vaultRoot); e == nil {
-		// One exclusive critical section for the swap + invalidation, so an in-flight
-		// retriever build cannot publish over the old graph (see Server.retriever).
-		s.mu.Lock()
-		s.graph = g
-		s.cachedRetriever.Store(nil)
-		s.mu.Unlock()
+	} else {
+		if reindexErr := s.reindexAndPublish(durableCtx, false); reindexErr != nil {
+			ownerDown = true
+			slog.Error("mesh ui: promoted a note but could not reindex it", "note", res.ID, "error", reindexErr)
+		}
 	}
 	// Return a vault-relative path, never the server's absolute filesystem path. This one
 	// leaked on EVERY successful promote, not just on an error: in member mode the caller
@@ -152,7 +163,7 @@ func (s *Server) handlePendingDiscard(w http.ResponseWriter, r *http.Request) {
 	// deletion for the owning writer and waits for it. A discard that reports success
 	// while the item is still in the queue would have the reviewer discard it twice.
 	ownerDown, err := s.resolveIndexWrites(r.Context(),
-		func() error { return s.store.DeletePending(req.ID) },
+		func() error { return s.store.DeletePendingContext(r.Context(), req.ID) },
 		index.Op{Kind: index.OpDeletePending, ID: req.ID},
 	)
 	if err != nil {

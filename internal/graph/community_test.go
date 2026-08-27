@@ -3,7 +3,45 @@
 
 package graph
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+// cancelAfterChecksContext deterministically cancels after the context-aware pass has
+// polled it a requested number of times. It avoids scheduler/timing races in tests that
+// must land cancellation inside a graph loop rather than before entry.
+type cancelAfterChecksContext struct {
+	remaining int
+	cause     error
+	done      chan struct{}
+}
+
+func newCancelAfterChecksContext(checks int, cause error) *cancelAfterChecksContext {
+	return &cancelAfterChecksContext{remaining: checks, cause: cause, done: make(chan struct{})}
+}
+
+func (*cancelAfterChecksContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterChecksContext) Done() <-chan struct{} {
+	if c.remaining > 0 {
+		c.remaining--
+		if c.remaining == 0 {
+			close(c.done)
+		}
+	}
+	return c.done
+}
+func (c *cancelAfterChecksContext) Err() error {
+	select {
+	case <-c.done:
+		return c.cause
+	default:
+		return nil
+	}
+}
+func (*cancelAfterChecksContext) Value(any) any { return nil }
 
 // Two disconnected triangles must fall into two communities. (Label propagation
 // can merge bridge-connected clusters; that quality gap is what the later
@@ -163,6 +201,55 @@ func TestDetectCommunitiesDeterministic(t *testing.T) {
 		n2, _ := g2.Node(id)
 		if n1.Community != n2.Community {
 			t.Errorf("nondeterministic community for %s: %d vs %d", id, n1.Community, n2.Community)
+		}
+	}
+}
+
+func TestDetectCommunitiesContextMatchesWrapper(t *testing.T) {
+	build := func() *Graph {
+		g := New()
+		for _, id := range []string{"a", "b", "c", "x", "y", "z"} {
+			g.AddNode(&Node{ID: id, Kind: "note", Label: id})
+		}
+		clique(g, "a", "b", "c")
+		clique(g, "x", "y", "z")
+		return g
+	}
+	wrapper, contextual := build(), build()
+	want := wrapper.DetectCommunities(0)
+	got, err := contextual.DetectCommunitiesContext(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("DetectCommunitiesContext: %v", err)
+	}
+	if got != want {
+		t.Fatalf("community count: context=%d wrapper=%d", got, want)
+	}
+	for _, id := range []string{"a", "b", "c", "x", "y", "z"} {
+		wn, _ := wrapper.Node(id)
+		gn, _ := contextual.Node(id)
+		if gn.Community != wn.Community {
+			t.Fatalf("community for %s: context=%d wrapper=%d", id, gn.Community, wn.Community)
+		}
+	}
+}
+
+func TestDetectCommunitiesContextCancellationDoesNotPublishPartialPartition(t *testing.T) {
+	g := New()
+	ids := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	for _, id := range ids {
+		g.AddNode(&Node{ID: id, Kind: "note", Label: id, Community: 77})
+	}
+	clique(g, ids...)
+
+	cause := errors.New("stop community detection")
+	ctx := newCancelAfterChecksContext(40, cause)
+	if _, err := g.DetectCommunitiesContext(ctx, 100); !errors.Is(err, cause) {
+		t.Fatalf("DetectCommunitiesContext error = %v, want cause %v", err, cause)
+	}
+	for _, id := range ids {
+		n, _ := g.Node(id)
+		if n.Community != 77 {
+			t.Fatalf("cancellation published a partial partition: %s community=%d, want 77", id, n.Community)
 		}
 	}
 }

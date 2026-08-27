@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 )
@@ -29,11 +30,19 @@ func (s *Store) IncrMetric(key string, n int64) error {
 
 // Metric reads one counter (0 if absent).
 func (s *Store) Metric(key string) (int64, error) {
+	return s.MetricContext(context.Background(), key)
+}
+
+// MetricContext is Metric with caller-controlled cancellation.
+func (s *Store) MetricContext(ctx context.Context, key string) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Reporting surface, not a hot path: land pending increments first so a dashboard
 	// never shows a number that lags the flush ticker.
-	s.flushTelemetry()
+	s.flushReportingTelemetryContext(ctx)
 	var v int64
-	err := s.readDB.QueryRow(`SELECT value FROM metrics WHERE key=?`, key).Scan(&v)
+	err := s.readDB.QueryRowContext(ctx, `SELECT value FROM metrics WHERE key=?`, key).Scan(&v)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -45,11 +54,22 @@ func (s *Store) TopFetched(limit int) ([]struct {
 	NoteID string `json:"note_id"`
 	Count  int64  `json:"count"`
 }, error) {
+	return s.TopFetchedContext(context.Background(), limit)
+}
+
+// TopFetchedContext is TopFetched with caller-controlled cancellation.
+func (s *Store) TopFetchedContext(ctx context.Context, limit int) ([]struct {
+	NoteID string `json:"note_id"`
+	Count  int64  `json:"count"`
+}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if limit <= 0 {
 		limit = 10
 	}
-	s.flushTelemetry() // reporting surface: include increments not yet flushed
-	rows, err := s.readDB.Query(
+	s.flushReportingTelemetryContext(ctx) // reporting surface: include increments not yet flushed
+	rows, err := s.readDB.QueryContext(ctx,
 		`SELECT substr(key,7), value FROM metrics WHERE key LIKE 'fetch:%' ORDER BY value DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -74,7 +94,15 @@ func (s *Store) TopFetched(limit int) ([]struct {
 
 // NotesByType returns type -> count for coverage.
 func (s *Store) NotesByType() (map[string]int, error) {
-	rows, err := s.readDB.Query(`SELECT type, count(*) FROM notes GROUP BY type`)
+	return s.NotesByTypeContext(context.Background())
+}
+
+// NotesByTypeContext is NotesByType with caller-controlled cancellation.
+func (s *Store) NotesByTypeContext(ctx context.Context) (map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.readDB.QueryContext(ctx, `SELECT type, count(*) FROM notes GROUP BY type`)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +121,15 @@ func (s *Store) NotesByType() (map[string]int, error) {
 
 // ContributorCounts tallies authored notes per author (from provenance frontmatter).
 func (s *Store) ContributorCounts() (map[string]int, error) {
-	rows, err := s.readDB.Query(`SELECT frontmatter FROM notes`)
+	return s.ContributorCountsContext(context.Background())
+}
+
+// ContributorCountsContext is ContributorCounts with caller-controlled cancellation.
+func (s *Store) ContributorCountsContext(ctx context.Context) (map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.readDB.QueryContext(ctx, `SELECT frontmatter FROM notes`)
 	if err != nil {
 		return nil, err
 	}
@@ -112,4 +148,14 @@ func (s *Store) ContributorCounts() (map[string]int, error) {
 		}
 	}
 	return out, rows.Err()
+}
+
+// flushReportingTelemetryContext keeps the reporting surfaces' historical one-second
+// ceiling while allowing a shorter caller deadline (including request cancellation) to
+// win. Telemetry is best-effort and must never inherit SQLite's normal 30-second write
+// patience merely because the public Context API was given context.Background.
+func (s *Store) flushReportingTelemetryContext(ctx context.Context) {
+	flushCtx, cancel := context.WithTimeout(ctx, telemetryFlushTimeout)
+	defer cancel()
+	s.flushTelemetryContext(flushCtx)
 }

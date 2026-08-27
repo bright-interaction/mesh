@@ -17,6 +17,10 @@ import (
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
+// maxWebNoteBytes bounds both the filesystem read and the markdown/frontmatter
+// work performed by the public note route.
+const maxWebNoteBytes = 1 << 20
+
 // handleSearch runs the same fused retrieval the agent gets over MCP and returns
 // ranked cards, so a human can search the vault from the browser. The retriever is
 // cached (built lazily, invalidated on reindex/config change) instead of rebuilt per
@@ -48,9 +52,19 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		limit = mcp.SearchLimitMax
 	}
 	budget := atoiOr(r.URL.Query().Get("budget"), mcp.SearchBudgetDefault)
-	rt := s.retriever()
+	rt, err := s.retrieverContext(r.Context())
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		http.Error(w, "search failed", http.StatusInternalServerError)
+		return
+	}
 	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r), AllowPath: s.allowedPath(r)})
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		http.Error(w, "search failed", http.StatusInternalServerError)
 		return
 	}
@@ -63,8 +77,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 // never from client input, so it cannot escape the vault.
 func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	rel, err := s.store.NotePath(id)
+	rel, err := s.store.NotePathContext(r.Context(), id)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		http.Error(w, "unknown note id", http.StatusNotFound)
 		return
 	}
@@ -78,15 +95,55 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 	// Scope read check: opaque 404 (same as a missing note) so a scoped member cannot
 	// probe which ids exist outside their scope.
 	if allowed := s.allowedScopes(r); allowed != nil {
-		sc, serr := s.store.NoteScope(id)
+		sc, serr := s.store.NoteScopeContext(r.Context(), id)
+		if r.Context().Err() != nil {
+			return
+		}
 		if serr != nil || !scopeIntersect(sc, allowed) {
 			http.Error(w, "unknown note id", http.StatusNotFound)
 			return
 		}
 	}
-	data, err := os.ReadFile(filepath.Join(s.vaultRoot, rel))
+	fullPath := filepath.Join(s.vaultRoot, rel)
+	info, err := vault.LstatContext(r.Context(), fullPath)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		http.Error(w, "read failed", http.StatusInternalServerError)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		http.Error(w, "read failed", http.StatusInternalServerError)
+		return
+	}
+	if info.Size() > maxWebNoteBytes {
+		http.Error(w, "note is too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	data, err := vault.ReadFileHeadContext(r.Context(), fullPath, maxWebNoteBytes+1)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		http.Error(w, "read failed", http.StatusInternalServerError)
+		return
+	}
+	if len(data) > maxWebNoteBytes {
+		http.Error(w, "note is too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	// Close the lstat/read race as far as portable path-based APIs permit: reject
+	// an entry replaced by a symlink or another inode while the bounded read ran.
+	after, err := vault.LstatContext(r.Context(), fullPath)
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(info, after) {
+		if r.Context().Err() != nil {
+			return
+		}
+		http.Error(w, "read failed", http.StatusInternalServerError)
+		return
+	}
+	if r.Context().Err() != nil {
 		return
 	}
 	// Split the YAML frontmatter off before rendering, so the reader only shows prose,
@@ -104,6 +161,9 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 			"tags": fm.Tags, "scope": fm.Scope, "confidence": fm.Confidence, "source": fm.Source,
 			"related": fm.Related, "do": fm.Do, "dont": fm.Dont, "why": fm.Why,
 		}
+	}
+	if r.Context().Err() != nil {
+		return
 	}
 	// html is server-rendered (gomarkdown) from the body only, so the frontmatter never
 	// shows up as prose above the content. Note bodies are UNTRUSTED (ingested connector

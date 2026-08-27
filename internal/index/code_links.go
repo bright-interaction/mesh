@@ -4,11 +4,13 @@
 package index
 
 import (
+	"context"
 	"database/sql"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // The note<->code bridge: link a note to the code symbols it names in backticks, so an
@@ -55,11 +57,36 @@ var identRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]
 // full (high signal); bodies only inside backticks (prose would be too noisy). Capped
 // per token so a common name does not fan out. No-op when the code index is empty.
 func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
-	if n, _ := s.Count("code_symbols"); n == 0 {
-		_ = s.Write(func(tx *sql.Tx) error { _, e := tx.Exec(`DELETE FROM note_code_links`); return e })
+	return s.LinkNotesToCodeContext(context.Background(), vaultRoot)
+}
+
+// LinkNotesToCodeContext is LinkNotesToCode with cooperative cancellation across its
+// SQL scans, note-file pass, symbol resolution, and final replacement transaction.
+func (s *Store) LinkNotesToCodeContext(ctx context.Context, vaultRoot string) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	var symbolCount int
+	if err := s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM code_symbols`).Scan(&symbolCount); err != nil {
+		return 0, err
+	}
+	if symbolCount == 0 {
+		err := s.WriteContext(ctx, func(tx *sql.Tx) error {
+			_, e := tx.ExecContext(ctx, `DELETE FROM note_code_links`)
+			return e
+		})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
+		// Preserve LinkNotesToCode's best-effort empty-index cleanup: the bridge is
+		// already semantically empty when there are no symbols.
+		_ = err
 		return 0, nil
 	}
-	rows, err := s.readDB.Query(`SELECT id, path, title FROM notes`)
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id, path, title FROM notes`)
 	if err != nil {
 		return 0, err
 	}
@@ -70,6 +97,10 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 	type noteMeta struct{ id, path, title string }
 	var notes []noteMeta
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			rows.Close()
+			return 0, err
+		}
 		var nm noteMeta
 		if err := rows.Scan(&nm.id, &nm.path, &nm.title); err != nil {
 			rows.Close()
@@ -77,9 +108,13 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 		}
 		notes = append(notes, nm)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
 	rows.Close()
 
-	resolve, err := s.symbolResolver()
+	resolve, err := s.symbolResolverContext(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -87,11 +122,17 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 	type link struct{ noteID, symID, name string }
 	var links []link
 	for _, n := range notes {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		seen := map[string]bool{}
-		consider := func(tok string) {
+		consider := func(tok string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			tok = strings.TrimSpace(tok)
 			if seen[tok] || !distinctive(tok) {
-				return
+				return nil
 			}
 			seen[tok] = true
 			syms := resolve(tok, 5)
@@ -101,34 +142,49 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 			// merely says `Store` to every service's Store is noise. A qualified token
 			// (Type.Method) is already specific, so its capped matches link as before.
 			if !strings.Contains(tok, ".") && len(syms) != 1 {
-				return
+				return nil
 			}
 			for _, sym := range syms {
 				links = append(links, link{n.id, sym.id, sym.name})
 			}
+			return nil
 		}
 		// Title: scan every identifier-like token (the note's subject).
 		for _, tok := range identRe.FindAllString(n.title, -1) {
-			consider(tok)
+			if err := consider(tok); err != nil {
+				return 0, err
+			}
 		}
 		// Body: only backtick code spans (prose is too noisy for a full scan).
-		if body, err := os.ReadFile(filepath.Join(vaultRoot, n.path)); err == nil {
+		body, readErr := vault.ReadFileContext(ctx, filepath.Join(vaultRoot, n.path))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
+		if readErr == nil {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
 			for _, m := range backtickRe.FindAllStringSubmatch(string(body), -1) {
-				consider(m[1])
+				if err := consider(m[1]); err != nil {
+					return 0, err
+				}
 			}
 		}
 	}
-	err = s.Write(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM note_code_links`); err != nil {
+	err = s.WriteContext(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM note_code_links`); err != nil {
 			return err
 		}
-		ins, err := tx.Prepare(`INSERT OR IGNORE INTO note_code_links(note_id,symbol_id,name) VALUES(?,?,?)`)
+		ins, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO note_code_links(note_id,symbol_id,name) VALUES(?,?,?)`)
 		if err != nil {
 			return err
 		}
 		defer ins.Close()
 		for _, l := range links {
-			if _, err := ins.Exec(l.noteID, l.symID, l.name); err != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := ins.ExecContext(ctx, l.noteID, l.symID, l.name); err != nil {
 				return err
 			}
 		}
@@ -137,7 +193,8 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	n, _ := s.Count("note_code_links")
+	var n int
+	_ = s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM note_code_links`).Scan(&n)
 	return n, nil
 }
 
@@ -151,7 +208,11 @@ type symRow struct{ id, name string }
 // every distinctive token in every note: ~57s per rebuild against a
 // monorepo-sized index, versus ~1s for this map build.
 func (s *Store) symbolResolver() (func(tok string, limit int) []symRow, error) {
-	rows, err := s.readDB.Query(`SELECT id, name FROM code_symbols`)
+	return s.symbolResolverContext(context.Background())
+}
+
+func (s *Store) symbolResolverContext(ctx context.Context) (func(tok string, limit int) []symRow, error) {
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id, name FROM code_symbols`)
 	if err != nil {
 		return nil, err
 	}
@@ -159,6 +220,9 @@ func (s *Store) symbolResolver() (func(tok string, limit int) []symRow, error) {
 	byExact := map[string][]symRow{}
 	bySuffix := map[string][]symRow{}
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var r symRow
 		if err := rows.Scan(&r.id, &r.name); err != nil {
 			return nil, err

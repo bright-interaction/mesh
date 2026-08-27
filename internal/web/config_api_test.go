@@ -5,7 +5,9 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func cfgServer(t *testing.T) (*Server, string) {
@@ -86,6 +89,61 @@ func TestConfigRoundTrip(t *testing.T) {
 	if !found {
 		t.Fatal("weight_fts field missing from GET")
 	}
+}
+
+func TestConfigHandlersHonorCanceledRequestContext(t *testing.T) {
+	t.Run("GET", func(t *testing.T) {
+		s, _ := cfgServer(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodGet, "/api/config", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("cancelled GET /api/config = %d, want 500", rec.Code)
+		}
+	})
+
+	t.Run("PUT", func(t *testing.T) {
+		s, dir := cfgServer(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(`{"updates":{"retrieval.weight_fts":"0.5"}}`)).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("cancelled PUT /api/config = %d, want 500", rec.Code)
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".mesh", "config.toml")); !os.IsNotExist(err) {
+			t.Fatalf("cancelled PUT wrote config.toml: %v", err)
+		}
+	})
+
+}
+
+func TestConfigUpdateWaitHonorsCancellation(t *testing.T) {
+	s, _ := cfgServer(t)
+	release, err := s.acquireConfigUpdate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := s.acquireConfigUpdate(ctx)
+		errCh <- err
+	}()
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiting config update cancellation = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting config update ignored cancellation")
+	}
+	release()
 }
 
 func TestConfigEnvLock(t *testing.T) {
