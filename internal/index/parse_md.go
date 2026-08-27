@@ -57,7 +57,7 @@ type ParsedNote struct {
 // Issue is a non-fatal problem found while parsing or building the graph.
 type Issue struct {
 	Path string
-	Kind string // missing-id|duplicate-id|broken-link|broken-anchor|duplicate-anchor|ambiguous-id-key|ambiguous-path-key|ambiguous-link-key|ambiguous-link|unterminated-comment
+	Kind string // missing-id|duplicate-id|broken-link|broken-anchor|duplicate-anchor|ambiguous-id-key|ambiguous-path-key|ambiguous-link-key|ambiguous-link|unterminated-comment|unterminated-fence
 	Msg  string
 }
 
@@ -209,6 +209,10 @@ func Parse(path string, data []byte) (*ParsedNote, error) {
 		pn.Issues = append(pn.Issues, Issue{path, "unterminated-comment",
 			"<!-- on line " + strconv.Itoa(openComment) + " is never closed, so the rest of the note is hidden from the graph and from search; close it with -->"})
 	}
+	if vault.UnterminatedFence(body) {
+		pn.Issues = append(pn.Issues, Issue{path, "unterminated-fence",
+			"a code fence is opened and never closed in the body, so everything below it is hidden from the graph and from search; close the fence"})
+	}
 	for _, field := range []struct {
 		name, text string
 	}{{"do", fm.Do}, {"dont", fm.Dont}, {"why", fm.Why}} {
@@ -218,6 +222,11 @@ func Parse(path string, data []byte) (*ParsedNote, error) {
 		if _, open := vault.StripNonContent(field.text); open > 0 {
 			pn.Issues = append(pn.Issues, Issue{path, "unterminated-comment",
 				"<!-- in frontmatter " + field.name + " is never closed, so the rest of that field is hidden from the graph and from search; close it with -->"})
+		}
+		if vault.UnterminatedFence(field.text) {
+			pn.Issues = append(pn.Issues, Issue{path, "unterminated-fence",
+				"a code fence is opened and never closed in the " + field.name + ": frontmatter field" +
+					", so everything below it is hidden from the graph and from search; close the fence"})
 		}
 	}
 	cleanLines := strings.Split(clean, "\n")

@@ -27,6 +27,21 @@ const (
 // with three different rules and disagreed about what a note contained.
 func StripNonContent(body string) (string, int) { return stripMarkup(body, true, true) }
 
+// UnterminatedFence reports whether body ends inside a fenced code block. It uses the
+// same scanner as StripNonContent rather than duplicating its character, run-length,
+// container-prefix, and info-string matching rules. An open fence blanks the appended
+// probe line; balanced markup leaves that line visible.
+func UnterminatedFence(body string) bool {
+	const probe = "meshunterminatedfenceprobe"
+	clean, openComment := StripNonContent(body + "\n" + probe + "\n")
+	if openComment > 0 {
+		return false // the existing unterminated-comment diagnostic owns this case
+	}
+	at := len(strings.Split(body, "\n"))
+	lines := strings.Split(clean, "\n")
+	return at >= len(lines) || strings.TrimSpace(lines[at]) != probe
+}
+
 // StripComments blanks only the HTML comments, keeping code text intact. Search and
 // embeddings want `mesh index --workers 4` to be findable, so code is content there
 // even though it is not a place to read links from. Comment, fence and code-span

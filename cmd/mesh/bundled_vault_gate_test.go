@@ -37,7 +37,7 @@ import (
 //     such examples in backticks: `[[wikilinks]]`.
 //   - an unterminated code fence hid a dangling link from BuildGraph AND from `mesh
 //     lint`, which reported "14 files, 0 errors, 0 notices" over a vault that had an
-//     unresolvable link in it. See fenceLeftOpen.
+//     unresolvable link in it. See vault.UnterminatedFence.
 
 // bundledVaultNoteFloor is the smallest note count that still means "the sample vault is
 // really here". Without a floor every gate below passes vacuously the day vault/ is
@@ -105,47 +105,10 @@ func copyBundledVault(t *testing.T) string {
 	return dst
 }
 
-// fenceLeftOpen reports whether a note body ends inside an unterminated code fence.
-//
-// It does NOT re-implement CommonMark fence grammar - fence matching is char-, run-length-
-// and info-string-sensitive (internal/vault/markup.go stripLines), and a second copy of
-// those rules would drift from the real one. Instead it asks the parser's own scanner:
-// append a sentinel line and strip with the same vault.StripNonContent the parser uses.
-// If the body ends inside an open fence the sentinel is swallowed as fence content; if
-// the body is balanced the sentinel survives as ordinary text.
-//
-// Why the bundled vault needs this at all: an unterminated fence hides everything below
-// it from the graph AND from search, with no diagnostic anywhere. StripNonContent reports
-// an unterminated COMMENT (the parser turns that into an unterminated-comment issue) but
-// there is no fence counterpart. Reproduced 2026-08-26: with an unclosed ``` above a
-// [[this-note-does-not-exist]], BuildGraph reported nothing and `mesh lint ./vault` said
-// "14 files, 0 errors, 0 notices" over a vault holding an unresolvable link. Without this
-// check the zero-debt gate passes vacuously in exactly that case.
-func fenceLeftOpen(body string) bool {
-	clean, openComment := vault.StripNonContent(body + "\n" + fenceProbeSentinel + "\n")
-	if openComment > 0 {
-		// An unterminated COMMENT swallows the sentinel too, but the parser already
-		// raises unterminated-comment for that, so it is not this check's to report.
-		return false
-	}
-	// StripNonContent preserves line structure byte-for-byte, so the sentinel sits at a
-	// known line index. Check THAT line rather than searching the whole body: a note that
-	// merely mentions the sentinel word would otherwise mask a real open fence below it,
-	// which is a guard that can be defeated by its own subject matter.
-	at := len(strings.Split(body, "\n"))
-	lines := strings.Split(clean, "\n")
-	if at >= len(lines) {
-		return false
-	}
-	return strings.TrimSpace(lines[at]) != fenceProbeSentinel
-}
-
 const fenceProbeSentinel = "meshbundledvaultfenceprobe"
 
-// TestFenceLeftOpenAcrossMarkupShapes ablates fenceLeftOpen itself. It is the newest idea
-// in this file and the only check here with no counterpart anywhere else in Mesh, so it
-// gets its own table: a false NEGATIVE lets the zero-debt gate pass over a hidden dangling
-// link, and a false POSITIVE reds CI on an innocent note.
+// TestFenceLeftOpenAcrossMarkupShapes pins the production lint detector across the
+// markup shapes that previously existed only in this bundled-vault gate.
 //
 // The sentinel-collision case is why the check reads one line instead of searching the
 // body - with strings.Contains it returned false on a genuinely open fence.
@@ -181,8 +144,8 @@ func TestFenceLeftOpenAcrossMarkupShapes(t *testing.T) {
 		{"sentinel word above a genuinely open fence", "# T\n\n" + fenceProbeSentinel + "\n\n```\ncode\n", true},
 	}
 	for _, tc := range cases {
-		if got := fenceLeftOpen(tc.body); got != tc.want {
-			t.Errorf("fenceLeftOpen(%q) = %v, want %v [%s]", tc.body, got, tc.want, tc.name)
+		if got := vault.UnterminatedFence(tc.body); got != tc.want {
+			t.Errorf("vault.UnterminatedFence(%q) = %v, want %v [%s]", tc.body, got, tc.want, tc.name)
 		}
 	}
 }
@@ -232,22 +195,6 @@ func bundledVaultDebt(t *testing.T, root string) ([]index.FileError, []index.Iss
 		if base := filepath.Base(pn.Path); !isKebab(base) && !isConventionalDoc(base) {
 			issues = append(issues, index.Issue{Path: pn.Path, Kind: "filename", Msg: "filename is not kebab-case"})
 		}
-		// The body is only half the surface. BuildGraph extracts wikilinks from do/dont/why
-		// through the same vault.StripNonContent (internal/index/parse_md.go), so an
-		// unterminated fence inside one of those YAML scalars hides a dangling link exactly
-		// the way a body fence does - and do: is precisely where this vault's original
-		// defect lived. Verified: a `do: |` block carrying an unclosed fence above a
-		// [[dangling-link]] produced 0 links, 0 issues and a clean bill of health.
-		for _, f := range []struct{ where, text string }{
-			{"body", pn.Body}, {"do:", pn.FM.Do}, {"dont:", pn.FM.Dont}, {"why:", pn.FM.Why},
-		} {
-			if fenceLeftOpen(f.text) {
-				issues = append(issues, index.Issue{Path: pn.Path, Kind: "unterminated-fence",
-					Msg: "a code fence is opened and never closed in the " + f.where +
-						", so everything below it is hidden from the graph and from search " +
-						"- and no linter reports it; close the fence"})
-			}
-		}
 	}
 	return ferrs, issues
 }
@@ -274,9 +221,8 @@ func TestBundledVaultIsZeroDebt(t *testing.T) {
 	if len(ferrs) > 0 || len(issues) > 0 {
 		t.Fatalf("the bundled sample vault carries %d parse error(s) and %d problem(s); "+
 			"it ships to users and must carry zero.\n"+
-			"`mesh lint ./vault` names most of them (it is the same detection, with softer "+
-			"severity), but NOT an unterminated fence - this gate is the only thing that "+
-			"catches that one.\n"+
+			"`mesh lint ./vault` names all of them (it is the same detection, with softer "+
+			"severity for authoring debt).\n"+
 			"A [[link]] that resolves to nothing is either a note that should exist, or a "+
 			"syntax example that belongs in backticks: `[[like-this]]`.",
 			len(ferrs), len(issues))
