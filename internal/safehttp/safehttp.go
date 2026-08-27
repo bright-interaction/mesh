@@ -80,17 +80,28 @@ func AllowPrivateLLMEndpoint() bool {
 	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 }
 
+const (
+	maxIdleConns        = 10
+	maxIdleConnsPerHost = 2
+	idleConnTimeout     = 90 * time.Second
+)
+
+// Transports own connection pools and are safe for concurrent use. Keep one pool per
+// exact dial policy: sharing across trust policies would let a config-controlled public
+// endpoint inherit the operator client's loopback permission, while creating a pool per
+// short-lived retriever would let retired pools accumulate until their idle timeout.
+var (
+	publicTransport      = newTransport(false, "")
+	publicLLMTransport   = newTransport(false, llmRemedy)
+	operatorLLMTransport = newTransport(true, "")
+)
+
 // newClient builds the guarded client. remedy is appended to a refusal so the caller's
 // own opt-in is named in the error the user actually sees; pass "" when there is none.
 func newClient(timeout time.Duration, allowPrivate bool, remedy string) *http.Client {
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext:           dialContext(allowPrivate, remedy),
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 20 * time.Second,
-			MaxIdleConns:          10,
-		},
+		Timeout:   timeout,
+		Transport: transportFor(allowPrivate, remedy),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
 				return fmt.Errorf("stopped after 3 redirects")
@@ -114,6 +125,35 @@ func newClient(timeout time.Duration, allowPrivate bool, remedy string) *http.Cl
 			}
 			return nil // the redirect target is re-dialed through the guard, so it is re-checked
 		},
+	}
+}
+
+func transportFor(allowPrivate bool, remedy string) *http.Transport {
+	switch {
+	case allowPrivate && remedy == "":
+		return operatorLLMTransport
+	case !allowPrivate && remedy == "":
+		return publicTransport
+	case !allowPrivate && remedy == llmRemedy:
+		return publicLLMTransport
+	default:
+		// newClient is package-private and has exactly the three policy combinations
+		// above. Fail closed if a new caller forgets to allocate a distinct shared pool.
+		panic("safehttp: unsupported transport policy")
+	}
+}
+
+func newTransport(allowPrivate bool, remedy string) *http.Transport {
+	return &http.Transport{
+		DialContext:           dialContext(allowPrivate, remedy),
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		MaxIdleConns:          maxIdleConns,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		// A response body can be closed correctly and still leave its connection in
+		// the keep-alive pool. Expire quiet model-server sockets instead of retaining
+		// them for the lifetime of a long-running MCP process.
+		IdleConnTimeout: idleConnTimeout,
 	}
 }
 

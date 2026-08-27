@@ -4,10 +4,12 @@
 package safehttp
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -78,6 +80,79 @@ func TestOperatorLLMClientReachesLoopback(t *testing.T) {
 		t.Fatalf("OperatorLLMClient could not reach a local endpoint: %v", err)
 	}
 	resp.Body.Close()
+}
+
+// Retrievers are rebuilt as the index/config generation changes. A transport per
+// retriever left one quiet model-server socket in each pool forever, accumulating
+// thousands of connections in a long-running MCP process. Pools are shared within an
+// exact trust policy, bounded, and never shared across the SSRF boundary.
+func TestClientsShareOnlyTheirBoundedPolicyTransport(t *testing.T) {
+	t.Setenv("MESH_ALLOW_PRIVATE_LLM_ENDPOINT", "")
+
+	publicA, publicB := Client(time.Second), Client(2*time.Second)
+	llmA, llmB := LLMClient(time.Second), LLMClient(2*time.Second)
+	operatorA, operatorB := OperatorLLMClient(time.Second), LoopbackAllowed(2*time.Second)
+	if publicA == publicB || llmA == llmB || operatorA == operatorB {
+		t.Fatal("constructors must return independent clients so request timeouts stay caller-specific")
+	}
+	if publicA.Transport != publicB.Transport || llmA.Transport != llmB.Transport || operatorA.Transport != operatorB.Transport {
+		t.Fatal("clients with the same dial policy do not share their connection pool")
+	}
+	if publicA.Transport == llmA.Transport || publicA.Transport == operatorA.Transport || llmA.Transport == operatorA.Transport {
+		t.Fatal("clients with different SSRF/error policies share a transport")
+	}
+
+	for name, client := range map[string]*http.Client{
+		"public":   publicA,
+		"llm":      llmA,
+		"operator": operatorA,
+	} {
+		t.Run(name, func(t *testing.T) {
+			transport, ok := client.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+			}
+			if transport.IdleConnTimeout != idleConnTimeout {
+				t.Fatalf("IdleConnTimeout = %s, want %s", transport.IdleConnTimeout, idleConnTimeout)
+			}
+			if transport.MaxIdleConns != maxIdleConns || transport.MaxIdleConnsPerHost != maxIdleConnsPerHost {
+				t.Fatalf("idle bounds = (%d total, %d per host), want (%d, %d)",
+					transport.MaxIdleConns, transport.MaxIdleConnsPerHost, maxIdleConns, maxIdleConnsPerHost)
+			}
+		})
+	}
+}
+
+func TestShortLivedClientsReuseThePolicyPool(t *testing.T) {
+	var opened atomic.Int64
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			opened.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	for i := 0; i < 25; i++ {
+		resp, err := LoopbackAllowed(5 * time.Second).Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			resp.Body.Close()
+			t.Fatal(err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	operatorLLMTransport.CloseIdleConnections()
+	if got := opened.Load(); got != 1 {
+		t.Fatalf("25 sequential short-lived clients opened %d connections, want 1 shared keep-alive connection", got)
+	}
 }
 
 // Every refusal a stranger can trigger has to name its remedy. The BYOAI refusal named
