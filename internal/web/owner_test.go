@@ -4,7 +4,9 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"os"
@@ -270,5 +272,57 @@ func TestNewOwningServerKeepsAWritableStore(t *testing.T) {
 	// that creates the index.
 	if n, _ := s.store.Count("notes"); n == 0 {
 		t.Fatal("the owning viewer did not index the vault at startup")
+	}
+}
+
+func TestNewOwningServerPublishesAndReleasesItsOwnership(t *testing.T) {
+	dir := t.TempDir()
+	writeNote(t, dir, "n.md", "---\nid: n\ntype: note\nwhen: 2026-01-01\n---\n# N\nbody\n")
+	s, err := NewOwningServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, live := index.OwnerStatus(filepath.Join(dir, ".mesh"))
+	if !live || info.Role != "mesh ui --own-index" {
+		t.Fatalf("owning viewer did not publish its claim: info=%+v live=%v", info, live)
+	}
+	if _, err := index.AcquireOwnerLock(filepath.Join(dir, ".mesh"), "second viewer", false); !errors.Is(err, index.ErrOwnerHeld) {
+		t.Fatalf("second declared writer was admitted beside owning viewer: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, live := index.OwnerStatus(filepath.Join(dir, ".mesh")); live {
+		t.Fatal("owning viewer left its claim behind after Close")
+	}
+}
+
+func TestNewOwningServerDrainsPendingOpsQueuedAfterStartup(t *testing.T) {
+	dir := t.TempDir()
+	writeNote(t, dir, "n.md", "---\nid: n\ntype: note\nwhen: 2026-01-01\n---\n# N\nbody\n")
+	s, err := NewOwningServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	reader, err := index.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	pending := index.PendingNote{Type: "gotcha", Title: "UI owner drains extraction", Do: "poll owner ops after startup"}
+	name, err := reader.EnqueueOp(index.Op{Kind: index.OpAddPending, Pending: &pending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.ownerOpWake <- struct{}{}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := reader.AwaitOpApplied(ctx, name, 2*time.Second); err != nil {
+		t.Fatalf("mesh ui --own-index left a post-start extraction op queued: %v", err)
+	}
+	got, err := reader.GetPending(index.PendingID(pending.Type, pending.Title))
+	if err != nil || got.Do != pending.Do {
+		t.Fatalf("mesh ui --own-index did not persist the pending item: got=%+v err=%v", got, err)
 	}
 }

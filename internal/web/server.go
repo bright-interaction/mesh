@@ -31,10 +31,14 @@ var assetsFS embed.FS
 
 // Server serves the localhost graph viewer + app shell for one vault.
 type Server struct {
-	vaultRoot string
-	store     *index.Store
-	auth      authConfig
-	basePath  string // "" for root, or "/app" when served under a path
+	vaultRoot     string
+	store         *index.Store
+	owner         *index.OwnerLock // non-nil only for NewOwningServer; released by Close
+	ownerOpCancel context.CancelFunc
+	ownerOpDone   chan struct{}
+	ownerOpWake   chan struct{} // deterministic test wake; ticker is the cross-process path
+	auth          authConfig
+	basePath      string // "" for root, or "/app" when served under a path
 
 	// scopeResolver, when set, maps a request to the caller's allowed-scope set so the
 	// graph/search/note surfaces are filtered per member. nil (standalone `mesh ui`) =
@@ -186,13 +190,19 @@ func NewServer(vaultRoot string) (*Server, error) {
 // nobody ever updates. Same split as internal/mcp: NewServer is the per-window reader,
 // NewServerAt is the hub that owns what it serves.
 func NewOwningServer(vaultRoot string) (*Server, error) {
-	store, err := index.Open(vaultRoot)
+	owner, err := index.AcquireOwnerLock(filepath.Join(vaultRoot, ".mesh"), "mesh ui --own-index", false)
 	if err != nil {
+		return nil, err
+	}
+	store, err := index.OpenOwned(vaultRoot, owner)
+	if err != nil {
+		_ = owner.Release()
 		return nil, err
 	}
 	g, err := index.Reindex(store, vaultRoot)
 	if err != nil {
-		store.Close()
+		_ = store.Close()
+		_ = owner.Release()
 		return nil, err
 	}
 	// Apply anything a reader queued for an owner before this process started. Normally
@@ -204,7 +214,14 @@ func NewOwningServer(vaultRoot string) (*Server, error) {
 	// Dashboard shows a real reuse number immediately even if no mesh mcp ran (idempotent).
 	_, _ = store.BackfillWritebacks()
 	_, _ = store.LinkNotesToCode(vaultRoot) // build the note<->code bridge if a code index exists
-	return newServer(vaultRoot, store, g), nil
+	s := newServer(vaultRoot, store, g)
+	s.owner = owner
+	opCtx, opCancel := context.WithCancel(context.Background())
+	s.ownerOpCancel = opCancel
+	s.ownerOpDone = make(chan struct{})
+	s.ownerOpWake = make(chan struct{}, 1)
+	go s.pollOwnerOps(opCtx)
+	return s, nil
 }
 
 func newServer(vaultRoot string, store *index.Store, g *graph.Graph) *Server {
@@ -224,7 +241,42 @@ func newServer(vaultRoot string, store *index.Store, g *graph.Graph) *Server {
 	}
 }
 
-func (s *Server) Close() error { return s.store.Close() }
+func (s *Server) Close() error {
+	if s.ownerOpCancel != nil {
+		s.ownerOpCancel()
+		<-s.ownerOpDone // never close the store under an in-flight queue transaction
+	}
+	storeErr := s.store.Close()
+	if s.owner == nil {
+		return storeErr
+	}
+	return errors.Join(storeErr, s.owner.Release())
+}
+
+const ownerOpPollInterval = 250 * time.Millisecond
+
+// pollOwnerOps keeps a long-lived `mesh ui --own-index` honest as the vault's declared
+// owner after startup. Reader processes publish bookkeeping and automatic extraction
+// into .mesh/ops; draining only in the constructor leaves anything queued later waiting
+// forever because a UI process can own the vault for days without an HTTP reindex call.
+func (s *Server) pollOwnerOps(ctx context.Context) {
+	defer close(s.ownerOpDone)
+	ticker := time.NewTicker(ownerOpPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-s.ownerOpWake:
+		}
+		if n, err := s.store.DrainOps(); err != nil {
+			slog.Warn("mesh ui: owner op queue remains pending", "error", err)
+		} else if n > 0 {
+			slog.Debug("mesh ui: applied queued owner ops", "count", n)
+		}
+	}
+}
 
 // refresh rebuilds the in-memory graph from the PERSISTED tables, without touching the
 // vault or the write lock. It is how a read-only viewer picks up whatever the owning
@@ -553,15 +605,9 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 	}
 	newSrv := NewServer
 	if ownIndex {
-		// Claim the vault first. This process is a DECLARED owner, so it takes the claim
-		// from an opportunistic `mesh mcp` (which drops back to reading) and refuses to
-		// start beside another declared owner, rather than silently becoming the second
-		// long-lived writer this whole split exists to prevent.
-		lock, lerr := index.AcquireOwnerLock(filepath.Join(vaultRoot, ".mesh"), "mesh ui --own-index", false)
-		if lerr != nil {
-			return lerr
-		}
-		defer lock.Release()
+		// NewOwningServer acquires and retains the declared owner lease for the whole
+		// server lifetime. Keeping acquisition in the constructor also protects direct
+		// embedders and tests, rather than only this HTTP wrapper.
 		newSrv = NewOwningServer
 	}
 	s, err := newSrv(vaultRoot)

@@ -13,6 +13,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/extract"
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/llm"
+	"github.com/bright-interaction/mesh/internal/mcp"
 )
 
 // knownInVault must return true for a candidate that restates an existing note (so the
@@ -88,6 +89,48 @@ func TestWriteToPendingQualityGate(t *testing.T) {
 	}
 	if !strings.Contains(items[0].Title, "KEEP") {
 		t.Errorf("wrong candidate queued: %q", items[0].Title)
+	}
+}
+
+func TestWriteToPendingRoutesThroughLiveMCPOwner(t *testing.T) {
+	dir := t.TempDir()
+	seed, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := index.ReindexFull(seed, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := mcp.NewOwningServer(dir, "mesh mcp --watch (test)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if err := owner.WaitReady(); err != nil {
+		t.Fatal(err)
+	}
+	afterPendingOpEnqueue = func() {
+		if err := owner.Reconcile(); err != nil {
+			t.Errorf("MCP owner did not drain extraction op: %v", err)
+		}
+	}
+	t.Cleanup(func() { afterPendingOpEnqueue = nil })
+
+	cand := extract.Candidate{Type: "gotcha", Title: "Stop hook survives a live MCP owner", Do: "queue through the owner", Confidence: "high"}
+	if err := writeToPending(dir, "session.jsonl", []extract.Candidate{cand}, nil); err != nil {
+		t.Fatalf("automatic extraction failed beside its normal live MCP owner: %v", err)
+	}
+	reader, err := index.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	got, err := reader.GetPending(index.PendingID(cand.Type, cand.Title))
+	if err != nil || got.Do != cand.Do {
+		t.Fatalf("MCP owner did not persist queued extraction: got=%+v err=%v", got, err)
 	}
 }
 

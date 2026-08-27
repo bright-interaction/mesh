@@ -86,6 +86,35 @@ func TestOpQueueCarriesAWriteFromAReaderToTheOwner(t *testing.T) {
 	}
 }
 
+func TestOpQueueCarriesPendingUpsertFromReaderToOwner(t *testing.T) {
+	dir := opsVault(t)
+	reader, err := OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	pending := PendingNote{Type: "gotcha", Title: "Queued by extraction", Do: "route it", Source: "session.jsonl"}
+	name, err := reader.EnqueueOp(Op{Kind: OpAddPending, Pending: &pending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	if _, err := owner.DrainOps(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := owner.GetPending(PendingID(pending.Type, pending.Title))
+	if err != nil || got.Do != pending.Do || got.Source != pending.Source {
+		t.Fatalf("queued pending upsert did not land: got=%+v err=%v", got, err)
+	}
+	if reader.OpQueued(name) {
+		t.Fatal("pending upsert op remained queued after commit")
+	}
+}
+
 // The wait is the caller-facing half: it must return as soon as the owner applies the
 // op, and report ErrOwnerNotIndexing (not success, not a generic error) when no owner
 // ever does.

@@ -477,6 +477,12 @@ func TestTakeMineReceiptNamesADeferredRemainder(t *testing.T) {
 			want: []string{"8000 changed note(s) are still queued", "this note may be one of them", "mesh sync"},
 		},
 		{
+			name:    "an exact deferred list proves this note was sent",
+			sum:     meshclient.Summary{Pushed: 4000, Remaining: 1, Deferred: []string{"topics/other.md"}, Head: "abcdef1234"},
+			want:    []string{"1 changed note(s) are still queued", "resolved note was sent", "named deferred paths were not"},
+			notWant: []string{"may be one of them"},
+		},
+		{
 			name: "a single deferred note is enough to caveat the receipt",
 			sum:  meshclient.Summary{Pushed: 4000, Remaining: 1, Head: "abcdef1234"},
 			want: []string{"1 changed note(s) are still queued"},

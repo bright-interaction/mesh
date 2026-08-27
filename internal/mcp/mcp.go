@@ -49,6 +49,7 @@ type Server struct {
 	retriever *retrieve.Retriever
 
 	reloadMu sync.Mutex       // serializes rebuilds across dispatch + watcher
+	electMu  sync.Mutex       // serializes opportunistic recovery elections
 	cache    *index.NoteCache // parsed-note cache for incremental reconcile; guarded by reloadMu
 	// viewHashes fingerprints the index the in-memory graph was last loaded from
 	// (path -> retrieval hash), so a read-only server can report what a refresh changed
@@ -61,6 +62,9 @@ type Server struct {
 	// `mesh ui --own-index`) can take the claim back mid-session, so every write path
 	// asks owns() rather than assuming the store's writability is the whole answer.
 	owner *index.OwnerLock
+	// ownerRole is non-empty only for NewOwningServer. It lets a server that lost a
+	// temporary declared-owner interval recover indexing on the next watch/tool pass.
+	ownerRole string
 
 	reindexMu      sync.Mutex // guards the mesh_reindex throttle state below
 	lastReindexAt  time.Time
@@ -70,6 +74,9 @@ type Server struct {
 	ready    chan struct{} // closed when retrieval is servable (initial reload done)
 	readyErr error         // written once before ready closes
 	bg       chan struct{} // closed when ALL background startup work is done (enrichment included)
+	opCancel context.CancelFunc
+	opDone   chan struct{}
+	opWake   chan struct{} // deterministic wake in tests; ticker is the cross-process path
 
 	agent string // calling client's name from initialize (provenance default), guarded by mu
 
@@ -77,7 +84,17 @@ type Server struct {
 	// note. A field rather than a bare const so a test can shorten it without mutating
 	// global state (which would race across parallel tests); production never sets it.
 	ownerIndexTimeout time.Duration
+	// Deterministic test seam immediately before the atomic expected-version graph
+	// snapshot. Production leaves it nil.
+	beforeOwnerVersionRefresh func()
 }
+
+// Deterministic startup seams for owner turnover tests. Production leaves them nil.
+var afterMCPReadOnlyOpen func()
+var beforeMCPOwnedOpen func(*index.OwnerLock)
+var beforeMCPInitialReload func()
+var beforeMCPAwaitOwnerCaughtUp func()
+var beforeMCPEnrichment func()
 
 // NewServer opens the vault's index (at <vaultRoot>/.mesh) READ-ONLY and loads it into
 // memory. This is the per-window server for a vault that already has an owning writer:
@@ -96,7 +113,7 @@ func NewServer(vaultRoot string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newServerWithStore(vaultRoot, store, nil)
+	return newServerWithStore(vaultRoot, store, nil, "")
 }
 
 // NewOwningServer elects this process the vault's OWNING WRITER when no other live
@@ -115,28 +132,62 @@ func NewServer(vaultRoot string) (*Server, error) {
 // `mesh sync --watch`, `mesh ui --own-index`) takes it, and this server drops back to
 // reader behaviour on its own; see owns.
 func NewOwningServer(vaultRoot, role string) (*Server, error) {
-	lock, err := index.AcquireOwnerLock(filepath.Join(vaultRoot, ".mesh"), role, true)
-	if err != nil {
+	meshDir := filepath.Join(vaultRoot, ".mesh")
+	deadline := time.Now().Add(ownerIndexTimeout)
+	for {
+		lock, err := index.AcquireOwnerLock(meshDir, role, true)
 		if errors.Is(err, index.ErrOwnerHeld) {
-			return NewServer(vaultRoot) // someone else owns it: read beside them, as before
+			store, oerr := index.OpenReadOnly(vaultRoot)
+			if oerr == nil {
+				if afterMCPReadOnlyOpen != nil {
+					afterMCPReadOnlyOpen()
+				}
+				if _, live := index.OwnerStatus(meshDir); live {
+					s, serr := newServerWithStore(vaultRoot, store, nil, role)
+					if serr != nil {
+						_ = store.Close()
+						return nil, serr
+					}
+					return s, nil
+				}
+				_ = store.Close()
+			} else if _, live := index.OwnerStatus(meshDir); !live {
+				// The holder vanished before a read-only open completed. Re-elect
+				// instead of returning a permanently ownerless reader.
+				continue
+			}
+			if time.Now().After(deadline) {
+				if oerr != nil {
+					return nil, oerr
+				}
+				return nil, ErrOwnerNotIndexing
+			}
+			time.Sleep(index.OwnerIndexPollInterval)
+			continue
 		}
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		if beforeMCPOwnedOpen != nil {
+			beforeMCPOwnedOpen(lock)
+		}
+		store, oerr := index.OpenOwned(vaultRoot, lock)
+		if oerr != nil {
+			lost := !lock.Held()
+			_ = lock.Release()
+			if lost && errors.Is(oerr, index.ErrReadOnly) && time.Now().Before(deadline) {
+				continue
+			}
+			return nil, oerr
+		}
+		s, serr := newServerWithStore(vaultRoot, store, lock, role)
+		if serr != nil {
+			_ = store.Close()
+			_ = lock.Release()
+			return nil, serr
+		}
+		return s, nil
 	}
-	store, err := index.Open(vaultRoot)
-	if err != nil {
-		_ = lock.Release()
-		return nil, err
-	}
-	// The claim is preemptible after startup. Gate the Store itself, not only MCP tool
-	// branches, so background telemetry, checkpoints, and any direct Store write stop
-	// the instant a declared owner takes the lock.
-	store.SetWriteGuard(lock.Held)
-	s, err := newServerWithStore(vaultRoot, store, lock)
-	if err != nil {
-		_ = lock.Release()
-		return nil, err
-	}
-	return s, nil
 }
 
 // NewServerAt is like NewServer but keeps the index in an explicit dir instead of
@@ -147,11 +198,16 @@ func NewServerAt(vaultRoot, indexDir string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newServerWithStore(vaultRoot, store, nil)
+	return newServerWithStore(vaultRoot, store, nil, "")
 }
 
-func newServerWithStore(vaultRoot string, store *index.Store, owner *index.OwnerLock) (*Server, error) {
-	s := &Server{vaultRoot: vaultRoot, store: store, owner: owner, cache: index.NewNoteCache(), ready: make(chan struct{}), bg: make(chan struct{}), ownerIndexTimeout: ownerIndexTimeout}
+func newServerWithStore(vaultRoot string, store *index.Store, owner *index.OwnerLock, ownerRole string) (*Server, error) {
+	return newServerWithStoreTimeout(vaultRoot, store, owner, ownerRole, ownerIndexTimeout)
+}
+
+func newServerWithStoreTimeout(vaultRoot string, store *index.Store, owner *index.OwnerLock, ownerRole string, wait time.Duration) (*Server, error) {
+	opCtx, opCancel := context.WithCancel(context.Background())
+	s := &Server{vaultRoot: vaultRoot, store: store, owner: owner, ownerRole: ownerRole, cache: index.NewNoteCache(), ready: make(chan struct{}), bg: make(chan struct{}), ownerIndexTimeout: wait, opCancel: opCancel, opDone: make(chan struct{}), opWake: make(chan struct{}, 1)}
 	// The initial load runs in the background so the MCP handshake answers
 	// immediately: a full reload of a grown vault plus the note<->code bridge
 	// exceeds a client's connect timeout (Claude Code kills the server at 30s
@@ -160,16 +216,56 @@ func newServerWithStore(vaultRoot string, store *index.Store, owner *index.Owner
 	// closes as soon as retrieval is servable (reload done) so a tool call
 	// gating on awaitReady waits ~1s, not for the enrichment passes below it.
 	go func() {
+		opPollStarted := false
 		defer close(s.bg)
+		defer func() {
+			if !opPollStarted {
+				close(s.opDone)
+			}
+		}()
 		// A read-only store cannot reindex: ReindexFull rewrites notes / search_index /
 		// nodes / edges, so on this path the owning writer has already done that work and
 		// all this server has to do is read the result into memory. LoadGraph is pure SQL
 		// over readDB and was written for exactly this split.
-		if err := s.load(); err != nil {
-			s.readyErr = fmt.Errorf("initial index load: %w", err)
+		loadErr := s.load()
+		if errors.Is(loadErr, index.ErrReadOnly) && !s.owns() {
+			// A declared owner may take an elected MCP claim after construction but
+			// before the asynchronous ReindexFull commits. That displacement is not a
+			// permanent startup failure: wait for/refresh the winner (or recover if it
+			// already exited), exactly as later reindex passes do.
+			// AwaitOwnerCaughtUp has its own exact owner bound. Give the wrapping context
+			// one poll of slack so the semantic ErrOwnerNotIndexing wins its deadline race
+			// with context.DeadlineExceeded and startup can attempt owner-exit recovery.
+			ctx, cancel := context.WithTimeout(context.Background(), s.ownerIndexTimeout+index.OwnerIndexPollInterval)
+			_, loadErr = s.reindexPass(ctx)
+			cancel()
+			if errors.Is(loadErr, ErrOwnerNotIndexing) {
+				// The declared winner can exit after reindexPass observes its claim but
+				// before/during AwaitOwnerCaughtUp. The wait then correctly reports stale,
+				// but sealing that into readyErr leaves an ownerless MCP permanently dead.
+				// Take one final election after the terminal wait and refresh the stable
+				// read connection when recovery committed the drift.
+				recovered, rerr := s.reconcileAfterOwnerExit()
+				switch {
+				case rerr != nil:
+					loadErr = rerr
+				case recovered:
+					_, loadErr = s.refresh()
+				}
+			}
+		}
+		if loadErr != nil {
+			s.readyErr = fmt.Errorf("initial index load: %w", loadErr)
 			fmt.Fprintf(os.Stderr, "mesh mcp: %v\n", s.readyErr)
 			close(s.ready)
 			return
+		}
+		if s.ownerRole != "" {
+			// Start the queue wake path as soon as the index is servable. Backfill and
+			// note/code enrichment can take longer than the owner's 10-second receipt
+			// bound on a large vault; queued extraction must not wait behind them.
+			opPollStarted = true
+			go s.pollOwnerOps(opCtx)
 		}
 		close(s.ready)
 		if !s.owns() {
@@ -178,6 +274,9 @@ func newServerWithStore(vaultRoot string, store *index.Store, owner *index.Owner
 			// servers taking the write lock at startup, which is the contention this
 			// whole split exists to remove.
 			return
+		}
+		if beforeMCPEnrichment != nil {
+			beforeMCPEnrichment()
 		}
 		// Seed the flywheel measurement from the existing agent-authored corpus once, so
 		// the reuse number reflects accumulated knowledge from day one (idempotent).
@@ -230,6 +329,8 @@ func (s *Server) FlywheelStats() (index.FlywheelStats, error) { return s.store.F
 
 func (s *Server) Close() error {
 	<-s.bg // never close the store under the initial background load/enrichment
+	s.opCancel()
+	<-s.opDone // never close the store under an in-flight owner-op reconcile
 	err := s.store.Close()
 	// Give the vault up AFTER the store is closed, so the next owner never starts
 	// indexing while this process still has a writable connection open.
@@ -237,6 +338,55 @@ func (s *Server) Close() error {
 		err = rerr
 	}
 	return err
+}
+
+const ownerOpPollInterval = 250 * time.Millisecond
+
+// pollOwnerOps gives owner-routed bookkeeping a wake path even when an MCP server was
+// started without --watch. The queue lives under .mesh, intentionally outside the note
+// watcher, so relying only on fsnotify/periodic vault passes makes automatic extraction
+// time out beside an otherwise healthy no-watch owner.
+func (s *Server) pollOwnerOps(ctx context.Context) {
+	defer close(s.opDone)
+	ticker := time.NewTicker(ownerOpPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-s.opWake:
+		}
+		entries, err := os.ReadDir(index.OpsDir(s.store.MeshDir()))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			slog.Warn("mesh mcp: cannot inspect owner op queue", "err", err)
+			continue
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		queued := false
+		for _, entry := range entries {
+			if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".json") {
+				queued = true
+				break
+			}
+		}
+		if !queued {
+			continue
+		}
+		if !s.owns() {
+			if _, live := index.OwnerStatus(s.store.MeshDir()); live {
+				continue // the current owner has its own drain path
+			}
+		}
+		if _, err := s.reconcileOnce(false); err != nil {
+			slog.Warn("mesh mcp: owner op queue remains pending", "err", err)
+		}
+	}
 }
 
 // owns reports whether this process is the vault's owning writer RIGHT NOW: the store is
@@ -259,6 +409,56 @@ func (s *Server) owns() bool {
 // OwnsIndex reports whether this server is the vault's owning writer, so the command
 // that started it can tell the operator which of the two it got.
 func (s *Server) OwnsIndex() bool { return s.owns() }
+
+// reconcileAfterOwnerExit restores self-sufficiency for an electing MCP server that
+// started beside, or was temporarily preempted by, a declared owner. Its original
+// Store may be physically read-only (or permanently bound to the old nonce), so the
+// recovery pass uses a separately owned Store and then closes it before this server
+// refreshes through its stable read connection. This avoids swapping Store pointers
+// under concurrent tool calls while still ensuring the next watch/tool pass indexes
+// editor and write-back bytes after the temporary owner exits.
+func (s *Server) reconcileAfterOwnerExit() (bool, error) {
+	if s.ownerRole == "" || s.owns() {
+		return false, nil
+	}
+	s.electMu.Lock()
+	defer s.electMu.Unlock()
+	if s.owns() {
+		return false, nil
+	}
+	meshDir := filepath.Join(s.vaultRoot, ".mesh")
+	if _, live := index.OwnerStatus(meshDir); live {
+		return false, nil
+	}
+	lock, err := index.AcquireOwnerLock(meshDir, s.ownerRole, true)
+	if errors.Is(err, index.ErrOwnerHeld) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	writer, err := index.OpenOwned(s.vaultRoot, lock)
+	if err != nil {
+		lost := !lock.Held()
+		return false, errors.Join(func() error {
+			if lost && errors.Is(err, index.ErrReadOnly) {
+				return nil
+			}
+			return err
+		}(), lock.Release())
+	}
+	if _, derr := writer.DrainOps(); derr != nil {
+		slog.Warn("mesh mcp: could not drain owner op queue during recovery", "err", derr)
+	}
+	_, rerr := index.Reconcile(writer, s.vaultRoot)
+	lost := !lock.Held()
+	cerr := writer.Close()
+	lerr := lock.Release()
+	if lost && errors.Is(rerr, index.ErrReadOnly) {
+		return false, errors.Join(cerr, lerr)
+	}
+	return rerr == nil, errors.Join(rerr, cerr, lerr)
+}
 
 // snapshot returns the current graph + retriever under a read lock, so a
 // concurrent rebuild swapping them in never tears a reader's view.
@@ -309,6 +509,21 @@ func (s *Server) refresh() (index.Reconciliation, error) {
 	if err != nil {
 		return index.Reconciliation{}, err
 	}
+	return s.installRefreshedGraph(g), nil
+}
+
+func (s *Server) refreshAtNoteVersion(noteID, notePath, noteHash string) (bool, error) {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	g, matched, err := s.store.LoadGraphAtNoteVersion(noteID, notePath, noteHash)
+	if err != nil || !matched {
+		return matched, err
+	}
+	s.installRefreshedGraph(g)
+	return true, nil
+}
+
+func (s *Server) installRefreshedGraph(g *graph.Graph) index.Reconciliation {
 	// Fingerprint the index we just loaded. A read error here costs the NEXT refresh its
 	// counts, never its correctness, so it must not fail the refresh: the graph is already
 	// good and the caller's notes are already queryable.
@@ -339,7 +554,7 @@ func (s *Server) refresh() (index.Reconciliation, error) {
 		s.viewHashes = after
 	}
 	s.swap(g)
-	return rec, nil
+	return rec
 }
 
 // ErrOwnerNotIndexing means the single owning writer did not index a just-written note
@@ -364,16 +579,81 @@ const ownerIndexTimeout = index.OwnerIndexBound
 // where a durable, perfectly fine note reads as owner_down.
 const OwnerIndexBound = index.OwnerIndexBound
 
-// awaitOwnerIndexed blocks until the single owning writer has indexed noteID, then
-// refreshes this server's in-memory graph from what the owner persisted. This is the
-// whole of "write-back through the owner": the wait is index.AwaitNoteIndexed, and what
-// this adds is the refresh of THIS server's view once the owner has landed it.
-func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID string) error {
-	if err := s.store.AwaitNoteIndexed(ctx, noteID, s.ownerIndexTimeout); err != nil {
+// awaitOwnerIndexed blocks until the single owning writer has indexed the CURRENT
+// version of notePath, then refreshes this server's in-memory graph from what the owner
+// persisted. Checking only noteID is insufficient: an editor can remove an indexed note
+// and a writer can reuse its slug before the owner sees the removal. In that window the
+// old row has the right id and path but the wrong retrieval hash, and accepting it would
+// return a false success receipt while queries still serve the deleted note's content.
+func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string) error {
+	timeout := s.ownerIndexTimeout
+	if timeout <= 0 {
+		timeout = ownerIndexTimeout
+	}
+	rel, err := filepath.Rel(s.vaultRoot, notePath)
+	if err != nil {
 		return err
 	}
-	_, rerr := s.refresh() // the caller wants the note queryable, not the counts
-	return rerr
+	rel = filepath.Clean(rel)
+	deadline := time.Now().Add(timeout)
+	for {
+		pn, perr := index.ParseFile(notePath)
+		switch {
+		case perr == nil:
+			pn.Path = rel
+			targetHash := index.RetrievalHash(pn)
+			if s.beforeOwnerVersionRefresh != nil {
+				s.beforeOwnerVersionRefresh()
+			}
+			matched, rerr := s.refreshAtNoteVersion(noteID, rel, targetHash)
+			if rerr != nil {
+				return rerr
+			}
+			if matched {
+				// Installing one atomic database snapshot is not enough to prove the
+				// CURRENT file is queryable. An editor can publish newer bytes after
+				// ParseFile and before the snapshot is installed. Re-read the path
+				// after publication and only acknowledge if it still names the exact
+				// version represented by that snapshot.
+				currentDB, derr := s.store.NoteVersionMatches(noteID, rel, targetHash)
+				if derr != nil {
+					return derr
+				}
+				if !currentDB {
+					break
+				}
+				current, cerr := index.ParseFile(notePath)
+				switch {
+				case cerr == nil:
+					current.Path = rel
+					if index.RetrievalHash(current) == targetHash {
+						return nil
+					}
+				case os.IsNotExist(cerr):
+					// The current path is now ahead of (or absent from) the
+					// installed snapshot. Keep waiting for its owner.
+				default:
+					return cerr
+				}
+			}
+		case os.IsNotExist(perr):
+			// An editor removed the new file before publication. Keep waiting so
+			// the caller gets the same honest not-queryable receipt as any other
+			// change the owner has not absorbed.
+		default:
+			return perr
+		}
+		if time.Now().After(deadline) {
+			return ErrOwnerNotIndexing
+		}
+		timer := time.NewTimer(index.OwnerIndexPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // pendingDrift is the part of the vault the owning writer has not absorbed yet and still
@@ -417,9 +697,12 @@ func (s *Server) awaitOwnerCaughtUp(ctx context.Context) (index.Reconciliation, 
 // publishWriteBack makes a just-created note queryable, by whichever route this server
 // is allowed to take: the owner of its index reindexes directly, a read-only server
 // waits for the owning writer to do it.
-func (s *Server) publishWriteBack(ctx context.Context, noteID string) error {
+func (s *Server) publishWriteBack(ctx context.Context, noteID, notePath string) error {
 	if !s.owns() {
-		return s.awaitOwnerIndexed(ctx, noteID)
+		if _, err := s.reconcileAfterOwnerExit(); err != nil {
+			return err
+		}
+		return s.awaitOwnerIndexed(ctx, noteID, notePath)
 	}
 	_, err := s.reconcileOnce(true)
 	return err
@@ -431,6 +714,12 @@ func (s *Server) publishWriteBack(ctx context.Context, noteID string) error {
 func (s *Server) reload() error {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
+	if beforeMCPInitialReload != nil {
+		beforeMCPInitialReload()
+	}
+	if _, err := s.store.DrainOps(); err != nil {
+		slog.Warn("mesh mcp: could not drain owner op queue", "err", err)
+	}
 	g, notes, err := index.ReindexFull(s.store, s.vaultRoot)
 	if err != nil {
 		return err
@@ -455,6 +744,9 @@ func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error)
 	// saw change, which is what the watcher's log line and mesh_reindex both want.
 	if !s.owns() {
 		start := time.Now()
+		if _, err := s.reconcileAfterOwnerExit(); err != nil {
+			return index.Reconciliation{}, err
+		}
 		rec, err := s.refresh()
 		if err != nil {
 			return index.Reconciliation{}, err
@@ -464,6 +756,9 @@ func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error)
 	}
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
+	if _, err := s.store.DrainOps(); err != nil {
+		slog.Warn("mesh mcp: could not drain owner op queue", "err", err)
+	}
 	rec, err := index.ReconcileIncremental(s.store, s.vaultRoot, s.cache, !authoritative)
 	if err != nil {
 		return rec, err
@@ -488,6 +783,16 @@ const reindexThrottle = 5 * time.Second
 // owner, it just picks up whatever has landed.
 func (s *Server) reindexPass(ctx context.Context) (index.Reconciliation, error) {
 	if !s.owns() {
+		recovered, err := s.reconcileAfterOwnerExit()
+		if err != nil {
+			return index.Reconciliation{}, err
+		}
+		if recovered {
+			return s.refresh()
+		}
+		if beforeMCPAwaitOwnerCaughtUp != nil {
+			beforeMCPAwaitOwnerCaughtUp()
+		}
 		return s.awaitOwnerCaughtUp(ctx)
 	}
 	return s.reconcileOnce(true)

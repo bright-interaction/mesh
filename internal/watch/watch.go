@@ -123,8 +123,10 @@ func Run(ctx context.Context, opt Options) error {
 
 	// Reflect disk from the moment we start (bootstraps an empty index too). Startup is
 	// always authoritative: nothing is known about what changed while we were not running.
-	reconcile(opt, logf, Pass{Reason: ReasonStartup, Authoritative: true})
-	lastFull := time.Now()
+	var lastFull time.Time
+	if reconcile(opt, logf, Pass{Reason: ReasonStartup, Authoritative: true}) {
+		lastFull = time.Now()
+	}
 
 	// Debounce timer, created stopped: armed only once an event arrives.
 	debounce := time.NewTimer(opt.Debounce)
@@ -184,27 +186,27 @@ func Run(ctx context.Context, opt Options) error {
 			// authoritative content-hash pass, which parses the whole vault, runs only
 			// once per FullReconcile. See DefaultFullReconcile for why the two cadences
 			// are separate.
-			full := time.Since(lastFull) >= opt.FullReconcile
-			if full {
+			full := lastFull.IsZero() || time.Since(lastFull) >= opt.FullReconcile
+			if reconcile(opt, logf, Pass{Reason: ReasonTick, Authoritative: full}) && full {
 				lastFull = time.Now()
 			}
-			reconcile(opt, logf, Pass{Reason: ReasonTick, Authoritative: full})
 		}
 	}
 }
 
 // reconcile runs one drift-check + reindex. The caller decides both halves of the Pass:
 // which reason this is, and whether it gets the content-hash check or the mtime fast path.
-func reconcile(opt Options, logf func(string, ...any), p Pass) {
+func reconcile(opt Options, logf func(string, ...any), p Pass) bool {
 	res, err := opt.OnReindex(p)
 	if err != nil {
 		logf("reindex failed (%s): %v", p.Reason, err)
-		return
+		return false
 	}
 	if res.Reindexed {
 		logf("reindexed +%d ~%d -%d in %s (%s)",
 			res.Added, res.Changed, res.Removed, res.Dur.Round(time.Millisecond), p.Reason)
 	}
+	return true
 }
 
 // addWatches (re)adds a watch on every indexed directory under root. fsnotify

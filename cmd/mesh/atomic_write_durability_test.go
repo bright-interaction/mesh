@@ -140,9 +140,6 @@ var unguardedWriters = map[string]string{
 	// atomic rename, the fsync is one more line, and this map's own rule is that an
 	// exemption cannot outlive its reason. saveState now fsyncs, so it is covered by the
 	// checks below rather than excused here. Do not re-add it.
-	"pkg/meshclient/vault.go:writeCredentials": "writes .mesh/credentials.json (the hub URL " +
-		"and token), not note bytes, at 0600. A lost credential file is re-obtained by " +
-		"running `mesh join` again; no knowledge is in it.",
 }
 
 // TestEveryNoteByteWriterFsyncs walks the whole module, finds every function that writes

@@ -5,12 +5,17 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // startOwner runs the single owning writer against dir's index for the duration of the
@@ -199,6 +204,152 @@ func TestWriteBackWithNoOwnerSavesDurablyAndFailsLoudly(t *testing.T) {
 	// re-reads what the owner already persisted, so it cannot fix this.
 	if want := "Do NOT call mesh_reindex"; !containsStr(warning, want) {
 		t.Fatalf("owner-down warning must steer away from mesh_reindex, got: %q", warning)
+	}
+}
+
+// A note id is not a publication receipt by itself. An editor can delete an indexed
+// note and a writer can reuse its slug before the owner has reconciled the deletion.
+// In that window NotePath(id) still names the old indexed version. Write-back must wait
+// for the bytes it just wrote, rather than treating that stale row as success.
+func TestWriteBackDoesNotMistakeAStaleReusedIDForTheNewNote(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "gotchas", "reused-id.md")
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, []byte("---\nid: reused-id\ntype: gotcha\nwhen: 2026-01-01\ndo: old indexed bytes\ndont: x\nwhy: old\n---\n# Reused ID\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, dir)
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := NewServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.WaitReady(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	srv.ownerIndexTimeout = 150 * time.Millisecond // deliberately no owner
+
+	out := writeNoteVia(t, srv, "reused id")
+	if out["index_stale"] != true || out["owner_down"] != true {
+		t.Fatalf("the old row for a reused id was accepted as publication of new bytes: %v", out)
+	}
+}
+
+func TestAwaitOwnerIndexedDoesNotRefreshPastTheValidatedVersion(t *testing.T) {
+	dir := t.TempDir()
+	notePath := filepath.Join(dir, "published.md")
+	if err := os.WriteFile(notePath, []byte("---\nid: published\ntype: note\n---\n# Published\nexpected bytes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, dir)
+	srv, err := NewServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	owner, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	srv.ownerIndexTimeout = 150 * time.Millisecond
+	var once sync.Once
+	srv.beforeOwnerVersionRefresh = func() {
+		once.Do(func() {
+			if werr := owner.Write(func(tx *sql.Tx) error {
+				if _, err := tx.Exec(`DELETE FROM edges WHERE source = 'note:published' OR target = 'note:published'`); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(`DELETE FROM nodes WHERE id = 'note:published' OR note_id = 'published'`); err != nil {
+					return err
+				}
+				_, err := tx.Exec(`DELETE FROM notes WHERE id = 'published'`)
+				return err
+			}); werr != nil {
+				t.Fatal(werr)
+			}
+		})
+	}
+
+	err = srv.awaitOwnerIndexed(context.Background(), "published", notePath)
+	if !errors.Is(err, ErrOwnerNotIndexing) {
+		t.Fatalf("row removed at refresh boundary was acknowledged as queryable: %v", err)
+	}
+}
+
+func TestAwaitOwnerIndexedDoesNotAcknowledgeDiskThatAdvancedDuringRefresh(t *testing.T) {
+	dir := t.TempDir()
+	notePath := filepath.Join(dir, "published.md")
+	oldBytes := []byte("---\nid: published\ntype: note\n---\n# Published\nindexed bytes\n")
+	newBytes := []byte("---\nid: published\ntype: note\n---\n# Published\neditor advanced the disk version\n")
+	if err := os.WriteFile(notePath, oldBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, dir)
+	srv, err := NewServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.ownerIndexTimeout = 150 * time.Millisecond // deliberately no owner update
+	var once sync.Once
+	srv.beforeOwnerVersionRefresh = func() {
+		once.Do(func() {
+			if werr := os.WriteFile(notePath, newBytes, 0o644); werr != nil {
+				t.Fatal(werr)
+			}
+		})
+	}
+
+	err = srv.awaitOwnerIndexed(context.Background(), "published", notePath)
+	if !errors.Is(err, ErrOwnerNotIndexing) {
+		t.Fatalf("disk advanced beyond the installed index snapshot but was acknowledged: %v", err)
+	}
+}
+
+func TestCancelledWriteDoesNotCreateANote(t *testing.T) {
+	srv := newTestServer(t)
+	ctx, cancel := context.WithCancel(WithLocalOperator(context.Background()))
+	cancel()
+
+	raw := json.RawMessage(`{"type":"gotcha","title":"cancelled before write","do":"x","dont":"y","why":"z"}`)
+	if _, rerr := srv.toolWrite(ctx, raw, ""); rerr == nil {
+		t.Fatal("a request cancelled before dispatch still reported a successful durable write")
+	}
+	if _, err := os.Stat(filepath.Join(srv.vaultRoot, "gotchas", "cancelled-before-write.md")); !os.IsNotExist(err) {
+		t.Fatalf("a request cancelled before dispatch created a note anyway: %v", err)
+	}
+}
+
+type cancelAfterFirstErrContext struct {
+	context.Context
+	errCalls int
+}
+
+func (c *cancelAfterFirstErrContext) Err() error {
+	c.errCalls++
+	if c.errCalls == 1 {
+		return nil
+	}
+	return context.Canceled
+}
+
+func TestCancellationDuringPreparationDoesNotCrossTheCreateBoundary(t *testing.T) {
+	srv := newTestServer(t)
+	ctx := &cancelAfterFirstErrContext{Context: WithLocalOperator(context.Background())}
+	raw := json.RawMessage(`{"type":"gotcha","title":"cancelled during preparation","do":"x","dont":"y","why":"z"}`)
+
+	if _, rerr := srv.toolWrite(ctx, raw, ""); rerr == nil {
+		t.Fatal("cancellation during reversible preparation still crossed the durable-write boundary")
+	}
+	if _, err := os.Stat(filepath.Join(srv.vaultRoot, "gotchas", "cancelled-during-preparation.md")); !os.IsNotExist(err) {
+		t.Fatalf("cancellation during preparation created a note anyway: %v", err)
 	}
 }
 

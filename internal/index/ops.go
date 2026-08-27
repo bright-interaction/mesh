@@ -51,6 +51,9 @@ type Op struct {
 	// reader that observed them.
 	Counts map[string]int64 `json:"counts,omitempty"`
 	Reuse  []ReuseEvent     `json:"reuse,omitempty"`
+	// OpAddPending: the complete idempotent pending-note upsert. A pointer keeps
+	// malformed/missing payloads distinguishable from a deliberately empty field.
+	Pending *PendingNote `json:"pending,omitempty"`
 }
 
 // ReuseEvent is one note fetched in a later session than it was authored in: the atom
@@ -73,6 +76,9 @@ const (
 	// generates them is read-only now, so without this route the flywheel measurement
 	// simply stops.
 	OpTelemetry = "telemetry"
+	// OpAddPending carries automatic extraction into the review queue when the live
+	// MCP/watch owner is the only process allowed to mutate SQLite.
+	OpAddPending = "add_pending"
 )
 
 // opsQueueCap bounds the directory. A reader whose owner is dead can keep enqueuing
@@ -211,6 +217,13 @@ func (s *Store) DrainOps() (int, error) {
 			err = s.RecordWriteback(op.NoteID, op.Source)
 		case OpTelemetry:
 			err = s.applyTelemetryOp(op)
+		case OpAddPending:
+			if op.Pending == nil {
+				slog.Warn("mesh: dropping an add-pending op with no payload", "file", name)
+				_ = os.Remove(path)
+				continue
+			}
+			err = s.AddPending(*op.Pending)
 		default:
 			slog.Warn("mesh: dropping an op of unknown kind", "file", name, "kind", op.Kind)
 			_ = os.Remove(path)

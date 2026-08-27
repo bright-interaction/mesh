@@ -5,6 +5,7 @@ package watch
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -165,6 +166,51 @@ func TestPeriodicTickIsCheapUntilTheFullInterval(t *testing.T) {
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("the authoritative pass never ran after the full-reconcile interval")
+		}
+	}
+}
+
+func TestFailedAuthoritativePassRetriesOnTheNextTick(t *testing.T) {
+	dir := t.TempDir()
+	calls := make(chan Pass, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	failedFull := false
+	go Run(ctx, Options{
+		Root:          dir,
+		Debounce:      time.Hour,
+		Reconcile:     5 * time.Millisecond,
+		FullReconcile: 30 * time.Millisecond,
+		OnReindex: func(p Pass) (Result, error) {
+			calls <- p
+			if p.Reason == ReasonTick && p.Authoritative && !failedFull {
+				failedFull = true
+				return Result{}, errors.New("injected authoritative failure")
+			}
+			return Result{}, nil
+		},
+	})
+
+	if p := <-calls; p.Reason != ReasonStartup || !p.Authoritative {
+		t.Fatalf("first pass = %+v, want authoritative startup", p)
+	}
+	for {
+		select {
+		case p := <-calls:
+			if p.Reason != ReasonTick || !p.Authoritative {
+				continue
+			}
+			select {
+			case retry := <-calls:
+				if retry.Reason != ReasonTick || !retry.Authoritative {
+					t.Fatalf("failed authoritative pass was treated as completed; next pass = %+v", retry)
+				}
+				return
+			case <-time.After(3 * time.Second):
+				t.Fatal("no retry after failed authoritative pass")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("authoritative pass never ran")
 		}
 	}
 }

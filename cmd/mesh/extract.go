@@ -200,11 +200,11 @@ func runRecurring(ctx context.Context, client llm.Client, dir string, n, concurr
 // precision), i.e. the benchmark judged but production did not. The panel fails OPEN
 // (an LLM hiccup queues the candidate for the human, never silently drops knowledge).
 func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, judges []llm.Client) error {
-	store, err := index.OpenCurrent(vaultRoot)
+	store, writable, closeStore, err := openOneShotCurrentOrReadOnly(vaultRoot, "mesh extract")
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer closeStore()
 	rtr, closeRtr := buildVaultRetriever(store, vaultRoot) // best-effort dedup context
 	defer closeRtr()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -219,6 +219,7 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, jud
 
 	src := filepath.Base(transcript)
 	queued, dupes, filtered := 0, 0, 0
+	var queuedOps []string
 	for _, cnd := range cands {
 		if known, of := knownInVault(ctx, rtr, cnd); known {
 			dupes++
@@ -250,19 +251,44 @@ func writeToPending(vaultRoot, transcript string, cands []extract.Candidate, jud
 				continue
 			}
 		}
-		if err := store.AddPending(index.PendingNote{
+		pending := index.PendingNote{
 			Type: cnd.Type, Title: cnd.Title, Do: cnd.Do, Dont: cnd.Dont,
 			Why: cnd.Why, Confidence: cnd.Confidence, Source: src,
-		}); err != nil {
-			return err
+		}
+		if writable {
+			if err := store.AddPending(pending); err != nil {
+				return err
+			}
+		} else {
+			name, err := store.EnqueueOp(index.Op{Kind: index.OpAddPending, Pending: &pending})
+			if err != nil {
+				return err
+			}
+			queuedOps = append(queuedOps, name)
+			if afterPendingOpEnqueue != nil {
+				afterPendingOpEnqueue()
+			}
 		}
 		// Track it so two near-duplicate candidates in the SAME batch also collapse.
 		queuedTitles = append(queuedTitles, index.PendingNote{Type: cnd.Type, Title: cnd.Title})
 		queued++
 	}
+	if len(queuedOps) > 0 {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), index.OwnerIndexBound)
+		defer waitCancel()
+		for _, name := range queuedOps {
+			if err := store.AwaitOpApplied(waitCtx, name, index.OwnerIndexBound); err != nil {
+				return fmt.Errorf("extracted candidate is durably queued but the owning writer did not add it to review in time: %w", err)
+			}
+		}
+	}
 	fmt.Printf("queued %d candidate(s) for review in %s (%d duplicate, %d below quality bar)\n", queued, vaultRoot, dupes, filtered)
 	return nil
 }
+
+// Deterministic test seam after a read-only extraction publishes its op file and before
+// it waits for the owner. Production leaves it nil.
+var afterPendingOpEnqueue func()
 
 // nearDuplicatePending reports whether a candidate title restates a review item already
 // in the queue, by the same title-similarity bar used to dedup against the vault. This
@@ -279,13 +305,20 @@ func nearDuplicatePending(title string, existing []index.PendingNote) (string, b
 // buildVaultRetriever builds a retriever over the vault for dedup. Best-effort: any
 // failure returns a nil retriever (dedup is then skipped, candidates all queue).
 func buildVaultRetriever(store *index.Store, vaultRoot string) (*retrieve.Retriever, func()) {
-	if _, err := index.Reconcile(store, vaultRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "dedup disabled (reindex %s: %v)\n", vaultRoot, err)
-		return nil, func() {}
+	if !store.ReadOnly() {
+		if _, err := index.Reconcile(store, vaultRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "dedup disabled (reindex %s: %v)\n", vaultRoot, err)
+			return nil, func() {}
+		}
+	}
+	if store.ReadOnly() {
+		if err := store.AwaitOwnerCaughtUp(context.Background(), vaultRoot, index.OwnerIndexBound); err != nil {
+			fmt.Fprintf(os.Stderr, "dedup may be stale (owner catch-up %s: %v)\n", vaultRoot, err)
+		}
 	}
 	g, err := store.LoadGraph()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "dedup disabled (load graph: %v)\n", err)
+		fmt.Fprintf(os.Stderr, "dedup disabled (reindex %s: %v)\n", vaultRoot, err)
 		return nil, func() {}
 	}
 	return retrieve.NewFromEnv(store, g), func() {}

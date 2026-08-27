@@ -83,8 +83,8 @@ func TestJoinAnotherHubResetsTheSyncBase(t *testing.T) {
 	if _, err := JoinVault(hubA.URL, "invite-a", vaultDir); err != nil {
 		t.Fatalf("join hub A: %v", err)
 	}
-	if got := len(roundsA); got != 1 || len(roundsA[0]) != 2 {
-		t.Fatalf("join to hub A pushed %v, want one round of 2 notes", sizes(roundsA))
+	if got := sizes(roundsA); !equalInts(got, []int{0, 2}) {
+		t.Fatalf("join to hub A pushed %v, want pull-first then 2 notes", got)
 	}
 	// Give the old state a delete high-water mark, the way a real hub with a delete
 	// ledger would have. Hub B's ledger starts at 0, so carrying this over hides every
@@ -102,11 +102,11 @@ func TestJoinAnotherHubResetsTheSyncBase(t *testing.T) {
 	if _, err := JoinVault(hubB.URL, "invite-b", vaultDir); err != nil {
 		t.Fatalf("join hub B: %v", err)
 	}
-	if len(roundsB) != 1 {
-		t.Fatalf("join to hub B ran %d sync rounds, want 1", len(roundsB))
+	if len(roundsB) != 2 {
+		t.Fatalf("join to hub B ran %d sync rounds, want pull-first plus survivor push", len(roundsB))
 	}
 	sent := map[string]string{}
-	for _, it := range roundsB[0] {
+	for _, it := range roundsB[1] {
 		sent[it.path] = it.op
 	}
 	for _, rel := range []string{"notes/alpha.md", "notes/beta.md"} {
@@ -149,11 +149,11 @@ func TestReJoiningTheSameHubKeepsTheSyncBase(t *testing.T) {
 	if _, err := JoinVault(hub.URL, "invite-2", vaultDir); err != nil {
 		t.Fatalf("second join: %v", err)
 	}
-	if len(rounds) != 2 {
-		t.Fatalf("ran %d sync rounds, want 2", len(rounds))
+	if len(rounds) != 3 {
+		t.Fatalf("ran %d sync rounds, want initial pull+push and one rejoin round", len(rounds))
 	}
-	if len(rounds[1]) != 0 {
+	if len(rounds[2]) != 0 {
 		t.Errorf("re-joining the same vault re-pushed %v; an unchanged note must stay "+
-			"unchanged, or every token rotation floods the hub", rounds[1])
+			"unchanged, or every token rotation floods the hub", rounds[2])
 	}
 }

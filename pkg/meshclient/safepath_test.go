@@ -359,7 +359,6 @@ func TestSyncVaultRefusesHostileHubPaths(t *testing.T) {
 	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
 		t.Fatal(err)
 	}
-
 	if _, err := SyncVault(vaultDir); err != nil {
 		t.Fatal(err)
 	}
@@ -399,6 +398,11 @@ func TestSyncVaultKeepsWindowEditDirty(t *testing.T) {
 	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := writeState(vaultDir, syncState{
+		HeadSHA: "base", Hashes: map[string]string{"notes/a.md": contentHash([]byte("v0\n"))}, HubURL: srv.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := SyncVault(vaultDir); err != nil {
 		t.Fatal(err)
@@ -428,6 +432,11 @@ func TestSyncVaultKeepsWindowEditDirty(t *testing.T) {
 	}))
 	defer srv2.Close()
 	if err := writeCredentials(vaultDir, credentials{HubURL: srv2.URL, Token: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	st = readState(vaultDir)
+	st.HubURL = srv2.URL // the test swaps transports, not vault identity
+	if err := writeState(vaultDir, st); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := SyncVault(vaultDir); err != nil {

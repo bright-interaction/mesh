@@ -4,11 +4,14 @@
 package meshclient
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,6 +21,8 @@ import (
 	"github.com/bright-interaction/mesh/internal/merge"
 	"github.com/bright-interaction/mesh/internal/syncproto"
 	"github.com/bright-interaction/mesh/internal/vault"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 // credentials and sync state live under <vault>/.mesh, which is git-ignored and
@@ -25,6 +30,10 @@ import (
 type credentials struct {
 	HubURL string `json:"hub_url"`
 	Token  string `json:"token"`
+	// VaultID lets SyncVault detect and fail safe if a crash ever leaves
+	// credentials and sync.json describing different vaults. Older credential
+	// files omit it, so HubURL remains the compatibility fallback.
+	VaultID string `json:"vault_id,omitempty"`
 }
 
 type syncState struct {
@@ -50,7 +59,7 @@ func writeCredentials(vaultDir string, c credentials) error {
 		return err
 	}
 	b, _ := json.MarshalIndent(c, "", "  ")
-	return os.WriteFile(credPath(vaultDir), b, 0o600)
+	return writeFileAtomicPrivate(credPath(vaultDir), b, 0o600)
 }
 
 func readCredentials(vaultDir string) (credentials, error) {
@@ -112,6 +121,7 @@ type Summary struct {
 	Dropped          []string // full-reconcile: locals removed because deleted upstream
 	Rejected         []string // hub refused these (viewer/ACL/scope/oversize/unsupported path); kept dirty to retry
 	Remaining        int      // dirty notes deferred to the next round because the batch was bounded
+	Deferred         []string // exact vault-relative paths counted by Remaining; none reached the hub this round
 }
 
 func contentHash(b []byte) string {
@@ -145,6 +155,13 @@ func computeOutbox(vaultDir string, prev map[string]string) ([]syncproto.OutboxI
 		}
 	}
 	for rel := range prev {
+		// The response stream also carries the hub-owned root mesh.toml and
+		// .gitattributes, but the client never pushes them. Older/buggy clients
+		// may have admitted those paths into sync.json; silently shed them rather
+		// than manufacturing a delete because vault.Walk intentionally omits them.
+		if _, ok := vault.SafeSyncNotePath(rel); !ok {
+			continue
+		}
 		if _, ok := current[rel]; !ok {
 			outbox = append(outbox, syncproto.OutboxItem{Path: rel, Op: "delete"})
 		}
@@ -159,6 +176,25 @@ type park struct {
 	sibling string // where the incoming hub version was parked
 }
 
+// pathProtection describes which local state must win over an inbound delta.
+// Presence and absence are separate: an unwriteable conflict sibling protects
+// bytes only when the live note exists, while a rejected/deferred delete protects
+// the deliberate absence too.
+type pathProtection struct {
+	present bool
+	missing bool
+}
+
+var beforeDurableUpsert func(string)
+
+// readDeltaFile is a test seam for deterministic local I/O failures between
+// outbox capture and response application.
+var readDeltaFile = os.ReadFile
+
+// Test seam for an editor save after unknown-base tombstone quarantine but
+// before the survivor phase begins.
+var afterUntrustedTombstoneQuarantine func()
+
 // applyDeltas writes or removes files per the hub's response, guarding against
 // the external-editor race (SPEC 6.6): sentHashes is the on-disk state captured
 // when the outbox was computed, so if a path changed on disk SINCE then a local
@@ -172,9 +208,15 @@ type park struct {
 // so an unvalidated Join is arbitrary file write outside the vault. An unsafe
 // path is skipped and logged, never fatal, so one bad entry cannot stop the rest
 // of a legitimate sync.
-func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[string]string, rejected map[string]bool) ([]park, error) {
+func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[string]string, protected map[string]pathProtection) ([]park, error) {
+	if err := validateDeltas(vaultDir, deltas); err != nil {
+		return nil, err
+	}
 	var parked []park
 	for _, d := range deltas {
+		if d.Op != "upsert" && d.Op != "delete" {
+			return parked, fmt.Errorf("sync: unsupported delta operation %q for %s", d.Op, d.Path)
+		}
 		abs, perr := safeNotePath(vaultDir, d.Path)
 		if perr != nil {
 			slog.Warn("sync: refusing hub delta path", "path", d.Path, "err", perr)
@@ -182,13 +224,15 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 			// local note. Nothing of the user's is dropped; the local file is untouched.
 			continue
 		}
-		onDisk, readErr := os.ReadFile(abs)
+		onDisk, readErr := readDeltaFile(abs)
 		sentHash, wasSent := sentHashes[d.Path]
 		// A local change during the window is either an edit (present but
 		// different) or a delete (absent now, but present at send time).
 		locallyChanged := (readErr == nil && contentHash(onDisk) != sentHash) ||
 			(readErr != nil && wasSent)
-		// A REJECTED path is locally changed by definition, whatever the hashes say.
+		// A protected path is locally changed by definition in the state named by
+		// its protection. Rejected/deferred upserts protect bytes; their deletes
+		// protect absence; an unparked conflict protects only bytes that exist.
 		//
 		// syncproto states the contract plainly: "The client keeps its local copy; the
 		// edit simply did not land upstream." Without this, it did the opposite. The
@@ -202,19 +246,36 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 		// Treating it as changed routes it into the park-and-keep branch below, which is
 		// what Protected and keepParkedDirty already exist for: the local bytes stay, the
 		// hub version lands in a sibling, and the path re-pushes next round.
-		// Only when there ARE local bytes to protect. If the file is absent there is
-		// nothing at risk, and forcing the flag would block a legitimate delta from
-		// landing at all.
-		if rejected[d.Path] && readErr == nil {
+		protection := protected[d.Path]
+		if (readErr == nil && protection.present) || (readErr != nil && protection.missing) {
 			locallyChanged = true
 		}
 
 		if d.Op == "delete" {
+			if readErr != nil {
+				// A read error is not evidence that the pathname is absent. A note
+				// created during the request may be unreadable, a broken symlink, or
+				// another non-regular object; passing hash(nil) to the guarded remover
+				// can relocate it and can discard an empty file. Only a confirming
+				// Lstat absence makes the delete already satisfied.
+				if _, lerr := os.Lstat(abs); os.IsNotExist(lerr) {
+					//safe-skip: the pathname is confirmed absent, so there are no
+					// local bytes to remove or preserve.
+					continue
+				} else if lerr != nil {
+					return parked, fmt.Errorf("sync: inspect unreadable delete path %s: %w", d.Path, lerr)
+				}
+				return parked, fmt.Errorf("sync: refusing to delete unreadable path %s: %w", d.Path, readErr)
+			}
 			if locallyChanged {
 				continue // local edit/recreate after send: keep it, skip the delete
 			}
-			if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+			removed, sibling, err := removeFileDurable(vaultDir, d.Path, contentHash(onDisk))
+			if err != nil {
 				return parked, err
+			}
+			if !removed && sibling != "" {
+				parked = append(parked, park{note: d.Path, sibling: sibling})
 			}
 			//safe-skip: the delete was applied above. Nothing is being dropped here.
 			continue
@@ -224,7 +285,7 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 		if err != nil {
 			return parked, err
 		}
-		if locallyChanged && contentHash(onDisk) != contentHash(b) {
+		if locallyChanged && (readErr != nil || contentHash(onDisk) != contentHash(b)) {
 			// External-editor race: park the incoming version, keep the local
 			// change (a local delete keeps the path absent; a local edit keeps it).
 			// The sibling is derived from the already-validated delta path, so a
@@ -236,17 +297,154 @@ func applyDeltas(vaultDir string, deltas []syncproto.Delta, sentHashes map[strin
 			if perr != nil {
 				return parked, perr
 			}
-			if err := writeFileAtomic(sibAbs, b, 0o644); err != nil {
+			created, err := writeNewFileDurable(sibAbs, b, 0o644)
+			if err != nil {
 				return parked, err
+			}
+			if !created {
+				existing, rerr := os.ReadFile(sibAbs)
+				if rerr != nil || contentHash(existing) != contentHash(b) {
+					// The deterministic sibling is user-owned once it exists. Keep
+					// it and park this incoming version under an unpredictable,
+					// no-clobber name instead.
+					sib, err = parkContent(vaultDir, d.Path, "hub-protected", b, 0o644)
+					if err != nil {
+						return parked, err
+					}
+				}
 			}
 			parked = append(parked, park{note: d.Path, sibling: sib})
 			continue
 		}
-		if err := writeFileAtomic(abs, b, 0o644); err != nil {
+		applied, sibling, err := replaceFileDurable(vaultDir, d.Path, readErr == nil, contentHash(onDisk), b)
+		if err != nil {
 			return parked, err
+		}
+		if !applied && sibling != "" {
+			parked = append(parked, park{note: d.Path, sibling: sibling})
 		}
 	}
 	return parked, nil
+}
+
+// validateDeltas rejects a malformed response before the first filesystem
+// mutation. The collision key models the aliases common client filesystems
+// resolve to one pathname (case, trailing dots/spaces, and Unicode normalization),
+// even when the hub runs on case-sensitive Linux and can represent both names.
+func validateDeltas(vaultDir string, deltas []syncproto.Delta) error {
+	seen := make(map[string]string, len(deltas))
+	for _, d := range deltas {
+		if d.Op != "upsert" && d.Op != "delete" {
+			return fmt.Errorf("sync: unsupported delta operation %q for %s", d.Op, d.Path)
+		}
+		if _, err := safeNotePath(vaultDir, d.Path); err != nil {
+			continue // unsafe inbound paths are skipped, preserving the existing contract
+		}
+		key, ok := clientPathCollisionKey(d.Path)
+		if !ok {
+			continue
+		}
+		if first, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("sync: duplicate delta paths %q and %q alias on the client filesystem", first, d.Path)
+		}
+		seen[key] = d.Path
+		if d.Op == "upsert" {
+			b, err := base64.StdEncoding.DecodeString(d.ContentB64)
+			if err != nil {
+				return fmt.Errorf("sync: invalid base64 delta for %s: %w", d.Path, err)
+			}
+			if !merge.IsText(b) {
+				return fmt.Errorf("sync: refusing non-text or oversize delta for %s", d.Path)
+			}
+		}
+	}
+	return nil
+}
+
+// validateSyncResponse rejects contradictions in a successful-looking response
+// before conflict siblings, deltas, or tombstone drops mutate the filesystem.
+// Tombstones name client notes only; the two hub-owned root files can be sent as
+// upserts but can never be deleted by a client-side drop list.
+func validateSyncResponse(vaultDir string, resp syncproto.SyncResponse, sentOutbox []syncproto.OutboxItem) error {
+	if err := validateDeltas(vaultDir, resp.Deltas); err != nil {
+		return err
+	}
+	live := make(map[string]string, len(resp.Deltas))
+	for _, d := range resp.Deltas {
+		if d.Op != "upsert" {
+			continue
+		}
+		if _, err := safeNotePath(vaultDir, d.Path); err != nil {
+			continue // the delta itself is safely skipped by applyDeltas
+		}
+		if key, ok := clientPathCollisionKey(d.Path); ok {
+			live[key] = d.Path
+		}
+	}
+	seenTombstones := make(map[string]string, len(resp.Tombstones))
+	for _, rel := range resp.Tombstones {
+		if _, ok := vault.SafeSyncNotePath(rel); !ok {
+			return fmt.Errorf("sync: unsafe tombstone path %q", rel)
+		}
+		if _, err := safeNotePath(vaultDir, rel); err != nil {
+			return fmt.Errorf("sync: unsafe tombstone path %q: %w", rel, err)
+		}
+		key, ok := clientPathCollisionKey(rel)
+		if !ok {
+			return fmt.Errorf("sync: unsafe tombstone path %q", rel)
+		}
+		if first, duplicate := seenTombstones[key]; duplicate {
+			return fmt.Errorf("sync: duplicate tombstone paths %q and %q alias on the client filesystem", first, rel)
+		}
+		if livePath, contradiction := live[key]; contradiction {
+			return fmt.Errorf("sync: response describes client path %q as live and %q as tombstoned", livePath, rel)
+		}
+		seenTombstones[key] = rel
+	}
+
+	// Rejected is an acknowledgement set for this exact request, not an
+	// independent path stream. Requiring exact membership lets all downstream
+	// protection/state logic use the sent path key safely; accepting a case or
+	// Unicode alias would miss those maps on a case-sensitive runtime while still
+	// naming the same file on APFS/Windows. Uniqueness also keeps Pushed from
+	// becoming negative on a duplicated response entry.
+	sent := make(map[string]bool, len(sentOutbox))
+	for _, item := range sentOutbox {
+		sent[item.Path] = true
+	}
+	seenRejected := make(map[string]string, len(resp.Rejected))
+	for _, rel := range resp.Rejected {
+		if _, ok := vault.SafeSyncNotePath(rel); !ok {
+			return fmt.Errorf("sync: unsafe rejected path %q", rel)
+		}
+		if _, err := safeNotePath(vaultDir, rel); err != nil {
+			return fmt.Errorf("sync: unsafe rejected path %q: %w", rel, err)
+		}
+		key, ok := clientPathCollisionKey(rel)
+		if !ok {
+			return fmt.Errorf("sync: unsafe rejected path %q", rel)
+		}
+		if first, duplicate := seenRejected[key]; duplicate {
+			return fmt.Errorf("sync: duplicate rejected paths %q and %q alias on the client filesystem", first, rel)
+		}
+		if !sent[rel] {
+			return fmt.Errorf("sync: rejected path %q was not in the transmitted outbox", rel)
+		}
+		seenRejected[key] = rel
+	}
+	return nil
+}
+
+func clientPathCollisionKey(rel string) (string, bool) {
+	clean, ok := safeRelPath(rel)
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(filepath.ToSlash(clean), "/")
+	for i := range parts {
+		parts[i] = strings.TrimRight(norm.NFC.String(cases.Fold().String(parts[i])), ". ")
+	}
+	return strings.Join(parts, "/"), true
 }
 
 // keepParkedDirty rewrites current so each guard-parked path keeps its pre-sync
@@ -288,22 +486,49 @@ func keepDeferredDirty(current, base map[string]string, deferred []string) {
 // overwrites it with no conflict sibling, because sentHashes then matches disk.
 //
 // sentHashes is the on-disk state at send time, so a path whose hash differs from
-// it changed during the window. Two cases are NOT window edits and are skipped:
-// a path the hub sent a delta for (applyDeltas wrote it, and its own guard plus
-// keepParkedDirty already decided what happens), and a path we dropped because it
-// was deleted upstream. Everything else is reset to its send-time hash, which is
-// what the hub has, so the next computeOutbox re-detects the change: an edit
-// re-pushes as an upsert and a window delete re-pushes as a delete.
-func keepWindowEditsDirty(current, sentHashes map[string]string, deltas []syncproto.Delta, dropped []string) {
-	skip := make(map[string]bool, len(deltas)+len(dropped))
+// it changed during the window. Response deltas establish the new authoritative
+// base for their note paths, while dropped paths establish absence; every other
+// changed path is reset to its send-time state. That makes an edit re-push as an
+// upsert and a window delete re-push as a delete.
+func keepWindowEditsDirty(_ string, current, sentHashes map[string]string, deltas []syncproto.Delta, dropped []string) {
+	// A response delta describes the hub at the new HeadSHA, so its state is the
+	// base for that path regardless of what is currently on disk. This is more
+	// precise than excluding every delta path from the window check: an editor can
+	// save after applyDeltas and before sync.json is written, and a protected local
+	// edit/delete deliberately makes disk differ from the delta. Persisting the
+	// delta state keeps either change dirty for the next round.
+	expected := make(map[string]*string, len(deltas)+len(dropped))
 	for _, d := range deltas {
-		skip[d.Path] = true
+		// Root config files are valid inbound deltas but are hub-owned, never
+		// client notes. Admitting them to the note hash base makes the next
+		// computeOutbox infer a client-side delete because Walk omits them.
+		if _, ok := vault.SafeSyncNotePath(d.Path); !ok {
+			continue
+		}
+		switch d.Op {
+		case "upsert":
+			b, err := base64.StdEncoding.DecodeString(d.ContentB64)
+			if err != nil {
+				continue // applyDeltas would have failed the round before this point
+			}
+			h := contentHash(b)
+			expected[d.Path] = &h
+		case "delete":
+			expected[d.Path] = nil
+		}
 	}
 	for _, rel := range dropped {
-		skip[rel] = true
+		expected[rel] = nil
+	}
+	for rel, want := range expected {
+		if want == nil {
+			delete(current, rel)
+		} else {
+			current[rel] = *want
+		}
 	}
 	restore := func(rel string) {
-		if skip[rel] {
+		if _, handled := expected[rel]; handled {
 			return
 		}
 		if old, ok := sentHashes[rel]; ok {
@@ -345,7 +570,7 @@ func keepWindowEditsDirty(current, sentHashes map[string]string, deltas []syncpr
 // it keeps the file rather than risk destroying local content. Such a note can
 // re-share on the next push (a re-share, never a loss). The horizon GC assumes
 // base is intact for offline clients.
-func dropFullReconcileOrphans(vaultDir string, deltas []syncproto.Delta, tombstones []string, base map[string]string) ([]string, error) {
+func dropFullReconcileOrphans(vaultDir string, deltas []syncproto.Delta, tombstones []string, base map[string]string, protected ...*[]park) ([]string, error) {
 	keep := make(map[string]bool, len(deltas))
 	for _, d := range deltas {
 		if d.Op == "upsert" {
@@ -409,10 +634,14 @@ func dropFullReconcileOrphans(vaultDir string, deltas []syncproto.Delta, tombsto
 		if contentHash(onDisk) != baseHash {
 			continue // locally edited or recreated since last sync: keep it
 		}
-		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+		removed, sibling, err := removeFileDurable(vaultDir, rel, baseHash)
+		if err != nil {
 			return dropped, err
 		}
-		dropped = append(dropped, rel)
+		recordDeletePark(protected, rel, sibling)
+		if removed {
+			dropped = append(dropped, rel)
+		}
 	}
 	return dropped, nil
 }
@@ -422,7 +651,7 @@ func dropFullReconcileOrphans(vaultDir string, deltas []syncproto.Delta, tombsto
 // (base[rel]) is removed. A path never synced locally, locally edited, or recreated
 // since fails the gate and is kept, so an unacknowledged local change is never lost.
 // This is the incremental sibling of dropFullReconcileOrphans' safety gate.
-func dropTombstoned(vaultDir string, tombstones []string, base map[string]string) ([]string, error) {
+func dropTombstoned(vaultDir string, tombstones []string, base map[string]string, protected ...*[]park) ([]string, error) {
 	var dropped []string
 	for _, rel := range tombstones {
 		baseHash, ok := base[rel]
@@ -444,12 +673,70 @@ func dropTombstoned(vaultDir string, tombstones []string, base map[string]string
 		if contentHash(onDisk) != baseHash {
 			continue // locally edited or recreated since last sync: keep it
 		}
-		if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+		removed, sibling, err := removeFileDurable(vaultDir, rel, baseHash)
+		if err != nil {
 			return dropped, err
 		}
-		dropped = append(dropped, rel)
+		recordDeletePark(protected, rel, sibling)
+		if removed {
+			dropped = append(dropped, rel)
+		}
 	}
 	return dropped, nil
+}
+
+// quarantineUntrustedTombstones handles the one case contentHash gates cannot:
+// an unknown base has no trusted hash for a stale local file. Positive evidence
+// from the full-reconcile tombstone list means the live sync pathname must stay
+// deleted, but the local bytes are moved into a visible conflict sibling rather
+// than destroyed. A user can explicitly take-mine to recreate it; sync never does
+// so automatically merely because sync.json was lost.
+func quarantineUntrustedTombstones(vaultDir string, deltas []syncproto.Delta, tombstones []string) ([]park, []string, error) {
+	live := make(map[string]bool, len(deltas))
+	for _, d := range deltas {
+		if d.Op == "upsert" {
+			if key, ok := clientPathCollisionKey(d.Path); ok {
+				live[key] = true
+			}
+		}
+	}
+	var parked []park
+	var removed []string
+	for _, rel := range tombstones {
+		key, _ := clientPathCollisionKey(rel)
+		if live[key] {
+			continue
+		}
+		abs, err := safeNotePath(vaultDir, rel)
+		if err != nil {
+			slog.Warn("sync: refusing hub tombstone path during unknown-base quarantine", "path", rel, "err", err)
+			continue
+		}
+		b, err := os.ReadFile(abs)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return parked, removed, err
+		}
+		captured, err := captureGuardedFile(vaultDir, rel, contentHash(b), "tombstone-quarantine", nil)
+		if err != nil {
+			return parked, removed, err
+		}
+		if captured == nil {
+			continue
+		}
+		parked = append(parked, park{note: rel, sibling: captured.rel})
+		removed = append(removed, rel)
+	}
+	return parked, removed, nil
+}
+
+func recordDeletePark(dst []*[]park, note, sibling string) {
+	if sibling == "" || len(dst) == 0 || dst[0] == nil {
+		return
+	}
+	*dst[0] = append(*dst[0], park{note: note, sibling: sibling})
 }
 
 // writeConflictSiblings preserves the client's losing version of each conflicted
@@ -463,6 +750,8 @@ func dropTombstoned(vaultDir string, tombstones []string, base map[string]string
 // Returns the paths whose local version could NOT be parked. The caller must protect
 // those from applyDeltas, or the hub's winning version silently overwrites the user's
 // losing version with no copy anywhere.
+var beforeConflictSiblingPublish func(string)
+
 func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]string, error) {
 	var unparked []string
 	for _, cf := range conflicts {
@@ -489,8 +778,38 @@ func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]s
 			// bytes at risk.
 			continue
 		}
-		if err := writeFileAtomic(sibAbs, local, 0o644); err != nil {
+		if existing, rerr := os.ReadFile(sibAbs); rerr == nil {
+			if contentHash(existing) == contentHash(local) {
+				continue // idempotent replay of the same preserved loser
+			}
+			// A conflict sibling is user-owned resolution work once it exists. Never
+			// overwrite different bytes merely because a replayed or hostile response
+			// named the same path; protect the live loser as well because no new sibling
+			// was written for it in this round.
+			slog.Warn("sync: refusing to overwrite an existing conflict sibling", "path", cf.SiblingPath)
+			unparked = append(unparked, cf.Path)
+			continue
+		} else if !os.IsNotExist(rerr) {
+			// Unreadable means unequal cannot be disproved. Fail in the data-safe
+			// direction and protect the live note rather than replacing either copy.
+			slog.Warn("sync: cannot verify existing conflict sibling", "path", cf.SiblingPath, "err", rerr)
+			unparked = append(unparked, cf.Path)
+			continue
+		}
+		if beforeConflictSiblingPublish != nil {
+			beforeConflictSiblingPublish(sibAbs)
+		}
+		created, err := writeNewFileDurable(sibAbs, local, 0o644)
+		if err != nil {
 			return unparked, err
+		}
+		if !created {
+			existing, rerr := os.ReadFile(sibAbs)
+			if rerr == nil && contentHash(existing) == contentHash(local) {
+				continue // the same loser won the publication race
+			}
+			slog.Warn("sync: conflict sibling appeared during publication; preserving it", "path", cf.SiblingPath, "err", rerr)
+			unparked = append(unparked, cf.Path)
 		}
 	}
 	return unparked, nil
@@ -542,14 +861,17 @@ func writeConflictSiblings(vaultDir string, conflicts []syncproto.Conflict) ([]s
 // created it first, and a default of 0644 here would have published that listing to
 // every uid on the box on the next fresh join. A durability fix that widens a file
 // somebody deliberately made private is worse than the gap it closes.
-func writeFileAtomic(path string, b []byte, newPerm os.FileMode) error {
+func writeFileAtomic(path string, b []byte, newPerm os.FileMode, forceMode ...bool) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	perm := newPerm
-	if fi, err := os.Stat(path); err == nil {
-		perm = fi.Mode().Perm()
+	force := len(forceMode) > 0 && forceMode[0]
+	if !force {
+		if fi, err := os.Stat(path); err == nil {
+			perm = fi.Mode().Perm()
+		}
 	}
 	tmp, err := os.CreateTemp(dir, ".mesh-tmp-*")
 	if err != nil {
@@ -587,6 +909,345 @@ func writeFileAtomic(path string, b []byte, newPerm os.FileMode) error {
 	return nil
 }
 
+// writeFileAtomicPrivate is the credentials-only variant: an accidentally
+// permissive legacy mode must not survive token rotation. The temp is chmod'd
+// before publication, so there is no post-rename window with a readable token.
+func writeFileAtomicPrivate(path string, b []byte, perm os.FileMode) error {
+	return writeFileAtomic(path, b, perm, true)
+}
+
+// The two hooks are deterministic test seams for an editor's atomic-save rename
+// between applyDeltas/drop*'s first hash check and the guarded atomic capture.
+var beforeDurableRemove func(string)
+
+// beforeGuardedRename exercises the narrower race after the guard has fsynced
+// the live inode but before it renames that pathname into its sibling.
+var beforeGuardedRename func(string)
+
+// guardedFile is a pathname atomically captured into a visible conflict sibling.
+// If the process crashes mid-operation, bytes remain discoverable by `mesh
+// conflicts`; a temporary hidden file would turn a crash-safety fix into loss by
+// another name.
+type guardedFile struct {
+	rel     string
+	path    string
+	content []byte
+	perm    os.FileMode
+}
+
+func guardBasePath(rel string) string {
+	if strings.EqualFold(filepath.Ext(rel), ".md") {
+		return rel
+	}
+	// The two non-note paths the protocol admits (mesh.toml and .gitattributes)
+	// still need a safe, walker-excluded capture name. Give them a markdown base
+	// solely for the conflict marker; the Summary carries the exact sibling path.
+	dir := filepath.Dir(rel)
+	base := strings.TrimLeft(filepath.Base(rel), ".")
+	if base == "" {
+		base = "root-file"
+	}
+	return filepath.ToSlash(filepath.Join(dir, base+"-root.md"))
+}
+
+func newGuardSibling(vaultDir, rel, role string, content []byte) (string, string, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		now := time.Now()
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return "", "", err
+		}
+		// A cryptographically unpredictable 128-bit component makes the only
+		// remaining check+rename destination race unreachable in practice. The
+		// process/file sync lock already excludes other Mesh writers; an editor
+		// cannot guess this pathname before the atomic rename.
+		user := fmt.Sprintf("%s-%s-%d", role, hex.EncodeToString(nonce[:]), attempt)
+		candidate := merge.SiblingPath(guardBasePath(rel), now, user, content)
+		abs, err := safeSiblingPath(vaultDir, candidate)
+		if err != nil {
+			return "", "", err
+		}
+		if _, err := os.Lstat(abs); os.IsNotExist(err) {
+			return candidate, abs, nil
+		} else if err != nil {
+			return "", "", err
+		}
+	}
+	return "", "", fmt.Errorf("sync: could not allocate a conflict sibling for %s", rel)
+}
+
+func captureGuardedFile(vaultDir, rel, expectedHash, role string, before func(string)) (*guardedFile, error) {
+	path, err := safeNotePath(vaultDir, rel)
+	if err != nil {
+		return nil, err
+	}
+	if before != nil {
+		before(path)
+	}
+
+	// The live pathname may name editor-owned bytes that were never fsynced. Make
+	// that inode durable while it still has its original name, then verify the
+	// pathname still names the same inode before capturing it. Atomic-save editors
+	// replace the inode; retrying makes their replacement durable too rather than
+	// letting our rename become its sole pathname first.
+	var syncedContent []byte
+	var syncedInfo os.FileInfo
+	for attempt := 0; attempt < 8; attempt++ {
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("open live guard path %s: %w", rel, err)
+		}
+		content, rerr := io.ReadAll(f)
+		fi, sterr := f.Stat()
+		serr := f.Sync()
+		cerr := f.Close()
+		if err := errors.Join(rerr, sterr, serr, cerr); err != nil {
+			return nil, fmt.Errorf("make live guard path %s durable: %w", rel, err)
+		}
+		if beforeGuardedRename != nil {
+			beforeGuardedRename(path)
+		}
+		current, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("verify live guard path %s: %w", rel, err)
+		}
+		if !os.SameFile(fi, current) || fi.Size() != current.Size() || !fi.ModTime().Equal(current.ModTime()) {
+			continue
+		}
+		syncedContent = content
+		syncedInfo = fi
+		break
+	}
+	if syncedInfo == nil {
+		return nil, fmt.Errorf("sync: %s kept changing while preparing a guarded update", rel)
+	}
+
+	backupRel, backup, err := newGuardSibling(vaultDir, rel, role, []byte(expectedHash))
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Rename(path, backup); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	dir := filepath.Dir(path)
+	// Re-open and verify what the atomic rename actually captured. The stable
+	// pre-rename identity check closes deterministic atomic-save races; this second
+	// check handles the irreducible final stat->rename window without ever trusting
+	// stale bytes. A different/modified inode is fsynced here and returned to the
+	// caller, whose expected-hash gate restores or parks it rather than deleting it.
+	f, err := os.OpenFile(backup, os.O_RDWR, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open guarded copy %s: %w", backupRel, err)
+	}
+	captured, rerr := io.ReadAll(f)
+	fi, sterr := f.Stat()
+	var serr error
+	if sterr == nil && (!os.SameFile(syncedInfo, fi) || contentHash(captured) != contentHash(syncedContent)) {
+		serr = f.Sync()
+	}
+	cerr := f.Close()
+	if err := errors.Join(rerr, sterr, serr, cerr); err != nil {
+		return nil, fmt.Errorf("make guarded copy %s durable: %w", backupRel, err)
+	}
+	syncDir(dir)
+	perm := fi.Mode().Perm()
+	return &guardedFile{rel: backupRel, path: backup, content: captured, perm: perm}, nil
+}
+
+var linkFile = os.Link
+
+// writeNewFileDurable publishes a fully-written same-directory temp only if path
+// is still absent. The hard link is atomic and no-clobber: concurrent readers see
+// either no path or complete bytes, and an editor that installed a newer inode
+// wins. Filesystems without hard-link support fail the round safely; no partial
+// live markdown is ever published.
+func writeNewFileDurable(path string, b []byte, perm os.FileMode) (bool, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, err
+	}
+	f, err := os.CreateTemp(dir, ".mesh-new-*")
+	if err != nil {
+		return false, err
+	}
+	tmp := f.Name()
+	_, werr := f.Write(b)
+	perr := f.Chmod(perm)
+	serr := f.Sync()
+	cerr := f.Close()
+	if err := errors.Join(werr, perr, serr, cerr); err != nil {
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	if err := linkFile(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	// The live link now names already-fsynced data. Make that directory entry
+	// durable before cleaning up the staging link.
+	syncDir(dir)
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return true, err
+	}
+	syncDir(dir)
+	return true, nil
+}
+
+func discardGuardedFile(g *guardedFile, dir string) error {
+	if g == nil {
+		return nil
+	}
+	if err := os.Remove(g.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	syncDir(dir)
+	return nil
+}
+
+func restoreGuardedFile(g *guardedFile, path string) (bool, error) {
+	if g == nil {
+		return false, nil
+	}
+	restored, err := writeNewFileDurable(path, g.content, g.perm)
+	if err != nil || !restored {
+		return restored, err // sibling remains; a newer live path, if any, is untouched
+	}
+	if err := discardGuardedFile(g, filepath.Dir(path)); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func parkContent(vaultDir, rel, role string, content []byte, perm os.FileMode) (string, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		sibling, path, err := newGuardSibling(vaultDir, rel, fmt.Sprintf("%s-%d", role, attempt), content)
+		if err != nil {
+			return "", err
+		}
+		created, err := writeNewFileDurable(path, content, perm)
+		if err != nil {
+			return "", err
+		}
+		if created {
+			return sibling, nil
+		}
+	}
+	return "", fmt.Errorf("sync: could not park content for %s", rel)
+}
+
+// removeFileDurable atomically captures the pathname, then verifies the MOVED
+// inode against expectedHash. A late editor save is restored without clobbering
+// anything newer; a matching capture is removed and the directory fsynced before
+// sync.json may advance.
+func removeFileDurable(vaultDir, rel, expectedHash string) (removed bool, sibling string, err error) {
+	path, err := safeNotePath(vaultDir, rel)
+	if err != nil {
+		return false, "", err
+	}
+	captured, err := captureGuardedFile(vaultDir, rel, expectedHash, "delete-guard", beforeDurableRemove)
+	if err != nil {
+		return false, "", err
+	}
+	if captured == nil {
+		return false, "", nil
+	}
+	dir := filepath.Dir(path)
+	if contentHash(captured.content) != expectedHash {
+		restored, err := restoreGuardedFile(captured, path)
+		if err != nil {
+			return false, captured.rel, err
+		}
+		if restored {
+			return false, "", nil
+		}
+		slog.Warn("sync: local edit raced a delete; preserved beside a newer live version",
+			"path", rel, "sibling", captured.rel)
+		return false, captured.rel, nil
+	}
+	if err := discardGuardedFile(captured, dir); err != nil {
+		return false, captured.rel, err
+	}
+	return true, "", nil
+}
+
+// replaceFileDurable is the upsert twin of removeFileDurable. It installs the
+// hub bytes only while the live pathname still describes the version we checked;
+// otherwise the local editor wins and the hub bytes are parked for resolution.
+func replaceFileDurable(vaultDir, rel string, expectedExists bool, expectedHash string, incoming []byte) (applied bool, sibling string, err error) {
+	path, err := safeNotePath(vaultDir, rel)
+	if err != nil {
+		return false, "", err
+	}
+	if !expectedExists {
+		if beforeDurableUpsert != nil {
+			beforeDurableUpsert(path)
+		}
+		created, err := writeNewFileDurable(path, incoming, 0o644)
+		if err != nil {
+			return false, "", err
+		}
+		if created {
+			return true, "", nil
+		}
+		sibling, err := parkContent(vaultDir, rel, "hub-race", incoming, 0o644)
+		return false, sibling, err
+	}
+
+	captured, err := captureGuardedFile(vaultDir, rel, expectedHash, "upsert-guard", beforeDurableUpsert)
+	if err != nil {
+		return false, "", err
+	}
+	if captured == nil {
+		// The editor deleted the note after our first read. Keep that deletion and
+		// park the incoming hub version.
+		sibling, err := parkContent(vaultDir, rel, "hub-race", incoming, 0o644)
+		return false, sibling, err
+	}
+	if contentHash(captured.content) != expectedHash {
+		restored, rerr := restoreGuardedFile(captured, path)
+		if rerr != nil {
+			return false, captured.rel, rerr
+		}
+		if !restored {
+			slog.Warn("sync: local edit raced an upsert; preserved beside a newer live version",
+				"path", rel, "sibling", captured.rel)
+		}
+		sibling, perr := parkContent(vaultDir, rel, "hub-race", incoming, 0o644)
+		return false, sibling, perr
+	}
+
+	created, err := writeNewFileDurable(path, incoming, captured.perm)
+	if err != nil {
+		return false, captured.rel, err
+	}
+	if created {
+		if err := discardGuardedFile(captured, filepath.Dir(path)); err != nil {
+			return false, captured.rel, err
+		}
+		return true, "", nil
+	}
+	// A still-later editor save occupied the path after capture. The old captured
+	// bytes are already in hub history, so discard them and park the incoming hub
+	// bytes; the new live bytes remain untouched and dirty.
+	if err := discardGuardedFile(captured, filepath.Dir(path)); err != nil {
+		return false, captured.rel, err
+	}
+	sibling, err = parkContent(vaultDir, rel, "hub-race", incoming, 0o644)
+	return false, sibling, err
+}
+
 // syncDir fsyncs a directory so a rename that just landed in it survives a power
 // cut. Best effort on purpose: opening or fsyncing a directory handle is a no-op or
 // an error on some platforms and network filesystems (Windows cannot open one at
@@ -608,14 +1269,76 @@ func syncDir(dir string) {
 // apply the hub's deltas, and persist the new base. It does not reindex; the
 // caller (cmd/mesh) runs index.Reconcile afterward.
 func SyncVault(vaultDir string) (Summary, error) {
+	release, err := acquireVaultSyncLock(vaultDir)
+	if err != nil {
+		return Summary{}, err
+	}
+	defer release()
+	return syncVaultLocked(vaultDir)
+}
+
+// syncVaultLocked is SyncVault with the same-vault process/file lock already
+// held. JoinVault uses it so no sync can observe credentials half-transitioned
+// to another hub.
+func syncVaultLocked(vaultDir string) (Summary, error) {
+	return syncVaultRound(vaultDir, true, nil)
+}
+
+func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []string) (Summary, error) {
 	creds, err := readCredentials(vaultDir)
 	if err != nil {
 		return Summary{}, err
 	}
 	state := readState(vaultDir)
+	// Recover from an interrupted join produced by this or an older client. A base
+	// from another hub is never evidence about what the credential's hub has; the
+	// only safe baseline is empty, which forces a full reconcile and re-push.
+	hubBase := strings.TrimRight(creds.HubURL, "/")
+	if joinTargetsAnotherVault(state, state.HubURL, hubBase, creds.VaultID) {
+		state = syncState{Hashes: map[string]string{}, VaultID: creds.VaultID, HubURL: hubBase}
+	}
+	// Missing/corrupt/reset state is an UNKNOWN base, not proof every local note
+	// is new. Sending those bytes before reading the hub's delete ledger can
+	// resurrect every stale tombstoned path and clear its tombstone. Pull the
+	// authoritative snapshot first; genuine survivors are pushed in a second
+	// round below, still within this one locked SyncVault call.
+	pullFirst := allowPullFirst && state.HeadSHA == ""
 	outbox, sentHashes, err := computeOutbox(vaultDir, state.Hashes)
 	if err != nil {
 		return Summary{}, err
+	}
+	// Phase two remembers every authoritative tombstone learned by the unknown-
+	// base pull. An editor can atomically save a stale buffer back after phase one
+	// quarantined it; capture those bytes again and, independently, exclude the
+	// aliased pathname from this call's outbox. That preserves the edit without
+	// automatically clearing the hub's tombstone.
+	var preParked []park
+	var preDropped []string
+	if len(suppressTombstones) > 0 {
+		preParked, preDropped, err = quarantineUntrustedTombstones(vaultDir, nil, suppressTombstones)
+		if err != nil {
+			return Summary{}, err
+		}
+		blocked := make(map[string]bool, len(suppressTombstones))
+		for _, rel := range suppressTombstones {
+			if key, ok := clientPathCollisionKey(rel); ok {
+				blocked[key] = true
+			}
+		}
+		kept := outbox[:0]
+		for _, item := range outbox {
+			key, ok := clientPathCollisionKey(item.Path)
+			if ok && blocked[key] {
+				delete(sentHashes, item.Path) // quarantine made it absent at send time
+				continue
+			}
+			kept = append(kept, item)
+		}
+		outbox = kept
+	}
+	outboxOps := make(map[string]string, len(outbox))
+	for _, item := range outbox {
+		outboxOps[item.Path] = item.Op
 	}
 	// Bound the push. The hub caps one request at maxSyncOutboxItems and answers 413 with
 	// "split the push into smaller batches", but the client had no batching, so a vault
@@ -637,7 +1360,12 @@ func SyncVault(vaultDir string) (Summary, error) {
 	// since deletes are appended last they truncate FIRST, so a locally deleted note stayed
 	// alive on the hub forever. deferred carries those paths to keepDeferredDirty below.
 	var deferred []string
-	if len(outbox) > maxOutboxPerSync {
+	if pullFirst {
+		for _, it := range outbox {
+			deferred = append(deferred, it.Path)
+		}
+		outbox = nil
+	} else if len(outbox) > maxOutboxPerSync {
 		for _, it := range outbox[maxOutboxPerSync:] {
 			deferred = append(deferred, it.Path)
 		}
@@ -649,14 +1377,32 @@ func SyncVault(vaultDir string) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	if err := validateSyncResponse(vaultDir, resp, outbox); err != nil {
+		return Summary{}, err
+	}
 	// Build the protected set BEFORE applying deltas. Three things go in it, for the same
 	// reason: applyDeltas must not overwrite local bytes that nothing else is holding.
 	//   - paths the hub REJECTED (the contract says the client keeps its local copy)
 	//   - paths the bounded batch DEFERRED (the hub never saw those bytes this round)
 	//   - paths whose conflict sibling could not be written (nothing holds the loser)
-	rejectedSet := make(map[string]bool, len(resp.Rejected)+len(deferred))
+	protected := make(map[string]pathProtection, len(resp.Rejected)+len(deferred))
+	protectOutbox := func(rel string) {
+		p := protected[rel]
+		switch outboxOps[rel] {
+		case "delete":
+			p.missing = true
+		case "upsert":
+			p.present = true
+		}
+		protected[rel] = p
+	}
 	for _, rel := range resp.Rejected {
-		rejectedSet[rel] = true
+		protectOutbox(rel)
+	}
+	if pullFirst {
+		for rel := range outboxOps {
+			protectOutbox(rel)
+		}
 	}
 	// A deferred path sits in exactly the position a rejected one does: the hub did not
 	// see our version, so any delta it sends for that path is built on a base that does
@@ -668,7 +1414,7 @@ func SyncVault(vaultDir string) (Summary, error) {
 	// full reconcile (a reset sync.json on a grown vault), because then the hub sends a
 	// delta for every path while our push is capped.
 	for _, rel := range deferred {
-		rejectedSet[rel] = true
+		protectOutbox(rel)
 	}
 	// Preserve our losing versions locally before deltas overwrite the paths.
 	unparked, err := writeConflictSiblings(vaultDir, resp.Conflicts)
@@ -676,29 +1422,55 @@ func SyncVault(vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	for _, rel := range unparked {
-		rejectedSet[rel] = true // no sibling holds this local version: protect it
+		p := protected[rel]
+		p.present = true // no sibling holds this local version: protect its bytes
+		protected[rel] = p
 	}
-	parked, err := applyDeltas(vaultDir, resp.Deltas, sentHashes, rejectedSet)
+	parked, err := applyDeltas(vaultDir, resp.Deltas, sentHashes, protected)
 	if err != nil {
 		return Summary{}, err
+	}
+	parked = append(preParked, parked...)
+	// Catch a save that landed while phase two's request was in flight. A live
+	// upsert in this response supersedes the old tombstone and is deliberately
+	// excluded from quarantine.
+	if len(suppressTombstones) > 0 {
+		lateParked, lateDropped, qerr := quarantineUntrustedTombstones(vaultDir, resp.Deltas, suppressTombstones)
+		if qerr != nil {
+			return Summary{}, qerr
+		}
+		parked = append(parked, lateParked...)
+		preDropped = append(preDropped, lateDropped...)
 	}
 	// A full reconcile's deltas are upserts-only, so remove locals the snapshot
 	// proves were deleted upstream (else they linger and can resurrect). Must run
 	// before the recompute below so the dropped paths leave the persisted hashes.
-	var dropped []string
+	dropped := append([]string(nil), preDropped...)
 	if resp.FullReconcile {
-		dropped, err = dropFullReconcileOrphans(vaultDir, resp.Deltas, resp.Tombstones, state.Hashes)
+		var roundDropped []string
+		roundDropped, err = dropFullReconcileOrphans(vaultDir, resp.Deltas, resp.Tombstones, state.Hashes, &parked)
 		if err != nil {
 			return Summary{}, err
+		}
+		dropped = append(dropped, roundDropped...)
+		if pullFirst {
+			quarantined, removed, qerr := quarantineUntrustedTombstones(vaultDir, resp.Deltas, resp.Tombstones)
+			if qerr != nil {
+				return Summary{}, qerr
+			}
+			parked = append(parked, quarantined...)
+			dropped = append(dropped, removed...)
 		}
 	} else if len(resp.Tombstones) > 0 {
 		// Incremental drop-list: prune notes the hub deleted since our last seq, content-
 		// safely. A scoped client may never receive the delete delta, so without this it
 		// keeps the deleted note locally (serving stale knowledge) and can resurrect it.
-		dropped, err = dropTombstoned(vaultDir, resp.Tombstones, state.Hashes)
+		var roundDropped []string
+		roundDropped, err = dropTombstoned(vaultDir, resp.Tombstones, state.Hashes, &parked)
 		if err != nil {
 			return Summary{}, err
 		}
+		dropped = append(dropped, roundDropped...)
 	}
 	// Recompute hashes from disk so the next outbox reflects the canonical (post-
 	// merge) hub state, not what we optimistically pushed; then keep any
@@ -708,7 +1480,7 @@ func SyncVault(vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	keepParkedDirty(current, state.Hashes, parked)
-	keepWindowEditsDirty(current, sentHashes, resp.Deltas, dropped)
+	keepWindowEditsDirty(vaultDir, current, sentHashes, resp.Deltas, dropped)
 	// AFTER keepWindowEditsDirty on purpose: that one resets a path to its send-time
 	// hash, which for a deferred path is exactly the hash that would mark it synced.
 	// Proven by ablation: swapping these two lines puts the never-pushed remainder back.
@@ -726,6 +1498,13 @@ func SyncVault(vaultDir string) (Summary, error) {
 			delete(current, rel)
 		}
 	}
+	// sync.json is exclusively the PUSH baseline. Keep hub-owned root files and
+	// any legacy/hostile non-note key out even if an earlier helper restored one.
+	for rel := range current {
+		if _, ok := vault.SafeSyncNotePath(rel); !ok {
+			delete(current, rel)
+		}
+	}
 	// Carry the vault identity forward. It is what makes a later `mesh join` able to
 	// tell "same hub, keep the base" from "different hub, this base is a lie", so a
 	// round that dropped it would re-open that hole on the next sync. HubURL is
@@ -733,13 +1512,17 @@ func SyncVault(vaultDir string) (Summary, error) {
 	// vault joined before this shipped starts being protected without a re-join.
 	hubURL := state.HubURL
 	if hubURL == "" {
-		hubURL = creds.HubURL
+		hubURL = hubBase
+	}
+	vaultID := state.VaultID
+	if vaultID == "" {
+		vaultID = creds.VaultID
 	}
 	if err := writeState(vaultDir, syncState{
 		HeadSHA: resp.HeadSHA,
 		Hashes:  current,
 		TombSeq: resp.TombstoneSeq,
-		VaultID: state.VaultID,
+		VaultID: vaultID,
 		HubURL:  hubURL,
 	}); err != nil {
 		return Summary{}, err
@@ -747,13 +1530,52 @@ func SyncVault(vaultDir string) (Summary, error) {
 	sum := Summary{Pushed: len(outbox) - len(resp.Rejected), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped, Rejected: resp.Rejected}
 	// Tell the caller work remains, rather than letting a bounded batch look complete.
 	sum.Remaining = len(deferred)
+	sum.Deferred = append([]string(nil), deferred...)
 	for _, c := range resp.Conflicts {
 		sum.ConflictSiblings = append(sum.ConflictSiblings, c.SiblingPath)
 	}
 	for _, p := range parked {
 		sum.Protected = append(sum.Protected, p.sibling)
 	}
+	if pullFirst {
+		if afterUntrustedTombstoneQuarantine != nil {
+			afterUntrustedTombstoneQuarantine()
+		}
+		pending, _, perr := computeOutbox(vaultDir, current)
+		if perr != nil {
+			return sum, perr
+		}
+		if len(pending) == 0 {
+			sum.Remaining = 0
+			sum.Deferred = nil
+			return sum, nil
+		}
+		next, nerr := syncVaultRound(vaultDir, false, resp.Tombstones)
+		if nerr != nil {
+			return sum, fmt.Errorf("sync: authoritative pull succeeded but survivor push failed: %w", nerr)
+		}
+		return combineSummaries(sum, next), nil
+	}
 	return sum, nil
+}
+
+func combineSummaries(first, second Summary) Summary {
+	head := second.Head
+	if head == "" {
+		head = first.Head
+	}
+	return Summary{
+		Pushed:           first.Pushed + second.Pushed,
+		Pulled:           first.Pulled + second.Pulled,
+		Conflicts:        first.Conflicts + second.Conflicts,
+		Head:             head,
+		ConflictSiblings: append(first.ConflictSiblings, second.ConflictSiblings...),
+		Protected:        append(first.Protected, second.Protected...),
+		Dropped:          append(first.Dropped, second.Dropped...),
+		Rejected:         append(first.Rejected, second.Rejected...),
+		Remaining:        second.Remaining,
+		Deferred:         append([]string(nil), second.Deferred...),
+	}
 }
 
 // JoinVault redeems an invite, stores credentials, verifies embedding
@@ -763,6 +1585,11 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 	if err := os.MkdirAll(vaultDir, 0o755); err != nil {
 		return Summary{}, err
 	}
+	release, err := acquireVaultSyncLock(vaultDir)
+	if err != nil {
+		return Summary{}, err
+	}
+	defer release()
 	// Read what this directory was joined to BEFORE writeCredentials overwrites it.
 	// The old hub URL is one of the two ways we can recognise a re-join that switches
 	// hubs, and it only exists until the next line runs.
@@ -775,9 +1602,6 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	hubBase := strings.TrimRight(hubURL, "/")
-	if err := writeCredentials(vaultDir, credentials{HubURL: hubBase, Token: jr.ClientToken}); err != nil {
-		return Summary{}, err
-	}
 	c.Token = jr.ClientToken
 	vi, err := c.Vault()
 	if err != nil {
@@ -806,8 +1630,19 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 	// client pushes everything it holds, which is what "join and clone" already means.
 	// The identity is stamped either way, so a state file written before this existed
 	// starts carrying it after one join and the comparison gets sharper, not weaker.
-	if joinTargetsAnotherVault(prevState, prevCreds.HubURL, hubBase, vaultID) {
+	switching := joinTargetsAnotherVault(prevState, prevCreds.HubURL, hubBase, vaultID)
+	if switching {
+		// Neutralise the old hub's base BEFORE publishing the new credentials. A
+		// crash between these two durable renames then leaves either the intact old
+		// pair or old credentials with an empty (safe) base, never new credentials
+		// paired with the old hub's hashes/cursor.
 		prevState = syncState{Hashes: map[string]string{}}
+		if err := writeState(vaultDir, prevState); err != nil {
+			return Summary{}, err
+		}
+	}
+	if err := writeCredentials(vaultDir, credentials{HubURL: hubBase, Token: jr.ClientToken, VaultID: vaultID}); err != nil {
+		return Summary{}, err
 	}
 	prevState.VaultID = vaultID
 	prevState.HubURL = hubBase
@@ -815,7 +1650,7 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 		return Summary{}, err
 	}
 	// Fresh directory: base "" -> the hub returns a full snapshot.
-	return SyncVault(vaultDir)
+	return syncVaultLocked(vaultDir)
 }
 
 // joinTargetsAnotherVault reports whether a join is pointing an ALREADY-joined
@@ -830,6 +1665,12 @@ func JoinVault(hubURL, invite, vaultDir string) (Summary, error) {
 func joinTargetsAnotherVault(prev syncState, prevHubURL, hubURL, vaultID string) bool {
 	if prev.HeadSHA == "" && len(prev.Hashes) == 0 && prev.TombSeq == 0 {
 		return false
+	}
+	// A newly known identity cannot authenticate a legacy base that carried no
+	// identity at all. The URL may be unchanged across an in-place hub rebuild;
+	// preserving its hashes/cursor would then silently skip notes and deletes.
+	if prev.VaultID == "" && vaultID != "" {
+		return true
 	}
 	if prev.VaultID != "" && vaultID != "" {
 		return prev.VaultID != vaultID

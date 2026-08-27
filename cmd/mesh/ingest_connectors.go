@@ -79,13 +79,15 @@ func reindexVault(vaultRoot string, ownedFolders ...string) error {
 	if err != nil {
 		return err
 	}
-	notes, ferrs := index.ParseFiles(files, 0)
+	_, ferrs := index.ParseFiles(files, 0)
 	var ownedBad int
+	parseDropped := make(map[string]bool, len(ferrs))
 	for _, fe := range ferrs {
 		rel := fe.Path
 		if r, rerr := filepath.Rel(vaultRoot, fe.Path); rerr == nil {
 			rel = r
 		}
+		parseDropped[filepath.ToSlash(rel)] = true
 		if ownedPath(rel, ownedFolders) {
 			ownedBad++
 			fmt.Fprintf(os.Stderr, "ingest: just-imported note %s will not parse, so it is invisible to search and the graph: %v\n", rel, fe.Err)
@@ -93,37 +95,31 @@ func reindexVault(vaultRoot string, ownedFolders ...string) error {
 		}
 		fmt.Fprintf(os.Stderr, "warning: %s will not parse, so it stays invisible to search and the graph (it predates this import): %v\n", rel, fe.Err)
 	}
-	for _, pn := range notes {
-		if rel, err := filepath.Rel(vaultRoot, pn.Path); err == nil {
-			pn.Path = rel
-		}
+	// Connector bytes are already durable. Reconcile through the single-owner protocol:
+	// claim an idle vault transiently, or wait for its live watcher without opening a
+	// second writable SQLite connection beside it.
+	if err := reconcileOneShotThroughOwner(context.Background(), vaultRoot, "mesh ingest"); err != nil {
+		return err
 	}
-	store, err := index.Open(vaultRoot)
+	store, err := index.OpenReadOnly(vaultRoot)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	// The third caller that parses a vault and writes it itself, so it needs the same
-	// duplicate-id claim pass the other two run. An importer is the likeliest source of a
-	// collision of all: it writes files nobody reviewed, and a connector that reuses a
-	// slug would otherwise silently displace an existing note in the index.
-	incumbent, ierr := store.IDOwners()
-	if ierr != nil {
-		incumbent = nil
+	dropped, err := store.DroppedNotes()
+	if err != nil {
+		return err
 	}
-	notes, dupes := index.ClaimUniqueIDs(notes, incumbent)
-	for _, d := range dupes {
+	for _, d := range dropped {
+		rel := filepath.ToSlash(d.Path)
+		if parseDropped[rel] {
+			continue // already classified and printed above
+		}
 		fmt.Fprintf(os.Stderr, "ingest: %s is NOT indexed and is invisible to search and the graph: %v\n", d.Path, d.Err)
-		if ownedPath(d.Path, ownedFolders) {
+		if ownedPath(rel, ownedFolders) {
 			ownedBad++
 		}
 	}
-	g, _ := index.BuildGraph(notes)
-	g.DetectCommunities(0)
-	if _, err := store.IndexVault(notes, g); err != nil {
-		return err
-	}
-	store.RecordDropped(vaultRoot, append(ferrs, dupes...))
 	// Reported AFTER the index is written, not instead of it: the notes that DID
 	// parse still belong in the index, so the healthy part of the import lands and
 	// the failure is what the exit code carries.

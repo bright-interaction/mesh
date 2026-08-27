@@ -5,16 +5,21 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
-	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/merge"
 	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/bright-interaction/mesh/internal/textdiff"
@@ -194,7 +199,10 @@ func conflictsResolveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, baseErr := os.Stat(baseAbs)
+			base, baseErr := os.ReadFile(baseAbs)
+			if baseErr != nil && !os.IsNotExist(baseErr) {
+				return baseErr
+			}
 			baseExists := baseErr == nil
 
 			if keepBase {
@@ -204,7 +212,15 @@ func conflictsResolveCmd() *cobra.Command {
 				if fi, serr := os.Stat(sibAbs); serr == nil && !fi.Mode().IsRegular() {
 					return fmt.Errorf("%s is not a regular file", args[0])
 				}
-				if err := os.Remove(sibAbs); err != nil {
+				observed, rerr := os.ReadFile(sibAbs)
+				if os.IsNotExist(rerr) {
+					fmt.Println("already resolved (sibling gone).")
+					return nil
+				}
+				if rerr != nil {
+					return rerr
+				}
+				if err := removeConflictSiblingIfUnchanged(sibAbs, baseAbs, observed, base, nil); err != nil {
 					if os.IsNotExist(err) {
 						fmt.Println("already resolved (sibling gone).")
 						return nil
@@ -222,17 +238,24 @@ func conflictsResolveCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("taking your version for %s. note: this overwrites the current note (which may be a curator/teammate merge); if it advanced, sync will re-park your version safely.\n", textdiff.Sanitize(baseRel))
-			if err := writeFileAtomic(baseAbs, mine); err != nil {
+			capture, err := replaceBaseIfUnchanged(baseAbs, base, baseExists, mine, nil)
+			if err != nil {
 				return err
 			}
 			// The push is the commit point: separate it from the (best-effort) reindex
 			// so a reindex failure is never mistaken for a failed push (which would
 			// wrongly keep the sibling and tell the user to retry an already-landed push).
-			sum, serr := meshclient.SyncVault(vaultDir)
+			sum, serr := syncTakeMine(vaultDir, baseAbs, baseRel, mine, meshclient.SyncVault)
+			serr = errors.Join(serr, discardResolutionCapture(capture))
 			if serr != nil {
+				if errors.Is(serr, errConflictInputChanged) {
+					fmt.Printf("a conflict-resolution file changed after Mesh observed it, so Mesh cannot claim that your parked bytes were what landed: %v\n", serr)
+					fmt.Printf("your parked version is KEPT at %s; review the new base, then re-run resolve --take-mine if it should still win.\n", args[0])
+					return errors.Join(serr, reindexBestEffort(cmd.Context(), vaultDir))
+				}
 				fmt.Printf("base written, but the push failed: %v\n", serr)
 				fmt.Printf("your parked version is KEPT at %s; re-run resolve --take-mine when the hub is reachable.\n", args[0])
-				return serr
+				return errors.Join(serr, reindexBestEffort(cmd.Context(), vaultDir))
 			}
 			// Both branches below ask about the SAME round, and both must ask about the
 			// note the operator is rescuing, never about the vault:
@@ -267,29 +290,384 @@ func conflictsResolveCmd() *cobra.Command {
 				for _, line := range takeMineRejectedReceipt(baseRel, args[0], sum) {
 					fmt.Println(line)
 				}
-				reindexBestEffort(vaultDir)
-				return fmt.Errorf("the hub refused %s, so nothing was pushed and your parked version was kept", textdiff.Sanitize(baseRel))
+				rerr := reindexBestEffort(cmd.Context(), vaultDir)
+				return errors.Join(fmt.Errorf("the hub refused %s, so nothing was pushed and your parked version was kept", textdiff.Sanitize(baseRel)), rerr)
 			}
 			if takeMineReConflicted(baseRel, sum) {
 				for _, line := range takeMineReConflictedReceipt(baseRel, sum) {
 					fmt.Println(line)
 				}
-				reindexBestEffort(vaultDir)
-				return nil
+				return reindexBestEffort(cmd.Context(), vaultDir)
 			}
-			if err := os.Remove(sibAbs); err != nil && !os.IsNotExist(err) {
+			if err := removeConflictSiblingIfUnchanged(sibAbs, baseAbs, mine, mine, nil); err != nil && !os.IsNotExist(err) {
 				return err
 			}
-			reindexBestEffort(vaultDir)
 			for _, line := range takeMineReceipt(baseRel, sum) {
 				fmt.Println(line)
 			}
-			return nil
+			return reindexBestEffort(cmd.Context(), vaultDir)
 		},
 	}
 	c.Flags().BoolVar(&keepBase, "keep-base", false, "accept the current note (delete your parked sibling)")
 	c.Flags().BoolVar(&takeMine, "take-mine", false, "overwrite the note with your parked version, then sync")
 	return c
+}
+
+// removeConflictSibling makes a successful conflict-resolution deletion durable before
+// its caller prints the acknowledgement. Removing a name without syncing its parent can
+// resurrect the sibling after a power cut even though Mesh already said it was resolved.
+func removeConflictSibling(path string) error {
+	return removeConflictSiblingWithSync(path, resolutionSyncDir)
+}
+
+func removeConflictSiblingWithSync(path string, syncParent func(string) error) error {
+	dir := filepath.Dir(path)
+	// Probe before unlinking. On a filesystem/platform where directory durability is
+	// unavailable, retain the sibling and fail loudly rather than acknowledging a
+	// deletion whose directory entry cannot be made durable.
+	if err := syncParent(dir); err != nil {
+		return fmt.Errorf("conflict sibling retained because its directory cannot be flushed durably: %w", err)
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	if err := syncParent(dir); err != nil {
+		return fmt.Errorf("conflict sibling was removed but its directory deletion is not proven durable: %w", err)
+	}
+	return nil
+}
+
+var errConflictInputChanged = errors.New("a conflict-resolution input changed after it was observed")
+
+// Keep the narrower name for the post-sync caller and its regression. Both races have
+// the same safe outcome: preserve every observed version and refuse a clean receipt.
+var errTakeMineChangedDuringSync = errConflictInputChanged
+
+var errTakeMineDeferred = errors.New("the resolved note was deferred by the bounded sync round")
+
+type resolutionCapture struct {
+	path               string
+	original           string
+	base               string
+	observed           []byte
+	originalMustBeGone bool
+}
+
+// Deterministic test seams for atomic-save races immediately before and after the
+// guarded rename. Production leaves both nil.
+var beforeResolutionCaptureRename func(string)
+var afterResolutionCaptureRename func(string)
+var resolutionLink = os.Link
+
+// replaceBaseIfUnchanged publishes replacement only after atomically moving the base
+// that currently occupies basePath into a discoverable conflict sibling. Comparing the
+// captured inode closes the old read->rename window: a save made after validation is
+// restored, never overwritten. The capture remains until sync finishes so an editor
+// that still has the old inode open cannot be silently discarded either.
+func replaceBaseIfUnchanged(basePath string, observed []byte, existed bool, replacement []byte, beforeCapture func()) (*resolutionCapture, error) {
+	perm := os.FileMode(0o644)
+	if fi, err := os.Stat(basePath); err == nil {
+		perm = fi.Mode().Perm()
+	}
+	var capture *resolutionCapture
+	var err error
+	if existed {
+		capture, err = captureObservedFile(basePath, basePath, observed, beforeCapture)
+		if err != nil {
+			return nil, err
+		}
+	} else if beforeCapture != nil {
+		beforeCapture()
+	}
+	if err := writeFileExclusiveDurable(basePath, replacement, perm); err != nil {
+		if capture != nil {
+			err = errors.Join(err, restoreResolutionCapture(capture))
+		}
+		if errors.Is(err, fs.ErrExist) {
+			return nil, fmt.Errorf("%w: the base appeared during take-mine publication", errConflictInputChanged)
+		}
+		return nil, err
+	}
+	return capture, nil
+}
+
+// removeConflictSiblingIfUnchanged moves the sibling out of its user-visible name
+// before comparing it. That rename is the deletion boundary: bytes an editor published
+// after the command's read are captured and restored instead of being unlinked.
+func removeConflictSiblingIfUnchanged(path, basePath string, observed, observedBase []byte, beforeCapture func()) error {
+	capture, err := captureObservedFile(path, basePath, observed, beforeCapture)
+	if err != nil {
+		return err
+	}
+	currentBase, berr := os.ReadFile(basePath)
+	if berr != nil || !bytes.Equal(currentBase, observedBase) {
+		restoreErr := restoreResolutionCapture(capture)
+		if berr != nil {
+			return errors.Join(fmt.Errorf("%w: cannot verify the kept base %s: %v", errConflictInputChanged, basePath, berr), restoreErr)
+		}
+		return errors.Join(fmt.Errorf("%w: the kept base %s changed before sibling removal", errConflictInputChanged, basePath), restoreErr)
+	}
+	return discardResolutionCapture(capture)
+}
+
+func captureObservedFile(path, basePath string, observed []byte, beforeCapture func()) (*resolutionCapture, error) {
+	capturePath, err := newResolutionCapturePath(basePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := probeResolutionHardLinks(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("conflict-resolution input retained because this filesystem cannot make the required no-clobber hard link: %w", err)
+	}
+	if beforeCapture != nil {
+		beforeCapture()
+	}
+	// Make the inode durable while it still has the user-visible name. An atomic-save
+	// editor can replace that inode between open and rename, so verify the pathname's
+	// identity after fsync and retry until the inode we are about to remove is durable.
+	var syncedContent []byte
+	var syncedInfo os.FileInfo
+	for attempt := 0; attempt < 8; attempt++ {
+		f, oerr := os.OpenFile(path, os.O_RDWR, 0)
+		if oerr != nil {
+			return nil, oerr
+		}
+		content, rerr := io.ReadAll(f)
+		fi, sterr := f.Stat()
+		serr := f.Sync()
+		cerr := f.Close()
+		if err := errors.Join(rerr, sterr, serr, cerr); err != nil {
+			return nil, fmt.Errorf("make conflict-resolution input durable: %w", err)
+		}
+		if beforeResolutionCaptureRename != nil {
+			beforeResolutionCaptureRename(path)
+		}
+		current, verr := os.Stat(path)
+		if verr != nil {
+			return nil, verr
+		}
+		if !os.SameFile(fi, current) || fi.Size() != current.Size() || !fi.ModTime().Equal(current.ModTime()) {
+			continue
+		}
+		syncedContent = content
+		syncedInfo = fi
+		break
+	}
+	if syncedInfo == nil {
+		return nil, fmt.Errorf("%w: %s kept changing while Mesh prepared its capture", errConflictInputChanged, path)
+	}
+	if err := resolutionDurabilityProbe(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("conflict-resolution input retained because its directory cannot be flushed durably: %w", err)
+	}
+	if err := os.Rename(path, capturePath); err != nil {
+		return nil, err
+	}
+	capture := &resolutionCapture{
+		path: capturePath, original: path, base: basePath, observed: append([]byte(nil), observed...),
+		originalMustBeGone: filepath.Clean(path) != filepath.Clean(basePath),
+	}
+	// Verify which inode the rename actually captured. The final stat->rename gap is
+	// irreducible without filesystem compare-and-rename; if a replacement won it, make
+	// that inode durable now and let the observed-byte check restore it safely.
+	f, err := os.OpenFile(capturePath, os.O_RDWR, 0)
+	if err != nil {
+		return nil, errors.Join(err, restoreResolutionCapture(capture))
+	}
+	actual, rerr := io.ReadAll(f)
+	fi, sterr := f.Stat()
+	var serr error
+	if sterr == nil && (!os.SameFile(syncedInfo, fi) || syncedInfo.Size() != fi.Size() ||
+		!syncedInfo.ModTime().Equal(fi.ModTime()) || !bytes.Equal(syncedContent, actual)) {
+		serr = f.Sync()
+	}
+	cerr := f.Close()
+	if err := errors.Join(rerr, sterr, serr, cerr); err != nil {
+		return nil, errors.Join(err, restoreResolutionCapture(capture))
+	}
+	if err := resolutionSyncDir(filepath.Dir(path)); err != nil {
+		return nil, errors.Join(fmt.Errorf("conflict-resolution capture directory is not durable: %w", err), restoreResolutionCapture(capture))
+	}
+	if afterResolutionCaptureRename != nil {
+		afterResolutionCaptureRename(path)
+	}
+	if !bytes.Equal(actual, observed) {
+		rerr := restoreResolutionCapture(capture)
+		return nil, errors.Join(fmt.Errorf("%w: %s changed before removal", errConflictInputChanged, path), rerr)
+	}
+	return capture, nil
+}
+
+// resolutionDurabilityProbe checks platform support before a destructive namespace
+// change. Its separate name keeps the durability census focused on the post-rename
+// flush that actually commits a newly published entry.
+func resolutionDurabilityProbe(dir string) error { return resolutionSyncDir(dir) }
+
+// probeResolutionHardLinks proves the no-clobber primitive before Mesh renames a user
+// pathname away. Without it, a filesystem that rejects hard links fails both replacement
+// publication and restoration, leaving the bytes discoverable only under a recovery
+// name even though the command could have refused without moving anything.
+func probeResolutionHardLinks(dir string) error {
+	f, err := os.CreateTemp(dir, ".mesh-resolution-link-probe-*")
+	if err != nil {
+		return err
+	}
+	source := f.Name()
+	target := source + ".link"
+	if err := f.Close(); err != nil {
+		_ = os.Remove(source)
+		return err
+	}
+	defer os.Remove(source)
+	defer os.Remove(target)
+	return resolutionLink(source, target)
+}
+
+func discardResolutionCapture(capture *resolutionCapture) error {
+	if capture == nil {
+		return nil
+	}
+	actual, err := os.ReadFile(capture.path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(actual, capture.observed) {
+		return fmt.Errorf("%w: newer bytes were preserved at %s", errConflictInputChanged, capture.path)
+	}
+	if capture.originalMustBeGone {
+		if _, err := os.Lstat(capture.original); err == nil {
+			return fmt.Errorf("%w: a new conflict-resolution input appeared at %s; both versions were kept", errConflictInputChanged, capture.original)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return removeConflictSibling(capture.path)
+}
+
+// restoreResolutionCapture never overwrites a path an editor recreated after the
+// capture. A hard link gives the captured inode its original name only if that name is
+// still absent; otherwise the discoverable capture is deliberately left in place.
+func restoreResolutionCapture(capture *resolutionCapture) error {
+	if err := resolutionLink(capture.path, capture.original); err != nil {
+		return fmt.Errorf("captured bytes remain at %s because %s could not be restored: %w", capture.path, capture.original, err)
+	}
+	if err := resolutionSyncDir(filepath.Dir(capture.original)); err != nil {
+		return fmt.Errorf("captured bytes were restored at %s and retained at %s because the directory flush failed: %w", capture.original, capture.path, err)
+	}
+	return removeConflictSibling(capture.path)
+}
+
+func newResolutionCapturePath(basePath string) (string, error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		nonce := make([]byte, 16)
+		if _, err := rand.Read(nonce); err != nil {
+			return "", err
+		}
+		candidate := merge.SiblingPath(basePath, time.Now().UTC(), "resolve-race", nonce)
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("could not allocate a conflict-resolution capture beside %s", basePath)
+}
+
+func syncNamedFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	return errors.Join(err, f.Close())
+}
+
+// writeFileExclusiveDurable installs a prepared inode only if path is still absent.
+// The hard-link publication is the no-overwrite half of take-mine: an editor that
+// recreates the base after capture wins, and the resolver returns an ambiguity.
+func writeFileExclusiveDurable(path string, b []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := probeResolutionHardLinks(dir); err != nil {
+		return fmt.Errorf("replacement not published because this filesystem lacks no-clobber hard links: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".mesh-resolve-exclusive-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := resolutionSyncDir(dir); err != nil {
+		cleanup()
+		return fmt.Errorf("replacement not published because its directory cannot be flushed durably: %w", err)
+	}
+	if err := resolutionLink(tmpName, path); err != nil {
+		cleanup()
+		return err
+	}
+	cleanup()
+	if err := resolutionSyncDir(dir); err != nil {
+		return fmt.Errorf("replacement was published but its directory entry is not proven durable: %w", err)
+	}
+	return nil
+}
+
+// syncTakeMine performs the network half of take-mine and verifies the local note still
+// contains the parked bytes before the caller drops the sibling and prints a success
+// receipt. Editors do not participate in Mesh's owner lock: one can save this path while
+// SyncVault is hashing or pushing it. Without the post-sync comparison, Mesh could push
+// those different bytes, delete the parked evidence, and claim the operator's version
+// landed. A rejection or re-conflict already has a fail-safe sibling-preserving receipt,
+// so those outcomes keep their existing handling even though SyncVault may replace base.
+func syncTakeMine(vaultDir, baseAbs, baseRel string, mine []byte, syncFn func(string) (meshclient.Summary, error)) (meshclient.Summary, error) {
+	sum, err := syncFn(vaultDir)
+	if err != nil {
+		return sum, err
+	}
+	if takeMineDeferred(baseRel, sum) {
+		return sum, fmt.Errorf("%w: %s did not reach the hub; %d changed note(s) remain queued",
+			errTakeMineDeferred, textdiff.Sanitize(baseRel), sum.Remaining)
+	}
+	if takeMineRejected(baseRel, sum) || takeMineReConflicted(baseRel, sum) {
+		return sum, nil
+	}
+	current, err := os.ReadFile(baseAbs)
+	if err != nil {
+		return sum, fmt.Errorf("%w: cannot verify the base after sync: %v", errTakeMineChangedDuringSync, err)
+	}
+	if !bytes.Equal(current, mine) {
+		return sum, errTakeMineChangedDuringSync
+	}
+	return sum, nil
+}
+
+func takeMineDeferred(baseRel string, sum meshclient.Summary) bool {
+	want := path.Clean(filepath.ToSlash(baseRel))
+	for _, rel := range sum.Deferred {
+		if path.Clean(filepath.ToSlash(rel)) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // takeMineReceipt renders what `mesh conflicts resolve --take-mine` tells the user
@@ -311,8 +689,12 @@ func takeMineReceipt(baseRel string, sum meshclient.Summary) []string {
 	lines := []string{fmt.Sprintf("resolved %s: took your version and pushed it (HEAD %s).",
 		textdiff.Sanitize(baseRel), short8(sum.Head))}
 	if sum.Remaining > 0 {
+		deferredDetail := "this note may be one of them because this Summary has no exact deferred-path list"
+		if len(sum.Deferred) > 0 {
+			deferredDetail = "the resolved note was sent; the named deferred paths were not"
+		}
 		lines = append(lines, fmt.Sprintf("  the round was bounded: %d changed note(s) are still queued and "+
-			"NOT on the hub yet, and this note may be one of them; run `mesh sync` again.", sum.Remaining))
+			"NOT on the hub yet; %s. Run `mesh sync` again.", sum.Remaining, deferredDetail))
 	}
 	return append(lines, otherConflictLines(sum.Conflicts, sum.ConflictSiblings)...)
 }
@@ -494,15 +876,12 @@ func validateSibling(vaultDir, arg string) (sibAbs, baseAbs, baseRel string, err
 // the result. It is best-effort: the push already landed, so a reindex failure
 // (e.g. the db is locked by a concurrent `mesh sync --watch`) is a warning, not a
 // failure of the resolve. The next sync/index reconciles it.
-func reindexBestEffort(vaultDir string) {
-	store, err := index.Open(vaultDir)
-	if err == nil {
-		_, err = index.Reconcile(store, vaultDir)
-		store.Close()
-	}
+func reindexBestEffort(ctx context.Context, vaultDir string) error {
+	err := reconcileOneShotThroughOwner(ctx, vaultDir, "mesh conflicts resolve")
 	if err != nil {
-		fmt.Printf("note: reindex failed (%v); run `mesh index` to refresh search.\n", err)
+		fmt.Printf("index stale: the conflict-resolution file state is durable, but the owning writer did not make it queryable: %v\n", err)
 	}
+	return err
 }
 
 // writeFileAtomic writes b to path via a temp file + rename in the same directory,

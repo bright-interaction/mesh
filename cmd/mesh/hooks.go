@@ -215,11 +215,11 @@ Keep it short and friendly, then carry on with whatever they need.
 // first run. The census and the exit code are shared with init through reportDroppedNotes
 // so the two commands cannot answer the same vault differently again.
 func indexVault(vaultAbs string) (int, error) {
-	store, recovered, err := index.OpenRebuild(vaultAbs)
+	store, recovered, closeStore, err := openOneShotRebuild(vaultAbs, "mesh install")
 	if err != nil {
 		return 0, installIndexError(vaultAbs, err)
 	}
-	defer store.Close()
+	defer closeStore()
 	if recovered {
 		fmt.Printf("  ! %s was corrupt and unreadable; discarded it and rebuilt from the markdown\n", filepath.Join(vaultAbs, ".mesh", "mesh.db"))
 		fmt.Println("    your notes are intact; stored embeddings went with it, so re-run `mesh embed` if you use semantic search")

@@ -76,11 +76,13 @@ var writerCommands = map[string]string{
 // CREATE the database when it is absent. index.OpenReadOnly does neither, which is why it
 // is the only one a read-only command may call.
 var writableOpeners = map[string]bool{
-	"Open":          true,
-	"OpenAt":        true,
-	"OpenCurrent":   true,
-	"OpenCurrentAt": true,
-	"OpenRebuild":   true,
+	"Open":             true,
+	"OpenOwned":        true,
+	"OpenAt":           true,
+	"OpenCurrent":      true,
+	"OpenCurrentAt":    true,
+	"OpenRebuild":      true,
+	"OpenRebuildOwned": true,
 }
 
 // readOnlyOpener is the one constructor a read-only command may use.

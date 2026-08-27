@@ -140,12 +140,15 @@ func initCmd() *cobra.Command {
 					return err
 				}
 			}
-			store, err := index.Open(root)
+			if err := reconcileOneShotThroughOwner(cmd.Context(), root, "mesh init"); err != nil {
+				return err
+			}
+			store, err := index.OpenReadOnly(root)
 			if err != nil {
 				return err
 			}
 			defer store.Close()
-			g, err := index.Reindex(store, root)
+			g, err := store.LoadGraph()
 			if err != nil {
 				return err
 			}
@@ -694,11 +697,14 @@ func embedCmd() *cobra.Command {
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
 				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
-			store, err := index.OpenCurrent(root)
+			store, closeStore, err := openOneShotCurrent(root, "mesh embed")
 			if err != nil {
+				if errors.Is(err, index.ErrOwnerHeld) {
+					return fmt.Errorf("mesh embed must update the vector tables exclusively; stop the live mesh mcp/watch owner, run mesh embed, then restart it: %w", err)
+				}
 				return err
 			}
-			defer store.Close()
+			defer closeStore()
 			files, err := store.NoteFiles()
 			if err != nil {
 				return err
@@ -952,11 +958,11 @@ func healthCmd() *cobra.Command {
 			if _, err := os.Stat(filepath.Join(root, ".mesh", "mesh.db")); err != nil {
 				return fmt.Errorf("no index (run: mesh index %s)", shellpath.Quote(root))
 			}
-			store, err := index.OpenCurrent(root)
+			store, writable, closeStore, err := openOneShotCurrentOrReadOnly(root, "mesh health")
 			if err != nil {
 				return err
 			}
-			defer store.Close()
+			defer closeStore()
 			if integrityErr := store.CheckIntegrity(root); integrityErr != nil {
 				if errors.Is(integrityErr, index.ErrIndexCorrupt) {
 					fmt.Printf("health: BROKEN - the index database is corrupt\n%v\n", integrityErr)
@@ -973,14 +979,7 @@ func healthCmd() *cobra.Command {
 				return fmt.Errorf("index is stale")
 			}
 			now := time.Now()
-			if _, err := store.ComputeHealth(root, now); err != nil {
-				return err
-			}
-			if _, err := store.ComputeContradictions(now); err != nil {
-				return err
-			}
-			counts, _ := store.HealthCounts()
-			findings, err := store.ListHealth("")
+			findings, counts, err := commandHealthPass(store, root, now, writable)
 			if err != nil {
 				return err
 			}
@@ -1055,6 +1054,50 @@ func healthCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func commandHealthPass(store *index.Store, root string, now time.Time, writable bool) ([]index.HealthFinding, map[string]int, error) {
+	if writable {
+		if _, err := store.ComputeHealth(root, now); err != nil {
+			return nil, nil, err
+		}
+		if _, err := store.ComputeContradictions(now); err != nil {
+			return nil, nil, err
+		}
+		findings, err := store.ListHealth("")
+		counts, _ := store.HealthCounts()
+		return findings, counts, err
+	}
+	findings, err := store.ScanHealth(root, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	contradictions, err := store.ScanContradictions()
+	if err != nil {
+		return nil, nil, err
+	}
+	findings = append(findings, contradictions...)
+	persisted, err := store.ListHealth("")
+	if err != nil {
+		return nil, nil, err
+	}
+	computed := map[string]bool{"dead_ref": true, "overdue": true, "contradiction": true}
+	for _, finding := range persisted {
+		if !computed[finding.Issue] {
+			findings = append(findings, finding)
+		}
+	}
+	counts := make(map[string]int, len(findings))
+	for _, finding := range findings {
+		counts[finding.Issue]++
+	}
+	sort.Slice(findings, func(i, j int) bool {
+		if findings[i].Issue != findings[j].Issue {
+			return findings[i].Issue < findings[j].Issue
+		}
+		return findings[i].NoteID < findings[j].NoteID
+	})
+	return findings, counts, nil
 }
 
 func flywheelCmd() *cobra.Command {
@@ -1215,11 +1258,12 @@ func indexCmd() *cobra.Command {
 				// recoverCorruptIndex.
 				var recovered bool
 				var oerr error
-				store, recovered, oerr = index.OpenRebuild(root)
+				var closeStore func()
+				store, recovered, closeStore, oerr = openOneShotRebuild(root, "mesh index")
 				if oerr != nil {
 					return oerr
 				}
-				defer store.Close()
+				defer closeStore()
 				if recovered {
 					fmt.Fprintf(os.Stderr, "warning: %s was corrupt and unreadable; removed it and rebuilt from the markdown. "+
 						"Notes are intact. Any stored embeddings went with it, so re-run mesh embed if you use semantic search.\n",
@@ -1302,11 +1346,14 @@ func codeReindexCmd() *cobra.Command {
 			if err := vault.RequireRoot(root); err != nil {
 				return err
 			}
-			store, err := index.OpenCurrent(root)
+			store, closeStore, err := openOneShotCurrent(root, "mesh code reindex")
 			if err != nil {
+				if errors.Is(err, index.ErrOwnerHeld) {
+					return fmt.Errorf("mesh code reindex must update the code tables exclusively; stop the live mesh mcp/watch owner, run mesh code reindex, then restart it: %w", err)
+				}
 				return err
 			}
-			defer store.Close()
+			defer closeStore()
 			cfg, _ := meshcfg.LoadConfig(store.MeshDir())
 			roots := rootsFlag
 			if len(roots) == 0 {
@@ -1902,12 +1949,16 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 		return fmt.Errorf("refusing to bind %s without a token: set --token or MESH_MCP_TOKEN (fail-closed)", addr)
 	}
 	if doWatch {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go func() {
+		stopWatch := startMCPBackgroundWatch(func(ctx context.Context) {
 			logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, "mesh watch: "+format+"\n", a...) }
-			_ = srv.Watch(ctx, debounce, reconcile, fullReconcile, logf)
-		}()
+			if err := srv.Watch(ctx, debounce, reconcile, fullReconcile, logf); err != nil {
+				fmt.Fprintf(os.Stderr, "mesh watch: %v\n", err)
+			}
+		})
+		// mcpCmd closes srv as soon as this function returns. Join the watcher first:
+		// its reconcile callback uses srv's store, cache and graph, so merely cancelling
+		// it leaves a close/use race whenever shutdown lands during a reconcile.
+		defer stopWatch()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /mcp", func(w http.ResponseWriter, r *http.Request) {
@@ -1934,6 +1985,22 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 	}
 	fmt.Fprintf(os.Stderr, "mesh mcp: serving HTTP at %s/mcp (auth: %v)\n", addr, token != "")
 	return httpSrv.ListenAndServe()
+}
+
+// startMCPBackgroundWatch starts one watcher and returns a stop function that cancels
+// AND joins it. Joining is part of the ownership contract: callers may close the MCP
+// server only after stop returns.
+func startMCPBackgroundWatch(run func(context.Context)) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run(ctx)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // defaultLocalReconcile is how often an owning writer re-checks the vault when no file
@@ -1995,7 +2062,7 @@ func watchCmd() *cobra.Command {
 				return err
 			}
 			defer owner.Release()
-			store, err := index.Open(root)
+			store, err := index.OpenOwned(root, owner)
 			if err != nil {
 				return err
 			}
@@ -2058,35 +2125,31 @@ func joinCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			store, err := index.Open(vaultDir)
-			if err != nil {
-				return err
-			}
-			defer store.Close()
-			if _, err := index.Reconcile(store, vaultDir); err != nil {
-				return err
-			}
-			abs, _ := filepath.Abs(vaultDir)
-			fmt.Printf("joined and cloned %s\n", abs)
-			// A join ENDS in a sync round (JoinVault returns SyncVault's Summary), so it
-			// can conflict, be refused, or defer part of the push exactly like `mesh sync`.
-			// This site used to print Head and Pulled and nothing else, which is the worst
-			// place in the product to be silent: someone who ran `mesh init ~/notes`, wrote
-			// an index.md and then joined a hub had their file replaced by the hub's
-			// version, their bytes parked in a .sync-conflict sibling, and was told only
-			// "5 files pulled". A viewer-role join reported no refusals, and a join into a
-			// vault with more dirty notes than one batch never said work remained. Same
-			// renderer as every other round.
-			for _, line := range syncSummaryLines(sum) {
-				fmt.Println(line)
-			}
-			fmt.Println("next:")
-			fmt.Println("  mesh sync " + shellpath.Quote(vaultDir) + "                       # push your edits, pull teammates'")
-			fmt.Printf("  mesh mcp --vault %s --watch       # point your agent at the vault\n", shellpath.Quote(vaultDir))
-			return nil
+			return finishJoin(cmd.Context(), vaultDir, sum, reconcileOneShotThroughOwner)
 		},
 	}
 	return c
+}
+
+type joinIndexReconcile func(context.Context, string, string) error
+
+func finishJoin(ctx context.Context, vaultDir string, sum meshclient.Summary, reconcile joinIndexReconcile) error {
+	abs, _ := filepath.Abs(vaultDir)
+	fmt.Printf("joined and cloned %s\n", abs)
+	// JoinVault already redeemed the one-time invite and completed its sync round.
+	// Print that durable receipt before asking about index liveness so a stale owner
+	// cannot make a completed, non-repeatable join look safe to retry.
+	for _, line := range syncSummaryLines(sum) {
+		fmt.Println(line)
+	}
+	if err := reconcile(ctx, vaultDir, "mesh join"); err != nil {
+		fmt.Printf("index stale: the invite was redeemed and the join/sync file writes are complete, but the owning writer did not make them queryable: %v\n", err)
+		return err
+	}
+	fmt.Println("next:")
+	fmt.Println("  mesh sync " + shellpath.Quote(vaultDir) + "                       # push your edits, pull teammates'")
+	fmt.Printf("  mesh mcp --vault %s --watch       # point your agent at the vault\n", shellpath.Quote(vaultDir))
+	return nil
 }
 
 func syncCmd() *cobra.Command {
@@ -2102,17 +2165,32 @@ func syncCmd() *cobra.Command {
 			if err := vault.RequireRoot(vaultDir); err != nil {
 				return err
 			}
-			if doWatch {
-				// The long-lived half of this command is an owning writer, so it claims the
-				// vault like `mesh watch` does. The one-shot path is not claimed: it is a
-				// single bounded pass, and SQLite's busy timeout already covers it.
-				owner, err := claimIndexOwnership(vaultDir, "mesh sync --watch")
-				if err != nil {
-					return err
+			if !doWatch {
+				// Keep the durable sync receipt separate from index liveness. SyncVault may
+				// have pushed/pulled successfully even when a live owner then fails to absorb
+				// the resulting files; print that completed round before returning a loud
+				// index error, so a retry is never mistaken for an unperformed network write.
+				sum, serr := meshclient.SyncVault(vaultDir)
+				rerr := reconcileOneShotThroughOwner(cmd.Context(), vaultDir, "mesh sync")
+				if serr == nil {
+					for _, line := range syncSummaryLines(sum) {
+						fmt.Println(line)
+					}
 				}
-				defer owner.Release()
+				if rerr != nil {
+					fmt.Printf("index stale: the sync round and its file writes are complete, but the owning writer did not make them queryable: %v\n", rerr)
+				}
+				return errors.Join(serr, rerr)
 			}
-			store, err := index.Open(vaultDir)
+
+			// The long-lived half of this command is an owning writer, so it claims the
+			// vault like `mesh watch` does.
+			owner, err := claimIndexOwnership(vaultDir, "mesh sync --watch")
+			if err != nil {
+				return err
+			}
+			defer owner.Release()
+			store, err := index.OpenOwned(vaultDir, owner)
 			if err != nil {
 				return err
 			}
@@ -2121,7 +2199,7 @@ func syncCmd() *cobra.Command {
 			// One sync round: push/pull via the hub, then reindex so search reflects
 			// the merged result. Reused by the one-shot path and the watch loop. The
 			// LiveIndexer makes the watch loop incremental (full seed on the first call,
-			// targeted updates after); the one-shot path just does that single full pass.
+			// targeted updates after).
 			live := index.NewLiveIndexer(store, vaultDir)
 			// The periodic tick has two jobs with very different costs. Converging the
 			// LOCAL index is cheap and has to happen inside the write-back bound, because
@@ -2163,18 +2241,6 @@ func syncCmd() *cobra.Command {
 				default:
 					return sum, rerr
 				}
-			}
-
-			if !doWatch {
-				// one-shot: a full authoritative reconcile, and always a hub round
-				sum, err := syncOnce(watch.Pass{Reason: watch.ReasonStartup, Authoritative: true})
-				if err != nil {
-					return err
-				}
-				for _, line := range syncSummaryLines(sum) {
-					fmt.Println(line)
-				}
-				return nil
 			}
 
 			// --watch: continuous reconcile driven by three sources, all funneled

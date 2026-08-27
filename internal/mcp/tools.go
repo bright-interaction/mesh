@@ -1057,6 +1057,13 @@ func (s *Server) toolChangedSince(ctx context.Context, raw json.RawMessage) (any
 }
 
 func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType string) (any, *rpcError) {
+	// Cancellation is still reversible until CreateNote starts. Once CreateNote returns,
+	// the note is durable and must receive a success-with-staleness receipt rather than
+	// an error that invites a duplicate retry. Refuse a request that was already cancelled
+	// before crossing that boundary.
+	if ctx.Err() != nil {
+		return nil, &rpcError{Code: codeInternalError, Message: "request cancelled before the note was written"}
+	}
 	var a struct {
 		Type       string   `json:"type"`
 		Title      string   `json:"title"`
@@ -1130,6 +1137,13 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 		related = relate.Derive(ctx, rt, g,
 			strings.TrimSpace(a.Title+"\n"+a.Do+"\n"+a.Why), "", a.Tags, 3)
 	}
+	// Preparation above is reversible and can include retrieval work. Cancellation may
+	// arrive after the entry check while it runs, so check once more at the exact durable
+	// boundary. There is deliberately no cancellation error after CreateNote returns:
+	// from that point the success-with-staleness receipt prevents duplicate retries.
+	if ctx.Err() != nil {
+		return nil, &rpcError{Code: codeInternalError, Message: "request cancelled before the note was written"}
+	}
 	res, err := vault.CreateNote(s.vaultRoot, vault.NewNoteSpec{
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
 		Related: related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
@@ -1174,7 +1188,7 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	// mesh_reindex and knows not to retry the write.
 	var indexStale string
 	var ownerDown bool
-	if err := s.publishWriteBack(ctx, res.ID); err != nil {
+	if err := s.publishWriteBack(ctx, res.ID, res.Path); err != nil {
 		ownerDown = errors.Is(err, ErrOwnerNotIndexing)
 		slog.Error("mesh write: the note was saved but the index did not refresh",
 			"id", res.ID, "path", res.Path, "owner_down", ownerDown, "error", err)

@@ -4,8 +4,10 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/syncproto"
+	"github.com/bright-interaction/mesh/pkg/meshclient"
 )
 
 // fakeHub answers the three routes JoinVault drives, with a scripted sync response.
@@ -34,7 +37,35 @@ func fakeHub(t *testing.T, sync syncproto.SyncResponse) *httptest.Server {
 				VaultID: "vault-one", HeadSHA: sync.HeadSHA, MeshToml: "[embedding]\n",
 			})
 		case "/v1/sync":
-			_ = json.NewEncoder(w).Encode(sync)
+			var req syncproto.SyncRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode sync request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			resp := sync
+			if len(req.Outbox) == 0 {
+				// Join's unknown-base recovery is pull-first. Conflicts and
+				// rejections acknowledge pushed paths, so script them only on the
+				// survivor phase where those paths were actually transmitted.
+				resp.Deltas = nil
+				resp.Conflicts = nil
+				resp.Rejected = nil
+				resp.FullReconcile = true
+			} else {
+				sent := make(map[string]bool, len(req.Outbox))
+				for _, item := range req.Outbox {
+					sent[item.Path] = true
+				}
+				for _, rejected := range resp.Rejected {
+					if !sent[rejected] {
+						t.Errorf("fake hub rejected %q, which was not in outbox %+v", rejected, req.Outbox)
+						http.Error(w, "invalid scripted rejection", http.StatusInternalServerError)
+						return
+					}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(resp)
 		default:
 			http.NotFound(w, r)
 		}
@@ -61,6 +92,12 @@ func TestJoinReceiptNamesConflictsAndRefusals(t *testing.T) {
 	}
 	const sibling = "index.sync-conflict-20260813-stranger-0123456789abcdef.md"
 	const refused = "team/private.md"
+	if err := os.MkdirAll(filepath.Join(vaultDir, "team"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vaultDir, filepath.FromSlash(refused)), []byte("private local note\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	srv := fakeHub(t, syncproto.SyncResponse{
 		HeadSHA: "abcdef1234567890",
 		Deltas: []syncproto.Delta{{
@@ -92,5 +129,25 @@ func TestJoinReceiptNamesConflictsAndRefusals(t *testing.T) {
 			t.Errorf("`mesh join` receipt never mentions %q, so the user is not told what the "+
 				"join round did to their notes:\n%s", want, out)
 		}
+	}
+}
+
+func TestJoinPrintsDurableReceiptBeforeReportingIndexFailure(t *testing.T) {
+	indexErr := errors.New("owner did not catch up")
+	out, err := capture(t, func() error {
+		return finishJoin(context.Background(), "/joined-vault", meshclient.Summary{
+			Head: "abcdef1234567890", Pulled: 2,
+		}, func(context.Context, string, string) error { return indexErr })
+	})
+	if !errors.Is(err, indexErr) {
+		t.Fatalf("finishJoin error = %v, want index failure", err)
+	}
+	receiptAt := strings.Index(out, "joined and cloned")
+	staleAt := strings.Index(out, "index stale")
+	if receiptAt < 0 || staleAt < 0 || receiptAt > staleAt {
+		t.Fatalf("durable join receipt must precede index-liveness error:\n%s", out)
+	}
+	if !strings.Contains(out, "synced:") || !strings.Contains(out, "the invite was redeemed") {
+		t.Fatalf("receipt does not distinguish completed join from stale index:\n%s", out)
 	}
 }

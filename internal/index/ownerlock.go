@@ -129,6 +129,17 @@ type OwnerLock struct {
 // It returns an error wrapping ErrOwnerHeld when a live writer already holds the vault.
 // Every other error is a real filesystem failure.
 func AcquireOwnerLock(meshDir, role string, preemptible bool) (*OwnerLock, error) {
+	return acquireOwnerLock(meshDir, role, preemptible, !preemptible)
+}
+
+// AcquireOneShotOwnerLock claims an idle vault for a bounded database operation. It
+// never preempts a live MCP/watch owner, but once acquired it is non-preemptible so a
+// schema change or auxiliary-table rebuild cannot lose authorization halfway through.
+func AcquireOneShotOwnerLock(meshDir, role string) (*OwnerLock, error) {
+	return acquireOwnerLock(meshDir, role, false, false)
+}
+
+func acquireOwnerLock(meshDir, role string, preemptible, mayPreempt bool) (*OwnerLock, error) {
 	if err := ensureVaultMeshDir(meshDir); err != nil {
 		return nil, err
 	}
@@ -146,37 +157,45 @@ func AcquireOwnerLock(meshDir, role string, preemptible bool) (*OwnerLock, error
 	if err != nil {
 		return nil, err
 	}
-	// Two attempts: the second one runs only after we removed a lock nobody holds, and a
-	// peer that raced us to the same conclusion has to lose one of them.
-	for attempt := 0; attempt < 2; attempt++ {
-		f, oerr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if oerr == nil {
-			_, werr := f.Write(body)
-			cerr := f.Close()
-			if werr != nil || cerr != nil {
-				os.Remove(path)
-				return nil, errors.Join(werr, cerr)
+	var claimed *OwnerLock
+	err = withOwnerMetadataLock(meshDir, func() error {
+		// Two attempts: the second one runs only after removing an abandoned or
+		// preemptible claim. The metadata guard makes the nonce read, removal and
+		// replacement one indivisible operation with respect to every Mesh process.
+		for attempt := 0; attempt < 2; attempt++ {
+			f, oerr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if oerr == nil {
+				_, werr := f.Write(body)
+				cerr := f.Close()
+				if werr != nil || cerr != nil {
+					_ = os.Remove(path)
+					return errors.Join(werr, cerr)
+				}
+				claimed = &OwnerLock{path: path, info: me, stop: make(chan struct{}), done: make(chan struct{})}
+				return nil
 			}
-			l := &OwnerLock{path: path, info: me, stop: make(chan struct{}), done: make(chan struct{})}
-			go l.beat()
-			return l, nil
+			if !errors.Is(oerr, fs.ErrExist) {
+				return oerr
+			}
+			info, live := readOwner(path)
+			// A live holder keeps it, unless it is an opportunistic claim and we are the
+			// declared owner. Note the asymmetry: preemptible callers never preempt, so two
+			// `mesh mcp` servers cannot take the vault from each other in a loop.
+			if live && !(mayPreempt && info.Preemptible) {
+				return &OwnerHeldError{Info: info}
+			}
+			if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+				return rerr
+			}
 		}
-		if !errors.Is(oerr, fs.ErrExist) {
-			return nil, oerr
-		}
-		info, live := readOwner(path)
-		// A live holder keeps it, unless it is an opportunistic claim and we are the
-		// declared owner. Note the asymmetry: preemptible callers never preempt, so two
-		// `mesh mcp` servers cannot take the vault from each other in a loop.
-		if live && !(info.Preemptible && !preemptible) {
-			return nil, &OwnerHeldError{Info: info}
-		}
-		if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-			return nil, rerr
-		}
+		info, _ := readOwner(path)
+		return &OwnerHeldError{Info: info}
+	})
+	if err != nil {
+		return nil, err
 	}
-	info, _ := readOwner(path)
-	return nil, &OwnerHeldError{Info: info}
+	go claimed.beat()
+	return claimed, nil
 }
 
 // OwnerStatus reports who owns the vault's index, and whether that claim is live. It is
@@ -188,6 +207,10 @@ func AcquireOwnerLock(meshDir, role string, preemptible bool) (*OwnerLock, error
 // a non-zero exit only alongside index drift, which is the case where the absence has
 // already cost something and nothing running will put it right.
 func OwnerStatus(meshDir string) (OwnerInfo, bool) {
+	// Status is observational: do not create owner.lock.guard (or chmod/touch .mesh)
+	// merely because a read-only command asked who owns the vault. Owner claims are
+	// published under the metadata lock; readOwner safely treats a missing/partial view
+	// as not live.
 	return readOwner(filepath.Join(meshDir, OwnerLockName))
 }
 
@@ -223,8 +246,48 @@ func (l *OwnerLock) Held() bool {
 	if l == nil {
 		return false
 	}
+	held := false
+	_ = withExistingOwnerMetadataLock(filepath.Dir(l.path), func() error {
+		info, _ := readOwner(l.path)
+		held = info.Nonce != "" && info.Nonce == l.info.Nonce
+		return nil
+	})
+	return held
+}
+
+// acquireLease returns an ownership lease held until release is called. Metadata
+// takeover takes the same cross-process lock, so a declared owner cannot replace this
+// claim between the authorization check and a SQLite schema/transaction COMMIT.
+func (l *OwnerLock) acquireLease() (release func(), ok bool) {
+	if l == nil {
+		return nil, false
+	}
+	guard, err := acquireOwnerMetadataLock(filepath.Dir(l.path), false)
+	if err != nil {
+		return nil, false
+	}
 	info, _ := readOwner(l.path)
-	return info.Nonce != "" && info.Nonce == l.info.Nonce
+	if info.Nonce == "" || info.Nonce != l.info.Nonce {
+		_ = guard.release()
+		return nil, false
+	}
+	return func() { _ = guard.release() }, true
+}
+
+// acquireUnownedLease authorizes a legacy writable Store only while no live owner is
+// declared. Holding the metadata guard makes that absence linearizable with schema and
+// transaction commit: an owner acquisition waits for the operation already in flight,
+// and every later legacy write fails closed once the owner claim is published.
+func acquireUnownedLease(meshDir string, createGuard bool) (func(), error) {
+	guard, err := acquireOwnerMetadataLock(meshDir, createGuard)
+	if err != nil {
+		return nil, err
+	}
+	info, live := readOwner(filepath.Join(meshDir, OwnerLockName))
+	if live {
+		return nil, errors.Join(&OwnerHeldError{Info: info}, guard.release())
+	}
+	return func() { _ = guard.release() }, nil
 }
 
 // Release stops the heartbeat and removes the lock file, but only when it still names
@@ -238,13 +301,25 @@ func (l *OwnerLock) Release() error {
 		close(l.stop)
 		<-l.done
 	})
-	if !l.Held() {
+	return l.releaseClaim(nil)
+}
+
+// releaseClaim performs the nonce check and removal under the cross-process metadata
+// guard. beforeRemove is a deterministic test seam: production always passes nil.
+func (l *OwnerLock) releaseClaim(beforeRemove func()) error {
+	return withExistingOwnerMetadataLock(filepath.Dir(l.path), func() error {
+		info, _ := readOwner(l.path)
+		if info.Nonce == "" || info.Nonce != l.info.Nonce {
+			return nil
+		}
+		if beforeRemove != nil {
+			beforeRemove()
+		}
+		if err := os.Remove(l.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
 		return nil
-	}
-	if err := os.Remove(l.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	return nil
+	})
 }
 
 // beat touches the lock file so a peer that cannot inspect our pid (another host, or an
@@ -259,18 +334,19 @@ func (l *OwnerLock) beat() {
 		case <-l.stop:
 			return
 		case now := <-t.C:
-			// A declared owner may have replaced this preemptible claim at the same
-			// path. Never heartbeat somebody else's lock; stop as soon as the nonce no
-			// longer names us.
-			if !l.Held() {
-				return
-			}
-			if err := os.Chtimes(l.path, now, now); err != nil {
-				// The file is gone (released, or a declared owner took over). Stop
-				// beating; Held is what the rest of the process reads anyway.
-				if errors.Is(err, fs.ErrNotExist) {
-					return
+			stillHeld := false
+			err := withExistingOwnerMetadataLock(filepath.Dir(l.path), func() error {
+				// A declared owner may have replaced this preemptible claim at the same
+				// path. Never heartbeat somebody else's lock.
+				info, _ := readOwner(l.path)
+				if info.Nonce == "" || info.Nonce != l.info.Nonce {
+					return nil
 				}
+				stillHeld = true
+				return os.Chtimes(l.path, now, now)
+			})
+			if !stillHeld || errors.Is(err, fs.ErrNotExist) {
+				return
 			}
 		}
 	}

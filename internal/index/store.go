@@ -47,6 +47,10 @@ type Store struct {
 	// orderly shutdown.
 	writeGuardMu sync.RWMutex
 	writeGuard   func() bool
+	// writeLease makes ownership linearizable with COMMIT. An OwnerLock lease holds
+	// the same cross-process metadata lock takeover needs, from authorization through
+	// schema/transaction commit.
+	writeLease func() (release func(), ok bool)
 
 	mu      sync.Mutex  // guards dropped + droppedSynced
 	dropped []FileError // notes dropped as unparseable by the last full reindex
@@ -194,20 +198,72 @@ const vaultMeshDirMode = 0o700
 // starts the writer goroutine.
 func Open(vaultRoot string) (*Store, error) {
 	dir := filepath.Join(vaultRoot, ".mesh")
-	if err := ensureVaultMeshDir(dir); err != nil {
+	return openUnownedAt(vaultRoot, dir, true)
+}
+
+// OpenOwned holds owner's cross-process lease across writable Open and installs the
+// same lease on every later Store transaction before takeover can proceed.
+func OpenOwned(vaultRoot string, owner *OwnerLock) (*Store, error) {
+	return openOwnedWithHook(vaultRoot, owner, nil)
+}
+
+// openOwnedWithHook is OpenOwned with a deterministic test seam after the lease is
+// acquired and before schema open begins.
+func openOwnedWithHook(vaultRoot string, owner *OwnerLock, afterLease func()) (*Store, error) {
+	release, ok := owner.acquireLease()
+	if !ok {
+		return nil, ErrReadOnly
+	}
+	defer release()
+	if afterLease != nil {
+		afterLease()
+	}
+	store, err := openAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"), true)
+	if err != nil {
 		return nil, err
 	}
-	return openAt(vaultRoot, dir, true)
+	attachOwnerLease(store, owner)
+	return store, nil
+}
+
+func attachOwnerLease(store *Store, owner *OwnerLock) {
+	store.writeGuardMu.Lock()
+	store.writeGuard = owner.Held
+	store.writeLease = owner.acquireLease
+	store.writeGuardMu.Unlock()
+}
+
+func attachUnownedLease(store *Store) {
+	store.writeGuardMu.Lock()
+	store.writeLease = func() (func(), bool) {
+		release, err := acquireUnownedLease(store.dir, false)
+		return release, err == nil
+	}
+	store.writeGuardMu.Unlock()
 }
 
 // OpenCurrent opens a writable store without replacing an existing mismatched schema.
 // Use it when a command writes auxiliary state but does not immediately rebuild notes.
 func OpenCurrent(vaultRoot string) (*Store, error) {
 	dir := filepath.Join(vaultRoot, ".mesh")
-	if err := ensureVaultMeshDir(dir); err != nil {
+	return openUnownedAt(vaultRoot, dir, false)
+}
+
+// OpenCurrentOwned is OpenCurrent under owner's lifetime lease. Commands that mutate
+// auxiliary index tables (embeddings, health, code, review queue) use it so they cannot
+// open a second writer beside the vault's declared owner.
+func OpenCurrentOwned(vaultRoot string, owner *OwnerLock) (*Store, error) {
+	release, ok := owner.acquireLease()
+	if !ok {
+		return nil, ErrReadOnly
+	}
+	defer release()
+	store, err := openAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"), false)
+	if err != nil {
 		return nil, err
 	}
-	return openAt(vaultRoot, dir, false)
+	attachOwnerLease(store, owner)
+	return store, nil
 }
 
 // ensureVaultMeshDir creates <vault>/.mesh at vaultMeshDirMode and, when it already
@@ -287,12 +343,29 @@ func EnsureOwnerOnlyDir(dir string) error { return ensureVaultMeshDir(dir) }
 // <vaultRoot>/.mesh. The hub uses this to index its served vault into a dir OUTSIDE
 // the git repo, so the index is never synced to clients.
 func OpenAt(vaultRoot, meshDir string) (*Store, error) {
-	return openAt(vaultRoot, meshDir, true)
+	return openUnownedAt(vaultRoot, meshDir, true)
 }
 
 // OpenCurrentAt is OpenCurrent with an explicit index directory.
 func OpenCurrentAt(vaultRoot, meshDir string) (*Store, error) {
-	return openAt(vaultRoot, meshDir, false)
+	return openUnownedAt(vaultRoot, meshDir, false)
+}
+
+func openUnownedAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) {
+	if err := ensureVaultMeshDir(meshDir); err != nil {
+		return nil, err
+	}
+	release, err := acquireUnownedLease(meshDir, true)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	store, err := openAt(vaultRoot, meshDir, allowSchemaRebuild)
+	if err != nil {
+		return nil, err
+	}
+	attachUnownedLease(store)
+	return store, nil
 }
 
 func openAt(vaultRoot, meshDir string, allowSchemaRebuild bool) (*Store, error) {
@@ -699,7 +772,25 @@ func recoverCorruptIndex(dbPath string, openErr error) (bool, error) {
 // loud: silently deleting a file on the operator's disk is not acceptable even when the
 // file is garbage.
 func OpenRebuild(vaultRoot string) (*Store, bool, error) {
-	s, err := Open(vaultRoot)
+	meshDir := filepath.Join(vaultRoot, ".mesh")
+	if err := ensureVaultMeshDir(meshDir); err != nil {
+		return nil, false, err
+	}
+	release, err := acquireUnownedLease(meshDir, true)
+	if err != nil {
+		return nil, false, err
+	}
+	defer release()
+	s, recovered, err := openRebuild(vaultRoot)
+	if err != nil {
+		return nil, false, err
+	}
+	attachUnownedLease(s)
+	return s, recovered, nil
+}
+
+func openRebuild(vaultRoot string) (*Store, bool, error) {
+	s, err := openAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"), true)
 	if err == nil {
 		if integrityErr := s.CheckIntegrity(vaultRoot); integrityErr == nil {
 			return s, false, nil
@@ -715,11 +806,28 @@ func OpenRebuild(vaultRoot string) (*Store, bool, error) {
 	if !recovered {
 		return nil, false, rerr
 	}
-	s, err = Open(vaultRoot)
+	s, err = openAt(vaultRoot, filepath.Join(vaultRoot, ".mesh"), true)
 	if err != nil {
 		return nil, false, err
 	}
 	return s, true, nil
+}
+
+// OpenRebuildOwned is OpenRebuild under the same lifetime ownership lease as
+// OpenOwned. Corruption recovery can close, remove and recreate mesh.db, so the lease
+// deliberately spans that entire sequence, not merely the final Store transaction.
+func OpenRebuildOwned(vaultRoot string, owner *OwnerLock) (*Store, bool, error) {
+	release, ok := owner.acquireLease()
+	if !ok {
+		return nil, false, ErrReadOnly
+	}
+	defer release()
+	store, recovered, err := openRebuild(vaultRoot)
+	if err != nil {
+		return nil, false, err
+	}
+	attachOwnerLease(store, owner)
+	return store, recovered, nil
 }
 
 // CheckIntegrity scans the whole index before a diagnostic or recovery surface claims
@@ -1131,13 +1239,32 @@ func (s *Store) SetWriteGuard(guard func() bool) {
 }
 
 func (s *Store) canWrite() bool {
+	release, ok, _ := s.acquireWriteAuthorization()
+	if ok {
+		release()
+	}
+	return ok
+}
+
+func (s *Store) acquireWriteAuthorization() (release func(), ok, linearized bool) {
 	if s.readOnly {
-		return false
+		return func() {}, false, false
 	}
 	s.writeGuardMu.RLock()
 	guard := s.writeGuard
+	lease := s.writeLease
 	s.writeGuardMu.RUnlock()
-	return guard == nil || guard()
+	if lease != nil {
+		release, ok := lease()
+		if !ok {
+			return func() {}, false, true
+		}
+		return release, true, true
+	}
+	if guard != nil && !guard() {
+		return func() {}, false, false
+	}
+	return func() {}, true, false
 }
 
 // NoteDate carries the lifecycle dates retrieval needs for freshness decay.
@@ -1195,7 +1322,8 @@ func (s *Store) writer() {
 				}
 			}
 		case <-ticker.C:
-			if !s.canWrite() {
+			release, ok, _ := s.acquireWriteAuthorization()
+			if !ok {
 				continue
 			}
 			// PASSIVE first: it returns at once and never blocks the writer on a live
@@ -1214,16 +1342,19 @@ func (s *Store) writer() {
 			// instead of stalling the writer, which is the failure this whole area
 			// already produced once.
 			if s.walBytes() > walSizeLimit {
-				s.checkpointTruncateBestEffort()
+				s.checkpointTruncateBestEffortAuthorized()
 			}
+			release()
 		}
 	}
 }
 
 func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
-	if !s.canWrite() {
+	release, ok, linearized := s.acquireWriteAuthorization()
+	if !ok {
 		return ErrReadOnly
 	}
+	defer release()
 	tx, err := s.writeDB.Begin()
 	if err != nil {
 		return err
@@ -1248,7 +1379,7 @@ func (s *Store) runTx(fn func(*sql.Tx) error) (err error) {
 	}
 	// A preemptible claim may have been taken while fn was running (a full reindex can
 	// take seconds). Roll the work back instead of committing beside the new owner.
-	if !s.canWrite() {
+	if !linearized && !s.canWrite() {
 		return ErrReadOnly
 	}
 	return tx.Commit()
@@ -1477,9 +1608,15 @@ func (s *Store) walBytes() int64 {
 }
 
 func (s *Store) checkpointTruncateBestEffort() {
-	if !s.canWrite() {
+	release, ok, _ := s.acquireWriteAuthorization()
+	if !ok {
 		return
 	}
+	defer release()
+	s.checkpointTruncateBestEffortAuthorized()
+}
+
+func (s *Store) checkpointTruncateBestEffortAuthorized() {
 	// Its OWN connection, never one out of writeDB. writeDB is capped at a single
 	// connection, so `PRAGMA busy_timeout=2000` executed on it did not end with this
 	// function: the connection went back to the pool carrying 2000 and every later write

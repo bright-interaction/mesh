@@ -58,14 +58,19 @@ func TestSyncVaultBoundedBatchPushesTheRemainder(t *testing.T) {
 	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := writeState(vaultDir, syncState{HeadSHA: "base", Hashes: map[string]string{}, HubURL: srv.URL}); err != nil {
+		t.Fatal(err)
+	}
 
 	var remaining []int
+	var deferred [][]string
 	for i := 0; i < 3; i++ {
 		sum, err := SyncVault(vaultDir)
 		if err != nil {
 			t.Fatalf("round %d: %v", i+1, err)
 		}
 		remaining = append(remaining, sum.Remaining)
+		deferred = append(deferred, append([]string(nil), sum.Deferred...))
 	}
 
 	wantSizes := []int{maxOutboxPerSync, extra, 0}
@@ -74,6 +79,18 @@ func TestSyncVaultBoundedBatchPushesTheRemainder(t *testing.T) {
 	}
 	if wantRemaining := []int{extra, 0, 0}; !equalInts(remaining, wantRemaining) {
 		t.Errorf("Summary.Remaining per round = %v, want %v", remaining, wantRemaining)
+	}
+	if len(deferred[0]) != extra || len(deferred[1]) != 0 || len(deferred[2]) != 0 {
+		t.Fatalf("Summary.Deferred sizes per round = [%d %d %d], want [%d 0 0]", len(deferred[0]), len(deferred[1]), len(deferred[2]), extra)
+	}
+	firstSent := map[string]bool{}
+	for _, it := range rounds[0] {
+		firstSent[it.path] = true
+	}
+	for _, rel := range deferred[0] {
+		if firstSent[rel] {
+			t.Fatalf("Summary.Deferred named %s even though the first round sent it", rel)
+		}
 	}
 	sent := map[string]string{}
 	for i, round := range rounds {
@@ -132,6 +149,19 @@ func TestSyncVaultBoundedBatchPushesTheRemainder(t *testing.T) {
 	}
 }
 
+func TestCombinedSummaryCarriesTheFinalExactDeferredSet(t *testing.T) {
+	first := Summary{Remaining: 2, Deferred: []string{"notes/a.md", "notes/b.md"}, Head: "pull"}
+	second := Summary{Pushed: 1, Remaining: 1, Deferred: []string{"notes/b.md"}, Head: "push"}
+	got := combineSummaries(first, second)
+	if got.Remaining != 1 || len(got.Deferred) != 1 || got.Deferred[0] != "notes/b.md" {
+		t.Fatalf("combined deferred state = count %d paths %v, want final round's exact tail", got.Remaining, got.Deferred)
+	}
+	second.Deferred[0] = "mutated.md"
+	if got.Deferred[0] != "notes/b.md" {
+		t.Fatal("combined Summary aliases the caller's deferred slice")
+	}
+}
+
 // TestSyncVaultProtectsDeferredNotesFromInboundDeltas covers the other half of the
 // bounded push: keeping a deferred note dirty is worthless if the same round destroys
 // its bytes.
@@ -169,6 +199,11 @@ func TestSyncVaultProtectsDeferredNotesFromInboundDeltas(t *testing.T) {
 	}))
 	defer srv.Close()
 	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	// A non-empty but GC'd base makes a real hub answer FullReconcile without
+	// triggering the unknown-base pull-first phase that this test does not target.
+	if err := writeState(vaultDir, syncState{HeadSHA: "gc-d-base", Hashes: map[string]string{}, HubURL: srv.URL}); err != nil {
 		t.Fatal(err)
 	}
 
