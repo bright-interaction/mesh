@@ -1,6 +1,10 @@
 .git
 .mesh
 **/.mesh
+# Production credentials live beside docker-compose.yml on the deploy host.
+# Never send them (or their backups) into BuildKit's context/cache.
+.env*
+*.env*
 bin
 vault/.mesh
 docs
