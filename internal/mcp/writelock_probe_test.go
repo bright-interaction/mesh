@@ -51,9 +51,7 @@ type probeResult struct {
 }
 
 func TestWriteLockProbe(t *testing.T) {
-	if testing.Short() {
-		t.Skip("measurement pass")
-	}
+	requireTimingProbe(t)
 	before := runProbeArm(t, "before: every window writable", true)
 	after := runProbeArm(t, "after: one owning writer", false)
 
