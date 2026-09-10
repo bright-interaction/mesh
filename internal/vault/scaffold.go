@@ -54,6 +54,26 @@ type CreateResult struct {
 	TODOs []string
 }
 
+// PreparedNote is a fully rendered note that has not yet been published. It exists for
+// callers such as the team hub that must put note creation inside a larger durable
+// transaction (the hub's Git commit). Content is ready to write at Result.Path.
+//
+// Preparing does NOT reserve the id. The caller must serialize PrepareNoteContext and
+// publication against every other writer for this vault. Ordinary callers must use
+// CreateNoteContext, whose O_EXCL publication supplies that serialization itself.
+type PreparedNote struct {
+	Result  CreateResult
+	Content []byte
+}
+
+type notePlan struct {
+	base    string
+	dir     string
+	date    string
+	fm      *Frontmatter
+	claimed map[string]string
+}
+
 // DirForType maps a note type to its vault subdirectory.
 func DirForType(t NoteType) string {
 	switch t {
@@ -169,72 +189,7 @@ func createNoteContext(
 	claimedIDs func(context.Context, string) (map[string]string, error),
 	openFile func(string, int, os.FileMode) (*os.File, error),
 ) (*CreateResult, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	// The vault has to be there already. MkdirAll below invents every missing parent,
-	// so without this a typo in --vault produced a whole new vault plus a note nobody
-	// would ever look at, and exit 0. Checked here rather than only in the CLI because
-	// the MCP write-back tool and the web pending API reach this same writer.
-	if err := RequireRoot(root); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !spec.Type.Valid() {
-		return nil, fmt.Errorf("%w: invalid type %q", ErrInvalidSpec, spec.Type)
-	}
-	title := strings.TrimSpace(spec.Title)
-	if title == "" {
-		return nil, fmt.Errorf("%w: title is required", ErrInvalidSpec)
-	}
-	base := Slugify(title)
-	if base == "" {
-		base = fallbackIDBase
-	}
-	if len(base) > maxSlugLen {
-		return nil, fmt.Errorf("%w: title too long: it slugs to %d characters and the filename limit is %d, so shorten the title by at least %d characters",
-			ErrInvalidSpec, len(base), maxSlugLen, len(base)-maxSlugLen)
-	}
-	dir := filepath.Join(root, DirForType(spec.Type))
-	date := Now().Format("2006-01-02")
-
-	fm := &Frontmatter{
-		Type:       spec.Type,
-		Title:      title,
-		When:       date,
-		Created:    date,
-		Related:    normalizeLinks(spec.Related),
-		Tags:       normalizeTags(spec.Tags),
-		Status:     spec.Status,
-		Severity:   spec.Severity,
-		Author:     strings.TrimSpace(spec.Author),
-		Agent:      strings.TrimSpace(spec.Agent),
-		Source:     strings.TrimSpace(spec.Source),
-		SourceURL:  strings.TrimSpace(spec.SourceURL),
-		Confidence: strings.TrimSpace(spec.Confidence),
-		ReviewBy:   strings.TrimSpace(spec.ReviewBy),
-		ImportedAt: strings.TrimSpace(spec.ImportedAt),
-		Scope:      normalizeTags(spec.Scope),
-	}
-	if spec.Type.RequiresFlywheel() {
-		fm.Do = orTODO(spec.Do)
-		fm.Dont = orTODO(spec.Dont)
-		fm.Why = orTODO(spec.Why)
-	} else {
-		fm.Do, fm.Dont, fm.Why = spec.Do, spec.Dont, spec.Why
-	}
-
-	// Every id already claimed ANYWHERE in the vault, because a note id is vault-global
-	// while a note file lives in one type directory. The O_EXCL claim below is scoped to
-	// dir, so on its own it proves nothing about the other type directories: a gotcha and
-	// a decision with the same title both got `id: <slug>`, both got a success receipt,
-	// and one of the two was silently unretrievable from that moment on.
-	claimed, err := claimedIDs(ctx, root)
+	plan, err := planNoteContext(ctx, root, spec, claimedIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +198,7 @@ func createNoteContext(
 	}
 	// Do not create even an empty type directory until the cancellable whole-vault
 	// scan has completed. That keeps pre-publication cancellation side-effect free.
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(plan.dir, 0o755); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -264,14 +219,14 @@ func createNoteContext(
 		}
 		// Shared with the in-place rewriter in IDClaims.Claim: the two writers must mint
 		// the same candidate sequence or each reads the ids the other reserved as free.
-		id := candidateID(base, n)
-		if _, taken := claimed[id]; taken {
+		id := candidateID(plan.base, n)
+		if _, taken := plan.claimed[id]; taken {
 			continue // held by a note somewhere in the vault, in this directory or another
 		}
-		path := filepath.Join(dir, id+".md")
-		fm.ID = id
+		path := filepath.Join(plan.dir, id+".md")
+		plan.fm.ID = id
 
-		content, err := renderNote(fm, spec.By)
+		content, err := renderNote(plan.fm, spec.By)
 		if err != nil {
 			return nil, err
 		}
@@ -298,7 +253,7 @@ func createNoteContext(
 		}
 		if _, err := f.Write([]byte(content)); err != nil {
 			closeErr := f.Close()
-			return nil, errors.Join(err, closeErr, removeNoteClaim(path, dir))
+			return nil, errors.Join(err, closeErr, removeNoteClaim(path, plan.dir))
 		}
 		// Flush the note's bytes to the device before this returns a CreateResult naming
 		// it. Everything downstream treats that receipt as "the note exists": the index
@@ -317,14 +272,14 @@ func createNoteContext(
 		// half-written note behind at an id the caller was told nothing about.
 		if err := f.Sync(); err != nil {
 			closeErr := f.Close()
-			return nil, errors.Join(err, closeErr, removeNoteClaim(path, dir))
+			return nil, errors.Join(err, closeErr, removeNoteClaim(path, plan.dir))
 		}
 		if err := f.Close(); err != nil {
-			return nil, errors.Join(err, removeNoteClaim(path, dir))
+			return nil, errors.Join(err, removeNoteClaim(path, plan.dir))
 		}
 		// The note is a NEW directory entry, so the data fsync alone does not make it
 		// reachable after a power cut. Fsync the directory too, after the file.
-		syncDir(dir)
+		syncDir(plan.dir)
 		// Re-check for a racer in another directory now that our own file exists. The
 		// vault scan above is check-then-act ACROSS directories: two CreateNote calls for
 		// the same title with different types can both scan, both find the id free, and
@@ -344,19 +299,108 @@ func createNoteContext(
 			// Cancellation after publication cannot return while our visible path is
 			// unresolved. The file is already closed and valid; remove it synchronously
 			// before surfacing cancellation, so no writer continues after this call.
-			return nil, errors.Join(checkErr, removeNoteClaim(path, dir))
+			return nil, errors.Join(checkErr, removeNoteClaim(path, plan.dir))
 		}
 		if other != "" {
-			if err := removeNoteClaim(path, dir); err != nil {
+			if err := removeNoteClaim(path, plan.dir); err != nil {
 				return nil, err
 			}
-			claimed[id] = other
+			plan.claimed[id] = other
 			continue
 		}
-		return &CreateResult{Path: path, ID: id, When: date, TODOs: fm.Validate()}, nil
+		return &CreateResult{Path: path, ID: id, When: plan.date, TODOs: plan.fm.Validate()}, nil
 	}
 	return nil, fmt.Errorf("%w: could not claim a free note id for %q after %d attempts; %d notes in this vault already hold ids starting with that slug, so give this note a more specific title",
-		ErrInvalidSpec, base, maxIDAttempts, maxIDAttempts)
+		ErrInvalidSpec, plan.base, maxIDAttempts, maxIDAttempts)
+}
+
+// PrepareNoteContext renders the exact note CreateNoteContext would create without
+// touching the filesystem. See PreparedNote: callers must serialize this with the
+// durable publication that follows it.
+func PrepareNoteContext(ctx context.Context, root string, spec NewNoteSpec) (*PreparedNote, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	plan, err := planNoteContext(ctx, root, spec, ClaimedIDsContext)
+	if err != nil {
+		return nil, err
+	}
+	for n := 1; n <= maxIDAttempts; n++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		id := candidateID(plan.base, n)
+		if _, taken := plan.claimed[id]; taken {
+			continue
+		}
+		path := filepath.Join(plan.dir, id+".md")
+		if _, err := os.Lstat(path); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		plan.fm.ID = id
+		content, err := renderNote(plan.fm, spec.By)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateRoundTrip(content, id); err != nil {
+			return nil, err
+		}
+		return &PreparedNote{
+			Result:  CreateResult{Path: path, ID: id, When: plan.date, TODOs: plan.fm.Validate()},
+			Content: []byte(content),
+		}, nil
+	}
+	return nil, fmt.Errorf("%w: could not claim a free note id for %q after %d attempts; %d notes in this vault already hold ids starting with that slug, so give this note a more specific title",
+		ErrInvalidSpec, plan.base, maxIDAttempts, maxIDAttempts)
+}
+
+func planNoteContext(ctx context.Context, root string, spec NewNoteSpec, claimedIDs func(context.Context, string) (map[string]string, error)) (*notePlan, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := RequireRoot(root); err != nil {
+		return nil, err
+	}
+	if !spec.Type.Valid() {
+		return nil, fmt.Errorf("%w: invalid type %q", ErrInvalidSpec, spec.Type)
+	}
+	title := strings.TrimSpace(spec.Title)
+	if title == "" {
+		return nil, fmt.Errorf("%w: title is required", ErrInvalidSpec)
+	}
+	base := Slugify(title)
+	if base == "" {
+		base = fallbackIDBase
+	}
+	if len(base) > maxSlugLen {
+		return nil, fmt.Errorf("%w: title too long: it slugs to %d characters and the filename limit is %d, so shorten the title by at least %d characters",
+			ErrInvalidSpec, len(base), maxSlugLen, len(base)-maxSlugLen)
+	}
+	date := Now().Format("2006-01-02")
+	fm := &Frontmatter{
+		Type: spec.Type, Title: title, When: date, Created: date,
+		Related: normalizeLinks(spec.Related), Tags: normalizeTags(spec.Tags),
+		Status: spec.Status, Severity: spec.Severity, Author: strings.TrimSpace(spec.Author),
+		Agent: strings.TrimSpace(spec.Agent), Source: strings.TrimSpace(spec.Source),
+		SourceURL: strings.TrimSpace(spec.SourceURL), Confidence: strings.TrimSpace(spec.Confidence),
+		ReviewBy: strings.TrimSpace(spec.ReviewBy), ImportedAt: strings.TrimSpace(spec.ImportedAt),
+		Scope: normalizeTags(spec.Scope),
+	}
+	if spec.Type.RequiresFlywheel() {
+		fm.Do, fm.Dont, fm.Why = orTODO(spec.Do), orTODO(spec.Dont), orTODO(spec.Why)
+	} else {
+		fm.Do, fm.Dont, fm.Why = spec.Do, spec.Dont, spec.Why
+	}
+	claimed, err := claimedIDs(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	return &notePlan{base: base, dir: filepath.Join(root, DirForType(spec.Type)), date: date, fm: fm, claimed: claimed}, nil
 }
 
 // removeNoteClaim withdraws an O_EXCL publication only after its file has been closed.

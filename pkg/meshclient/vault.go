@@ -20,6 +20,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/merge"
 	"github.com/bright-interaction/mesh/internal/syncproto"
+	"github.com/bright-interaction/mesh/internal/teamtelemetry"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
@@ -1373,12 +1374,23 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 		slog.Info("sync: pushing a bounded batch; the rest follow next round",
 			"batch", len(outbox), "remaining", len(deferred))
 	}
-	resp, err := New(creds.HubURL, creds.Token).Sync(syncproto.SyncRequest{BaseSHA: state.HeadSHA, Outbox: outbox, TombstoneSeq: state.TombSeq})
+	reuseEvents, err := teamtelemetry.Pending(vaultDir, creds.VaultID, teamtelemetry.MaxPerSync)
+	if err != nil {
+		slog.Warn("sync: could not read the private team-reuse outbox; note sync continues", "err", err)
+	}
+	resp, err := New(creds.HubURL, creds.Token).Sync(syncproto.SyncRequest{
+		BaseSHA: state.HeadSHA, Outbox: outbox, TombstoneSeq: state.TombSeq, ReuseEvents: reuseEvents,
+	})
 	if err != nil {
 		return Summary{}, err
 	}
 	if err := validateSyncResponse(vaultDir, resp, outbox); err != nil {
 		return Summary{}, err
+	}
+	if err := teamtelemetry.Ack(vaultDir, creds.VaultID, resp.AckedReuseEventIDs); err != nil {
+		// The hub deduplicates by event id, so retaining an acknowledged event only
+		// causes a harmless retry. Note convergence must not fail for telemetry cleanup.
+		slog.Warn("sync: could not remove acknowledged team-reuse events", "err", err)
 	}
 	// Build the protected set BEFORE applying deltas. Three things go in it, for the same
 	// reason: applyDeltas must not overwrite local bytes that nothing else is holding.

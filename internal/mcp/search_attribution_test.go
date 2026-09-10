@@ -23,7 +23,7 @@ func TestFirstFetchAfterSearchRecordsContentFreeRankAndRoute(t *testing.T) {
 	}
 	t.Cleanup(func() { s.Close() })
 
-	s.rememberSearch([]retrieve.Card{{NoteID: "sqlite"}, {NoteID: "note"}}, retrieve.Economics{Route: "model"})
+	s.rememberSearch(context.Background(), []retrieve.Card{{NoteID: "sqlite"}, {NoteID: "note"}}, retrieve.Economics{Route: "model"})
 	if _, rerr := s.toolFetch(context.Background(), mustJSON(map[string]any{"id": "note"})); rerr != nil {
 		t.Fatalf("fetch: %v", rerr)
 	}
@@ -45,5 +45,39 @@ func TestFirstFetchAfterSearchRecordsContentFreeRankAndRoute(t *testing.T) {
 	}
 	if got, err := s.store.Metric("retrieval:search_to_fetch"); err != nil || got != 1 {
 		t.Fatalf("same search attributed twice: %d,%v", got, err)
+	}
+}
+
+func TestHostedSearchAttributionIsIsolatedByActor(t *testing.T) {
+	dir := t.TempDir()
+	seedVaultFiles(t, dir)
+	seedIndex(t, dir)
+	s, err := NewOwningServer(dir, "actor-attribution-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WaitReady(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	a := WithTeamCaller(context.Background(), TeamCaller{ActorID: "actor-a"})
+	b := WithTeamCaller(context.Background(), TeamCaller{ActorID: "actor-b"})
+	s.rememberSearch(a, []retrieve.Card{{NoteID: "sqlite"}, {NoteID: "note"}}, retrieve.Economics{Route: "model"})
+	s.rememberSearch(b, []retrieve.Card{{NoteID: "note"}, {NoteID: "sqlite"}}, retrieve.Economics{Route: "local_confident"})
+	if _, rerr := s.toolFetch(a, mustJSON(map[string]any{"id": "note"})); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if _, rerr := s.toolFetch(b, mustJSON(map[string]any{"id": "sqlite"})); rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got, _ := s.store.Metric("retrieval:selected_rank:2"); got != 2 {
+		t.Fatalf("rank-2 selections = %d, want 2; one actor stole the other's slate", got)
+	}
+	if got, _ := s.store.Metric("rerank:selected_route:model"); got != 1 {
+		t.Fatalf("model route = %d, want 1", got)
+	}
+	if got, _ := s.store.Metric("rerank:selected_route:local_confident"); got != 1 {
+		t.Fatalf("local route = %d, want 1", got)
 	}
 }

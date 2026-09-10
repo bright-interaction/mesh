@@ -19,6 +19,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/relate"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/teamtelemetry"
 	"github.com/bright-interaction/mesh/internal/vault"
 	"golang.org/x/text/unicode/norm"
 )
@@ -843,7 +844,7 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	economics.ReturnedCards = len(cards)
 	economics.ReturnedTokens = retrieve.TotalTokensFunc(cards, searchCardTokens) + receiptTokens
 	retriever.RecordEconomics(economics)
-	s.rememberSearch(cards, economics)
+	s.rememberSearch(ctx, cards, economics)
 	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)
 	result := map[string]any{
 		"cards": labelCards(cards),
@@ -947,30 +948,44 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 	if strings.HasPrefix(src, importSourcePrefix) {
 		body = wrapUntrusted(src, srcURL, body)
 	}
+	now := time.Now()
 	_ = s.store.IncrMetric("fetches", 1)            // ROI telemetry (best-effort)
 	_ = s.store.IncrMetric("fetch:"+a.ID, 1)        // per-note reuse (most-reused list)
 	_ = s.store.RecordReuse(a.ID, flywheelReuseGap) // flywheel: a later fetch = the next run inheriting it
-	s.recordAttributedFetch(a.ID)
+	observeTeamReuse(ctx, a.ID, filepath.ToSlash(rel), now)
+	// Only the trusted local stdio transport may enqueue an event for later sync.
+	// A bare shared HTTP MCP has no authenticated logical reader, so attributing its
+	// requests to the machine's sync credential would fabricate cross-user reuse.
+	// Ordinary reference notes are excluded too: only agent write-backs participate
+	// in the team flywheel.
+	if localOperator(ctx) && s.store.IsAgentAuthoredNote(a.ID) {
+		_ = teamtelemetry.RecordForJoinedVault(s.vaultRoot, a.ID, now)
+	}
+	s.recordAttributedFetch(ctx, a.ID)
 	return rawText(body), nil
 }
 
 const searchAttributionWindow = 10 * time.Minute
 
-func (s *Server) rememberSearch(cards []retrieve.Card, economics retrieve.Economics) {
+func (s *Server) rememberSearch(ctx context.Context, cards []retrieve.Card, economics retrieve.Economics) {
 	ranks := make(map[string]int, len(cards))
 	for i, card := range cards {
 		ranks[card.NoteID] = i + 1
 	}
 	s.searchMu.Lock()
-	s.lastSearch = searchAttribution{at: time.Now(), ranks: ranks, route: economics.Route}
+	if s.lastSearch == nil {
+		s.lastSearch = make(map[string]searchAttribution)
+	}
+	s.lastSearch[attributionActor(ctx)] = searchAttribution{at: time.Now(), ranks: ranks, route: economics.Route}
 	s.searchMu.Unlock()
 }
 
-func (s *Server) recordAttributedFetch(noteID string) {
+func (s *Server) recordAttributedFetch(ctx context.Context, noteID string) {
+	actor := attributionActor(ctx)
 	s.searchMu.Lock()
-	last := s.lastSearch
+	last := s.lastSearch[actor]
 	if time.Since(last.at) > searchAttributionWindow {
-		s.lastSearch = searchAttribution{}
+		delete(s.lastSearch, actor)
 		s.searchMu.Unlock()
 		return
 	}
@@ -978,7 +993,7 @@ func (s *Server) recordAttributedFetch(noteID string) {
 	if ok {
 		// Attribute only the first matching fetch after a search: this is the
 		// agent's selection from that slate, not a count of later note reading.
-		s.lastSearch = searchAttribution{}
+		delete(s.lastSearch, actor)
 	}
 	s.searchMu.Unlock()
 	if !ok {
@@ -1184,6 +1199,14 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	s.mu.RLock()
 	agent := s.agent
 	s.mu.RUnlock()
+	caller, hosted := TeamCallerFromContext(ctx)
+	if hosted {
+		// Hosted authorship is an authenticated fact, not a caller-controlled field.
+		a.Author = caller.User
+		// HTTP initialize is stateless and server-global, so its clientInfo cannot be
+		// safely associated with this user. Use a truthful stable transport label.
+		agent = "mesh-hosted-mcp"
+	}
 	source := strings.TrimSpace(a.Source)
 	if source == "" {
 		source = "agent"
@@ -1209,7 +1232,8 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	if ctx.Err() != nil {
 		return nil, &rpcError{Code: codeInternalError, Message: "request cancelled before the note was written"}
 	}
-	res, err := vault.CreateNote(s.vaultRoot, vault.NewNoteSpec{
+	writtenAt := time.Now()
+	res, err := s.publishNote(ctx, vault.NewNoteSpec{
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
 		Related: related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
 		Author: a.Author, Agent: agent, Source: source, SourceURL: a.SourceURL,
@@ -1275,6 +1299,11 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	// contention this split exists to remove.
 	_ = s.store.IncrMetric("writes", 1)
 	_ = s.store.RecordWriteback(res.ID, source)
+	writebackPath := res.Path
+	if rel, rerr := filepath.Rel(s.vaultRoot, res.Path); rerr == nil {
+		writebackPath = filepath.ToSlash(rel)
+	}
+	observeTeamWriteback(ctx, res.ID, writebackPath, source, writtenAt)
 	// Return a vault-relative path, never the server's absolute filesystem path:
 	// on a hosted hub the absolute path would leak the server's absolute vault path
 	// to the agent.

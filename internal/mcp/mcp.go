@@ -84,12 +84,13 @@ type Server struct {
 	// surfaced it. It stores only ids, ranks, route and time, never query or note
 	// content, and is guarded separately because HTTP transports may be concurrent.
 	searchMu   sync.Mutex
-	lastSearch searchAttribution
+	lastSearch map[string]searchAttribution
 
 	// ownerIndexTimeout bounds the wait for the owning writer to index a just-written
 	// note. A field rather than a bare const so a test can shorten it without mutating
 	// global state (which would race across parallel tests); production never sets it.
 	ownerIndexTimeout time.Duration
+	notePublisher     NotePublisher
 	// Deterministic test seam immediately before the atomic expected-version graph
 	// snapshot. Production leaves it nil.
 	beforeOwnerVersionRefresh func()

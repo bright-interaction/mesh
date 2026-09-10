@@ -91,6 +91,15 @@ type SyncRequest struct {
 	// the field appeared, and refuse the round rather than send a response it would
 	// mishandle.
 	Proto int `json:"proto,omitempty"`
+	// ReuseEvents is a bounded, content-free telemetry outbox. Older hubs ignore this
+	// optional request field; clients delete events only when explicitly acknowledged.
+	ReuseEvents []ReuseEvent `json:"reuse_events,omitempty"`
+}
+
+type ReuseEvent struct {
+	EventID   string `json:"event_id"`
+	NoteID    string `json:"note_id"`
+	FetchedAt int64  `json:"fetched_at"`
 }
 
 // Delta is one change the hub sends back for the client to apply. Path must
@@ -133,7 +142,8 @@ type SyncResponse struct {
 	// permission (viewer role, or a read-only folder ACL), the note is too large or
 	// not text, or the path is outside the path contract above. The client keeps its
 	// local copy; the edit simply did not land upstream. Older clients ignore this.
-	Rejected []string `json:"rejected,omitempty"`
+	Rejected           []string `json:"rejected,omitempty"`
+	AckedReuseEventIDs []string `json:"acked_reuse_event_ids,omitempty"`
 }
 
 // CurationJob is a hub-recorded marker that a path had a true conflict and would

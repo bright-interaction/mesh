@@ -85,6 +85,18 @@ func (s *Store) RecordReuse(noteID string, gapSec int64) error {
 	return nil
 }
 
+// IsAgentAuthoredNote reports whether noteID currently carries source: agent in the
+// indexed vault. Team telemetry uses the note's durable provenance (rather than the
+// legacy local flywheel table, which an owning sync daemon may not have backfilled)
+// so ordinary reference-note fetches do not create outbox traffic the hub discards.
+func (s *Store) IsAgentAuthoredNote(noteID string) bool {
+	if noteID == "" {
+		return false
+	}
+	var source string
+	return s.readDB.QueryRow(`SELECT COALESCE(source,'') FROM notes WHERE id=?`, noteID).Scan(&source) == nil && source == "agent"
+}
+
 // ReusedNote is one note and how many later-session fetches it has drawn, for the
 // most-reused list (the concrete evidence behind the reuse rate).
 type ReusedNote struct {

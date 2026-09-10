@@ -351,6 +351,15 @@ land). A standalone `mesh-curator` worker can reconcile non-trivial conflicts wi
 the team's own BYOAI model, committing the merged note back through the normal sync
 path (the hub itself stays AI-free).
 
+The team dashboard separates actual cross-user reuse from the older
+same-user/later-session proxy. Agent-authored notes are attributed at their first
+hub publication; successful hosted MCP fetches count immediately, while local
+stdio MCP fetches upload a content-free, retry-safe event on the next `mesh sync`.
+The hub retains only aggregate `same`/`cross` event relations, never the reader,
+query, snippet, or note body. Hosted `mesh_append_note` writes are committed to the
+team Git history before success is returned, so they reach every sync client rather
+than remaining as untracked files in the hub worktree.
+
 ## Upgrading: behaviour changes you will notice
 
 An audit pass changed how several commands behave. Each of these is deliberate, and each
