@@ -84,7 +84,10 @@ func TestOrientReadsAnExistingIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orient over an indexed vault: %v", err)
 	}
-	if !strings.Contains(out, "Entry points") || !strings.Contains(out, "Hub") {
+	// Match the rendered card, not a coincidental word in the usage contract. The old
+	// assertion searched for "Hub" and passed only because the long contract named
+	// GitHub, even if the indexed entry itself disappeared.
+	if !strings.Contains(out, "Entry points") || !strings.Contains(out, "- hub (hub.md)") {
 		t.Errorf("orient did not render the indexed vault, got:\n%s", out)
 	}
 }

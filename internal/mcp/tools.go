@@ -38,7 +38,7 @@ func ToolSpecs() []map[string]any {
 	tools := []map[string]any{
 		{
 			"name":        "mesh_search",
-			"description": "Fused retrieval over the vault (full-text + graph proximity), tier-0 boosted (decisions/gotchas/post-mortems first). Returns ranked cards. Pass a token budget to get the best bundle that fits (default 8000). limit defaults to 20 and is capped at 100: narrow the query rather than raising it. The query is at most 4096 bytes and is read as at most 64 distinct terms, so send keywords, not a pasted document. Start here.",
+			"description": "Search notes with full-text, graph, and optional semantic ranking; returns budget-packed cards (default budget 8000, limit 20, max 100).",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -47,7 +47,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_fetch",
-			"description": "Fetch a note's full markdown by id (optionally just one heading section via anchor). Only call this when a search card is not enough.",
+			"description": "Fetch a note by id, optionally limited to one heading anchor; use only when its search card is insufficient.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"id"},
@@ -56,17 +56,17 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_god_nodes",
-			"description": "The map: the most-connected notes (hubs), ranked by how many other notes link to and from them, best entry points to orient before searching.",
+			"description": "List the most-connected notes as orientation entry points.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{"limit": intp}}),
 		},
 		{
 			"name":        "mesh_changed_since",
-			"description": "Notes modified after a unix timestamp, newest first. Pull only deltas when resuming. `since` is UNIX SECONDS, not milliseconds: a millisecond stamp is refused rather than silently matching nothing. limit defaults to 100 and is capped at 500; a capped reply sets truncated=true, so an absent truncated flag means you have the complete delta.",
+			"description": "List notes modified after a Unix-seconds timestamp (default limit 100, max 500; truncated signals more).",
 			"inputSchema": obj(map[string]any{"type": "object", "required": []string{"since"}, "properties": map[string]any{"since": intp, "limit": intp}}),
 		},
 		{
 			"name":        "mesh_neighbors",
-			"description": "The typed neighborhood of a note (its linked notes/tags, in and out), out to a small depth. Walk the graph one hop at a time instead of fetching whole files.",
+			"description": "List a note's typed inbound and outbound graph neighbors to a small depth.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"id"},
@@ -75,12 +75,12 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_community",
-			"description": "With an id: the note's community and its members. Without: the community overview (clusters by size with an exemplar each) to orient before searching.",
+			"description": "Show one note's community, or omit id for a cluster overview.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{"id": str, "limit": intp}}),
 		},
 		{
 			"name":        "mesh_append_note",
-			"description": "Write back what you learned: create a decision/gotcha/post-mortem/note with do/dont/why so the next agent inherits it (the flywheel). Mesh fills id/timestamp/placement.",
+			"description": "Create a durable decision, gotcha, post-mortem, or note; Mesh fills id, timestamp, placement, and agent provenance.",
 			"inputSchema": obj(map[string]any{
 				"type":     "object",
 				"required": []string{"type", "title"},
@@ -95,7 +95,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_write_entity",
-			"description": "Create an entity note (a system, tool, or concept page) with related links.",
+			"description": "Create a system, tool, or concept entity with related links.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"title"},
@@ -104,17 +104,17 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_reindex",
-			"description": "Re-read the vault from disk and rebuild the index NOW. Call this right after you edit note files directly in the editor or CLI so your next mesh_search/mesh_fetch/mesh_neighbors reflects the edits with no watcher lag (works even when the server was started without --watch). Returns what changed.",
+			"description": "Rebuild the index after direct note-file edits; Mesh write tools already reindex automatically.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
 		},
 		{
 			"name":        "mesh_health",
-			"description": "Run the knowledge-lifecycle health check NOW and return what is rotting: notes that cite a source file no longer in the code index (dead_ref), notes past their review_by date (overdue), plus contradiction findings. A stale index is reported explicitly instead of claiming an incomplete snapshot is clean. Use this to keep the vault trustworthy; fix or update the flagged notes. Returns findings grouped by issue + counts.",
+			"description": "Report dead source references, overdue reviews, contradictions, and stale-index status.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{"issue": str}}),
 		},
 		{
 			"name":        "mesh_code_search",
-			"description": "Locate SOURCE-CODE symbols (functions, types, methods, classes) by name across the indexed repos, ranked by name match. Returns cards with a file:line locator and signature so you jump straight to a definition instead of grepping the tree. Use this for 'where is X defined / what's in this area of the code'. This is the code index; mesh_search is for notes/knowledge. limit defaults to 12 and is capped at 100: narrow the query rather than raising it. The query is at most 4096 bytes and is read as at most 64 distinct terms.",
+			"description": "Find source-code symbols by name and return file, line, and signature (default limit 12, max 100).",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -123,7 +123,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_code_neighbors",
-			"description": "The call-graph neighborhood of a code symbol by id (an id from mesh_code_search): callees (what it calls) and callers (what calls it). Go has full edges; other languages return symbol locations without a call graph.",
+			"description": "Show callers and callees for a code-symbol id; Go has the full call graph.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"id"},
@@ -132,7 +132,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_code_context",
-			"description": "What do we KNOW about this code: resolve a symbol by name (like mesh_code_search) and return each match together with the team's notes that reference it (decisions/gotchas/post-mortems about that function or type). Use this before changing a function to inherit the institutional knowledge around it, not just its signature.",
+			"description": "Find code symbols and the team knowledge notes that reference them.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -141,17 +141,17 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_secret_status",
-			"description": "Is a secret vault attached? Reports whether Mesh is wired to a Dockyard capability-mode vault (encrypted secret storage + autorotation) and how to use it. No network call, never echoes a key. Call this to discover the broker before mesh_secret_list / mesh_secret_use.",
+			"description": "Report whether a capability-mode secret vault is attached; never returns secret values.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
 		},
 		{
 			"name":        "mesh_secret_list",
-			"description": "List the secrets in the attached vault (NAMES + provider + rotation status only, NEVER a value). Use it to see what credentials you can broker before calling mesh_secret_use. Returns an empty note if no vault is attached.",
+			"description": "List secret names, providers, and rotation status only; never returns values.",
 			"inputSchema": obj(map[string]any{"type": "object", "properties": map[string]any{}}),
 		},
 		{
 			"name":        "mesh_secret_use",
-			"description": "Get a credential you can use WITHOUT ever seeing it. Give the destination you will call (host+path, e.g. 'api.openai.com/v1/chat/completions'); Mesh mints a short-lived, single-use capability TOKEN bound to that destination. Send your request to the returned proxy_url with header `Authorization: Capability <token>` and the Dockyard vault injects the real, auto-rotated secret server-side. The plaintext secret never reaches you. Optionally pass secret_name to pin a specific vault entry and method to bind the HTTP method. Mint a fresh token per request; never store or log it.",
+			"description": "Mint a short-lived, single-use capability bound to a destination and method; never store or log it.",
 			"inputSchema": obj(map[string]any{
 				"type":     "object",
 				"required": []string{"destination"},
@@ -162,7 +162,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_setup_hooks",
-			"description": "ONBOARDING. Set up Claude Code SESSION hooks so you (the agent) automatically READ the mesh at the start of every session and get nudged to WRITE BACK what you learned before finishing - the flywheel that makes Mesh compound. Call with no args (action=status) to get the current install state plus the pitch and the exact questions to ask the user; then call action=install (read_only to skip the write-back nudge; dry_run to preview the settings.json first) to wire it into the project's .claude/settings.json. Offer this the FIRST time a user connects to Mesh. These are session hooks, NOT git pre/post-push.",
+			"description": "Inspect, install, or remove Claude Code session hooks; use dry_run to preview and read_only to omit write-back nudges.",
 			"inputSchema": obj(map[string]any{
 				"type": "object",
 				"properties": map[string]any{
