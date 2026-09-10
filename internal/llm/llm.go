@@ -101,7 +101,7 @@ func (c *cliClient) Complete(ctx context.Context, system, user string) (string, 
 	// PATH/HOME/locale are preserved so `claude -p` still authenticates.
 	// Append after sanitizing: a value inherited from the parent is stripped with
 	// the other MESH_* variables, then replaced with the one trusted fixed value.
-	cmd.Env = append(sanitizedEnv(), ChildEnv+"=1")
+	cmd.Env = SubprocessEnv()
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -203,6 +203,14 @@ func sanitizedEnv() []string {
 		out = append(out, kv)
 	}
 	return out
+}
+
+// SubprocessEnv is the least-privilege environment for any command-line model
+// Mesh starts. It removes Mesh and credential-shaped secrets, preserves the
+// provider CLI's own authentication, and marks the process so Mesh hooks never
+// harvest or nudge the strict-output child session.
+func SubprocessEnv() []string {
+	return append(sanitizedEnv(), ChildEnv+"=1")
 }
 
 // secretEnvName reports whether an env var name looks like a secret we must not hand to

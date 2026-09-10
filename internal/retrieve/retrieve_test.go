@@ -5,6 +5,7 @@ package retrieve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -93,6 +94,21 @@ func (constReranker) Rerank(_ context.Context, _ string, docs []string) ([]reran
 		out[i] = rerank.Result{Index: i, Score: 5}
 	}
 	return out, nil
+}
+
+type compactReranker struct {
+	got []rerank.Candidate
+}
+
+func (c *compactReranker) Model() string       { return "subscription/test/tiny" }
+func (c *compactReranker) CandidateLimit() int { return 2 }
+func (c *compactReranker) ResultLimit() int    { return 1 }
+func (c *compactReranker) Rerank(context.Context, string, []string) ([]rerank.Result, error) {
+	return nil, fmt.Errorf("full note bodies must not be sent to a compact reranker")
+}
+func (c *compactReranker) RerankCandidates(_ context.Context, _ string, candidates []rerank.Candidate) ([]rerank.Result, error) {
+	c.got = append([]rerank.Candidate(nil), candidates...)
+	return []rerank.Result{{Index: 0, Score: 0}, {Index: 1, Score: 10}}, nil
 }
 
 func buildVault(t *testing.T) *Retriever {
@@ -689,6 +705,57 @@ func TestRerankReordersHead(t *testing.T) {
 	}
 	if !strings.Contains(cards[0].Reason, "rerank") {
 		t.Errorf("reranked card should note rerank in its reason, got %q", cards[0].Reason)
+	}
+}
+
+func TestCompactRerankerSeesCardsAndCapsReturnedContext(t *testing.T) {
+	r := buildVault(t)
+	rr := &compactReranker{}
+	r.EnableRerank(rr)
+	cards, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rr.got) != 2 {
+		t.Fatalf("compact reranker saw %d candidates, want its cap of 2", len(rr.got))
+	}
+	for _, candidate := range rr.got {
+		if candidate.Title == "" {
+			t.Fatalf("compact candidate missing card fields: %#v", candidate)
+		}
+	}
+	if len(cards) != 1 {
+		t.Fatalf("subscription result cap returned %d cards, want 1", len(cards))
+	}
+	if cards[0].NodeID != "note:b" {
+		t.Fatalf("compact rerank did not promote second candidate: %#v", cardIDs(cards))
+	}
+}
+
+func TestSubscriptionRerankerActivatesWithoutEndpointOrOllama(t *testing.T) {
+	t.Setenv("MESH_RERANK_AGENT", "codex")
+	t.Setenv("MESH_RERANK_MODEL", "")
+	t.Setenv("MESH_RERANK_ENDPOINT", "")
+	r := buildVault(t)
+	r.enableRerank(meshcfg.Retrieval{})
+	if !r.RerankActive() {
+		t.Fatal("subscription reranker did not activate without an HTTP endpoint")
+	}
+	if got := r.RerankModel(); got != "subscription/codex/gpt-5.6-luna" {
+		t.Fatalf("RerankModel = %q", got)
+	}
+}
+
+func TestInvalidSubscriptionRerankerFailsLoudly(t *testing.T) {
+	t.Setenv("MESH_RERANK_AGENT", "typo")
+	r := buildVault(t)
+	r.enableRerank(meshcfg.Retrieval{})
+	if !r.RerankActive() {
+		t.Fatal("configured but invalid reranker must remain visible in status")
+	}
+	_, err := r.Retrieve(context.Background(), "sqlite storage", Options{Limit: 10})
+	if !errors.Is(err, ErrRerankUnavailable) {
+		t.Fatalf("invalid configured reranker silently switched off: %v", err)
 	}
 }
 

@@ -1,7 +1,7 @@
 # How retrieval works
 
-A search blends three signals into one ranked list, then optionally reranks the
-head with a cross-encoder, then packs the best bundle into a token budget.
+A search blends three signals into one ranked list, optionally reranks a bounded
+head, then packs the best bundle into a token budget.
 
 ## The signals
 
@@ -17,8 +17,11 @@ most needs to inherit.
 
 ## Rerank
 
-If you set a rerank endpoint (Settings), a cross-encoder rescasts the top results
-for precision. It is optional and BYOAI: point it at your own model.
+Rerank is optional and BYOAI. Configure a cross-encoder endpoint in Settings, or
+set `MESH_RERANK_AGENT=codex|claude` in the local Mesh process to reuse that
+developer's subscription login. Subscription mode sends at most 12 compact cards
+to a low-effort model and returns 5 by default; it does not require Ollama or an API
+key and never sends full note bodies.
 
 ## Budget packing
 

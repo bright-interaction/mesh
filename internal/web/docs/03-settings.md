@@ -15,7 +15,9 @@ Precedence is always environment over file over default, everywhere in Mesh.
 - **Embedding**: endpoint, model, dimensions, query/doc prefixes, and the NAME of
   the env var holding the bearer key. Turns on semantic search.
 - **Retrieval**: the fusion weights for full-text, graph, and vector signals.
-- **Rerank**: a cross-encoder endpoint, model, key env var, and blend.
+- **Rerank**: a cross-encoder endpoint, model, key env var, and blend. A user's
+  Codex/Claude subscription reranker is deliberately env-only
+  (`MESH_RERANK_AGENT`) so shared vault config cannot force provider egress.
 - **Scale (pro)**: the HNSW threshold.
 
 ## Secrets

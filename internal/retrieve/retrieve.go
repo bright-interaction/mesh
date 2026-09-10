@@ -126,8 +126,9 @@ type Retriever struct {
 	hnswGate    int                    // build hnsw only when chunk count >= this; 0 => never (brute force)
 	queryPrefix string                 // e.g. "search_query: " for nomic-style asymmetric models
 
-	rr          rerank.Reranker // optional cross-encoder; reorders the top-K head
-	rerankName  string          // model id, for status/diagnostics
+	rr          rerank.Reranker // optional endpoint or subscription reranker
+	rerankName  string          // provider/model id, for status/diagnostics
+	rerankSetup error           // configured but invalid; fail loudly instead of switching off
 	rerankBlend float64         // cross-encoder vs fused weight (see rerankBlendDefault)
 
 	// Learned/operator fusion-weight defaults (0 across all three => built-in
@@ -311,20 +312,35 @@ func envOrFile(key, fallback string) (string, bool) {
 	return fallback, false
 }
 
-// enableRerank turns on the cross-encoder rerank stage when the endpoint + model
-// are set (BYOAI, sovereign or cloud), env-first then the solo config file.
+// enableRerank turns on either a user-local subscription CLI (env-only, so shared
+// vault config cannot force data egress through a member's account) or the legacy
+// cross-encoder endpoint (env-first, then solo config). The subscription model sees
+// only compact cards, never the full vault or full candidate note bodies.
 func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
-	endpoint, fromEnv := envOrFile("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
-	model := envOr("MESH_RERANK_MODEL", rv.RerankModel)
-	if endpoint == "" || model == "" {
-		return
-	}
 	if b := os.Getenv("MESH_RERANK_BLEND"); b != "" {
 		if v, err := strconv.ParseFloat(b, 64); err == nil && v >= 0 && v <= 1 {
 			r.rerankBlend = v
 		}
 	} else if rv.RerankBlend > 0 {
 		r.rerankBlend = rv.RerankBlend
+	}
+
+	if agent := strings.ToLower(strings.TrimSpace(os.Getenv("MESH_RERANK_AGENT"))); agent != "" && agent != "http" {
+		model := strings.TrimSpace(os.Getenv("MESH_RERANK_MODEL"))
+		rr, err := rerank.NewSubscriptionCLI(agent, model)
+		if err != nil {
+			r.rerankName = "subscription/" + agent
+			r.rerankSetup = err
+			return
+		}
+		r.EnableRerank(rr)
+		return
+	}
+
+	endpoint, fromEnv := envOrFile("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
+	model := envOr("MESH_RERANK_MODEL", rv.RerankModel)
+	if endpoint == "" || model == "" {
+		return
 	}
 	// Same allow-list as the embedding key: see enableVectors.
 	keyEnv := meshcfg.ResolveKeyEnv("rerank.key_env", rv.RerankKeyEnv, "MESH_RERANK_KEY")
@@ -354,7 +370,7 @@ func (r *Retriever) EnableRerank(rr rerank.Reranker) bool {
 // genuinely wants to keep serving (a long-lived server, say) can errors.Is it and choose
 // to, while the default for a one-shot CLI or MCP call is to surface it. It never fires
 // when no reranker is configured.
-var ErrRerankUnavailable = errors.New("rerank endpoint unavailable")
+var ErrRerankUnavailable = errors.New("reranker unavailable")
 
 // ErrEmbeddingUnavailable wraps failures from a configured semantic lane. Silently
 // falling back to lexical results makes an operator believe vector retrieval ran when
@@ -378,7 +394,16 @@ const rerankProbeTimeout = 5 * time.Second
 // honest answer to "is it on". Returns nil when nothing is configured (there is nothing
 // to be wrong) and wraps failures in ErrRerankUnavailable.
 func (r *Retriever) RerankProbe(ctx context.Context) error {
+	if r.rerankSetup != nil {
+		return fmt.Errorf("%w: %w", ErrRerankUnavailable, r.rerankSetup)
+	}
 	if r.rr == nil {
+		return nil
+	}
+	if p, ok := r.rr.(rerank.Prober); ok {
+		if err := p.Probe(ctx); err != nil {
+			return fmt.Errorf("%w: %w", ErrRerankUnavailable, err)
+		}
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, rerankProbeTimeout)
@@ -390,9 +415,9 @@ func (r *Retriever) RerankProbe(ctx context.Context) error {
 }
 
 // SignalReport is the honest answer to "which retrieval signals will actually fire":
-// each optional stage as CONFIGURED plus, separately, whether its endpoint answered.
-// Reporting configuration alone is what let a dead reranker read as "active" on every
-// surface at once, so the two are never collapsed into one flag here.
+// each optional stage as CONFIGURED plus, separately, what its readiness check proved.
+// HTTP stages make an inference probe. Subscription CLIs only verify that the binary
+// exists so status costs no quota, and RerankCheck makes that limitation explicit.
 type SignalReport struct {
 	VectorsConfigured bool
 	VectorsReachable  bool
@@ -401,9 +426,10 @@ type SignalReport struct {
 	ANN               bool
 
 	RerankConfigured bool
-	RerankReachable  bool
-	RerankError      string // empty when reachable or not configured
+	RerankReachable  bool   // endpoint answered, or subscription CLI executable exists
+	RerankError      string // empty when ready or not configured
 	RerankModel      string
+	RerankCheck      string // what the probe verified; empty for an inference endpoint probe
 }
 
 // Signals probes every configured BYOAI stage once and returns what is really on. It is
@@ -431,6 +457,9 @@ func (r *Retriever) Signals(ctx context.Context) SignalReport {
 			rep.RerankError = err.Error()
 		} else {
 			rep.RerankReachable = true
+			if reporter, ok := r.rr.(rerank.ProbeReporter); ok {
+				rep.RerankCheck = reporter.ProbeReport()
+			}
 		}
 	}
 	return rep
@@ -450,8 +479,9 @@ func (r *Retriever) EmbedderProbe() error {
 	return nil
 }
 
-// RerankActive reports whether a cross-encoder rerank stage is configured.
-func (r *Retriever) RerankActive() bool { return r.rr != nil }
+// RerankActive reports whether any rerank stage is configured, including one
+// whose setup failed and must remain visible to status and retrieval callers.
+func (r *Retriever) RerankActive() bool { return r.rr != nil || r.rerankSetup != nil }
 
 // RerankModel returns the configured rerank model id (empty when inactive).
 func (r *Retriever) RerankModel() string { return r.rerankName }
@@ -881,16 +911,23 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	}
 	sortCards(cards)
 
-	// Cross-encoder rerank of the top-K head: a model that reads the query and
-	// each candidate jointly reorders the strongest fused results, which is the
-	// lever for top-1 precision. It refines the head only. A CONFIGURED endpoint that
-	// cannot be reached now fails the query (ErrRerankUnavailable) instead of returning
-	// the fused order dressed up as reranked. Skipped when tuning the fusion itself
-	// (NoRerank), so the fused order is what gets measured.
+	// Optional rerank of the head. HTTP cross-encoders score bounded note text;
+	// subscription CLIs rank an even smaller card slate. A CONFIGURED reranker that
+	// is unavailable fails the query rather than dressing fused output up as reranked.
+	// Skipped when tuning the fusion itself (NoRerank).
 	if !opt.NoRerank {
 		cards, err = r.rerankHead(ctx, query, cards, fused, opt)
 		if err != nil {
 			return nil, err
+		}
+		// Subscription ranking is explicitly a low-context mode: after a cheap model
+		// has selected the useful head, do not make the expensive calling agent read
+		// the discarded cards too. The operator can tune this bounded cap with
+		// MESH_RERANK_RESULTS; HTTP cross-encoder behavior is unchanged.
+		if compact, ok := r.rr.(rerank.CandidateReranker); ok {
+			if limit := compact.ResultLimit(); limit > 0 && len(cards) > limit {
+				cards = cards[:limit]
+			}
 		}
 	}
 
@@ -1077,12 +1114,23 @@ func sortCards(cards []Card) {
 // reranker configured, a head too short to reorder, a flat uninformative response) still
 // leave the fused order intact.
 func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, fusedRaw map[string]float64, opt Options) ([]Card, error) {
+	if r.rerankSetup != nil {
+		return nil, fmt.Errorf("%w (%s): %w", ErrRerankUnavailable, r.rerankName, r.rerankSetup)
+	}
 	if r.rr == nil || len(cards) < 2 {
 		return cards, nil
 	}
 	k := rerankK
+	if compact, ok := r.rr.(rerank.CandidateReranker); ok {
+		if limit := compact.CandidateLimit(); limit > 0 && limit < k {
+			k = limit
+		}
+	}
 	if k > len(cards) {
 		k = len(cards)
+	}
+	if k < 2 {
+		return cards, nil
 	}
 	candidateHead := cards[:k]
 	ids := make([]string, k)
@@ -1116,24 +1164,38 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 	if k < 2 {
 		return cards, nil
 	}
-	res, err := r.rr.Rerank(ctx, query, docs)
+	var res []rerank.Result
+	if compact, ok := r.rr.(rerank.CandidateReranker); ok {
+		candidates := make([]rerank.Candidate, k)
+		for i := range head {
+			candidates[i] = rerank.Candidate{
+				Index:   i,
+				Title:   head[i].Title,
+				Snippet: head[i].Snippet,
+				Reason:  head[i].Reason,
+			}
+		}
+		res, err = compact.RerankCandidates(ctx, query, candidates)
+	} else {
+		res, err = r.rr.Rerank(ctx, query, docs)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("%w (cross-encoder %s): %w\n  start the rerank endpoint (see tools/rerank-server), or unset MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL to search without it", ErrRerankUnavailable, r.rerankName, err)
+		return nil, fmt.Errorf("%w (%s): %w\n  fix the provider CLI, start the endpoint (see tools/rerank-server), or unset MESH_RERANK_AGENT / MESH_RERANK_ENDPOINT to search without it", ErrRerankUnavailable, r.rerankName, err)
 	}
 	if len(res) != k {
-		return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned %d scores for %d documents", ErrRerankUnavailable, r.rerankName, len(res), k)
+		return nil, fmt.Errorf("%w (%s): returned %d scores for %d candidates", ErrRerankUnavailable, r.rerankName, len(res), k)
 	}
 	scores := make([]float64, k)
 	seen := make([]bool, k)
 	for _, x := range res {
 		if x.Index < 0 || x.Index >= k {
-			return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned out-of-range document index %d for %d documents", ErrRerankUnavailable, r.rerankName, x.Index, k)
+			return nil, fmt.Errorf("%w (%s): returned out-of-range candidate index %d for %d candidates", ErrRerankUnavailable, r.rerankName, x.Index, k)
 		}
 		if seen[x.Index] {
-			return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned duplicate document index %d", ErrRerankUnavailable, r.rerankName, x.Index)
+			return nil, fmt.Errorf("%w (%s): returned duplicate candidate index %d", ErrRerankUnavailable, r.rerankName, x.Index)
 		}
 		if math.IsNaN(x.Score) || math.IsInf(x.Score, 0) {
-			return nil, fmt.Errorf("%w (cross-encoder %s): endpoint returned non-finite score for document index %d", ErrRerankUnavailable, r.rerankName, x.Index)
+			return nil, fmt.Errorf("%w (%s): returned non-finite score for candidate index %d", ErrRerankUnavailable, r.rerankName, x.Index)
 		}
 		seen[x.Index] = true
 		scores[x.Index] = x.Score

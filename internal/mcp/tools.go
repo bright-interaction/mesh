@@ -38,7 +38,7 @@ func ToolSpecs() []map[string]any {
 	tools := []map[string]any{
 		{
 			"name":        "mesh_search",
-			"description": "Search notes with full-text, graph, and optional semantic ranking; returns budget-packed cards (default budget 8000, limit 20, max 100).",
+			"description": "Search notes with full-text, graph, and optional vector/subscription ranking; returns budget-packed cards (default budget 8000, limit 20, max 100).",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},

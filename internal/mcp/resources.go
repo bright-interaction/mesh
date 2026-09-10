@@ -121,6 +121,7 @@ func (s *Server) statsJSON(ctx context.Context) string {
 			"reachable": sig.RerankReachable,
 			"error":     sig.RerankError,
 			"model":     sig.RerankModel,
+			"check":     sig.RerankCheck,
 		},
 	})
 	return string(b)

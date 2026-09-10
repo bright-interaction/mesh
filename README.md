@@ -9,9 +9,9 @@ It is one Go binary, no cgo, no external services. Retrieving from Mesh is cheap
 ## Honest scope
 
 - **The core, zero models:** cheap card-based retrieval (FTS + graph-BM25 + tier-0, pure Go, no inference, near-zero CPU) plus the agent write-back flywheel, in a single no-glue binary. `mesh_search` hands the agent ranked cards (title + snippet + why); **the agent reads the cards and picks** the 1-2 notes worth fetching. A capable coding agent is already a stronger relevance judge than any bolt-on reranker, so for the agent consumer the agent *is* the reranker, free. This is the whole product for an agent.
-- **Optional BYOAI add-ons (off by default, for cost-sensitive or non-agent consumers):**
+- **Optional BYOAI add-ons (off by default; Ollama is never required):**
   - **Vectors (`mesh embed`)** lift recall on paraphrase queries where keyword search breaks (13/20 -> 19/20 on the private corpus behind `docs/BENCHMARK.md`; read that file's caveats before quoting the number). Worth turning on when queries paraphrase the notes; can point at a cloud endpoint for zero local CPU, or be skipped (FTS keyword recall is already 23/25).
-  - **Cross-encoder rerank** lifts top-1 precision for a consumer that *trusts the top result without reading the cards* (`answer@1` 3/20 -> 10/20 on paraphrase). That is not a capable agent (which reads the cards and judges); it is a cheap/small downstream model, a blind "fetch top-1" pipeline, or a multi-tenant cloud deployment where offloading ranking to a local judge saves the tenant's billed model from reading and ranking candidates. Off unless an endpoint is configured. See `docs/BENCHMARK.md` for the matched-arm measurements.
+  - **Rerank** lifts top-1 precision for a consumer that *trusts the top result without reading the cards*. Use either a local/cloud cross-encoder, or let an already-authenticated Codex/Claude subscription rank 12 compact cards with its cheapest suitable model and return only the best 5. The subscription path needs no API key and no Ollama; it never scans the vault or receives full note bodies. See `docs/BENCHMARK.md` for the measured cross-encoder arm.
 - **Also shipped:** a keyboard TUI (`mesh tui`) and a browser app (`mesh ui`) over the same index, plus the client side of sovereign team sync (`mesh join` / `mesh sync` / `mesh conflicts`). The team-sync **server** those talk to is the commercial product and is not in this repository, see [LICENSING.md](LICENSING.md). All optional; the solo, local core stands alone.
 
 ## Install
@@ -173,10 +173,11 @@ use semantic search.
 
 ## Optional: semantic search + rerank (BYOAI, sovereign)
 
-The core above needs no models. These two stages are **optional** and **off by
-default**; turn them on only for the cases in "Honest scope" (paraphrase recall,
-or a cost-sensitive / non-agent consumer). Mesh runs no inference itself, both
-call HTTP endpoints **you** control, so they stay on your infrastructure:
+The core above needs no models. These stages are **optional** and **off by
+default**. Vectors improve paraphrase recall and require an embedding endpoint;
+rerank improves the order after local FTS + graph candidate generation and can
+use either an HTTP endpoint or a developer's existing Codex/Claude subscription.
+Ollama is one optional local endpoint, not a Mesh dependency.
 
 ```
 # 1. Vectors: embed notes via any OpenAI-compatible /embeddings endpoint (Ollama, etc.)
@@ -186,15 +187,36 @@ export MESH_EMBED_DOC_PREFIX="search_document: "   # nomic-style asymmetric mode
 export MESH_EMBED_QUERY_PREFIX="search_query: "
 mesh embed my-vault                                 # one vector per note
 
-# 2. Rerank: a cross-encoder sharpens top-1 precision (see tools/rerank-server)
+# 2a. No-Ollama subscription rerank: no API key; uses the CLI's existing login.
+#     Codex defaults to Luna/low. Claude defaults to Haiku 4.5/low.
+export MESH_RERANK_AGENT=codex    # or: claude
+
+# Optional token/latency caps (these defaults are already applied):
+export MESH_RERANK_CANDIDATES=12  # local FTS + graph cards sent to the small model
+export MESH_RERANK_RESULTS=5      # cards returned to the calling agent
+export MESH_RERANK_CARD_CHARS=500 # maximum matched-snippet bytes per card
+
+# 2b. Or use a cross-encoder endpoint (see tools/rerank-server).
+unset MESH_RERANK_AGENT
 export MESH_RERANK_ENDPOINT=http://127.0.0.1:8787/rerank
 export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
 
-mesh status my-vault    # PROBES both endpoints and says which signals really work
+mesh status my-vault    # checks configured signals (subscription checks spend no quota)
 ```
 
-Both endpoints above are local, and that is the supported default: an endpoint you
-pass on the command line or set in the environment is operator input, so Mesh dials
+The subscription presets run non-interactively in an empty temporary directory,
+disable tools, MCP servers, hooks, settings discovery, and session persistence,
+and mark the process as a Mesh LLM child. This prevents the strict-JSON child from
+loading the workspace's own Stop hook. Exact repeat rankings are cached and calls
+are serialized within each Mesh process, preventing its concurrent searches from
+becoming a quota burst. This
+path sends the query and compact card fields to the selected provider; it is
+therefore opt-in and configured only by local process environment, never by synced
+vault configuration. Override the model with `MESH_RERANK_MODEL` and the timeout
+with `MESH_RERANK_CMD_TIMEOUT` (default 90 seconds).
+
+Both HTTP endpoints above are local, and that is the supported endpoint default:
+an endpoint you pass on the command line or set in the environment is operator input, so Mesh dials
 it as given, `localhost` and `127.0.0.1` included. The SSRF guard applies to the
 endpoint someone else could have written for you: the `[embedding]` / `[rerank]`
 fields in `.mesh/config.toml`, which the web UI's settings page rewrites over
@@ -215,10 +237,11 @@ Vector search in this repository is a brute-force cosine scan, which stays under
 Once set, `mesh search` / `eval` / `mcp` fuse the semantic signal and apply the
 rerank automatically. Turning a stage OFF is safe (no embedder means lexical-only),
 but a stage you turned ON and that cannot be reached is an error, not a quiet
-downgrade: `mesh search` fails and names the endpoint, rather than handing back
-unreranked results that look reranked. Unset `MESH_RERANK_ENDPOINT` and
-`MESH_RERANK_MODEL` to turn rerank off for real. Pointing either env var at a
-cloud provider sends note content off-box, so keep them local to stay sovereign.
+downgrade: `mesh search` fails and names the configured provider, rather than handing
+back unreranked results that look reranked. Unset `MESH_RERANK_AGENT` and
+`MESH_RERANK_ENDPOINT` to turn rerank off for real. Pointing an endpoint at a cloud
+provider sends bounded note text off-box; enabling subscription rerank sends only
+the query plus compact cards.
 A ready-to-run local cross-encoder server lives in `tools/rerank-server/`.
 
 Got a set of labelled queries for your corpus? `mesh tune cases.json --test

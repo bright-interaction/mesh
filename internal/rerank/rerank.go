@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 // Copyright (C) 2026 Bright Interaction AB
 
-// Package rerank is the BYOAI cross-encoder layer. Like embeddings, Mesh never
-// runs inference itself: it POSTs (query, candidate documents) to an endpoint
-// the operator controls and gets back a relevance score per document. A
-// cross-encoder reads the query and a document jointly, so it is a sharper
-// relevance signal than the bi-encoder vector cosine - the lever for top-1
-// precision (answer@1). It is a mechanical scoring transform, not reasoning AI;
-// the agent is still the librarian. The endpoint can be fully local and
-// sovereign (a self-hosted ONNX cross-encoder, see tools/rerank-server) or any
-// cloud rerank API - the wire format is the same.
+// Package rerank is Mesh's optional BYOAI relevance layer. It supports a
+// conventional cross-encoder endpoint and a deliberately tiny card-ranking call
+// through an already-authenticated Codex or Claude subscription. Mesh still does
+// candidate generation locally; the model only reorders that bounded slate.
 package rerank
 
 import (

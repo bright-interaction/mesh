@@ -907,13 +907,17 @@ func statusCmd() *cobra.Command {
 			}
 			switch {
 			case sig.RerankConfigured && !sig.RerankReachable:
-				fmt.Printf("  rerank       UNREACHABLE (cross-encoder %s): %s\n", sig.RerankModel, sig.RerankError)
-				fmt.Println("               searches FAIL while it is configured and down; start the endpoint (see tools/rerank-server),")
-				fmt.Println("               or unset MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL to turn rerank off")
+				fmt.Printf("  rerank       UNAVAILABLE (%s): %s\n", sig.RerankModel, sig.RerankError)
+				fmt.Println("               searches FAIL while configured; fix the provider CLI/endpoint,")
+				fmt.Println("               or unset MESH_RERANK_AGENT / MESH_RERANK_ENDPOINT to turn rerank off")
 			case sig.RerankConfigured:
-				fmt.Printf("  rerank       active (cross-encoder %s)\n", sig.RerankModel)
+				fmt.Printf("  rerank       active (%s)", sig.RerankModel)
+				if sig.RerankCheck != "" {
+					fmt.Printf("; %s", sig.RerankCheck)
+				}
+				fmt.Println()
 			default:
-				fmt.Println("  rerank       off (set MESH_RERANK_ENDPOINT + MESH_RERANK_MODEL; see tools/rerank-server)")
+				fmt.Println("  rerank       off (set MESH_RERANK_AGENT=codex|claude, or configure a rerank endpoint)")
 			}
 			if wf, wg, wv := r.Weights(); wf != 0 || wg != 0 || wv != 0 {
 				fmt.Printf("  weights      learned fts=%.2f graph=%.2f vec=%.2f (MESH_WEIGHT_*)\n", wf, wg, wv)
