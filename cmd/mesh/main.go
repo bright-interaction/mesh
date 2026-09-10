@@ -73,6 +73,7 @@ func rootCmd() *cobra.Command {
 		healthCmd(),
 		flywheelCmd(),
 		economicsCmd(),
+		rerankCmd(),
 		ingestCmd(),
 		migrateCmd(),
 		scopeCmd(),

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -177,9 +178,9 @@ func (r *Retriever) Weights() (fts, graph, vec float64) {
 }
 
 // NewFromEnv builds a retriever and enables the optional BYOAI stages from the
-// environment. The semantic (vector) and rerank stages are independent: either,
-// both, or neither can be on. Falls back silently to lexical-only when nothing
-// is configured.
+// environment plus their local persisted configuration. The semantic (vector)
+// and rerank stages are independent: either, both, or neither can be on. Falls
+// back silently to lexical-only when nothing is configured.
 func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 	r, _ := NewFromEnvContext(context.Background(), store, g)
 	return r
@@ -316,10 +317,10 @@ func envOrFile(key, fallback string) (string, bool) {
 	return fallback, false
 }
 
-// enableRerank turns on either a user-local subscription CLI (env-only, so shared
-// vault config cannot force data egress through a member's account) or the legacy
-// cross-encoder endpoint (env-first, then solo config). The subscription model sees
-// only compact cards, never the full vault or full candidate note bodies.
+// enableRerank turns on either a user-local subscription CLI (environment first,
+// then the per-user/per-vault config outside the project) or the legacy cross-
+// encoder endpoint (env-first, then solo config). No shared vault or project file
+// can force subscription egress. The model sees compact cards, never note bodies.
 func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 	if b := os.Getenv("MESH_RERANK_BLEND"); b != "" {
 		if v, err := strconv.ParseFloat(b, 64); err == nil && v >= 0 && v <= 1 {
@@ -329,9 +330,28 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 		r.rerankBlend = rv.RerankBlend
 	}
 
-	if agent := strings.ToLower(strings.TrimSpace(os.Getenv("MESH_RERANK_AGENT"))); agent != "" && agent != "http" {
-		model := strings.TrimSpace(os.Getenv("MESH_RERANK_MODEL"))
-		rr, err := rerank.NewSubscriptionCLI(agent, model)
+	agent := strings.ToLower(strings.TrimSpace(os.Getenv("MESH_RERANK_AGENT")))
+	model := strings.TrimSpace(os.Getenv("MESH_RERANK_MODEL"))
+	policy := strings.TrimSpace(os.Getenv("MESH_RERANK_POLICY"))
+	if agent == "" {
+		sub, enabled, _, err := rerank.LoadLocalSubscription(filepath.Dir(r.store.MeshDir()))
+		if err != nil {
+			r.rerankName = "subscription/local-config"
+			r.rerankSetup = err
+			return
+		}
+		if enabled {
+			agent = sub.Agent
+			if model == "" {
+				model = sub.Model
+			}
+			if policy == "" {
+				policy = sub.Policy
+			}
+		}
+	}
+	if agent != "" && agent != "http" {
+		rr, err := rerank.NewConfiguredSubscriptionCLI(agent, model, policy)
 		if err != nil {
 			r.rerankName = "subscription/" + agent
 			r.rerankSetup = err
@@ -342,8 +362,8 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 	}
 
 	endpoint, fromEnv := envOrFile("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
-	model := envOr("MESH_RERANK_MODEL", rv.RerankModel)
-	if endpoint == "" || model == "" {
+	endpointModel := envOr("MESH_RERANK_MODEL", rv.RerankModel)
+	if endpoint == "" || endpointModel == "" {
 		return
 	}
 	// Same allow-list as the embedding key: see enableVectors.
@@ -355,7 +375,7 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 	if fromEnv {
 		newReranker = rerank.NewOperatorHTTP
 	}
-	r.EnableRerank(newReranker(endpoint, model, os.Getenv(keyEnv)))
+	r.EnableRerank(newReranker(endpoint, endpointModel, os.Getenv(keyEnv)))
 }
 
 // EnableRerank turns on the cross-encoder rerank stage. The reranker reorders the top-K

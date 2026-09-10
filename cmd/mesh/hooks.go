@@ -21,6 +21,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/llm"
 	"github.com/bright-interaction/mesh/internal/mcp"
+	"github.com/bright-interaction/mesh/internal/rerank"
 	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/spf13/cobra"
 )
@@ -269,7 +270,7 @@ func installIndexError(vaultAbs string, cause error) error {
 // it registers the MCP server in that client's own config and indexes the vault; the
 // agent then uses Mesh via the MCP server's instructions.
 func installCmd() *cobra.Command {
-	var dir, client string
+	var dir, client, rerankAgent string
 	var noMCP, enforce, remove bool
 	c := &cobra.Command{
 		Use:   "install [vault]",
@@ -294,7 +295,25 @@ func installCmd() *cobra.Command {
 				bin = "mesh"
 			}
 			if remove {
+				if rerankAgent != "" {
+					return fmt.Errorf("--rerank-agent cannot be combined with --remove; use mesh rerank disable %s", shellpath.Quote(vaultAbs))
+				}
 				return removeInstall(client, projAbs)
+			}
+			if noMCP && rerankAgent != "" {
+				return fmt.Errorf("--rerank-agent needs the local MCP registration; remove --no-mcp")
+			}
+			var rerankModel, rerankBin string
+			if rerankAgent != "" {
+				rerankAgent = strings.ToLower(strings.TrimSpace(rerankAgent))
+				rerankModel, err = rerank.DefaultSubscriptionModel(rerankAgent)
+				if err != nil {
+					return err
+				}
+				rerankBin, err = exec.LookPath(rerankAgent)
+				if err != nil {
+					return fmt.Errorf("%s CLI not found; install and sign in to it before enabling subscription rerank: %w", rerankAgent, err)
+				}
 			}
 			fmt.Printf("Setting up Mesh for %s...\n", client)
 
@@ -308,6 +327,11 @@ func installCmd() *cobra.Command {
 						fmt.Printf("  + registered the Mesh MCP server in %s\n", p)
 					} else {
 						fmt.Printf("  . MCP server already present in %s\n", p)
+					}
+					if rerankAgent != "" {
+						if err := installSubscriptionRerank(vaultAbs, rerankAgent, rerankModel, rerankBin); err != nil {
+							return err
+						}
 					}
 				}
 				res, err := hooks.Install(hooks.Options{ProjectDir: projAbs, Vault: vaultAbs, Bin: bin, EnforceWriteback: enforce})
@@ -344,6 +368,9 @@ func installCmd() *cobra.Command {
 				}
 				fmt.Println("\nDone. Start a new agent session (or reconnect the MCP server) and Mesh will")
 				fmt.Println("greet you and finish onboarding automatically, no commands needed.")
+				if rerankAgent == "" && !noMCP {
+					printSubscriptionRerankHint(client, vaultAbs)
+				}
 				return nil
 			}
 
@@ -356,6 +383,11 @@ func installCmd() *cobra.Command {
 				fmt.Printf("  + registered the Mesh MCP server for %s in %s\n", client, p)
 			} else {
 				fmt.Printf("  . MCP server already registered for %s in %s\n", client, p)
+			}
+			if rerankAgent != "" {
+				if err := installSubscriptionRerank(vaultAbs, rerankAgent, rerankModel, rerankBin); err != nil {
+					return err
+				}
 			}
 			nDropped, err := indexVault(vaultAbs)
 			if err != nil {
@@ -374,6 +406,9 @@ func installCmd() *cobra.Command {
 			fmt.Println("Note: the auto-onboard + write-back hooks are Claude Code only. Here the agent")
 			fmt.Println("uses Mesh via the MCP server's instructions, just ask it to use Mesh, or run")
 			fmt.Println("`mesh hooks install` if you also use Claude Code in this project.")
+			if rerankAgent == "" {
+				printSubscriptionRerankHint(client, vaultAbs)
+			}
 			return droppedNotesError(nDropped)
 		},
 	}
@@ -382,6 +417,7 @@ func installCmd() *cobra.Command {
 	c.Flags().BoolVar(&noMCP, "no-mcp", false, "skip registering the MCP server (claude-code only)")
 	c.Flags().BoolVar(&enforce, "enforce-writeback", false, "also install the Stop write-back nudge now (claude-code; default: the agent asks during onboarding)")
 	c.Flags().BoolVar(&remove, "remove", false, "undo the install: drop the mesh MCP entry from this client's config (and, on claude-code, the session hooks). Your vault is untouched")
+	c.Flags().StringVar(&rerankAgent, "rerank-agent", "", "opt in to subscription rerank through an existing codex or claude CLI login (pins the small Luna or Haiku model; no API key)")
 	return c
 }
 

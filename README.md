@@ -179,6 +179,32 @@ rerank improves the order after local FTS + graph candidate generation and can
 use either an HTTP endpoint or a developer's existing Codex/Claude subscription.
 Ollama is one optional local endpoint, not a Mesh dependency.
 
+For an existing MCP install, enable the small subscription model without editing
+shell startup files or adding an API key:
+
+```
+mesh rerank setup my-vault --client codex        # Codex: Luna, low effort
+mesh rerank setup my-vault --client claude-code  # Claude: Haiku 4.5, low effort
+mesh rerank status my-vault                      # executable check; no quota
+mesh rerank disable my-vault                     # remove this vault's opt-in
+```
+
+Or opt in while installing Mesh:
+
+```
+mesh install my-vault --client codex --rerank-agent codex
+mesh install my-vault --client claude-code --rerank-agent claude
+```
+
+Setup writes the provider, pinned small model, and `auto` policy into a 0600
+user-private config, keyed by the vault's canonical path and outside both the vault
+and project. It does not run the provider CLI, test authentication, or make a model call. Restart the client;
+the first ambiguous search checks the existing subscription login. Before changing
+the setting, the command says exactly what routed searches send to the provider.
+
+Environment variables remain available for one-shot `mesh search` / `mesh eval`
+use or custom deployments:
+
 ```
 # 1. Vectors: embed notes via any OpenAI-compatible /embeddings endpoint (Ollama, etc.)
 export MESH_EMBED_ENDPOINT=http://localhost:11434/v1
@@ -212,9 +238,9 @@ and mark the process as a Mesh LLM child. This prevents the strict-JSON child fr
 loading the workspace's own Stop hook. Exact repeat rankings are cached and calls
 are serialized within each Mesh process, preventing its concurrent searches from
 becoming a quota burst. This path sends the query and compact card fields to the
-selected provider; it is
-therefore opt-in and configured only by local process environment, never by synced
-vault configuration. Override the model with `MESH_RERANK_MODEL` and the timeout
+selected provider; it is therefore opt-in and configured only by the user-private
+per-vault file or local process environment, never by project or vault configuration.
+Override the model with `MESH_RERANK_MODEL` and the timeout
 with `MESH_RERANK_CMD_TIMEOUT` (default 90 seconds). `auto` is the subscription
 default: an exact note/title lookup or a clearly separated full-text winner stays
 zero-model, while an ambiguous slate is reranked. Set `MESH_RERANK_POLICY=always`
@@ -399,6 +425,7 @@ Set up and capture:
 | Command | Purpose |
 |---|---|
 | `mesh install` | One-shot setup: register the MCP server with your agent (plus the auto-onboard hook on Claude Code) |
+| `mesh install --rerank-agent codex\|claude` | Install and explicitly opt the local MCP server into the pinned small subscription model; no API key or setup inference call |
 | `mesh install --remove` | The inverse: drop the mesh entry from that client's config (and the session hooks on Claude Code). Run it before deleting the binary |
 | `mesh init [path]` | Bootstrap a new vault |
 | `mesh new <type> "<title>"` | Scaffold a note (id, date, placement, skeleton auto-filled) |
@@ -432,6 +459,7 @@ Inspect and maintain:
 | `mesh structure [vault]` | Grade the vault's organization: types, connectivity, tier-0, maps |
 | `mesh flywheel [vault]` | Write-back reuse metrics: does written-back knowledge get used again? |
 | `mesh economics [vault]` | Content-free retrieval economics: call rate, accounted tokens, cache/fallbacks and search-to-fetch choices |
+| `mesh rerank <setup\|status\|disable>` | Reversible local-only subscription rerank setup for an existing MCP registration |
 | `mesh guards <list\|suggest>` | Turn gotchas into candidate pre-commit guards (knowledge to enforcement) |
 | `mesh scope backfill` | Stamp an explicit access scope on notes that have none (which notes a given member may see; dry run unless `--apply`) |
 | `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines; `--require-rerank-win` also gates rerank economics |

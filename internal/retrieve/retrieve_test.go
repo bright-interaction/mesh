@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -743,6 +745,34 @@ func TestSubscriptionRerankerActivatesWithoutEndpointOrOllama(t *testing.T) {
 	}
 	if got := r.RerankModel(); got != "subscription/codex/gpt-5.6-luna" {
 		t.Fatalf("RerankModel = %q", got)
+	}
+}
+
+func TestUserLocalSubscriptionRerankerActivatesWithoutSharedConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	for _, key := range []string{"MESH_RERANK_AGENT", "MESH_RERANK_MODEL", "MESH_RERANK_POLICY", "MESH_RERANK_ENDPOINT"} {
+		t.Setenv(key, "")
+	}
+	r := buildVault(t)
+	vaultRoot := filepath.Dir(r.store.MeshDir())
+	if _, changed, err := rerank.SaveLocalSubscription(vaultRoot, rerank.SubscriptionConfig{
+		Agent: "codex", Model: "gpt-5.6-luna", Policy: "auto",
+	}); err != nil || !changed {
+		t.Fatalf("save local subscription changed=%v err=%v", changed, err)
+	}
+	r.enableRerank(meshcfg.Retrieval{})
+	if !r.RerankActive() || r.RerankModel() != "subscription/codex/gpt-5.6-luna" {
+		t.Fatalf("user-local subscription did not activate: active=%v model=%q", r.RerankActive(), r.RerankModel())
+	}
+	p, _ := rerank.LocalConfigPath()
+	if strings.HasPrefix(p, vaultRoot) {
+		t.Fatalf("subscription choice was stored in the shared vault: %s", p)
+	}
+	if _, err := os.Stat(filepath.Join(vaultRoot, ".mesh", "subscription-rerank.json")); !os.IsNotExist(err) {
+		t.Fatalf("subscription config appeared in the vault: %v", err)
 	}
 }
 

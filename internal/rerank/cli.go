@@ -35,6 +35,20 @@ const (
 	maxCLICacheEntries   = 256
 )
 
+// DefaultSubscriptionModel is the deliberately small model Mesh pins when its
+// onboarding command enables a subscription-backed reranker. Keeping the names
+// here makes the onboarding and execution defaults one decision.
+func DefaultSubscriptionModel(provider string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		return "gpt-5.6-luna", nil
+	case "claude":
+		return "claude-haiku-4-5-20251001", nil
+	default:
+		return "", fmt.Errorf("unknown subscription reranker %q (want codex|claude)", provider)
+	}
+}
+
 // Candidate is the compact, already-authorized card a language-model reranker
 // sees. It intentionally excludes the full note body: FTS + graph have already
 // narrowed the corpus, and a title plus matched snippet is enough for the small
@@ -100,6 +114,17 @@ var ErrCircuitOpen = errors.New("subscription reranker circuit open")
 // provider CLI. Supported providers are "codex" and "claude". Model may be
 // empty, selecting the lowest-cost preset (Luna for Codex, Haiku 4.5 for Claude).
 func NewSubscriptionCLI(provider, model string) (*CLI, error) {
+	return newSubscriptionCLI(provider, model, os.Getenv("MESH_RERANK_POLICY"))
+}
+
+// NewConfiguredSubscriptionCLI is the user-local-config counterpart to
+// NewSubscriptionCLI. The policy is explicit so retrieval need not mutate the
+// process environment merely to apply one vault's private preference.
+func NewConfiguredSubscriptionCLI(provider, model, policy string) (*CLI, error) {
+	return newSubscriptionCLI(provider, model, policy)
+}
+
+func newSubscriptionCLI(provider, model, policy string) (*CLI, error) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	model = strings.TrimSpace(model)
 
@@ -107,7 +132,7 @@ func NewSubscriptionCLI(provider, model string) (*CLI, error) {
 	switch provider {
 	case "codex":
 		if model == "" {
-			model = "gpt-5.6-luna"
+			model, _ = DefaultSubscriptionModel(provider)
 		}
 		argv = []string{
 			"codex", "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
@@ -118,7 +143,7 @@ func NewSubscriptionCLI(provider, model string) (*CLI, error) {
 		}
 	case "claude":
 		if model == "" {
-			model = "claude-haiku-4-5-20251001"
+			model, _ = DefaultSubscriptionModel(provider)
 		}
 		argv = []string{
 			"claude", "--print", "--safe-mode", "--restricted", "--strict-mcp-config", "--tools", "",
@@ -136,7 +161,7 @@ func NewSubscriptionCLI(provider, model string) (*CLI, error) {
 	if resultCap > candidateCap {
 		resultCap = candidateCap
 	}
-	policy := strings.ToLower(strings.TrimSpace(os.Getenv("MESH_RERANK_POLICY")))
+	policy = strings.ToLower(strings.TrimSpace(policy))
 	if policy == "" {
 		policy = "auto"
 	}
