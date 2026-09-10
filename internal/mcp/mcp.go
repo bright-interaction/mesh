@@ -934,7 +934,7 @@ func writeRPC(w http.ResponseWriter, resp response) {
 func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	switch req.Method {
 	case "initialize":
-		return s.handleInitialize(req.Params), nil
+		return s.handleInitialize(ctx, req.Params), nil
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
@@ -956,7 +956,7 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	}
 }
 
-func (s *Server) handleInitialize(params json.RawMessage) any {
+func (s *Server) handleInitialize(ctx context.Context, params json.RawMessage) any {
 	// Capture the calling agent's name (provenance default for write-back).
 	var p struct {
 		ClientInfo struct {
@@ -978,7 +978,7 @@ func (s *Server) handleInitialize(params json.RawMessage) any {
 			"resources": map[string]any{"listChanged": false, "subscribe": false},
 		},
 		"serverInfo":   map[string]any{"name": serverName, "version": serverVersion},
-		"instructions": contractText,
+		"instructions": s.initializeInstructions(ctx),
 	}
 }
 

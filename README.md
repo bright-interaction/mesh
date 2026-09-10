@@ -89,6 +89,18 @@ mesh doctor my-vault               # is the index fresh? any drift or lint probl
 Search matches the words in your notes, so query with terms the note actually
 uses. Semantic (paraphrase) matching is the optional BYOAI vector stage below.
 
+Connect the vault to your agent with one command:
+
+```
+mesh install my-vault --client codex       # or: claude-code, claude-desktop, cursor, vscode, windsurf
+```
+
+Restart or reconnect that client. Mesh will introduce itself once, offer a
+60-second tour, and then stay out of the way. Its permanent MCP instructions remain
+small, and retrieval stays zero-model unless you explicitly enable the optional
+subscription reranker described below. Claude Code also receives SessionStart hooks;
+the other clients need no project prompt-file edits.
+
 `mesh watch` is the local-first, Obsidian-like immediacy: edit a note in your
 editor and it is searchable at once, no commit, no manual `mesh index`. It
 reconciles at startup, on every change (debounced), and on a periodic safety
@@ -433,7 +445,7 @@ Set up and capture:
 
 | Command | Purpose |
 |---|---|
-| `mesh install` | One-shot setup: register the MCP server with your agent (plus the auto-onboard hook on Claude Code) |
+| `mesh install` | One-shot setup: register Mesh and deliver a one-time in-agent welcome; Claude Code also gets its SessionStart hook |
 | `mesh install --rerank-agent codex\|claude` | Install and explicitly opt the local MCP server into the pinned small subscription model; no API key or setup inference call |
 | `mesh install --remove` | The inverse: drop the mesh entry from that client's config (and the session hooks on Claude Code). Run it before deleting the binary |
 | `mesh init [path]` | Bootstrap a new vault |

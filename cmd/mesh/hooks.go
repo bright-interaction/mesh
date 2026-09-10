@@ -21,6 +21,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/llm"
 	"github.com/bright-interaction/mesh/internal/mcp"
+	"github.com/bright-interaction/mesh/internal/onboarding"
 	"github.com/bright-interaction/mesh/internal/rerank"
 	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/spf13/cobra"
@@ -265,17 +266,15 @@ func installIndexError(vaultAbs string, cause error) error {
 }
 
 // installCmd is the one-shot agent setup. For Claude Code it registers the MCP
-// server + the SessionStart read hook + arms the first-run welcome, so the agent
-// onboards the user automatically. For other clients (which have no session hooks)
-// it registers the MCP server in that client's own config and indexes the vault; the
-// agent then uses Mesh via the MCP server's instructions.
+// server + SessionStart read hook and arms the hook welcome. Other clients have no
+// session hooks, so their first local MCP initialization carries the one-time welcome.
 func installCmd() *cobra.Command {
 	var dir, client, rerankAgent string
 	var noMCP, enforce, remove bool
 	c := &cobra.Command{
 		Use:   "install [vault]",
-		Short: "One-shot setup: register the MCP server (and, on Claude Code, the auto-onboard hook). --remove undoes it",
-		Long:  "Wires a coding agent to use Mesh. --client claude-code (default) also installs the SessionStart read hook + a one-time welcome so the agent onboards you with no further commands. Other clients (claude-desktop, cursor, vscode, windsurf, codex) get the MCP server registered in their own config; session hooks are Claude Code only, so elsewhere the agent uses Mesh via the MCP server's instructions.\n\nIt also builds the vault's first index. If that fails (an unwritable vault, an unreadable .mesh/mesh.db) install stops and prints the repair instead of reporting success, because an agent wired to a mesh that cannot open just fails to connect, with no message.\n\nUse --remove to undo it: that drops the mesh entry from the same client config this command wrote (and, on claude-code, the session hooks too), leaving every other MCP server untouched. Run it before you delete the mesh binary, or the client keeps retrying a server that no longer exists. Your vault and its notes are never touched.",
+		Short: "One-shot setup: register Mesh and arm a one-time in-agent welcome. --remove undoes it",
+		Long:  "Wires a coding agent to use Mesh and arms a one-time welcome in the next agent session. --client claude-code (default) also installs its SessionStart read hook; other clients receive the welcome and read/write workflow through the local MCP server instructions, without changing project prompt files.\n\nIt also builds the vault's first index. If that fails (an unwritable vault, an unreadable .mesh/mesh.db) install stops and prints the repair instead of reporting success, because an agent wired to a mesh that cannot open just fails to connect, with no message.\n\nUse --remove to undo it: that drops the mesh entry from the same client config this command wrote (and, on claude-code, the session hooks too), leaving every other MCP server untouched. Run it before you delete the mesh binary, or the client keeps retrying a server that no longer exists. Your vault and its notes are never touched.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vaultPath := "."
@@ -393,19 +392,23 @@ func installCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := onboarding.SetPending(vaultAbs, client); err != nil {
+				return err
+			}
+			fmt.Println("  + armed the one-time in-agent welcome")
 			// The twin of the claude-code branch above, and it gets the same treatment for
 			// the same reason: the registration stands, the word "Done." does not.
 			if nDropped > 0 {
 				fmt.Printf("\nThe MCP server is registered for %s, but your mesh is INCOMPLETE: the note(s)\n", client)
 				fmt.Println("listed above are not in the index, so the agent will not see them. Fix them and run:")
 				fmt.Printf("  mesh index %s\n", shellpath.Quote(vaultAbs))
-				fmt.Printf("Then restart %s so it loads the MCP server.\n", client)
+				fmt.Printf("Then restart %s so it loads the MCP server and finishes onboarding.\n", client)
 			} else {
-				fmt.Printf("\nDone. Restart %s so it loads the MCP server.\n", client)
+				fmt.Printf("\nDone. Restart %s so it loads Mesh; it will greet you and offer a quick tour.\n", client)
 			}
-			fmt.Println("Note: the auto-onboard + write-back hooks are Claude Code only. Here the agent")
-			fmt.Println("uses Mesh via the MCP server's instructions, just ask it to use Mesh, or run")
-			fmt.Println("`mesh hooks install` if you also use Claude Code in this project.")
+			fmt.Println("Note: Claude Code is the only client with session lifecycle hooks. This client")
+			fmt.Println("receives the read/write workflow and one-time welcome through local MCP server")
+			fmt.Println("instructions; no project prompt file was edited.")
 			if rerankAgent == "" {
 				printSubscriptionRerankHint(client, vaultAbs)
 			}

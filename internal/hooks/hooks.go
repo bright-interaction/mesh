@@ -19,12 +19,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/bright-interaction/mesh/internal/onboarding"
 )
 
 // Clients lists the agent clients mesh install can register the MCP server for.
-// claude-code is the only one that also supports session hooks (auto-onboard);
-// the rest get the MCP tools + the server's instructions nudge.
-var Clients = []string{"claude-code", "claude-desktop", "cursor", "vscode", "windsurf", "codex"}
+// claude-code is the only one that also supports session hooks; every local MCP
+// client gets the retrieval contract and can receive a one-time onboarding message.
+var Clients = append([]string(nil), onboarding.Clients...)
 
 // clientConfig returns the MCP config path + format for a client. Formats:
 // "mcpServers" (Claude Desktop/Code/Cursor/Windsurf JSON), "servers" (VS Code JSON,
@@ -450,27 +452,16 @@ func InstallMCP(projectDir, vaultAbs, binPath string) (bool, string, error) {
 	return RegisterMCP("claude-code", projectDir, vaultAbs, binPath)
 }
 
-func onboardMarker(vaultRoot string) string { return filepath.Join(vaultRoot, ".mesh", "onboard") }
-
 // SetOnboardPending arms a one-time welcome: the next SessionStart orient prepends an
 // onboarding instruction so the agent greets the user and finishes setup itself.
 func SetOnboardPending(vaultRoot string) error {
-	p := onboardMarker(vaultRoot)
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(p, []byte("1"), 0o600)
+	return onboarding.SetSessionPending(vaultRoot)
 }
 
 // ConsumeOnboardPending returns true at most once (clearing the marker), so the
 // welcome fires on exactly the first session after install.
 func ConsumeOnboardPending(vaultRoot string) bool {
-	p := onboardMarker(vaultRoot)
-	if _, err := os.Stat(p); err != nil {
-		return false
-	}
-	_ = os.Remove(p)
-	return true
+	return onboarding.ConsumeSessionPending(vaultRoot)
 }
 
 // GetStatus reports whether the hooks are installed in a project.

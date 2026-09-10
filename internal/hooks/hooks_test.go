@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -154,6 +156,28 @@ func TestOnboardMarkerConsumeOnce(t *testing.T) {
 	}
 	if ConsumeOnboardPending(vault) {
 		t.Error("second consume should be false (fires exactly once)")
+	}
+}
+
+func TestOnboardMarkerHasOneWinnerUnderConcurrency(t *testing.T) {
+	vault := t.TempDir()
+	if err := SetOnboardPending(vault); err != nil {
+		t.Fatal(err)
+	}
+	var winners atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ConsumeOnboardPending(vault) {
+				winners.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := winners.Load(); got != 1 {
+		t.Fatalf("concurrent SessionStart consumes = %d, want exactly 1", got)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/onboarding"
 )
 
 // The automatic onboarding path, end to end: `mesh install` builds the first index and
@@ -274,4 +275,26 @@ func TestInstallIsTruthfulWhenNotesWereDropped(t *testing.T) {
 			t.Errorf("install reported dropped notes on a clean vault:\n%s", out)
 		}
 	})
+}
+
+func TestInstallArmsOneTimeMCPWelcomeForNonClaudeClient(t *testing.T) {
+	vault := t.TempDir()
+	proj := t.TempDir()
+	writeNote(t, vault, "one.md", goodNote)
+	out, err := runCLI(t, installCmd(), vault, "--dir", proj, "--client", "vscode")
+	if err != nil {
+		t.Fatalf("vscode install failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{"armed the one-time in-agent welcome", "it will greet you and offer a quick tour", "no project prompt file was edited"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("install receipt missing %q:\n%s", want, out)
+		}
+	}
+	client, ok := onboarding.ConsumePending(vault)
+	if !ok || client != "vscode" {
+		t.Fatalf("MCP onboarding marker = (%q, %v), want (vscode, true)", client, ok)
+	}
+	if _, err := os.Stat(filepath.Join(proj, "AGENTS.md")); !os.IsNotExist(err) {
+		t.Fatalf("install changed a durable project prompt: %v", err)
+	}
 }

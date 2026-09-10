@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/onboarding"
+	"github.com/bright-interaction/mesh/internal/rerank"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -124,6 +126,81 @@ func TestInitializeAndToolsList(t *testing.T) {
 	tools, _ := list["tools"].([]map[string]any)
 	if len(tools) != 17 {
 		t.Errorf("expected 17 tools, got %d", len(tools))
+	}
+}
+
+func TestInitializeDeliversMCPOnboardingOnceToLocalStdio(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newTestServer(t)
+	if err := onboarding.SetPending(s.vaultRoot, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	params := mustJSON(map[string]any{"clientInfo": map[string]any{"name": "codex"}})
+
+	// HTTP/hosted dispatches are not trusted local operators: they must neither see
+	// nor consume a marker stored on the server's machine.
+	remote, rerr := s.dispatch(context.Background(), request{Method: "initialize", Params: params})
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	remoteInstructions := remote.(map[string]any)["instructions"].(string)
+	if remoteInstructions != contractText {
+		t.Fatalf("remote initialize received local onboarding:\n%s", remoteInstructions)
+	}
+
+	local, rerr := s.dispatch(WithLocalOperator(context.Background()), request{Method: "initialize", Params: params})
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	instructions := local.(map[string]any)["instructions"].(string)
+	for _, want := range []string{"FIRST MESH SESSION", "shared knowledge vault", "zero-model by default", "--client codex", "Luna, low effort", contractText} {
+		if !strings.Contains(instructions, want) {
+			t.Errorf("one-time instructions missing %q:\n%s", want, instructions)
+		}
+	}
+	if len(instructions) > 2_000 {
+		t.Errorf("one-time instructions = %d bytes, budget is 2000", len(instructions))
+	}
+	// Codex may emphasize only the beginning of server instructions. Keep the first
+	// 512 bytes independently useful: identity, workflow, tour choice and no-delay
+	// guard all land before optional provider detail.
+	head := instructions
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	for _, want := range []string{"FIRST MESH SESSION", "shared knowledge vault", "60-second tour", "Do not delay their task", "zero-model by default"} {
+		if !strings.Contains(head, want) {
+			t.Errorf("first 512 onboarding bytes are not self-contained; missing %q:\n%s", want, head)
+		}
+	}
+
+	again, rerr := s.dispatch(WithLocalOperator(context.Background()), request{Method: "initialize", Params: params})
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := again.(map[string]any)["instructions"].(string); got != contractText {
+		t.Fatalf("second initialize repeated onboarding:\n%s", got)
+	}
+}
+
+func TestInitializeOnboardingReportsEnabledSubscriptionWithoutCallingIt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newTestServer(t)
+	if _, _, err := rerank.SaveLocalSubscription(s.vaultRoot, rerank.SubscriptionConfig{
+		Agent: "codex", Model: "gpt-5.6-luna", Policy: "auto",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := onboarding.SetPending(s.vaultRoot, "vscode"); err != nil {
+		t.Fatal(err)
+	}
+	init := call(t, s, "initialize", map[string]any{})
+	instructions := init["instructions"].(string)
+	if !strings.Contains(instructions, "already enabled with codex/gpt-5.6-luna at low effort") {
+		t.Fatalf("enabled setup not reported accurately:\n%s", instructions)
+	}
+	if strings.Contains(instructions, "--agent codex") {
+		t.Fatalf("enabled setup was presented as an opt-in:\n%s", instructions)
 	}
 }
 
