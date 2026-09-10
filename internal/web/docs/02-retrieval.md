@@ -21,7 +21,17 @@ Rerank is optional and BYOAI. Configure a cross-encoder endpoint in Settings, or
 set `MESH_RERANK_AGENT=codex|claude` in the local Mesh process to reuse that
 developer's subscription login. Subscription mode sends at most 12 compact cards
 to a low-effort model and returns 5 by default; it does not require Ollama or an API
-key and never sends full note bodies.
+key and never sends full note bodies. Its default `auto` policy keeps exact and
+clearly separated full-text matches local, calling Luna/Haiku only for ambiguous
+candidate slates. A provider failure is returned as an explicit local fallback and
+opens a short circuit instead of launching another failing child on every search.
+
+`mesh economics` reports content-free local counters for routes, calls, provider-
+reported model usage when available (tokenizer estimates otherwise), cache hits,
+fallbacks and returned context. A labelled `mesh eval`
+run can require the reranker to beat the identical local route on both quality and
+combined tokens with `--require-rerank-win`. MCP also attributes the first fetch
+after each search to its rank and route without retaining the query or note content.
 
 ## Budget packing
 

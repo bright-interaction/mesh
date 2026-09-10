@@ -80,6 +80,12 @@ type Server struct {
 
 	agent string // calling client's name from initialize (provenance default), guarded by mu
 
+	// lastSearch connects one subsequent mesh_fetch to the ranked slate that
+	// surfaced it. It stores only ids, ranks, route and time, never query or note
+	// content, and is guarded separately because HTTP transports may be concurrent.
+	searchMu   sync.Mutex
+	lastSearch searchAttribution
+
 	// ownerIndexTimeout bounds the wait for the owning writer to index a just-written
 	// note. A field rather than a bare const so a test can shorten it without mutating
 	// global state (which would race across parallel tests); production never sets it.
@@ -87,6 +93,12 @@ type Server struct {
 	// Deterministic test seam immediately before the atomic expected-version graph
 	// snapshot. Production leaves it nil.
 	beforeOwnerVersionRefresh func()
+}
+
+type searchAttribution struct {
+	at    time.Time
+	ranks map[string]int
+	route string
 }
 
 // Deterministic startup seams for owner turnover tests. Production leaves them nil.

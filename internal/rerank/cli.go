@@ -8,9 +8,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bright-interaction/mesh/internal/llm"
+	"github.com/bright-interaction/mesh/internal/tokenize"
 )
 
 const (
@@ -25,6 +28,7 @@ const (
 	defaultCLIResults    = 5
 	defaultCLICardChars  = 500
 	defaultCLITimeout    = 90 * time.Second
+	defaultCLICooldown   = 5 * time.Minute
 	maxCLIQueryChars     = 1200
 	maxCLITitleChars     = 180
 	maxCLIReasonChars    = 120
@@ -78,10 +82,19 @@ type CLI struct {
 	candidateCap int
 	resultCap    int
 	cardCharCap  int
+	policy       string
+	cooldown     time.Duration
 
-	mu    sync.Mutex
-	cache map[[sha256.Size]byte][]Result
+	mu        sync.Mutex
+	cache     map[[sha256.Size]byte][]Result
+	openUntil time.Time
+	openErr   string
 }
+
+// ErrCircuitOpen means a recent subscription failure is being negative-cached.
+// This prevents a usage-limit or authentication failure from spawning another
+// costly CLI session on every search during the same outage.
+var ErrCircuitOpen = errors.New("subscription reranker circuit open")
 
 // NewSubscriptionCLI builds a safe, no-API-key reranker for an already logged-in
 // provider CLI. Supported providers are "codex" and "claude". Model may be
@@ -123,6 +136,13 @@ func NewSubscriptionCLI(provider, model string) (*CLI, error) {
 	if resultCap > candidateCap {
 		resultCap = candidateCap
 	}
+	policy := strings.ToLower(strings.TrimSpace(os.Getenv("MESH_RERANK_POLICY")))
+	if policy == "" {
+		policy = "auto"
+	}
+	if policy != "auto" && policy != "always" {
+		return nil, fmt.Errorf("invalid MESH_RERANK_POLICY %q (want auto|always)", policy)
+	}
 	return &CLI{
 		provider:     provider,
 		model:        model,
@@ -131,6 +151,8 @@ func NewSubscriptionCLI(provider, model string) (*CLI, error) {
 		candidateCap: candidateCap,
 		resultCap:    resultCap,
 		cardCharCap:  envInt("MESH_RERANK_CARD_CHARS", defaultCLICardChars, 200, 2000),
+		policy:       policy,
+		cooldown:     envDurationSeconds("MESH_RERANK_FAILURE_COOLDOWN", defaultCLICooldown, 30, 3600),
 		cache:        make(map[[sha256.Size]byte][]Result),
 	}, nil
 }
@@ -140,6 +162,8 @@ func (c *CLI) Model() string { return "subscription/" + c.provider + "/" + c.mod
 func (c *CLI) CandidateLimit() int { return c.candidateCap }
 
 func (c *CLI) ResultLimit() int { return c.resultCap }
+
+func (c *CLI) RerankPolicy() string { return c.policy }
 
 func (c *CLI) Probe(context.Context) error {
 	if len(c.argv) == 0 {
@@ -164,11 +188,17 @@ func (c *CLI) Rerank(ctx context.Context, query string, docs []string) ([]Result
 }
 
 func (c *CLI) RerankCandidates(ctx context.Context, query string, candidates []Candidate) ([]Result, error) {
+	results, _, err := c.RerankCandidatesMeasured(ctx, query, candidates)
+	return results, err
+}
+
+func (c *CLI) RerankCandidatesMeasured(ctx context.Context, query string, candidates []Candidate) ([]Result, CallStats, error) {
+	var stats CallStats
 	if len(candidates) == 0 {
-		return nil, nil
+		return nil, stats, nil
 	}
 	if len(candidates) > c.candidateCap {
-		return nil, fmt.Errorf("subscription reranker received %d candidates, cap is %d", len(candidates), c.candidateCap)
+		return nil, stats, fmt.Errorf("subscription reranker received %d candidates, cap is %d", len(candidates), c.candidateCap)
 	}
 
 	compact := make([]Candidate, len(candidates))
@@ -182,7 +212,7 @@ func (c *CLI) RerankCandidates(ctx context.Context, query string, candidates []C
 	}
 	prompt, err := buildCLIPrompt(query, compact)
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 	key := sha256.Sum256([]byte(c.Model() + "\x00" + prompt))
 
@@ -192,31 +222,53 @@ func (c *CLI) RerankCandidates(ctx context.Context, query string, candidates []C
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if hit, ok := c.cache[key]; ok {
-		return cloneResults(hit), nil
+		stats.CacheHit = true
+		return cloneResults(hit), stats, nil
+	}
+	if time.Now().Before(c.openUntil) {
+		stats.CircuitOpen = true
+		return nil, stats, fmt.Errorf("%w until %s after: %s", ErrCircuitOpen, c.openUntil.Format(time.RFC3339), c.openErr)
 	}
 
-	out, err := c.run(ctx, prompt)
-	if err != nil {
-		return nil, err
+	stats.Called = true
+	stats.InputTokens = tokenize.Count(prompt)
+	started := time.Now()
+	out, diagnostic, err := c.run(ctx, prompt)
+	stats.Duration = time.Since(started)
+	if tokens, ok := providerTokenUsage(diagnostic); ok {
+		stats.ProviderTokens = tokens
+		stats.ProviderReported = true
 	}
+	if err != nil {
+		if ctx.Err() == nil {
+			c.openUntil = time.Now().Add(c.cooldown)
+			c.openErr = truncateUTF8(err.Error(), 240)
+		}
+		return nil, stats, err
+	}
+	stats.OutputTokens = tokenize.Count(out)
 	results, err := parseRanking(out, len(compact))
 	if err != nil {
-		return nil, fmt.Errorf("%s returned invalid strict JSON: %w", c.Model(), err)
+		c.openUntil = time.Now().Add(c.cooldown)
+		c.openErr = "invalid strict JSON"
+		return nil, stats, fmt.Errorf("%s returned invalid strict JSON: %w", c.Model(), err)
 	}
+	c.openUntil = time.Time{}
+	c.openErr = ""
 	if len(c.cache) >= maxCLICacheEntries {
 		clear(c.cache)
 	}
 	c.cache[key] = cloneResults(results)
-	return results, nil
+	return results, stats, nil
 }
 
-func (c *CLI) run(parent context.Context, prompt string) (string, error) {
+func (c *CLI) run(parent context.Context, prompt string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
 
 	dir, err := os.MkdirTemp("", "mesh-rerank-")
 	if err != nil {
-		return "", fmt.Errorf("create isolated reranker directory: %w", err)
+		return "", "", fmt.Errorf("create isolated reranker directory: %w", err)
 	}
 	defer os.RemoveAll(dir)
 
@@ -229,18 +281,39 @@ func (c *CLI) run(parent context.Context, prompt string) (string, error) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return "", stderr.String(), ctx.Err()
 		}
 		detail := truncateUTF8(strings.TrimSpace(stderr.String()), 500)
 		if detail == "" {
 			detail = err.Error()
 		}
-		return "", fmt.Errorf("%s CLI failed: %s", c.provider, detail)
+		return "", stderr.String(), fmt.Errorf("%s CLI failed: %s", c.provider, detail)
 	}
 	if stdout.Len() > maxRerankResponseBytes {
-		return "", fmt.Errorf("%s CLI output exceeded %d bytes", c.provider, maxRerankResponseBytes)
+		return "", stderr.String(), fmt.Errorf("%s CLI output exceeded %d bytes", c.provider, maxRerankResponseBytes)
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return strings.TrimSpace(stdout.String()), stderr.String(), nil
+}
+
+var (
+	tokensUsedPattern  = regexp.MustCompile(`(?im)tokens used\s*[:\r\n ]+\s*([0-9][0-9,]*)`)
+	totalTokensPattern = regexp.MustCompile(`(?i)"total_tokens"\s*:\s*([0-9]+)`)
+)
+
+// providerTokenUsage recognizes the stable human Codex footer and JSON usage
+// envelopes used by provider CLIs. Failure to recognize a future format is not
+// fatal: the caller keeps the tokenizer estimate and reports it as such.
+func providerTokenUsage(diagnostic string) (int, bool) {
+	match := tokensUsedPattern.FindStringSubmatch(diagnostic)
+	if len(match) != 2 {
+		matches := totalTokensPattern.FindAllStringSubmatch(diagnostic, -1)
+		if len(matches) == 0 {
+			return 0, false
+		}
+		match = matches[len(matches)-1]
+	}
+	n, err := strconv.Atoi(strings.ReplaceAll(match[1], ",", ""))
+	return n, err == nil && n >= 0
 }
 
 func buildCLIPrompt(query string, candidates []Candidate) (string, error) {

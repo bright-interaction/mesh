@@ -5,6 +5,7 @@ package rerank
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,9 @@ func TestSubscriptionCLIPresetsUseCheapModelsAndDisableAgentContext(t *testing.T
 	}
 	if codex.Model() != "subscription/codex/gpt-5.6-luna" {
 		t.Fatalf("codex model = %q", codex.Model())
+	}
+	if codex.RerankPolicy() != "auto" {
+		t.Fatalf("default policy = %q, want auto", codex.RerankPolicy())
 	}
 	joined := strings.Join(codex.argv, " ")
 	for _, want := range []string{"exec", "--ephemeral", "--ignore-user-config", "--sandbox read-only", "--disable plugins", "--disable shell_tool", "model_reasoning_effort=low"} {
@@ -39,6 +43,13 @@ func TestSubscriptionCLIPresetsUseCheapModelsAndDisableAgentContext(t *testing.T
 		if !strings.Contains(joined, want) {
 			t.Errorf("claude preset missing %q: %s", want, joined)
 		}
+	}
+}
+
+func TestSubscriptionCLIRejectsUnknownPolicy(t *testing.T) {
+	t.Setenv("MESH_RERANK_POLICY", "sometimes")
+	if _, err := NewSubscriptionCLI("codex", ""); err == nil {
+		t.Fatal("unknown rerank policy was silently accepted")
 	}
 }
 
@@ -132,12 +143,59 @@ func TestSubscriptionCLIConfigCaps(t *testing.T) {
 	t.Setenv("MESH_RERANK_RESULTS", "3")
 	t.Setenv("MESH_RERANK_CARD_CHARS", "333")
 	t.Setenv("MESH_RERANK_CMD_TIMEOUT", "12")
+	t.Setenv("MESH_RERANK_POLICY", "always")
+	t.Setenv("MESH_RERANK_FAILURE_COOLDOWN", "45")
 	c, err := NewSubscriptionCLI("codex", "gpt-custom")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.CandidateLimit() != 7 || c.ResultLimit() != 3 || c.cardCharCap != 333 || c.timeout != 12*time.Second {
+	if c.CandidateLimit() != 7 || c.ResultLimit() != 3 || c.cardCharCap != 333 || c.timeout != 12*time.Second || c.RerankPolicy() != "always" || c.cooldown != 45*time.Second {
 		t.Fatalf("env caps not applied: candidates=%d results=%d chars=%d timeout=%s", c.CandidateLimit(), c.ResultLimit(), c.cardCharCap, c.timeout)
+	}
+}
+
+func TestSubscriptionCLIMeasuresCacheAndOpensFailureCircuit(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	script := filepath.Join(dir, "rank.sh")
+	body := "#!/bin/sh\ncat >/dev/null\nprintf x >> \"$1\"\nprintf 'quota exhausted' >&2\nexit 1\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c := &CLI{
+		provider: "test", model: "tiny", argv: []string{script, countPath}, timeout: time.Second,
+		candidateCap: 2, cardCharCap: 200, cooldown: time.Minute, cache: make(map[[32]byte][]Result),
+	}
+	candidates := []Candidate{{Index: 0, Title: "one"}, {Index: 1, Title: "two"}}
+	_, first, err := c.RerankCandidatesMeasured(context.Background(), "pick one", candidates)
+	if err == nil || !first.Called || first.InputTokens == 0 || first.CircuitOpen {
+		t.Fatalf("first failure stats = %+v, err=%v", first, err)
+	}
+	_, second, err := c.RerankCandidatesMeasured(context.Background(), "pick one", candidates)
+	if !errors.Is(err, ErrCircuitOpen) || second.Called || !second.CircuitOpen {
+		t.Fatalf("second failure stats = %+v, err=%v", second, err)
+	}
+	count, _ := os.ReadFile(countPath)
+	if string(count) != "x" {
+		t.Fatalf("failure circuit launched %d processes, want 1", len(count))
+	}
+}
+
+func TestProviderTokenUsagePrefersReportedTotal(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want int
+	}{
+		{"tokens used\n3,524\n", 3524},
+		{`{"usage":{"input_tokens":10,"total_tokens":42}}`, 42},
+	} {
+		got, ok := providerTokenUsage(tc.raw)
+		if !ok || got != tc.want {
+			t.Fatalf("providerTokenUsage(%q) = %d,%t; want %d,true", tc.raw, got, ok, tc.want)
+		}
+	}
+	if _, ok := providerTokenUsage("ordinary diagnostic"); ok {
+		t.Fatal("providerTokenUsage invented usage for an unknown format")
 	}
 }
 

@@ -195,6 +195,7 @@ export MESH_RERANK_AGENT=codex    # or: claude
 export MESH_RERANK_CANDIDATES=12  # local FTS + graph cards sent to the small model
 export MESH_RERANK_RESULTS=5      # cards returned to the calling agent
 export MESH_RERANK_CARD_CHARS=500 # maximum matched-snippet bytes per card
+export MESH_RERANK_POLICY=auto    # default: exact/strong FTS stays local; ambiguous calls the model
 
 # 2b. Or use a cross-encoder endpoint (see tools/rerank-server).
 unset MESH_RERANK_AGENT
@@ -202,6 +203,7 @@ export MESH_RERANK_ENDPOINT=http://127.0.0.1:8787/rerank
 export MESH_RERANK_MODEL=Xenova/ms-marco-MiniLM-L-6-v2
 
 mesh status my-vault    # checks configured signals (subscription checks spend no quota)
+mesh economics my-vault # local, content-free call/token/cache/fallback counters
 ```
 
 The subscription presets run non-interactively in an empty temporary directory,
@@ -209,11 +211,15 @@ disable tools, MCP servers, hooks, settings discovery, and session persistence,
 and mark the process as a Mesh LLM child. This prevents the strict-JSON child from
 loading the workspace's own Stop hook. Exact repeat rankings are cached and calls
 are serialized within each Mesh process, preventing its concurrent searches from
-becoming a quota burst. This
-path sends the query and compact card fields to the selected provider; it is
+becoming a quota burst. This path sends the query and compact card fields to the
+selected provider; it is
 therefore opt-in and configured only by local process environment, never by synced
 vault configuration. Override the model with `MESH_RERANK_MODEL` and the timeout
-with `MESH_RERANK_CMD_TIMEOUT` (default 90 seconds).
+with `MESH_RERANK_CMD_TIMEOUT` (default 90 seconds). `auto` is the subscription
+default: an exact note/title lookup or a clearly separated full-text winner stays
+zero-model, while an ambiguous slate is reranked. Set `MESH_RERANK_POLICY=always`
+only for an evaluation or when reranking is a hard operator requirement. The strong
+match threshold is tunable with `MESH_RERANK_CONFIDENCE_MARGIN` (default 0.45).
 
 Both HTTP endpoints above are local, and that is the supported endpoint default:
 an endpoint you pass on the command line or set in the environment is operator input, so Mesh dials
@@ -234,11 +240,13 @@ Vector search in this repository is a brute-force cosine scan, which stays under
 5 ms well past a few thousand notes. The commercial build adds an approximate
 (HNSW) index for vaults large enough to need one, see [LICENSING.md](LICENSING.md).
 
-Once set, `mesh search` / `eval` / `mcp` fuse the semantic signal and apply the
-rerank automatically. Turning a stage OFF is safe (no embedder means lexical-only),
-but a stage you turned ON and that cannot be reached is an error, not a quiet
-downgrade: `mesh search` fails and names the configured provider, rather than handing
-back unreranked results that look reranked. Unset `MESH_RERANK_AGENT` and
+Once set, `mesh search` / `eval` / `mcp` fuse the semantic signal and route the
+bounded rerank according to its policy. Turning a stage OFF is safe (no embedder
+means lexical-only). HTTP rerank and subscription policy `always` fail loudly when
+unavailable. Subscription policy `auto` returns the local ranking with an explicit
+`fallback` receipt, opens a five-minute per-process circuit, and records the failure;
+it does not repeatedly spend quota or pretend the model answered. Tune the circuit
+with `MESH_RERANK_FAILURE_COOLDOWN` in seconds. Unset `MESH_RERANK_AGENT` and
 `MESH_RERANK_ENDPOINT` to turn rerank off for real. Pointing an endpoint at a cloud
 provider sends bounded note text off-box; enabling subscription rerank sends only
 the query plus compact cards.
@@ -251,6 +259,19 @@ winner. It tunes the fused ranking, so it helps most when you run vectors
 without a reranker (with a reranker on, the cross-encoder owns the top result and
 fusion weights wash out). Always pass a held-out `--test` set; tuning to the
 queries you report on is how you fool yourself.
+
+`mesh economics` also attributes the first `mesh_fetch` after a search to its
+content-free rank and route (within that MCP session and a ten-minute window), so
+real use reveals whether agents choose rank 1 or keep digging without retaining
+queries or note content.
+
+`mesh eval cases.json --require-rerank-win` adds the economics gate when a
+reranker is configured. It replays every labelled query through both the normal
+route and the identical local Mesh route, then requires equal-or-better recall@5
+and answer@1, a lower combined median after adding the second call's provider-reported
+tokens when available (otherwise the same bundled tokenizer estimate), and zero
+fallbacks. A failing gate is a reason to keep that provider/model
+opt-in, not to tune until the sample agrees.
 
 ## Wire it to your coding agent
 
@@ -410,9 +431,10 @@ Inspect and maintain:
 | `mesh health [vault]` | Knowledge lifecycle: dead source refs, overdue reviews, contradictions, plus notes missing from the index |
 | `mesh structure [vault]` | Grade the vault's organization: types, connectivity, tier-0, maps |
 | `mesh flywheel [vault]` | Write-back reuse metrics: does written-back knowledge get used again? |
+| `mesh economics [vault]` | Content-free retrieval economics: call rate, accounted tokens, cache/fallbacks and search-to-fetch choices |
 | `mesh guards <list\|suggest>` | Turn gotchas into candidate pre-commit guards (knowledge to enforcement) |
 | `mesh scope backfill` | Stamp an explicit access scope on notes that have none (which notes a given member may see; dry run unless `--apply`) |
-| `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines |
+| `mesh eval <cases.json>` | Gate-1 retrieval measurement vs FTS baselines; `--require-rerank-win` also gates rerank economics |
 | `mesh tune <cases.json>` | Learn fusion weights from labelled queries (validated on held-out) |
 
 View:

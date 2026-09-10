@@ -18,6 +18,7 @@ Precedence is always environment over file over default, everywhere in Mesh.
 - **Rerank**: a cross-encoder endpoint, model, key env var, and blend. A user's
   Codex/Claude subscription reranker is deliberately env-only
   (`MESH_RERANK_AGENT`) so shared vault config cannot force provider egress.
+  `MESH_RERANK_POLICY=auto|always` controls confidence routing; auto is default.
 - **Scale (pro)**: the HNSW threshold.
 
 ## Secrets

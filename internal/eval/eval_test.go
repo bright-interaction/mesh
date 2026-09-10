@@ -12,8 +12,31 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/rerank"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 )
+
+type accountingReranker struct{}
+
+func (accountingReranker) Model() string        { return "subscription/test/accounting" }
+func (accountingReranker) CandidateLimit() int  { return 12 }
+func (accountingReranker) ResultLimit() int     { return 5 }
+func (accountingReranker) RerankPolicy() string { return "always" }
+func (a accountingReranker) Rerank(ctx context.Context, query string, docs []string) ([]rerank.Result, error) {
+	candidates := make([]rerank.Candidate, len(docs))
+	return a.RerankCandidates(ctx, query, candidates)
+}
+func (accountingReranker) RerankCandidates(_ context.Context, _ string, candidates []rerank.Candidate) ([]rerank.Result, error) {
+	results := make([]rerank.Result, len(candidates))
+	for i := range candidates {
+		results[i] = rerank.Result{Index: i, Score: float64(len(candidates) - i)}
+	}
+	return results, nil
+}
+func (a accountingReranker) RerankCandidatesMeasured(ctx context.Context, query string, candidates []rerank.Candidate) ([]rerank.Result, rerank.CallStats, error) {
+	results, err := a.RerankCandidates(ctx, query, candidates)
+	return results, rerank.CallStats{Called: true, ProviderTokens: 50, ProviderReported: true}, err
+}
 
 // conceptEmbedder is a deterministic, network-free embedder that maps text to a
 // CONCEPT vector by keyword, not by token. Unlike the bag-of-words Stub it can
@@ -188,5 +211,16 @@ func TestRunGateBeatsBaselineOnLongNotes(t *testing.T) {
 	// The matched single-body baseline must be tracked (the fix the review demanded).
 	if rep.FTSTop1Median <= 0 {
 		t.Errorf("matched fts-top1 baseline should be measured, got %.0f", rep.FTSTop1Median)
+	}
+
+	// The economics arm must count provider-reported second-call usage and reject
+	// a reranker that preserves quality but only adds cost.
+	r.EnableRerank(accountingReranker{})
+	econ := RunGate(s, r, dir, []Case{{Query: "modernc sqlite storage", Relevant: []string{"storage"}}}, 400)
+	if !econ.RerankEvaluated || econ.RerankCalls != 1 || econ.ProviderReportedCalls != 1 || econ.RerankTokens != 50 {
+		t.Fatalf("rerank accounting missing: %+v", econ)
+	}
+	if econ.RerankCostWin || econ.RerankPass {
+		t.Fatalf("a quality-neutral 50-token second call incorrectly passed economics: %+v", econ)
 	}
 }

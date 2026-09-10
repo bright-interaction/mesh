@@ -84,7 +84,10 @@ Mesh returns cheap ranked cards and lets the agent pick the one note to open. Th
 why the core runs zero models. When saving the primary agent's context is more important
 than avoiding an extra call, optional subscription rerank lets Luna/Haiku rank a bounded
 card slate and returns only its small head. Vectors and HTTP rerank remain optional
-alternatives; Ollama is never required.
+alternatives; Ollama is never required. The default confidence gate keeps obvious
+matches local. Normal-route economics stay in content-free local counters; an
+exceptional fallback includes a tiny receipt so it cannot masquerade as model-ranked
+output.
 
 Editing through your editor (not a write API) is the intended path; the watcher or
 `mesh_reindex` keeps the index in lockstep. The API tab lists every tool and its schema.

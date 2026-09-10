@@ -72,6 +72,7 @@ func rootCmd() *cobra.Command {
 		statusCmd(),
 		healthCmd(),
 		flywheelCmd(),
+		economicsCmd(),
 		ingestCmd(),
 		migrateCmd(),
 		scopeCmd(),
@@ -464,9 +465,17 @@ func searchCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cards, err := retrieve.NewFromEnv(store, g).Retrieve(cmd.Context(), strings.Join(args, " "), retrieve.Options{Limit: limit, Budget: budget})
+			rt := retrieve.NewFromEnv(store, g)
+			var economics retrieve.Economics
+			cards, err := rt.Retrieve(cmd.Context(), strings.Join(args, " "), retrieve.Options{Limit: limit, Budget: budget, Economics: &economics})
 			if err != nil {
 				return err
+			}
+			economics.ReturnedCards = len(cards)
+			economics.ReturnedTokens = retrieve.TotalTokens(cards)
+			rt.RecordEconomics(economics)
+			if economics.Fallback {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: subscription rerank unavailable; returned explicit local fallback (circuit_open=%t)\n", economics.CircuitOpen)
 			}
 			if len(cards) == 0 {
 				fmt.Println("no matches")
@@ -500,6 +509,7 @@ func searchCmd() *cobra.Command {
 func evalCmd() *cobra.Command {
 	var vaultDir, casesFile string
 	var budget int
+	var requireRerankWin bool
 	c := &cobra.Command{
 		Use:   "eval <cases.json>",
 		Short: "Gate 1: measure Mesh retrieval vs the read-top-3-FTS baseline on a labelled query set",
@@ -545,14 +555,40 @@ func evalCmd() *cobra.Command {
 				pf(rep.SurfacingWin), pf(rep.AnswerWin), pf(rep.NaiveCostWin))
 			if rep.Pass {
 				fmt.Println("  VERDICT: PASS (all three sub-claims hold)")
-				return nil
+			} else {
+				fmt.Println("  VERDICT: PARTIAL (see sub-claims; matched fts-top1 cost shows the card overhead honestly)")
 			}
-			fmt.Println("  VERDICT: PARTIAL (see sub-claims; matched fts-top1 cost shows the card overhead honestly)")
-			return fmt.Errorf("gate 1 not fully met")
+
+			if rep.RerankEvaluated {
+				fmt.Printf("\nRerank economics: subscription/endpoint vs the identical local Mesh ranking\n")
+				fmt.Printf("  recall@5:              reranked %d/%d   local %d/%d\n", rep.RerankTop5Surfaced, rep.N, rep.LocalMeshSurfaced, rep.N)
+				fmt.Printf("  answer@1:              reranked %d/%d   local %d/%d\n", rep.MeshAnswer1, rep.N, rep.LocalMeshAnswer1, rep.N)
+				fmt.Printf("  combined tokens median: reranked %.0f   local %.0f\n", rep.CombinedMedian, rep.LocalMeshMedian)
+				fmt.Printf("  combined tokens mean:   reranked %.0f   local %.0f\n", rep.CombinedMean, rep.LocalMeshMean)
+				fmt.Printf("  model use:             %d calls, %d cache hits, %d fallbacks, %d accounted tokens (%d provider-reported calls)\n",
+					rep.RerankCalls, rep.RerankCacheHits, rep.RerankFallbacks, rep.RerankTokens, rep.ProviderReportedCalls)
+				fmt.Printf("  economics gate: quality>=local %s | combined-median<local %s | no-fallbacks %s\n",
+					pf(rep.RerankQualityWin), pf(rep.RerankCostWin), pf(rep.RerankFallbacks == 0))
+				if rep.RerankPass {
+					fmt.Println("  RERANK VERDICT: PASS (the second call earns its token cost)")
+				} else {
+					fmt.Println("  RERANK VERDICT: FAIL (keep this reranker opt-in; it has not earned default routing)")
+				}
+			} else if requireRerankWin {
+				return fmt.Errorf("--require-rerank-win needs a configured MESH_RERANK_AGENT or endpoint")
+			}
+			if !rep.Pass {
+				return fmt.Errorf("gate 1 not fully met")
+			}
+			if requireRerankWin && !rep.RerankPass {
+				return fmt.Errorf("rerank economics gate not met")
+			}
+			return nil
 		},
 	}
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
 	c.Flags().IntVar(&budget, "budget", 0, "token budget for the Mesh arm (0 = unbudgeted)")
+	c.Flags().BoolVar(&requireRerankWin, "require-rerank-win", false, "fail unless configured rerank beats local Mesh on quality and combined token median")
 	return c
 }
 
@@ -1152,6 +1188,130 @@ func flywheelCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	c.Flags().IntVar(&top, "top", 8, "show the N most-reused notes")
+	return c
+}
+
+type retrievalEconomicsReport struct {
+	Searches              int64   `json:"searches"`
+	RerankConfigured      int64   `json:"rerank_configured_searches"`
+	RerankCalls           int64   `json:"rerank_calls"`
+	CacheHits             int64   `json:"cache_hits"`
+	LocalExact            int64   `json:"local_exact"`
+	LocalConfident        int64   `json:"local_confident"`
+	Fallbacks             int64   `json:"fallbacks"`
+	CircuitOpen           int64   `json:"circuit_open"`
+	RerankInputTokens     int64   `json:"rerank_input_tokens"`
+	RerankOutputTokens    int64   `json:"rerank_output_tokens"`
+	AccountedModelTokens  int64   `json:"accounted_model_tokens"`
+	ProviderReportedCalls int64   `json:"provider_reported_calls"`
+	LocalContextTokens    int64   `json:"local_context_tokens"`
+	ActualContextTokens   int64   `json:"actual_context_tokens"`
+	ReturnedTokens        int64   `json:"returned_tokens"`
+	ReturnedCards         int64   `json:"returned_cards"`
+	RerankLatencyMS       int64   `json:"rerank_latency_ms"`
+	SearchLatencyMS       int64   `json:"search_latency_ms"`
+	CallRatePct           float64 `json:"call_rate_pct"`
+	AvgRerankTokens       float64 `json:"avg_rerank_tokens_per_call"`
+	AvgReturnedTokens     float64 `json:"avg_returned_tokens_per_search"`
+	AvgLocalContext       float64 `json:"avg_local_context_tokens_per_configured_search"`
+	AvgActualContext      float64 `json:"avg_actual_context_tokens_per_configured_search"`
+	AttributedFetches     int64   `json:"attributed_fetches"`
+	SelectedRank1         int64   `json:"selected_rank_1"`
+	SelectedTop5          int64   `json:"selected_top_5"`
+	SelectedAfterModel    int64   `json:"selected_after_model"`
+	SelectedAfterCache    int64   `json:"selected_after_cache"`
+	SelectedAfterFallback int64   `json:"selected_after_fallback"`
+}
+
+func economicsCmd() *cobra.Command {
+	var asJSON bool
+	c := &cobra.Command{
+		Use:   "economics [vault]",
+		Short: "Show content-free retrieval and optional-rerank token economics",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root := "."
+			if len(args) == 1 {
+				root = args[0]
+			}
+			store, err := index.OpenReadOnly(root)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			metric := func(key string) (int64, error) { return store.MetricContext(cmd.Context(), key) }
+			keys := map[string]*int64{}
+			rep := retrievalEconomicsReport{}
+			keys["retrieval:searches"] = &rep.Searches
+			keys["rerank:configured"] = &rep.RerankConfigured
+			keys["rerank:calls"] = &rep.RerankCalls
+			keys["rerank:cache_hits"] = &rep.CacheHits
+			keys["rerank:route:local_exact"] = &rep.LocalExact
+			keys["rerank:route:local_confident"] = &rep.LocalConfident
+			keys["rerank:fallbacks"] = &rep.Fallbacks
+			keys["rerank:circuit_open"] = &rep.CircuitOpen
+			keys["rerank:input_tokens"] = &rep.RerankInputTokens
+			keys["rerank:output_tokens"] = &rep.RerankOutputTokens
+			keys["rerank:accounted_tokens"] = &rep.AccountedModelTokens
+			keys["rerank:provider_reported_calls"] = &rep.ProviderReportedCalls
+			keys["rerank:local_context_tokens"] = &rep.LocalContextTokens
+			keys["rerank:actual_context_tokens"] = &rep.ActualContextTokens
+			keys["retrieval:returned_tokens"] = &rep.ReturnedTokens
+			keys["retrieval:returned_cards"] = &rep.ReturnedCards
+			keys["rerank:latency_ms"] = &rep.RerankLatencyMS
+			keys["retrieval:latency_ms"] = &rep.SearchLatencyMS
+			keys["retrieval:search_to_fetch"] = &rep.AttributedFetches
+			keys["retrieval:selected_rank:1"] = &rep.SelectedRank1
+			keys["rerank:selected_route:model"] = &rep.SelectedAfterModel
+			keys["rerank:selected_route:cache"] = &rep.SelectedAfterCache
+			keys["rerank:selected_route:fallback"] = &rep.SelectedAfterFallback
+			for key, dst := range keys {
+				v, err := metric(key)
+				if err != nil {
+					return err
+				}
+				*dst = v
+			}
+			for rank := 1; rank <= 5; rank++ {
+				v, err := metric(fmt.Sprintf("retrieval:selected_rank:%d", rank))
+				if err != nil {
+					return err
+				}
+				rep.SelectedTop5 += v
+			}
+			if rep.RerankConfigured > 0 {
+				rep.CallRatePct = 100 * float64(rep.RerankCalls) / float64(rep.RerankConfigured)
+				rep.AvgLocalContext = float64(rep.LocalContextTokens) / float64(rep.RerankConfigured)
+				rep.AvgActualContext = float64(rep.ActualContextTokens) / float64(rep.RerankConfigured)
+			}
+			if rep.RerankCalls > 0 {
+				rep.AvgRerankTokens = float64(rep.AccountedModelTokens) / float64(rep.RerankCalls)
+			}
+			if rep.Searches > 0 {
+				rep.AvgReturnedTokens = float64(rep.ReturnedTokens) / float64(rep.Searches)
+			}
+			if asJSON {
+				b, _ := json.MarshalIndent(rep, "", "  ")
+				fmt.Println(string(b))
+				return nil
+			}
+			fmt.Printf("Mesh retrieval economics (content-free local counters)\n\n")
+			fmt.Printf("  searches:                 %d\n", rep.Searches)
+			fmt.Printf("  rerank configured:        %d\n", rep.RerankConfigured)
+			fmt.Printf("  model calls:              %d (%.1f%% of configured searches)\n", rep.RerankCalls, rep.CallRatePct)
+			fmt.Printf("  cache hits:               %d\n", rep.CacheHits)
+			fmt.Printf("  local routes:             %d exact, %d confident\n", rep.LocalExact, rep.LocalConfident)
+			fmt.Printf("  explicit fallbacks:       %d (%d circuit-open)\n", rep.Fallbacks, rep.CircuitOpen)
+			fmt.Printf("  model tokens (accounted): %d (%.0f/call; %d/%d calls provider-reported)\n", rep.AccountedModelTokens, rep.AvgRerankTokens, rep.ProviderReportedCalls, rep.RerankCalls)
+			fmt.Printf("  tokenizer detail:         %d prompt + %d output estimated\n", rep.RerankInputTokens, rep.RerankOutputTokens)
+			fmt.Printf("  returned context:         %d tokens / %d cards (%.0f tokens/search)\n", rep.ReturnedTokens, rep.ReturnedCards, rep.AvgReturnedTokens)
+			fmt.Printf("  configured-search cost:   %.0f local-only vs %.0f actual tokens/search\n", rep.AvgLocalContext, rep.AvgActualContext)
+			fmt.Printf("  search→fetch choices:     %d attributed; %d rank-1, %d top-5\n", rep.AttributedFetches, rep.SelectedRank1, rep.SelectedTop5)
+			fmt.Printf("  chosen route:             %d model, %d cache, %d fallback\n", rep.SelectedAfterModel, rep.SelectedAfterCache, rep.SelectedAfterFallback)
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&asJSON, "json", false, "emit JSON")
 	return c
 }
 

@@ -814,6 +814,7 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 		budget = searchBudgetDefault
 	}
 	_, retriever := s.snapshot()
+	var economics retrieve.Economics
 	var allowed map[string]bool
 	if sf := scopeFromCtx(ctx); sf != nil {
 		allowed = sf.AllowedRead // nil-safe: nil => retriever does not filter
@@ -826,20 +827,38 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	// context, so it has to be measured on the FINAL form. Budget 0 here is not the
 	// /api/search defect (internal/web/search_cap_test.go): limit is already clamped
 	// above, so the unpacked set is bounded, and searchCardTokens packs it below.
-	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: limit, AllowedScopes: allowed})
+	cards, err := retriever.Retrieve(ctx, a.Query, retrieve.Options{Limit: limit, AllowedScopes: allowed, Economics: &economics})
 	if err != nil {
 		// retrievalErr, not internalErr: a timed-out search and a vault with nothing on
 		// the topic must not look the same to the agent. See retrievalUnavailableMsg.
 		return nil, retrievalErr(err)
 	}
-	cards = retrieve.PackToBudget(cards, budget, searchCardTokens)
+	receiptTokens := economics.ReceiptTokens()
+	cardBudget := budget - receiptTokens
+	if cardBudget <= 0 {
+		cards = nil
+	} else {
+		cards = retrieve.PackToBudget(cards, cardBudget, searchCardTokens)
+	}
+	economics.ReturnedCards = len(cards)
+	economics.ReturnedTokens = retrieve.TotalTokensFunc(cards, searchCardTokens) + receiptTokens
+	retriever.RecordEconomics(economics)
+	s.rememberSearch(cards, economics)
 	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)
-	return textResult(map[string]any{
+	result := map[string]any{
 		"cards": labelCards(cards),
 		// Reported with the SAME cost function the packer used, so the number the agent
 		// reads is the number that was packed to.
-		"tokens": retrieve.TotalTokensFunc(cards, searchCardTokens),
-	}), nil
+		"tokens": economics.ReturnedTokens,
+	}
+	// The normal route stays out of the wire payload: local counters hold the
+	// detailed economics without charging every agent response for telemetry.
+	// A fallback is exceptional and must be visible so local cards never
+	// masquerade as model-ranked output.
+	if economics.Fallback {
+		result["rerank"] = economics.Receipt()
+	}
+	return textResult(result), nil
 }
 
 // labelCard marks a card whose note came from a connector import: it stamps the source
@@ -931,7 +950,51 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 	_ = s.store.IncrMetric("fetches", 1)            // ROI telemetry (best-effort)
 	_ = s.store.IncrMetric("fetch:"+a.ID, 1)        // per-note reuse (most-reused list)
 	_ = s.store.RecordReuse(a.ID, flywheelReuseGap) // flywheel: a later fetch = the next run inheriting it
+	s.recordAttributedFetch(a.ID)
 	return rawText(body), nil
+}
+
+const searchAttributionWindow = 10 * time.Minute
+
+func (s *Server) rememberSearch(cards []retrieve.Card, economics retrieve.Economics) {
+	ranks := make(map[string]int, len(cards))
+	for i, card := range cards {
+		ranks[card.NoteID] = i + 1
+	}
+	s.searchMu.Lock()
+	s.lastSearch = searchAttribution{at: time.Now(), ranks: ranks, route: economics.Route}
+	s.searchMu.Unlock()
+}
+
+func (s *Server) recordAttributedFetch(noteID string) {
+	s.searchMu.Lock()
+	last := s.lastSearch
+	if time.Since(last.at) > searchAttributionWindow {
+		s.lastSearch = searchAttribution{}
+		s.searchMu.Unlock()
+		return
+	}
+	rank, ok := last.ranks[noteID]
+	if ok {
+		// Attribute only the first matching fetch after a search: this is the
+		// agent's selection from that slate, not a count of later note reading.
+		s.lastSearch = searchAttribution{}
+	}
+	s.searchMu.Unlock()
+	if !ok {
+		return
+	}
+	_ = s.store.IncrMetric("retrieval:search_to_fetch", 1)
+	if rank > 5 {
+		rank = 6
+	}
+	_ = s.store.IncrMetric(fmt.Sprintf("retrieval:selected_rank:%d", rank), 1)
+	switch last.route {
+	case "model", "cache", "local_exact", "local_confident", "fallback", "too_few", "disabled":
+		_ = s.store.IncrMetric("rerank:selected_route:"+last.route, 1)
+	default:
+		_ = s.store.IncrMetric("rerank:selected_route:other", 1)
+	}
 }
 
 func (s *Server) toolGodNodes(ctx context.Context, raw json.RawMessage) (any, *rpcError) {

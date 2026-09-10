@@ -43,6 +43,7 @@ var readOnlyCommands = map[string]string{
 	"codeSearchCmd":    "only calls store.SearchCode",
 	"codeContextCmd":   "only calls store.SearchCode + store.NotesForSymbolName",
 	"flywheelCmd":      "only calls store.FlywheelStats + store.TopReused",
+	"economicsCmd":     "only reads content-free retrieval counters",
 	"evalCmd":          "loads the graph and runs the retrieval benchmark",
 	"tuneCmd":          "loads the graph and sweeps retrieval parameters",
 }

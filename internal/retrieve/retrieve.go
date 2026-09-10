@@ -97,7 +97,11 @@ type Options struct {
 	WeightFTS   float64 // fusion weight; 0 across all three => resolved defaults
 	WeightGraph float64
 	WeightVec   float64
-	NoRerank    bool // skip the cross-encoder stage even when configured (for tuning the fusion itself)
+	NoRerank    bool // skip any rerank stage even when configured (for evaluation/tuning)
+	// Economics, when non-nil, receives content-free routing and token accounting
+	// for this call. Callers own the pointer, so concurrent searches never share
+	// mutable "last request" state.
+	Economics *Economics
 	// AllowedScopes, when non-nil, restricts results to notes whose scope intersects
 	// the set (access control). nil = unrestricted (solo / no-ACL fast path). This is
 	// THE read boundary and it is enforced throughout candidate generation: in the
@@ -695,6 +699,15 @@ func retrieveContextErr(ctx context.Context) error {
 // Retrieve runs the full pipeline and returns ranked (and optionally
 // budget-packed) cards.
 func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]Card, error) {
+	started := time.Now()
+	if opt.Economics != nil {
+		*opt.Economics = Economics{
+			RerankConfigured: r.RerankActive(),
+			RerankModel:      r.RerankModel(),
+			Route:            "disabled",
+		}
+		defer func() { opt.Economics.SearchLatencyMS = durationMillis(time.Since(started)) }()
+	}
 	if opt.Limit <= 0 {
 		opt.Limit = 20
 	}
@@ -910,6 +923,17 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		cards = append(cards, c)
 	}
 	sortCards(cards)
+	if opt.Economics != nil {
+		localView := cards
+		if opt.Limit > 0 && len(localView) > opt.Limit {
+			localView = localView[:opt.Limit]
+		}
+		if opt.Budget > 0 {
+			localView = packToBudget(localView, opt.Budget)
+		}
+		opt.Economics.LocalCards = len(localView)
+		opt.Economics.LocalCardTokens = TotalTokens(localView)
+	}
 
 	// Optional rerank of the head. HTTP cross-encoders score bounded note text;
 	// subscription CLIs rank an even smaller card slate. A CONFIGURED reranker that
@@ -929,6 +953,8 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 				cards = cards[:limit]
 			}
 		}
+	} else if opt.Economics != nil {
+		opt.Economics.Route = "disabled"
 	}
 
 	// Limit bounds the RETURNED set, after the reranker has had its say (so it can
@@ -942,6 +968,10 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 
 	if opt.Budget > 0 {
 		cards = packToBudget(cards, opt.Budget)
+	}
+	if opt.Economics != nil {
+		opt.Economics.ReturnedCards = len(cards)
+		opt.Economics.ReturnedTokens = TotalTokens(cards)
 	}
 	return cards, nil
 }
@@ -1104,24 +1134,31 @@ func sortCards(cards []Card) {
 // on the fused half of the blend), and the freshness decay was applied to the tail
 // only, so the head never decayed at all.
 //
-// It returns an error when the CONFIGURED reranker could not score the head. That is a
-// deliberate reversal: this used to return silently on a connect error, so a user who
+// HTTP and `always` policy return an error when the CONFIGURED reranker could not
+// score the head. That is a deliberate reversal: this used to return silently on a connect error, so a user who
 // pointed MESH_RERANK_ENDPOINT at a server that was down (or, before the client split
 // above, at a loopback address the SSRF guard refused) got byte-identical unreranked
 // results, exit 0, and `mesh status` still printing "rerank active". Zero requests ever
-// reached their server and nothing said so. A reranker the operator asked for and that
-// cannot be reached is an error, not a no-op. Conditions that are NOT errors (no
-// reranker configured, a head too short to reorder, a flat uninformative response) still
-// leave the fused order intact.
+// reached their server and nothing said so. Auto subscription mode is different by
+// explicit policy: it returns local cards, labels the fallback in the trace/wire, and
+// opens a circuit. Conditions that are NOT errors (no reranker configured, a head too
+// short to reorder, a flat uninformative response) still leave the fused order intact.
 func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, fusedRaw map[string]float64, opt Options) ([]Card, error) {
 	if r.rerankSetup != nil {
 		return nil, fmt.Errorf("%w (%s): %w", ErrRerankUnavailable, r.rerankName, r.rerankSetup)
 	}
-	if r.rr == nil || len(cards) < 2 {
+	if r.rr == nil {
+		return cards, nil
+	}
+	if len(cards) < 2 {
+		if opt.Economics != nil {
+			opt.Economics.Route = "too_few"
+		}
 		return cards, nil
 	}
 	k := rerankK
-	if compact, ok := r.rr.(rerank.CandidateReranker); ok {
+	compact, compactOK := r.rr.(rerank.CandidateReranker)
+	if compactOK {
 		if limit := compact.CandidateLimit(); limit > 0 && limit < k {
 			k = limit
 		}
@@ -1130,9 +1167,22 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 		k = len(cards)
 	}
 	if k < 2 {
+		if opt.Economics != nil {
+			opt.Economics.Route = "too_few"
+		}
 		return cards, nil
 	}
 	candidateHead := cards[:k]
+	if compactOK {
+		call, route := subscriptionRoute(query, candidateHead, rerankPolicy(r.rr))
+		if opt.Economics != nil {
+			opt.Economics.CandidateCards = k
+			opt.Economics.Route = route
+		}
+		if !call {
+			return cards, nil
+		}
+	}
 	ids := make([]string, k)
 	for i := range candidateHead {
 		ids[i] = candidateHead[i].NodeID
@@ -1162,10 +1212,15 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 	cards = append(head, cards[k:]...)
 	k = len(head)
 	if k < 2 {
+		if opt.Economics != nil {
+			opt.Economics.Route = "too_few"
+			opt.Economics.CandidateCards = k
+		}
 		return cards, nil
 	}
 	var res []rerank.Result
-	if compact, ok := r.rr.(rerank.CandidateReranker); ok {
+	var callStats rerank.CallStats
+	if compactOK {
 		candidates := make([]rerank.Candidate, k)
 		for i := range head {
 			candidates[i] = rerank.Candidate{
@@ -1175,11 +1230,58 @@ func (r *Retriever) rerankHead(ctx context.Context, query string, cards []Card, 
 				Reason:  head[i].Reason,
 			}
 		}
-		res, err = compact.RerankCandidates(ctx, query, candidates)
+		if measured, ok := r.rr.(rerank.MeasuredCandidateReranker); ok {
+			res, callStats, err = measured.RerankCandidatesMeasured(ctx, query, candidates)
+		} else {
+			callStats.Called = true
+			started := time.Now()
+			res, err = compact.RerankCandidates(ctx, query, candidates)
+			callStats.Duration = time.Since(started)
+		}
 	} else {
+		callStats.Called = true
+		callStats.InputTokens = EstimateTokens(query)
+		for _, doc := range docs {
+			callStats.InputTokens += EstimateTokens(doc)
+		}
+		started := time.Now()
 		res, err = r.rr.Rerank(ctx, query, docs)
+		callStats.Duration = time.Since(started)
+		if err == nil {
+			callStats.OutputTokens = estimateRerankResults(res)
+		}
+	}
+	if opt.Economics != nil {
+		opt.Economics.CandidateCards = k
+		opt.Economics.RerankCalled = callStats.Called
+		opt.Economics.CacheHit = callStats.CacheHit
+		opt.Economics.CircuitOpen = callStats.CircuitOpen
+		opt.Economics.RerankInput = callStats.InputTokens
+		opt.Economics.RerankOutput = callStats.OutputTokens
+		opt.Economics.RerankProviderTokens = callStats.ProviderTokens
+		opt.Economics.ProviderReported = callStats.ProviderReported
+		opt.Economics.RerankLatencyMS = durationMillis(callStats.Duration)
+		if callStats.CacheHit {
+			opt.Economics.Route = "cache"
+		} else {
+			opt.Economics.Route = "model"
+		}
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// Auto subscription mode is an optimization, never a retrieval dependency.
+		// Fall back to the already-ranked local cards, but make that state explicit
+		// in the trace and persistent counters. `always` and HTTP retain fail-loud
+		// semantics for evaluation and operator-enforced reranking.
+		if compactOK && rerankPolicy(r.rr) == "auto" {
+			if opt.Economics != nil {
+				opt.Economics.Route = "fallback"
+				opt.Economics.Fallback = true
+			}
+			return cards, nil
+		}
 		return nil, fmt.Errorf("%w (%s): %w\n  fix the provider CLI, start the endpoint (see tools/rerank-server), or unset MESH_RERANK_AGENT / MESH_RERANK_ENDPOINT to search without it", ErrRerankUnavailable, r.rerankName, err)
 	}
 	if len(res) != k {

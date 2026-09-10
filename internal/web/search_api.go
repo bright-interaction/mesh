@@ -60,7 +60,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "search failed", http.StatusInternalServerError)
 		return
 	}
-	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r), AllowPath: s.allowedPath(r)})
+	var economics retrieve.Economics
+	cards, err := rt.Retrieve(r.Context(), q, retrieve.Options{Limit: limit, Budget: budget, AllowedScopes: s.allowedScopes(r), AllowPath: s.allowedPath(r), Economics: &economics})
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
@@ -68,8 +69,24 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "search failed", http.StatusInternalServerError)
 		return
 	}
+	receiptTokens := economics.ReceiptTokens()
+	if receiptTokens > 0 {
+		cardBudget := budget - receiptTokens
+		if cardBudget <= 0 {
+			cards = nil
+		} else {
+			cards = retrieve.PackToBudget(cards, cardBudget, nil)
+		}
+	}
+	economics.ReturnedCards = len(cards)
+	economics.ReturnedTokens = retrieve.TotalTokens(cards) + receiptTokens
+	rt.RecordEconomics(economics)
 	_ = s.store.IncrMetric("queries", 1) // ROI telemetry (best-effort)
-	writeJSON(w, map[string]any{"cards": cards, "tokens": retrieve.TotalTokens(cards)})
+	result := map[string]any{"cards": cards, "tokens": economics.ReturnedTokens}
+	if economics.Fallback {
+		result["rerank"] = economics.Receipt()
+	}
+	writeJSON(w, result)
 }
 
 // handleNote returns one note's raw markdown by frontmatter id, the browser
