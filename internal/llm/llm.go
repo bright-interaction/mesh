@@ -39,6 +39,11 @@ import (
 // (operator-editable) endpoint cannot OOM the process; a chat completion is small.
 const maxLLMResponseBytes = 32 << 20
 
+// ChildEnv marks every command-line LLM subprocess started by Mesh. Session
+// hooks inherit the agent process environment, so Mesh's Stop hook uses this
+// marker to avoid nudging or auto-extracting its own strict-output children.
+const ChildEnv = "MESH_LLM_CHILD"
+
 // ErrRateLimited (429) is transient: the caller should back off and retry the
 // whole pass later, not hammer the rest of the batch.
 var ErrRateLimited = errors.New("llm: rate limited")
@@ -94,7 +99,9 @@ func (c *cliClient) Complete(ctx context.Context, system, user string) (string, 
 	// credential-shaped var so ingest tokens, the cookie/OIDC secrets, and the embed/
 	// rerank keys can't be exfiltrated. The child's OWN auth (ANTHROPIC_*/CLAUDE_*) and
 	// PATH/HOME/locale are preserved so `claude -p` still authenticates.
-	cmd.Env = sanitizedEnv()
+	// Append after sanitizing: a value inherited from the parent is stripped with
+	// the other MESH_* variables, then replaced with the one trusted fixed value.
+	cmd.Env = append(sanitizedEnv(), ChildEnv+"=1")
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

@@ -19,6 +19,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/llm"
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/shellpath"
 	"github.com/spf13/cobra"
@@ -525,11 +526,15 @@ func hooksUninstallCmd() *cobra.Command {
 func hooksStopCheckCmd() *cobra.Command {
 	var vault string
 	var autoExtract bool
+	var extractCap int
 	c := &cobra.Command{
 		Use:    "stop-check",
 		Short:  "Internal: a Stop hook that nudges write-back to Mesh once per session",
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if os.Getenv(llm.ChildEnv) != "" {
+				return nil
+			}
 			var in struct {
 				SessionID      string `json:"session_id"`
 				TranscriptPath string `json:"transcript_path"`
@@ -553,7 +558,11 @@ func hooksStopCheckCmd() *cobra.Command {
 					exMarker := filepath.Join(os.TempDir(), "mesh-extracted-"+sanitizeID(sid))
 					if _, err := os.Stat(exMarker); err != nil {
 						_ = os.WriteFile(exMarker, []byte("1"), 0o644)
-						spawnExtraction(vault, in.TranscriptPath)
+						if claimExtractionSlot(vault, extractCap, extractionNow()) {
+							spawnExtractionFn(vault, in.TranscriptPath)
+						} else if extractCap > 0 {
+							logExtractionSkip(vault, extractCap, in.TranscriptPath)
+						}
 					}
 				}
 				return nil // do not loop
@@ -573,7 +582,64 @@ func hooksStopCheckCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&vault, "vault", "", "vault to queue auto-extracted candidates into (enables the fallback extractor)")
 	c.Flags().BoolVar(&autoExtract, "extract", false, "auto-extract session learnings into the review queue when the agent did not write back")
+	c.Flags().IntVar(&extractCap, "extract-cap", 20, "maximum automatic extractions per local day (0 disables auto-extraction)")
 	return c
+}
+
+var (
+	spawnExtractionFn = spawnExtraction
+	extractionNow     = time.Now
+)
+
+// claimExtractionSlot atomically claims one of cap daily slots. O_EXCL makes the
+// ceiling hold even when many Stop hooks finish concurrently.
+func claimExtractionSlot(vault string, cap int, now time.Time) bool {
+	if cap <= 0 {
+		return false
+	}
+	root := filepath.Join(vault, ".mesh", "extract-slots")
+	today := now.Format("2006-01-02")
+	dir := filepath.Join(root, today)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false
+	}
+	pruneExtractionSlots(root, now.AddDate(0, 0, -1))
+	for i := 1; i <= cap; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("%d", i))
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_ = f.Close()
+			return true
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return false
+		}
+	}
+	return false
+}
+
+func pruneExtractionSlots(root string, yesterday time.Time) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	keepFrom := yesterday.Format("2006-01-02")
+	for _, entry := range entries {
+		if entry.IsDir() && entry.Name() < keepFrom {
+			_ = os.RemoveAll(filepath.Join(root, entry.Name()))
+		}
+	}
+}
+
+func logExtractionSkip(vault string, cap int, transcript string) {
+	logPath := filepath.Join(vault, ".mesh", "extract.log")
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o700)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "auto-extract: daily cap %d reached, skipping %s\n", cap, transcript)
 }
 
 // spawnExtraction launches `mesh extract --to-pending <vault> <transcript>` as a

@@ -233,6 +233,18 @@ func TestCLIComplete(t *testing.T) {
 	}
 }
 
+func TestCLICompleteMarksMeshChild(t *testing.T) {
+	t.Setenv(ChildEnv, "untrusted-parent-value")
+	c := &cliClient{argv: []string{writeScript(t, `printf '%s' "$MESH_LLM_CHILD"`)}, timeout: generousTimeout}
+	out, err := c.Complete(context.Background(), "system", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "1" {
+		t.Fatalf("%s = %q, want 1", ChildEnv, out)
+	}
+}
+
 // The CLI error taxonomy decides whether the curator halts the whole pass (ErrAuth,
 // no attempt charged) or charges THIS job an attempt. Only a CLI that could not start
 // or that reports a login problem is global; anything that depends on the job's own
