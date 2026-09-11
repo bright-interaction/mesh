@@ -1036,6 +1036,10 @@ func captureGuardedFile(vaultDir, rel, expectedHash, role string, before func(st
 	if err != nil {
 		return nil, err
 	}
+	backupDir := filepath.Dir(backup)
+	if err := vault.PrepareSiblingDirectory(path, backup); err != nil {
+		return nil, err
+	}
 	if err := os.Rename(path, backup); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -1063,6 +1067,7 @@ func captureGuardedFile(vaultDir, rel, expectedHash, role string, before func(st
 		return nil, fmt.Errorf("make guarded copy %s durable: %w", backupRel, err)
 	}
 	syncDir(dir)
+	syncDir(backupDir)
 	perm := fi.Mode().Perm()
 	return &guardedFile{rel: backupRel, path: backup, content: captured, perm: perm}, nil
 }
@@ -1117,6 +1122,7 @@ func discardGuardedFile(g *guardedFile, dir string) error {
 		return err
 	}
 	syncDir(dir)
+	syncDir(filepath.Dir(g.path))
 	return nil
 }
 

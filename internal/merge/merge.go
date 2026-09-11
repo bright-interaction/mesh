@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // MaxNoteBytes caps a mergeable note; larger or binary content is rejected
@@ -142,11 +143,33 @@ func conflict(path string, losing []byte, now time.Time, user string) Resolution
 // rather than spawning a new one every time).
 func SiblingPath(path string, now time.Time, user string, losing []byte) string {
 	ext := filepath.Ext(path)
-	stem := strings.TrimSuffix(path, ext)
+	dir := filepath.Dir(path)
+	stem := strings.TrimSuffix(filepath.Base(path), ext)
 	sum := sha256.Sum256([]byte(normalize(losing)))
 	short := hex.EncodeToString(sum[:])[:16] // 64-bit: collisions cryptographically implausible
-	return fmt.Sprintf("%s.sync-conflict-%s-%s-%s%s", stem, now.Format("20060102"), sanitizeUser(user), short, ext)
+	actor := sanitizeUser(user)
+	if len(actor) > 48 {
+		// Preserve 128 bits of identity, including guard nonces, without allowing
+		// a user-controlled label to consume the entire filesystem name budget.
+		h := sha256.Sum256([]byte(user))
+		actor = "u-" + hex.EncodeToString(h[:16])
+	}
+	suffix := fmt.Sprintf("%s%s-%s-%s%s", siblingMarker, now.Format("20060102"), actor, short, ext)
+	if len(stem+suffix) <= 240 {
+		return filepath.ToSlash(filepath.Join(dir, stem+suffix))
+	}
+	// Preserve the complete base name across two bounded components. A truncated
+	// slug cannot be reversed safely by conflicts resolve (and can alias another
+	// note). The reserved directory carries the prefix; the file still carries
+	// the normal conflict marker, so existing walkers exclude the parked bytes.
+	cut := len(stem) / 2
+	for cut > 0 && !utf8.RuneStart(stem[cut]) {
+		cut--
+	}
+	return filepath.ToSlash(filepath.Join(dir, "base-"+stem[:cut]+siblingDirectorySuffix, stem[cut:]+suffix))
 }
+
+const siblingDirectorySuffix = ".sync-conflict-base-v1"
 
 // siblingMarker is the reserved infix SiblingPath inserts; a legitimate base note
 // name never contains it (the vault walker excludes any file that does).
@@ -160,19 +183,30 @@ const siblingMarker = ".sync-conflict-"
 // (a doubly-nested/garbage name) is refused, since no real base note can.
 func BasePath(sibling string) (string, bool) {
 	ext := filepath.Ext(sibling)
-	stem := strings.TrimSuffix(sibling, ext)
+	stem := strings.TrimSuffix(filepath.Base(sibling), ext)
 	idx := strings.LastIndex(stem, siblingMarker)
 	if idx < 0 {
 		return "", false
 	}
-	base := stem[:idx] + ext
+	base := filepath.Join(filepath.Dir(sibling), stem[:idx]+ext)
+	// Overflow siblings split the original stem across a reserved parent and the
+	// file. Reassemble before the ordinary nested-marker/empty-name rejection.
+	dir := filepath.Dir(base)
+	if strings.HasSuffix(filepath.Base(dir), siblingDirectorySuffix) {
+		prefix := strings.TrimSuffix(filepath.Base(dir), siblingDirectorySuffix)
+		if !strings.HasPrefix(prefix, "base-") || prefix == "base-" {
+			return "", false
+		}
+		prefix = strings.TrimPrefix(prefix, "base-")
+		base = filepath.Join(filepath.Dir(dir), prefix+filepath.Base(base))
+	}
 	// Reject an empty base stem in any directory (e.g. "notes/.md" from a crafted
 	// ".sync-conflict-..." name) and a recovered base that still looks like a
 	// sibling (a doubly-nested/garbage name): no real base note can.
 	if strings.TrimSuffix(filepath.Base(base), ext) == "" || strings.Contains(base, siblingMarker) {
 		return "", false
 	}
-	return base, true
+	return filepath.ToSlash(base), true
 }
 
 // appendMerge unions two additive edits to a shared file. It succeeds only when

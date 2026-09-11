@@ -381,7 +381,11 @@ mesh sync my-vault                                    # push yours, pull theirs
 
 Reconcile-first: `mesh sync` is a three-way merge. Two people adding blocks to the
 same page auto-merge; a true overwrite of the same lines keeps the hub version and
-saves yours to a `*.sync-conflict-*.md` sibling to resolve by hand. Deletes and
+saves yours to a `*.sync-conflict-*.md` sibling to resolve by hand. Long note names
+use a reserved `.sync-conflict-base-v1` directory to keep every component within
+the filesystem limit while preserving the exact original name. Use v0.17 or newer
+to resolve these overflow conflicts; older clients retain the bytes but cannot
+reconstruct the base path. Deletes and
 renames propagate; the hub authors git history attributed to each user. Add
 `mesh sync --watch` for real-time SSE push (the hub's changes pull in as they
 land). A standalone `mesh-curator` worker can reconcile non-trivial conflicts with

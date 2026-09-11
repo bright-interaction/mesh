@@ -2224,7 +2224,8 @@ func hubDue(reason string, last time.Time, interval time.Duration, now time.Time
 // burst, the local index commit comes first so another process waiting to
 // acknowledge a write-back is never blocked on the network. The discovery pass
 // still runs after sync and therefore absorbs any notes the hub pulled. Passes
-// without exact paths retain the original sync-then-reconcile order.
+// without exact paths discover local changes before the network too: a missed
+// event or an SSE nudge must not put a saved note behind a slow failing sync.
 func syncWatchPass(
 	p watch.Pass,
 	doHub bool,
@@ -2235,6 +2236,8 @@ func syncWatchPass(
 	var targetedErr, syncErr error
 	if len(p.Paths) > 0 {
 		targetedErr = reconcile(p.Paths, false)
+	} else if doHub {
+		targetedErr = reconcile(nil, p.Authoritative)
 	}
 	if doHub {
 		sum, syncErr = syncHub()

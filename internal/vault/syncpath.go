@@ -81,6 +81,13 @@ func SafeSyncPath(p string) (string, bool) {
 		return "", false
 	}
 	parts := strings.Split(filepath.ToSlash(clean), "/")
+	// Refuse an unmaterializable wire path before any filesystem probe. The
+	// portable component limit is bytes, including the extension, not runes.
+	for _, part := range parts {
+		if len(part) > 255 {
+			return "", false
+		}
+	}
 	for _, dir := range parts[:len(parts)-1] {
 		if !syncableDir(dir) {
 			return "", false

@@ -458,6 +458,13 @@ func captureObservedFile(path, basePath string, observed []byte, beforeCapture f
 	if err := resolutionDurabilityProbe(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("conflict-resolution input retained because its directory cannot be flushed durably: %w", err)
 	}
+	captureDir := filepath.Dir(capturePath)
+	if err := vault.PrepareSiblingDirectory(basePath, capturePath); err != nil {
+		return nil, err
+	}
+	if err := resolutionDurabilityProbe(filepath.Dir(captureDir)); err != nil {
+		return nil, err
+	}
 	if err := os.Rename(path, capturePath); err != nil {
 		return nil, err
 	}
@@ -485,6 +492,9 @@ func captureObservedFile(path, basePath string, observed []byte, beforeCapture f
 	}
 	if err := resolutionSyncDir(filepath.Dir(path)); err != nil {
 		return nil, errors.Join(fmt.Errorf("conflict-resolution capture directory is not durable: %w", err), restoreResolutionCapture(capture))
+	}
+	if err := resolutionSyncDir(captureDir); err != nil {
+		return nil, errors.Join(err, restoreResolutionCapture(capture))
 	}
 	if afterResolutionCaptureRename != nil {
 		afterResolutionCaptureRename(path)
