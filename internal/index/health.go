@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -193,15 +194,54 @@ func (s *Store) ScanContradictions() ([]HealthFinding, error) {
 	if err != nil {
 		return nil, err
 	}
+	return contradictionFindings(notes), nil
+}
+
+// contradictionFindings preserves directed comparison order and the one-finding
+// per unordered pair policy. Tokenize each field once and visit only notes sharing
+// a tag, instead of allocating token/tag maps for every pair on every health pass.
+func contradictionFindings(notes []guidanceRow) []HealthFinding {
 	const threshold = 0.6
+	doTokens := make([]map[string]bool, len(notes))
+	dontTokens := make([]map[string]bool, len(notes))
+	byTag := map[string][]int{}
+	for i, n := range notes {
+		doTokens[i], dontTokens[i] = tokenSet(n.do), tokenSet(n.dont)
+		tags := map[string]bool{}
+		for _, tag := range n.tags {
+			tag = strings.ToLower(tag)
+			if !tags[tag] {
+				byTag[tag] = append(byTag[tag], i)
+				tags[tag] = true
+			}
+		}
+	}
 	var findings []HealthFinding
 	seen := map[string]bool{}
+	visited := make([]int, len(notes))
+	candidates := make([]int, 0, len(notes))
 	for i := range notes {
-		for j := range notes {
-			if i == j || !shareTag(notes[i].tags, notes[j].tags) {
+		if len(doTokens[i]) == 0 {
+			continue
+		}
+		candidates = candidates[:0]
+		for _, tag := range notes[i].tags {
+			for _, j := range byTag[strings.ToLower(tag)] {
+				if i != j && visited[j] != i+1 {
+					visited[j] = i + 1
+					candidates = append(candidates, j)
+				}
+			}
+		}
+		// Preserve which direction owns a finding when both directions qualify.
+		sort.Ints(candidates)
+		for _, j := range candidates {
+			a, b := len(doTokens[i]), len(dontTokens[j])
+			// Even complete containment cannot reach the threshold at this size ratio.
+			if b == 0 || float64(min(a, b))/float64(max(a, b)) < threshold {
 				continue
 			}
-			if jaccard(tokenSet(notes[i].do), tokenSet(notes[j].dont)) < threshold {
+			if jaccard(doTokens[i], dontTokens[j]) < threshold {
 				continue
 			}
 			// One unordered finding per pair.
@@ -216,7 +256,7 @@ func (s *Store) ScanContradictions() ([]HealthFinding, error) {
 			})
 		}
 	}
-	return findings, nil
+	return findings
 }
 
 type guidanceRow struct {

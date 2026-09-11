@@ -355,6 +355,13 @@ even when a previous hub call is slow. One queued follow-up coalesces edits made
 during sync; completion triggers local discovery without requesting another sync.
 Shutdown drains the active durable sync round before releasing the index owner.
 
+Startup still performs an authoritative full rebuild to catch offline edits and
+seed the incremental cache. Its log separates indexing from lifecycle-health time.
+From v0.20, contradiction checks tokenize guidance once per pass and restrict
+comparisons to shared tags, preserving the existing findings and 0.6 similarity
+threshold. This reduces work at startup and on the five-minute health cadence
+without skipping checks, adding model calls, or weakening index validation.
+
 Retriever setup and graph refreshes do not call embedding models. Actual semantic
 queries validate vector width, and explicit health checks still probe reachability
 and dimensions. Local write acknowledgements do not need an embedding endpoint.

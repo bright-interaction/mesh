@@ -141,7 +141,9 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 		}
 		li.cache.Seed(notes)
 		li.seeded = true
+		indexDur := time.Since(start)
 		li.refreshHealthIfDue()
+		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", time.Since(start)-indexDur)
 		dropped, err := li.store.DroppedNotes() // recorded by ReindexFull
 		if err != nil {
 			return Reconciliation{}, err
@@ -176,7 +178,9 @@ func (li *LiveIndexer) ReconcilePaths(paths []string) (Reconciliation, error) {
 		}
 		li.cache.Seed(notes)
 		li.seeded = true
+		indexDur := time.Since(start)
 		li.refreshHealthIfDue()
+		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", time.Since(start)-indexDur)
 		dropped, err := li.store.DroppedNotes()
 		if err != nil {
 			return Reconciliation{}, err
