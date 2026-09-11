@@ -63,7 +63,7 @@ func BenchmarkReconcileFull(b *testing.B) {
 
 // BenchmarkReconcileIncremental measures the NEW watcher cost per single-note edit:
 // DriftDeltaReport (parse all once, retain) + in-memory graph rebuild from cache +
-// targeted note/FTS writes + nodes/edges rewrite, no LoadGraph, no second parse.
+// targeted note/FTS writes + graph row diff, no LoadGraph, no second parse.
 func BenchmarkReconcileIncremental(b *testing.B) {
 	for _, n := range []int{100, 1000, 5000} {
 		b.Run(fmt.Sprintf("n%d", n), func(b *testing.B) {

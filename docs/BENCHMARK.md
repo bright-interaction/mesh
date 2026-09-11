@@ -51,6 +51,39 @@ To measure your own corpus, write 20 or so queries you actually ask, label the
 note ids that answer them, and run `mesh eval your-cases.json --vault /your/vault`
 with and without `--budget`.
 
+## Incremental graph persistence
+
+v0.24 replaces the incremental graph-table wipe/reinsert with an exact row diff
+inside the existing notes/FTS writer transaction. Full/startup indexing is
+unchanged. The global in-memory graph rebuild remains necessary; community
+labels and supersession attributes can change on notes outside the input delta.
+
+Reproduce the isolated persistence comparison (no private vault required):
+
+```sh
+go test ./internal/index -run '^$' -bench '^BenchmarkGraphPersistence$' -benchtime=3x -count=3
+```
+
+On an Apple M3 / Go 1.26.7, 2026-09-11, for a synthetic graph of 24,000 nodes and
+48,000 edges with one changed node label, three samples measured:
+
+| Persistence path | Time per operation | Allocated bytes per operation |
+|---|---:|---:|
+| Full graph rewrite | 501–531 ms | 47.8 MB |
+| Committed-row diff | 79–94 ms | 41.9 MB |
+
+This is roughly 5.6x faster comparing sample medians (524 ms / 93 ms), not an
+end-to-end writeback promise. Both paths include the writer transaction and
+commit. Parsing, graph/community construction, code linking, MCP acknowledgement,
+and background I/O contention are outside this benchmark. The diff still scans
+and compares every graph row, with linear temporary memory; a widespread graph
+change may still write most rows. No LLM calls are involved.
+
+Trigger-based regression tests separately verify zero graph row mutations for an
+unchanged graph, only changed-row mutations, full-rewrite parity, and rollback.
+The historical 0.4 ms edit figures below are not whole-vault writeback timings
+and should not be used as an operational latency guarantee.
+
 ## TL;DR
 
 Against the standard RAG pattern an agent would otherwise use, retrieve the

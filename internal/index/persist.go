@@ -142,8 +142,8 @@ func (s *Store) indexVaultContext(ctx context.Context, notes []*ParsedNote, g *g
 }
 
 // IndexVaultIncremental applies a drift delta: targeted INSERT OR REPLACE / DELETE
-// for the changed notes + their FTS rows and a full rewrite of the (globally rebuilt)
-// nodes/edges tables from the in-memory graph, all in one writer-goroutine transaction
+// for the changed notes + their FTS rows and a row diff of the globally rebuilt
+// graph against the committed nodes/edges, all in one writer-goroutine transaction
 // so a concurrent reader sees an all-or-nothing WAL snapshot. upserts are Added+Changed
 // notes (vault-relative Path); removedIDs are ids whose files are gone (and old ids
 // retired on an id change). Returns the number of upserted notes.
@@ -190,7 +190,7 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 			}
 		}
 
-		if err := writeGraphTables(tx, g); err != nil {
+		if err := writeGraphDeltaContext(context.Background(), tx, g); err != nil {
 			return err
 		}
 		return pruneOrphanVectors(tx)
@@ -220,9 +220,8 @@ func noteRowValues(pn *ParsedNote) (id, title, fmJSON, updated, reviewBy, source
 }
 
 // writeGraphTables wipes and rewrites the nodes + edges tables from the in-memory
-// graph. Shared by the full and incremental paths: communities are label-prop
-// (global), so the graph is rebuilt whole in memory either way, and dumping it to
-// two small tables is cheap relative to parsing the vault.
+// graph. The full reindex keeps this authoritative rewrite; incremental indexing
+// uses writeGraphDeltaContext to avoid rewriting unchanged rows.
 func writeGraphTables(tx *sql.Tx, g *graph.Graph) error {
 	return writeGraphTablesContext(context.Background(), tx, g)
 }

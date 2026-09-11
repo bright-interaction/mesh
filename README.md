@@ -393,6 +393,15 @@ graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
 
+From v0.24, incremental and targeted indexing compare the whole rebuilt graph
+with the committed database and write only changed nodes and edges. This keeps
+global community and supersession changes correct while avoiding a full graph
+table rewrite for a one-note edit. Notes, search rows, and graph deltas still
+commit atomically. The comparison remains linear in graph size; full/startup
+indexing still uses the authoritative full rewrite. No model calls or schema
+migration are added. See the [persistence benchmark](docs/BENCHMARK.md#incremental-graph-persistence)
+for the measured scope and reproduction command.
+
 From v0.23, the owning watcher's lifecycle-health analysis runs in one background
 pass per Store, outside the reconciliation mutex. Slow note reads, source-tree
 walks and Git checks no longer hold up the next indexing callback. The normal
