@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/shellpath"
 
 	_ "modernc.org/sqlite"
@@ -1418,9 +1419,8 @@ func (s *Store) writer() {
 	defer s.wg.Done()
 	// Periodically checkpoint the WAL from inside the single writer so mesh.db-wal
 	// cannot grow without bound even across idle stretches (autocheckpoint only fires
-	// on writes). PASSIVE, not TRUNCATE: PASSIVE returns immediately and never blocks
-	// the writer on a live reader, while journal_size_limit (DSN) still truncates the
-	// file to <=16MB after the checkpoint. Running it on this goroutine means it never
+	// on writes). PASSIVE does not wait for readers, but can copy pages and sync the
+	// database: its filesystem work can still delay the next job. Running it here never
 	// races a write: the select serves one job OR one checkpoint per iteration.
 	ticker := time.NewTicker(walCheckpointInterval)
 	defer ticker.Stop()
@@ -1450,30 +1450,32 @@ func (s *Store) writer() {
 				cancel()
 			}
 		case <-ticker.C:
-			release, ok, _ := s.acquireWriteAuthorization()
-			if !ok {
-				continue
-			}
-			// PASSIVE first: it returns at once and never blocks the writer on a live
-			// reader.
-			_, _ = s.writeDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
-			// PASSIVE alone does NOT bound the file, and the comment here used to claim
-			// it did. journal_size_limit only applies when a checkpoint RESETS the WAL,
-			// and a PASSIVE checkpoint that cannot fully drain (any reader mid-snapshot,
-			// which is normal under a watch daemon) never resets it. Measured on the live
-			// vault after 9 hours: 26.44MB against a 16MB limit, reclaimable to 0 the
-			// moment a TRUNCATE ran. So escalate on the size we can actually see.
-			//
-			// Only when it is over the limit, because TRUNCATE waits for readers to
-			// drain. checkpointTruncateBestEffort caps that on its own connection (2s
-			// busy_timeout, 3s context) so a busy vault degrades to "not this tick"
-			// instead of stalling the writer, which is the failure this whole area
-			// already produced once.
-			if s.walBytes() > walSizeLimit {
-				s.checkpointTruncateBestEffortAuthorized()
-			}
-			release()
+			s.checkpointWAL()
 		}
+	}
+}
+
+// checkpointWAL stays on the existing writer with the same authorization and
+// escalation policy. A PASSIVE checkpoint avoids reader lock waits, not disk I/O.
+func (s *Store) checkpointWAL() {
+	trace := latency.Start("index_checkpoint", "authorize")
+	defer trace.End()
+	release, ok, _ := s.acquireWriteAuthorization()
+	if !ok {
+		return
+	}
+	defer func() {
+		trace.Phase("release")
+		release()
+	}()
+	trace.Phase("passive")
+	_, _ = s.writeDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+	// PASSIVE alone does not bound the file: journal_size_limit applies only
+	// after a reset. Preserve the existing bounded TRUNCATE escalation.
+	trace.Phase("wal_size")
+	if s.walBytes() > walSizeLimit {
+		trace.Phase("truncate")
+		s.checkpointTruncateBestEffortAuthorized()
 	}
 }
 
@@ -1486,6 +1488,8 @@ func (s *Store) runTx(fn func(*sql.Tx) error) error {
 // job. The callback should still use the context-aware SQL methods for prompt
 // interruption of a statement that is already running.
 func (s *Store) runTxContext(ctx context.Context, fn func(*sql.Tx) error) (err error) {
+	trace := latency.Start("index_transaction", "authorize")
+	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1496,7 +1500,11 @@ func (s *Store) runTxContext(ctx context.Context, fn func(*sql.Tx) error) (err e
 	if !ok {
 		return ErrReadOnly
 	}
-	defer release()
+	defer func() {
+		trace.Phase("release")
+		release()
+	}()
+	trace.Phase("begin")
 	tx, err := s.beginWriteTxContext(ctx)
 	if err != nil {
 		return err
@@ -1508,14 +1516,17 @@ func (s *Store) runTxContext(ctx context.Context, fn func(*sql.Tx) error) (err e
 		// the writer keeps serving and the caller is told what happened. This mirrors
 		// the hub Store, which already guards this.
 		if r := recover(); r != nil {
+			trace.Phase("rollback")
 			_ = tx.Rollback()
 			err = fmt.Errorf("index write panicked: %v", r)
 			return
 		}
 		if err != nil {
+			trace.Phase("rollback")
 			_ = tx.Rollback()
 		}
 	}()
+	trace.Phase("callback")
 	if err = fn(tx); err != nil {
 		return err
 	}
@@ -1524,9 +1535,11 @@ func (s *Store) runTxContext(ctx context.Context, fn func(*sql.Tx) error) (err e
 	}
 	// A preemptible claim may have been taken while fn was running (a full reindex can
 	// take seconds). Roll the work back instead of committing beside the new owner.
+	trace.Phase("revalidate")
 	if !linearized && !s.canWrite() {
 		return ErrReadOnly
 	}
+	trace.Phase("commit")
 	return tx.Commit()
 }
 
@@ -1583,9 +1596,12 @@ func (s *Store) WriteContext(ctx context.Context, fn func(*sql.Tx) error) error 
 	if s.readOnly {
 		return ErrReadOnly
 	}
+	trace := latency.Start("index_write", "queue")
+	defer trace.End()
 	reply := make(chan error, 1)
 	select {
 	case s.jobs <- job{ctx: ctx, fn: fn, reply: reply}:
+		trace.Phase("transaction")
 		return <-reply
 	case <-ctx.Done():
 		return ctx.Err()

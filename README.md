@@ -393,6 +393,24 @@ graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
 
+From v0.26, slow persistence logs distinguish `index_write` queue wait from
+`index_transaction` authorization, SQLite begin, callback, commit/rollback and
+lease release. `persist_full` and `persist_incremental` separate notes/search,
+graph and vector pruning; `persist_graph_delta` separates encoding from node and
+edge work, with `persist_graph_nodes` / `persist_graph_edges` splitting scans,
+deletes and upserts. `index_checkpoint` shows the existing periodic checkpoint.
+PASSIVE avoids waiting for readers, but still performs page copies and possibly
+file sync ([SQLite contract](https://www.sqlite.org/c3ref/wal_checkpoint_v2.html)).
+Automatic checkpoints inside commit remain part of the commit phase.
+
+These are diagnostics, not a concurrency or durability change: no new writers,
+queue priority, timeout extension or weaker fsync settings. They remain silent
+below one second, use static labels without content/paths/SQL/error text, and
+report progress every ten seconds. Nested timings overlap, and a returned trace
+is not proof of success. Correlate process IDs and time windows; transaction and
+caller traces have separate IDs. They distinguish where time was spent, not
+whether the kernel delay came from storage, memory pressure or CPU scheduling.
+
 From v0.25, note planning reads identity headers with at most four concurrent
 readers per scan and merges results in traversal order. Short notes no longer
 reserve the full 64 KiB head-read ceiling. The scan still checks fresh disk

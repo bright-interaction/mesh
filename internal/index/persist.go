@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
@@ -62,6 +63,8 @@ func (s *Store) indexVaultContext(ctx context.Context, notes []*ParsedNote, g *g
 	}
 	count := 0
 	err := s.WriteContext(ctx, func(tx *sql.Tx) error {
+		trace := latency.Start("persist_full", "clear_notes_fts")
+		defer trace.End()
 		// Note + FTS get a full wipe here; nodes/edges are wiped+rewritten by
 		// writeGraphTables below.
 		for _, t := range []string{"notes", "search_index"} {
@@ -73,6 +76,7 @@ func (s *Store) indexVaultContext(ctx context.Context, notes []*ParsedNote, g *g
 			}
 		}
 
+		trace.Phase("notes_fts")
 		// INSERT OR REPLACE (not a plain INSERT) so a duplicate effectiveID cannot abort
 		// the whole reindex and take the index offline with an opaque PRIMARY KEY error.
 		//
@@ -127,13 +131,16 @@ func (s *Store) indexVaultContext(ctx context.Context, notes []*ParsedNote, g *g
 			}
 		}
 
+		trace.Phase("graph")
 		if err := writeGraphTablesContext(ctx, tx, g); err != nil {
 			return err
 		}
+		trace.Phase("prune_vectors")
 		if err := pruneOrphanVectorsContext(ctx, tx); err != nil {
 			return err
 		}
 		if replaceDropped {
+			trace.Phase("dropped")
 			return writeDroppedRowsContext(ctx, tx, dropped, time.Now().Unix())
 		}
 		return nil
@@ -149,6 +156,8 @@ func (s *Store) indexVaultContext(ctx context.Context, notes []*ParsedNote, g *g
 // retired on an id change). Returns the number of upserted notes.
 func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string, g *graph.Graph) (int, error) {
 	err := s.Write(func(tx *sql.Tx) error {
+		trace := latency.Start("persist_incremental", "remove_notes_fts")
+		defer trace.End()
 		// Deletes first: a rename frees a path another note now claims, and an id
 		// change retires the old id; deleting before inserting avoids the notes.path
 		// UNIQUE and notes.id PK collisions.
@@ -161,6 +170,7 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 			}
 		}
 
+		trace.Phase("upsert_notes_fts")
 		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
@@ -190,9 +200,11 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 			}
 		}
 
+		trace.Phase("graph")
 		if err := writeGraphDeltaContext(context.Background(), tx, g); err != nil {
 			return err
 		}
+		trace.Phase("prune_vectors")
 		return pruneOrphanVectors(tx)
 	})
 	return len(upserts), err
