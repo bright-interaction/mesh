@@ -34,6 +34,20 @@ import (
 // the note's own title, which retrieves that note first every time). Pass "" when the
 // note does not exist yet, as on the write path.
 func Derive(ctx context.Context, rt *retrieve.Retriever, g *graph.Graph, query, selfID string, selfTags []string, max int) []string {
+	return derive(ctx, rt, g, query, selfID, selfTags, max, true)
+}
+
+// DeriveCorroborated is the bulk-repair form of Derive. Every returned edge must
+// share at least one tag with the source note, including rank 1. A write-time
+// suggestion may reasonably take the best semantic match when a new note has no
+// other graph signal yet; a bulk rewrite cannot. One wrong edge changes both notes'
+// future graph expansion, so repair favors leaving an orphan for review over
+// manufacturing a relationship from rank alone.
+func DeriveCorroborated(ctx context.Context, rt *retrieve.Retriever, g *graph.Graph, query, selfID string, selfTags []string, max int) []string {
+	return derive(ctx, rt, g, query, selfID, selfTags, max, false)
+}
+
+func derive(ctx context.Context, rt *retrieve.Retriever, g *graph.Graph, query, selfID string, selfTags []string, max int, allowTop bool) []string {
 	if rt == nil || max <= 0 || strings.TrimSpace(query) == "" {
 		return nil
 	}
@@ -43,12 +57,22 @@ func Derive(ctx context.Context, rt *retrieve.Retriever, g *graph.Graph, query, 
 	if err != nil {
 		return nil
 	}
-	return Select(cards, func(id string) []string { return TagsOf(g, id) }, selfID, selfTags, max)
+	return selectLinks(cards, func(id string) []string { return TagsOf(g, id) }, selfID, selfTags, max, allowTop)
 }
 
 // Select applies the ranking policy to already-retrieved cards. Split out from Derive
 // so the policy is testable without standing up a store, an index and a retriever.
 func Select(cards []retrieve.Card, tagsFor func(noteID string) []string, selfID string, selfTags []string, max int) []string {
+	return selectLinks(cards, tagsFor, selfID, selfTags, max, true)
+}
+
+// SelectCorroborated applies the conservative bulk-repair policy without doing
+// retrieval, which keeps the policy independently testable.
+func SelectCorroborated(cards []retrieve.Card, tagsFor func(noteID string) []string, selfID string, selfTags []string, max int) []string {
+	return selectLinks(cards, tagsFor, selfID, selfTags, max, false)
+}
+
+func selectLinks(cards []retrieve.Card, tagsFor func(noteID string) []string, selfID string, selfTags []string, max int, allowTop bool) []string {
 	if max <= 0 {
 		return nil
 	}
@@ -61,9 +85,9 @@ func Select(cards []retrieve.Card, tagsFor func(noteID string) []string, selfID 
 			continue
 		}
 		seen[id] = true
-		// The first survivor is the top hit: take it on rank alone. Everything after
-		// it has to earn the edge by sharing a tag.
-		if len(out) > 0 && !sharesTag(want, tagSet(tagsFor(id))) {
+		// The ordinary write path may take the first survivor on rank alone. Bulk
+		// repair passes allowTop=false, so every durable edge needs a second signal.
+		if (!allowTop || len(out) > 0) && !sharesTag(want, tagSet(tagsFor(id))) {
 			continue
 		}
 		out = append(out, id)

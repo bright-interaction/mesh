@@ -338,7 +338,7 @@ Mesh speaks MCP (JSON-RPC) over stdio. Point your agent at:
 { "command": "mesh", "args": ["mcp", "--vault", "/abs/path/to/my-vault", "--watch"] }
 ```
 
-The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note or one heading by anchor), `mesh_god_nodes` (the hub map to orient), `mesh_changed_since` (deltas on resume), and the write-back tools `mesh_append_note` / `mesh_write_entity`. The retrieval contract (how to query cheaply, and to write back when done) is served as the MCP `initialize` instructions and the `mesh://contract` resource, so any agent uses it well without extra prompting.
+The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note or one heading by anchor), `mesh_god_nodes` (the hub map to orient), `mesh_changed_since` (deltas on resume), and the write-back tools `mesh_append_note` / `mesh_write_entity`. `mesh_append_note` also accepts `type: map`; an overview in `why` plus `related` entry points renders as a readable front-door page rather than an empty scaffold. The retrieval contract (how to query cheaply, and to write back when done) is served as the MCP `initialize` instructions and the `mesh://contract` resource, so any agent uses it well without extra prompting.
 
 That is the whole setup. The server elects itself the vault's **owning writer**
 when nothing else holds the vault (a claim in `<vault>/.mesh/owner.lock`), so a
@@ -502,7 +502,7 @@ Inspect and maintain:
 | `mesh lint [vault]` | Frontmatter / links / filenames (non-zero exit for CI) |
 | `mesh doctor [vault]` | Index freshness (drift), counts, health. Non-zero if the index is stale or any note is invisible to search |
 | `mesh health [vault]` | Knowledge lifecycle: dead source refs, overdue reviews, contradictions, plus notes missing from the index |
-| `mesh structure [vault]` | Grade the vault's organization: types, connectivity, tier-0, maps |
+| `mesh structure [vault]` | Grade the vault's organization; `--wire-orphans` proposes only shared-tag-corroborated links by default |
 | `mesh flywheel [vault]` | Write-back reuse metrics: does written-back knowledge get used again? |
 | `mesh economics [vault]` | Content-free retrieval economics: call rate, accounted tokens, cache/fallbacks and search-to-fetch choices |
 | `mesh rerank <setup\|status\|disable>` | Reversible local-only subscription rerank setup for an existing MCP registration |

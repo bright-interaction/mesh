@@ -23,7 +23,7 @@ import (
 // the vault structure standard. It complements `mesh lint` (frontmatter validity) and
 // `mesh health` (knowledge lifecycle): validity, organization, lifecycle.
 func structureCmd() *cobra.Command {
-	var verbose, wireOrphans, apply, fillBodies, fillTimelines bool
+	var verbose, wireOrphans, allowUncorroboratedTop, apply, fillBodies, fillTimelines bool
 	var repoPath string
 	c := &cobra.Command{
 		Use:   "structure [vault]",
@@ -51,7 +51,7 @@ func structureCmd() *cobra.Command {
 			rep := index.AnalyzeStructure(g, parsed, parseErrs)
 
 			if wireOrphans {
-				return wireOrphanNotes(cmd, root, rep, apply)
+				return wireOrphanNotes(cmd, root, rep, apply, allowUncorroboratedTop)
 			}
 			if fillBodies {
 				return fillNoteBodies(root, files, apply)
@@ -118,6 +118,7 @@ func structureCmd() *cobra.Command {
 	}
 	c.Flags().BoolVar(&verbose, "verbose", false, "list every finding with its note path")
 	c.Flags().BoolVar(&wireOrphans, "wire-orphans", false, "propose `related:` links for every orphan note (dry run unless --apply)")
+	c.Flags().BoolVar(&allowUncorroboratedTop, "allow-uncorroborated-top", false, "with --wire-orphans, accept the top retrieval hit without a shared tag (unsafe for bulk apply)")
 	c.Flags().BoolVar(&fillBodies, "fill-bodies", false, "fill a note's TODO-skeleton body sections from its already-authored do/dont/why (dry run unless --apply)")
 	c.Flags().BoolVar(&fillTimelines, "fill-timelines", false, "build a post-mortem's \"What happened\" from its own dates and the commit ids it names (dry run unless --apply)")
 	c.Flags().StringVar(&repoPath, "repo", "", "with --fill-timelines, a git repository to resolve commit ids against, so the timeline carries real committer times and subjects")
@@ -286,7 +287,7 @@ func fillNoteBodies(root string, files []string, apply bool) error {
 //
 // Notes that already declare `related` are skipped by BackfillRelatedFile, so running
 // this twice is safe and the second run reports nothing to do.
-func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport, apply bool) error {
+func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport, apply, allowUncorroboratedTop bool) error {
 	var orphans []index.StructureFinding
 	for _, f := range rep.Findings {
 		if f.Kind == "orphan" {
@@ -316,7 +317,11 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 	rt := retrieve.NewFromEnv(store, ig)
 
 	if !apply {
-		fmt.Printf("%d orphan(s); proposing up to 3 links each (dry run, pass --apply to write)\n\n", len(orphans))
+		fmt.Printf("%d orphan(s); proposing up to 3 corroborated links each (dry run, pass --apply to write)\n", len(orphans))
+		if allowUncorroboratedTop {
+			fmt.Println("warning: rank 1 may be accepted without a shared tag")
+		}
+		fmt.Println()
 	}
 	// One counter used to absorb three unrelated outcomes: "retrieval found no
 	// candidate links" (benign, the note simply has no neighbours yet), "the note
@@ -333,7 +338,12 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 		// note was scaffolded, so it is the closest thing to the note's own words that
 		// is available here without re-reading the file.
 		query := strings.ReplaceAll(id, "-", " ")
-		links := relate.Derive(cmd.Context(), rt, ig, query, id, relate.TagsOf(ig, id), 3)
+		var links []string
+		if allowUncorroboratedTop {
+			links = relate.Derive(cmd.Context(), rt, ig, query, id, relate.TagsOf(ig, id), 3)
+		} else {
+			links = relate.DeriveCorroborated(cmd.Context(), rt, ig, query, id, relate.TagsOf(ig, id), 3)
+		}
 		if len(links) == 0 {
 			noLinks++
 			continue
@@ -358,7 +368,7 @@ func wireOrphanNotes(cmd *cobra.Command, root string, rep index.StructureReport,
 	if apply {
 		verb = "wired"
 	}
-	fmt.Printf("\n%s %d note(s), skipped %d (%d with no candidate links, %d already declaring related)\n",
+	fmt.Printf("\n%s %d note(s), skipped %d (%d with no corroborated candidate links, %d already declaring related)\n",
 		verb, changed, noLinks+alreadyRelated, noLinks, alreadyRelated)
 	if failed > 0 {
 		fmt.Printf("failed on %d note(s)\n", failed)

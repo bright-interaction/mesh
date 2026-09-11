@@ -504,6 +504,14 @@ func renderBody(fm *Frontmatter) string {
 	if sections := bodySections(fm.Type); sections != nil {
 		return renderSections(fm, sections)
 	}
+	// An agent-authored map arrives with an overview in why and its front-door
+	// entries in related. Rendering the generic human TODO template here stranded
+	// both behind frontmatter: the graph was technically connected, but a teammate
+	// opening the map saw an empty page. Keep the skeleton for an empty `mesh new
+	// map`, while turning supplied, attributable facts into a useful body.
+	if fm.Type == TypeMap && (!Unfilled(fm.Why) || len(fm.Related) > 0) {
+		return renderAuthoredMap(fm)
+	}
 	body := bodyTemplate(fm.Type)
 	// A reference page keeps its full skeleton (its extra prompts are the point), but any
 	// heading that DOES have a frontmatter field behind it gets the prose instead of the
@@ -519,6 +527,39 @@ func renderBody(fm *Frontmatter) string {
 		body, _ = repairEntityPage(body, fm)
 	}
 	return body
+}
+
+func renderAuthoredMap(fm *Frontmatter) string {
+	var b strings.Builder
+	overview := strings.TrimSpace(fm.Why)
+	if !Unfilled(overview) {
+		lead := FirstSentence(overview)
+		if lead == "" {
+			lead = overview
+		}
+		b.WriteString("**")
+		b.WriteString(lead)
+		b.WriteString("**\n")
+		if rest := strings.TrimSpace(strings.TrimPrefix(overview, lead)); rest != "" {
+			b.WriteString("\n")
+			b.WriteString(rest)
+			b.WriteString("\n")
+		}
+	} else {
+		b.WriteString(entityLeadPlaceholder)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n## Start here\n")
+	if len(fm.Related) == 0 {
+		b.WriteString("<!-- TODO: link the domain's entry points -->\n")
+		return b.String()
+	}
+	for _, id := range fm.Related {
+		b.WriteString("- [[")
+		b.WriteString(id)
+		b.WriteString("]]\n")
+	}
+	return b.String()
 }
 
 func bodyTemplate(t NoteType) string {

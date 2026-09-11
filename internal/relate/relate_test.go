@@ -120,3 +120,24 @@ func TestSelectTagMatchIsNormalized(t *testing.T) {
 		t.Errorf("Select() = %v, want %v (tag match should be case/space insensitive)", got, want)
 	}
 }
+
+func TestSelectCorroboratedRequiresSharedTagAtEveryRank(t *testing.T) {
+	tags := map[string][]string{
+		"rank-one-but-wrong":  {"seo"},
+		"rank-two-confirmed":  {"mesh", "sync"},
+		"rank-three-wrong":    {"billing"},
+		"rank-four-confirmed": {"sync"},
+	}
+	got := SelectCorroborated(
+		cards("rank-one-but-wrong", "rank-two-confirmed", "rank-three-wrong", "rank-four-confirmed"),
+		func(id string) []string { return tags[id] }, "", []string{"mesh", "sync"}, 3,
+	)
+	want := []string{"rank-two-confirmed", "rank-four-confirmed"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("SelectCorroborated() = %v, want %v", got, want)
+	}
+
+	if got := SelectCorroborated(cards("rank-two-confirmed"), func(id string) []string { return tags[id] }, "", nil, 3); got != nil {
+		t.Errorf("untagged source produced corroborated links: %v", got)
+	}
+}

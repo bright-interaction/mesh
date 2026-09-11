@@ -223,3 +223,51 @@ func TestRenderedBodyKeepsSkeletonWhenUnauthored(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentAuthoredMapRendersOverviewAndEntryPoints(t *testing.T) {
+	res, err := CreateNote(t.TempDir(), NewNoteSpec{
+		Type:    TypeMap,
+		Title:   "Mesh operations map",
+		Why:     "Start here for Mesh runtime, release, and retrieval operations. Detailed procedures remain in the linked notes.",
+		Related: []string{"mesh", "mesh-release", "mesh-retrieval"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(res.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, body, had := SplitFrontmatter(string(data))
+	if !had {
+		t.Fatal("map has no frontmatter block")
+	}
+	for _, want := range []string{
+		"**Start here for Mesh runtime, release, and retrieval operations.**",
+		"Detailed procedures remain in the linked notes.",
+		"## Start here",
+		"- [[mesh]]",
+		"- [[mesh-release]]",
+		"- [[mesh-retrieval]]",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("authored map body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "<!-- TODO") {
+		t.Errorf("complete authored map retained TODO scaffolding:\n%s", body)
+	}
+}
+
+func TestEmptyMapKeepsHumanScaffold(t *testing.T) {
+	res, err := CreateNote(t.TempDir(), NewNoteSpec{Type: TypeMap, Title: "Map to fill"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(res.Path)
+	for _, want := range []string{"**One-liner.**", "section per sub-area", "<!-- TODO"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("empty map scaffold missing %q:\n%s", want, data)
+		}
+	}
+}

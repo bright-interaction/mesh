@@ -193,7 +193,7 @@ func TestFillNoteBodiesExitsNonZeroWhenFilesFail(t *testing.T) {
 // linkedNote is a note that links to the two others, so it is not itself an orphan.
 func linkedNote(id, title, body string) string {
 	return "---\nid: " + id + "\ntype: note\ntitle: " + title +
-		"\nwhen: \"2026-08-06\"\n---\n# " + title + "\n\n" + body + "\n"
+		"\nwhen: \"2026-08-06\"\ntags: [postgres]\n---\n# " + title + "\n\n" + body + "\n"
 }
 
 // TestWireOrphansSplitsBenignSkipsFromWriteFailures covers both halves of the third
@@ -228,7 +228,7 @@ func TestWireOrphansSplitsBenignSkipsFromWriteFailures(t *testing.T) {
 		{
 			name:      "a writable orphan is wired and the run exits 0",
 			wantErr:   false,
-			wantOut:   []string{"wired 1 note(s)", "no candidate links", "already declaring related"},
+			wantOut:   []string{"wired 1 note(s)", "no corroborated candidate links", "already declaring related"},
 			notWant:   []string{"failed on"},
 			wantWrite: true,
 		},

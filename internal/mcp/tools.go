@@ -81,7 +81,7 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_append_note",
-			"description": "Create a durable decision, gotcha, post-mortem, or note; Mesh fills id, timestamp, placement, and agent provenance.",
+			"description": "Create a durable decision, gotcha, post-mortem, map, or note; Mesh fills id, timestamp, placement, and agent provenance.",
 			"inputSchema": obj(map[string]any{
 				"type":     "object",
 				"required": []string{"type", "title"},
