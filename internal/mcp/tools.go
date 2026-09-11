@@ -859,6 +859,9 @@ func (s *Server) toolSearch(ctx context.Context, raw json.RawMessage) (any, *rpc
 	if economics.Fallback {
 		result["rerank"] = economics.Receipt()
 	}
+	if economics.SemanticFallback {
+		result["semantic"] = economics.SemanticReceipt()
+	}
 	return textResult(result), nil
 }
 

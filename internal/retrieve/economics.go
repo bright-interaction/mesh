@@ -21,6 +21,9 @@ const defaultRerankConfidenceMargin = 0.45
 // Economics is content-free accounting for one retrieval. It can safely be
 // persisted as counters: it contains no query, title, path, snippet, or note id.
 type Economics struct {
+	SemanticConfigured   bool   `json:"semantic_configured"`
+	SemanticFallback     bool   `json:"semantic_fallback,omitempty"`
+	SemanticCircuitOpen  bool   `json:"semantic_circuit_open,omitempty"`
 	RerankConfigured     bool   `json:"configured"`
 	RerankModel          string `json:"model,omitempty"`
 	Route                string `json:"route"`
@@ -54,6 +57,19 @@ type RerankReceipt struct {
 	AccountedTokens int    `json:"accounted_tokens,omitempty"`
 }
 
+// SemanticReceipt is emitted only when the optional vector lane could not run and
+// retrieval continued with the local FTS + graph lanes. Keeping it this small makes
+// the degradation visible without spending the token savings on diagnostic prose.
+type SemanticReceipt struct {
+	Route       string `json:"route"`
+	Fallback    bool   `json:"fallback"`
+	CircuitOpen bool   `json:"circuit_open,omitempty"`
+}
+
+func (e Economics) SemanticReceipt() SemanticReceipt {
+	return SemanticReceipt{Route: "lexical_graph", Fallback: e.SemanticFallback, CircuitOpen: e.SemanticCircuitOpen}
+}
+
 func (e Economics) Receipt() RerankReceipt {
 	return RerankReceipt{
 		Route:           e.Route,
@@ -77,10 +93,17 @@ func (e Economics) ModelTokens() int {
 // cards. The wrapper is included deliberately, slightly over-pricing the comma
 // used when it is merged into the complete response map.
 func (e Economics) ReceiptTokens() int {
-	if !e.Fallback {
+	if !e.Fallback && !e.SemanticFallback {
 		return 0
 	}
-	b, err := json.Marshal(map[string]RerankReceipt{"rerank": e.Receipt()})
+	receipts := make(map[string]any, 2)
+	if e.Fallback {
+		receipts["rerank"] = e.Receipt()
+	}
+	if e.SemanticFallback {
+		receipts["semantic"] = e.SemanticReceipt()
+	}
+	b, err := json.Marshal(receipts)
 	if err != nil {
 		return 0
 	}
@@ -103,6 +126,15 @@ func (r *Retriever) RecordEconomics(e Economics) {
 	inc("retrieval:returned_cards", int64(e.ReturnedCards))
 	inc("retrieval:returned_tokens", int64(e.ReturnedTokens))
 	inc("retrieval:latency_ms", e.SearchLatencyMS)
+	if e.SemanticConfigured {
+		inc("semantic:configured", 1)
+	}
+	if e.SemanticFallback {
+		inc("semantic:fallbacks", 1)
+	}
+	if e.SemanticCircuitOpen {
+		inc("semantic:circuit_open", 1)
+	}
 	if !e.RerankConfigured {
 		inc("rerank:off", 1)
 		return

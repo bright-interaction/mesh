@@ -142,6 +142,9 @@ type Retriever struct {
 
 	qvec   map[string][]float32 // query-embedding cache (keyed by prefixed query)
 	qvecMu sync.Mutex
+	// Prevent every concurrent search from paying the provider timeout after one
+	// request has already proved the optional semantic lane unavailable.
+	semanticCircuitUntil time.Time
 
 	freshHalfLife int                       // freshness decay half-life in days; 0 = off
 	freshDates    map[string]index.NoteDate // note id -> lifecycle dates, lazy-loaded
@@ -396,10 +399,14 @@ func (r *Retriever) EnableRerank(rr rerank.Reranker) bool {
 // when no reranker is configured.
 var ErrRerankUnavailable = errors.New("reranker unavailable")
 
-// ErrEmbeddingUnavailable wraps failures from a configured semantic lane. Silently
-// falling back to lexical results makes an operator believe vector retrieval ran when
-// it did not, and turns caller cancellation into a successful but unrelated answer.
+// ErrEmbeddingUnavailable wraps failures from a configured semantic lane. Ordinary
+// retrieval catches it and returns an explicitly labelled lexical + graph fallback;
+// caller cancellation and a per-call vector weight stay fail-loud.
 var ErrEmbeddingUnavailable = errors.New("embedding endpoint unavailable")
+
+var errEmbeddingCircuitOpen = errors.New("embedding circuit open")
+
+const semanticCircuitCooldown = time.Minute
 
 // ErrInvalidWeights means a retrieval could not produce a meaningful, deterministic
 // ranking because at least one configured fusion weight was negative or non-finite.
@@ -565,9 +572,9 @@ func (r *Retriever) resolveWeights(opt Options, vectorsActive bool) (wFTS, wGrap
 }
 
 // queryVec returns the (cached) embedding of the query, prefixed for asymmetric
-// models. A configured embedder failure is returned rather than silently changing the
-// query into lexical-only retrieval. The cache makes repeated retrievals of the same
-// query (e.g. a weight sweep) embed only once.
+// models. The cache makes repeated retrievals of the same query (e.g. a weight sweep)
+// embed only once. Retrieve decides whether a returned provider error is strict or an
+// explicitly reported local fallback.
 func (r *Retriever) queryVec(ctx context.Context, query string) ([]float32, error) {
 	if r.emb == nil {
 		return nil, nil
@@ -578,13 +585,25 @@ func (r *Retriever) queryVec(ctx context.Context, query string) ([]float32, erro
 	if v, ok := r.qvec[key]; ok {
 		return v, nil
 	}
+	if time.Now().Before(r.semanticCircuitUntil) {
+		return nil, fmt.Errorf("%w (embedder %s): %w", ErrEmbeddingUnavailable, r.emb.Model(), errEmbeddingCircuitOpen)
+	}
 	qv, err := r.emb.Embed(ctx, []string{key})
 	if err != nil {
+		if retrieveContextErr(ctx) == nil {
+			r.semanticCircuitUntil = time.Now().Add(semanticCircuitCooldown)
+		}
 		return nil, fmt.Errorf("%w (embedder %s): %w", ErrEmbeddingUnavailable, r.emb.Model(), err)
 	}
 	if len(qv) != 1 {
+		r.semanticCircuitUntil = time.Now().Add(semanticCircuitCooldown)
 		return nil, fmt.Errorf("%w (embedder %s): returned %d vectors for one query", ErrEmbeddingUnavailable, r.emb.Model(), len(qv))
 	}
+	if r.vecDim <= 0 || len(qv[0]) != r.vecDim {
+		r.semanticCircuitUntil = time.Now().Add(semanticCircuitCooldown)
+		return nil, fmt.Errorf("%w (embedder %s): query width %d does not match stored width %d", ErrEmbeddingUnavailable, r.emb.Model(), len(qv[0]), r.vecDim)
+	}
+	r.semanticCircuitUntil = time.Time{}
 	// Bound the cache: a long-lived shared Retriever (the SSH viewer builds one and
 	// never swaps it) under a high-cardinality query stream would otherwise grow this
 	// map forever. A query-embedding cache tolerates a coarse reset on overflow.
@@ -722,9 +741,10 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	started := time.Now()
 	if opt.Economics != nil {
 		*opt.Economics = Economics{
-			RerankConfigured: r.RerankActive(),
-			RerankModel:      r.RerankModel(),
-			Route:            "disabled",
+			SemanticConfigured: r.VectorsActive(),
+			RerankConfigured:   r.RerankActive(),
+			RerankModel:        r.RerankModel(),
+			Route:              "disabled",
 		}
 		defer func() { opt.Economics.SearchLatencyMS = durationMillis(time.Since(started)) }()
 	}
@@ -743,6 +763,54 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	wFTS, wGraph, wVec := r.resolveWeights(opt, vectorsActive)
 	if err := validateWeights(wFTS, wGraph, wVec); err != nil {
 		return nil, err
+	}
+
+	// Embeddings are an optional recall lane, not a dependency for ordinary Mesh
+	// retrieval. Probe the query side before scoring any lane so an unavailable,
+	// blocked, or width-incompatible provider can cleanly switch the whole request to
+	// lexical + graph weights. Cancellation remains an error, and an explicit vector
+	// weight remains strict: evals and operator-requested vector searches must never
+	// masquerade as semantic when they did not run.
+	var qv []float32
+	var readableVecs map[string]Card
+	if vectorsActive && wVec > 0 {
+		vecIDs := make([]string, 0, len(r.vecs))
+		for id := range r.vecs {
+			vecIDs = append(vecIDs, id)
+		}
+		sort.Strings(vecIDs)
+		var err error
+		readableVecs, err = r.currentCards(ctx, vecIDs, opt)
+		if err != nil {
+			return nil, fmt.Errorf("read current vector-candidate metadata: %w", err)
+		}
+		if len(readableVecs) == 0 {
+			vectorsActive = false
+		} else {
+			qv, err = r.queryVec(ctx, query)
+			if err != nil {
+				if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
+					return nil, ctxErr
+				}
+				if opt.WeightVec > 0 {
+					return nil, err
+				}
+				vectorsActive = false
+				if opt.Economics != nil {
+					opt.Economics.SemanticFallback = true
+					opt.Economics.SemanticCircuitOpen = errors.Is(err, errEmbeddingCircuitOpen)
+				}
+			}
+		}
+		if !vectorsActive {
+			wFTS, wGraph, wVec = r.resolveWeights(opt, false)
+			// A vector-only persisted default must not turn an optional-provider outage
+			// into an empty success. The caller did not explicitly demand vectors, so use
+			// Mesh's built-in local blend.
+			if wFTS == 0 && wGraph == 0 {
+				wFTS, wGraph = 0.7, 0.3
+			}
+		}
 	}
 
 	// Candidate generation is scope-aware: both keyword signals apply the read
@@ -824,27 +892,11 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 	// so a long multi-topic note still surfaces on the one section that answers
 	// the query instead of being diluted by a whole-note average.
 	if vectorsActive && wVec > 0 {
-		vecIDs := make([]string, 0, len(r.vecs))
-		for id := range r.vecs {
-			vecIDs = append(vecIDs, id)
-		}
-		sort.Strings(vecIDs)
-		readableVecs, err := r.currentCards(ctx, vecIDs, opt)
-		if err != nil {
-			return nil, fmt.Errorf("read current vector-candidate metadata: %w", err)
-		}
 		// Length guard: a query embedding whose width disagrees with the stored width
 		// would make every cosine 0, which min-max turns into a uniform 1 boosting every
 		// note equally. Skip the whole vector contribution rather than emit that garbage.
 		// vecDim is always > 0 once EnableVectors succeeds, so a mismatch is a real skip.
 		if len(readableVecs) > 0 {
-			qv, err := r.queryVec(ctx, query)
-			if err != nil {
-				return nil, err
-			}
-			if r.vecDim <= 0 || len(qv) != r.vecDim {
-				return nil, fmt.Errorf("%w (embedder %s): query width %d does not match stored width %d", ErrEmbeddingUnavailable, r.emb.Model(), len(qv), r.vecDim)
-			}
 			// Both arms produce the same shape: the top-K chunk vectors folded to a
 			// per-note max. Keeping the ANN and brute-force candidate sets identical is
 			// what makes the two paths rank alike (see vectorCandidates).

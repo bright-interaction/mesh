@@ -109,6 +109,15 @@ func (f failingEmbedder) Embed(context.Context, []string) ([][]float32, error) {
 	return nil, f.err
 }
 
+type countingFailingEmbedder struct{ calls int }
+
+func (*countingFailingEmbedder) Model() string { return "static-two" }
+func (*countingFailingEmbedder) Dim() int      { return 2 }
+func (f *countingFailingEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	f.calls++
+	return nil, errors.New("embed boom")
+}
+
 func TestConfiguredEmbeddingFailureIsReturned(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -127,6 +136,92 @@ func TestConfiguredEmbeddingFailureIsReturned(t *testing.T) {
 				t.Fatalf("configured embed failure = %v, want ErrEmbeddingUnavailable wrapping %v", err, tc.err)
 			}
 		})
+	}
+}
+
+func TestConfiguredEmbeddingFailureFallsBackForOrdinaryRetrieval(t *testing.T) {
+	r := buildVault(t)
+	if !r.EnableVectors(failingEmbedder{err: errors.New("embed boom")}, "static-two", 2,
+		map[string][][]float32{"note:a": {{1, 0}}}) {
+		t.Fatal("EnableVectors failed")
+	}
+	var economics Economics
+	cards, err := r.Retrieve(context.Background(), "storage", Options{
+		Limit: 10, NoRerank: true, Economics: &economics,
+	})
+	if err != nil {
+		t.Fatalf("an optional semantic outage must not take down ordinary retrieval: %v", err)
+	}
+	if len(cards) == 0 || cards[0].NodeID != "note:a" {
+		t.Fatalf("lexical + graph fallback lost the known result: %+v", cards)
+	}
+	if !economics.SemanticConfigured || !economics.SemanticFallback {
+		t.Fatalf("semantic fallback was not explicit in economics: %+v", economics)
+	}
+}
+
+func TestConfiguredEmbeddingCancellationNeverFallsBack(t *testing.T) {
+	r := buildVault(t)
+	if !r.EnableVectors(failingEmbedder{err: errors.New("embed should not run")}, "static-two", 2,
+		map[string][][]float32{"note:a": {{1, 0}}}) {
+		t.Fatal("EnableVectors failed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := r.Retrieve(ctx, "storage", Options{NoRerank: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation became a successful fallback: %v", err)
+	}
+}
+
+func TestPersistedVectorOnlyDefaultStillFallsBackLocally(t *testing.T) {
+	r := buildVault(t)
+	if !r.EnableVectors(failingEmbedder{err: errors.New("embed boom")}, "static-two", 2,
+		map[string][][]float32{"note:a": {{1, 0}}}) {
+		t.Fatal("EnableVectors failed")
+	}
+	r.SetWeights(0, 0, 1) // persisted/operator default, not a strict per-call request
+	var economics Economics
+	cards, err := r.Retrieve(context.Background(), "storage", Options{
+		Limit: 10, NoRerank: true, Economics: &economics,
+	})
+	if err != nil || len(cards) == 0 {
+		t.Fatalf("vector-only persisted default must retain a useful local fallback: cards=%d err=%v", len(cards), err)
+	}
+	if !economics.SemanticFallback {
+		t.Fatalf("fallback was not surfaced: %+v", economics)
+	}
+}
+
+func TestSemanticFallbackOpensCircuitForLaterSearches(t *testing.T) {
+	r := buildVault(t)
+	emb := &countingFailingEmbedder{}
+	if !r.EnableVectors(emb, "static-two", 2, map[string][][]float32{"note:a": {{1, 0}}}) {
+		t.Fatal("EnableVectors failed")
+	}
+	var first, second Economics
+	if _, err := r.Retrieve(context.Background(), "storage", Options{NoRerank: true, Economics: &first}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Retrieve(context.Background(), "sqlite", Options{NoRerank: true, Economics: &second}); err != nil {
+		t.Fatal(err)
+	}
+	if emb.calls != 1 {
+		t.Fatalf("two searches called unavailable provider %d times, want 1", emb.calls)
+	}
+	if !first.SemanticFallback || first.SemanticCircuitOpen {
+		t.Fatalf("first failure should open but not arrive through the circuit: %+v", first)
+	}
+	if !second.SemanticFallback || !second.SemanticCircuitOpen {
+		t.Fatalf("second fallback should report the open circuit: %+v", second)
+	}
+	r.RecordEconomics(first)
+	r.RecordEconomics(second)
+	if got, err := r.store.Metric("semantic:fallbacks"); err != nil || got != 2 {
+		t.Fatalf("semantic fallback metric = %d, %v; want 2", got, err)
+	}
+	if got, err := r.store.Metric("semantic:circuit_open"); err != nil || got != 1 {
+		t.Fatalf("semantic circuit-open metric = %d, %v; want 1", got, err)
 	}
 }
 

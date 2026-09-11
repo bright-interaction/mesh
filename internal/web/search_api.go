@@ -86,6 +86,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if economics.Fallback {
 		result["rerank"] = economics.Receipt()
 	}
+	if economics.SemanticFallback {
+		result["semantic"] = economics.SemanticReceipt()
+	}
 	writeJSON(w, result)
 }
 

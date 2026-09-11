@@ -257,6 +257,12 @@ mesh status my-vault    # checks configured signals (subscription checks spend n
 mesh economics my-vault # local, content-free call/token/cache/fallback counters
 ```
 
+Vectors are optional at query time. If the configured embedding provider is down,
+blocked by the endpoint security policy, or returns an incompatible vector, an
+ordinary search continues with FTS + graph and labels that fallback in CLI/API/MCP
+output. A cancelled request and a search with an explicit per-call vector weight still
+fail loudly, so benchmarks can never claim semantic retrieval when it did not run.
+
 The subscription presets run non-interactively in an empty temporary directory,
 disable tools, MCP servers, hooks, settings discovery, and session persistence,
 and mark the process as a Mesh LLM child. This prevents the strict-JSON child from

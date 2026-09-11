@@ -488,6 +488,9 @@ func searchCmd() *cobra.Command {
 			if economics.Fallback {
 				fmt.Fprintf(cmd.ErrOrStderr(), "warning: subscription rerank unavailable; returned explicit local fallback (circuit_open=%t)\n", economics.CircuitOpen)
 			}
+			if economics.SemanticFallback {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: semantic retrieval unavailable; returned FTS + graph fallback (circuit_open=%t)\n", economics.SemanticCircuitOpen)
+			}
 			if len(cards) == 0 {
 				fmt.Println("no matches")
 				return nil

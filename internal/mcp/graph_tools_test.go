@@ -6,6 +6,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,14 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/index"
 )
+
+type unavailableQueryEmbedder struct{}
+
+func (unavailableQueryEmbedder) Model() string { return "unavailable-test-model" }
+func (unavailableQueryEmbedder) Dim() int      { return 2 }
+func (unavailableQueryEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, errors.New("provider unavailable")
+}
 
 func serverWithNotes(t *testing.T, notes map[string]string) *Server {
 	t.Helper()
@@ -36,6 +45,28 @@ func serverWithNotes(t *testing.T, notes map[string]string) *Server {
 	}
 	t.Cleanup(func() { srv.Close() })
 	return srv
+}
+
+func TestSearchWireLabelsSemanticFallback(t *testing.T) {
+	s := newTestServer(t)
+	_, rt := s.snapshot()
+	if !rt.EnableVectors(unavailableQueryEmbedder{}, "unavailable-test-model", 2,
+		map[string][][]float32{"note:sqlite": {{1, 0}}}) {
+		t.Fatal("EnableVectors failed")
+	}
+
+	res, rerr := s.toolSearch(context.Background(), json.RawMessage(`{"query":"storage","budget":500}`))
+	if rerr != nil {
+		t.Fatalf("ordinary MCP search failed instead of falling back: %+v", rerr)
+	}
+	payload := toolText(t, res.(map[string]any))
+	if len(payload["cards"].([]any)) == 0 {
+		t.Fatal("fallback returned no cards")
+	}
+	semantic, ok := payload["semantic"].(map[string]any)
+	if !ok || semantic["route"] != "lexical_graph" || semantic["fallback"] != true {
+		t.Fatalf("wire response did not label semantic fallback: %v", payload)
+	}
 }
 
 func toolCall(t *testing.T, s *Server, name string, args map[string]any) map[string]any {

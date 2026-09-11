@@ -82,7 +82,8 @@ You are looking at `mesh ui`, the web app over one vault. The left rail:
 - **Review** is the queue of auto-extracted candidate notes to keep or discard, when
   auto-extraction is enabled.
 - **Settings** is optional tuning (semantic search, ranking, rerank). Mesh works with
-  none of it.
+  none of it. If an optional embedding provider is unavailable, search continues with
+  FTS + graph and labels the fallback; it does not make the knowledge base unavailable.
 - **Docs** is what you are reading now (start with the Overview for the full picture).
 - **API** documents the agent (MCP) tools and the HTTP API, with a copy-paste config.
 

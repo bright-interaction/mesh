@@ -91,6 +91,13 @@ func TestFallbackReceiptIsOnlyPricedWhenItIsOnTheWire(t *testing.T) {
 	if got := fallback.ReceiptTokens(); got <= 0 {
 		t.Fatalf("fallback receipt cost = %d, want positive", got)
 	}
+	semantic := Economics{SemanticConfigured: true, SemanticFallback: true}
+	if got := semantic.ReceiptTokens(); got <= 0 {
+		t.Fatalf("semantic fallback receipt cost = %d, want positive", got)
+	}
+	if got := semantic.SemanticReceipt(); got.Route != "lexical_graph" || !got.Fallback {
+		t.Fatalf("semantic fallback receipt = %+v", got)
+	}
 	provider := fallback
 	provider.ProviderReported = true
 	provider.RerankProviderTokens = 3524

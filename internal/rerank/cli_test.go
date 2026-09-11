@@ -163,7 +163,11 @@ func TestSubscriptionCLIMeasuresCacheAndOpensFailureCircuit(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := &CLI{
-		provider: "test", model: "tiny", argv: []string{script, countPath}, timeout: time.Second,
+		// Process startup competes with every package in `go test ./... -count=1`.
+		// One second repeatedly expired before the tiny script wrote its launch marker,
+		// producing "launched 0" only under full-suite load. Keep a bounded timeout,
+		// but give the scheduler enough room; the script itself exits immediately.
+		provider: "test", model: "tiny", argv: []string{script, countPath}, timeout: 10 * time.Second,
 		candidateCap: 2, cardCharCap: 200, cooldown: time.Minute, cache: make(map[[32]byte][]Result),
 	}
 	candidates := []Candidate{{Index: 0, Title: "one"}, {Index: 1, Title: "two"}}
