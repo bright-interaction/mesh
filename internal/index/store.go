@@ -45,6 +45,12 @@ type Store struct {
 	closeOnce sync.Once // Close is idempotent: a second close(s.done) would panic
 	closeErr  error     // the first Close's result, replayed to later callers
 
+	healthMu          sync.Mutex
+	healthClosed      bool
+	healthCancel      context.CancelFunc
+	healthDone        chan struct{}
+	healthLastAttempt time.Time
+
 	// writeGuard is an optional live ownership check. Opportunistic MCP ownership can
 	// be preempted after this Store was opened; every transaction and checkpoint must
 	// then stop writing even though the physical write connection still exists until
@@ -1778,6 +1784,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) shutdown() error {
+	s.stopBackgroundHealth()
 	// A read-only store has no writer goroutine, no jobs channel and no writeDB. It must
 	// also never open its own writable connection to run checkpointTruncateBestEffort,
 	// which is exactly what the writable path below does: an OpenReadOnly caller (a

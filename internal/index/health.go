@@ -8,7 +8,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io/fs"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -84,11 +83,15 @@ func (s *Store) ComputeHealth(vaultRoot string, now time.Time) ([]HealthFinding,
 // persisted rows instead would serve whatever the owner last wrote, and on a vault whose
 // owner never runs the pass that is nothing at all.
 func (s *Store) ScanHealth(vaultRoot string, now time.Time) ([]HealthFinding, error) {
-	codeFiles, err := s.codeFilePaths()
+	return s.scanHealthContext(context.Background(), vaultRoot, now)
+}
+
+func (s *Store) scanHealthContext(ctx context.Context, vaultRoot string, now time.Time) ([]HealthFinding, error) {
+	codeFiles, err := s.codeFilePathsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	notes, err := s.noteList()
+	notes, err := s.noteListContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +104,10 @@ func (s *Store) ScanHealth(vaultRoot string, now time.Time) ([]HealthFinding, er
 	var findings []HealthFinding
 	var candidates []HealthFinding
 	for _, n := range notes {
-		raw, err := os.ReadFile(filepath.Join(vaultRoot, n.path))
+		raw, err := vault.ReadFileContext(ctx, filepath.Join(vaultRoot, n.path))
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if err != nil {
 			continue
 		}
@@ -161,14 +167,21 @@ func (s *Store) ScanHealth(vaultRoot string, now time.Time) ([]HealthFinding, er
 		for _, c := range candidates {
 			refs[c.Detail] = true
 		}
-		onDisk := existsUnderRoots(s.codeRoots(), refs)
+		roots, err := s.codeRootsContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		onDisk, err := existsUnderRootsContext(ctx, roots, refs)
+		if err != nil {
+			return nil, err
+		}
 		for _, c := range candidates {
 			if !onDisk[c.Detail] {
 				findings = append(findings, c)
 			}
 		}
 	}
-	return findings, nil
+	return findings, ctx.Err()
 }
 
 // tier0Health are the institutional types whose do/dont guidance is worth checking
@@ -190,22 +203,34 @@ func (s *Store) ComputeContradictions(now time.Time) ([]HealthFinding, error) {
 // high-precision); the curator can later confirm with an LLM. Pure computation over the
 // index's read side, writing nothing, for the same reason as ScanHealth.
 func (s *Store) ScanContradictions() ([]HealthFinding, error) {
-	notes, err := s.tier0Guidance()
+	return s.scanContradictionsContext(context.Background())
+}
+
+func (s *Store) scanContradictionsContext(ctx context.Context) ([]HealthFinding, error) {
+	notes, err := s.tier0GuidanceContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return contradictionFindings(notes), nil
+	return contradictionFindingsContext(ctx, notes)
 }
 
 // contradictionFindings preserves directed comparison order and the one-finding
 // per unordered pair policy. Tokenize each field once and visit only notes sharing
 // a tag, instead of allocating token/tag maps for every pair on every health pass.
 func contradictionFindings(notes []guidanceRow) []HealthFinding {
+	findings, _ := contradictionFindingsContext(context.Background(), notes)
+	return findings
+}
+
+func contradictionFindingsContext(ctx context.Context, notes []guidanceRow) ([]HealthFinding, error) {
 	const threshold = 0.6
 	doTokens := make([]map[string]bool, len(notes))
 	dontTokens := make([]map[string]bool, len(notes))
 	byTag := map[string][]int{}
 	for i, n := range notes {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		doTokens[i], dontTokens[i] = tokenSet(n.do), tokenSet(n.dont)
 		tags := map[string]bool{}
 		for _, tag := range n.tags {
@@ -221,6 +246,9 @@ func contradictionFindings(notes []guidanceRow) []HealthFinding {
 	visited := make([]int, len(notes))
 	candidates := make([]int, 0, len(notes))
 	for i := range notes {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if len(doTokens[i]) == 0 {
 			continue
 		}
@@ -236,6 +264,9 @@ func contradictionFindings(notes []guidanceRow) []HealthFinding {
 		// Preserve which direction owns a finding when both directions qualify.
 		sort.Ints(candidates)
 		for _, j := range candidates {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			a, b := len(doTokens[i]), len(dontTokens[j])
 			// Even complete containment cannot reach the threshold at this size ratio.
 			if b == 0 || float64(min(a, b))/float64(max(a, b)) < threshold {
@@ -256,7 +287,7 @@ func contradictionFindings(notes []guidanceRow) []HealthFinding {
 			})
 		}
 	}
-	return findings
+	return findings, ctx.Err()
 }
 
 type guidanceRow struct {
@@ -265,7 +296,11 @@ type guidanceRow struct {
 }
 
 func (s *Store) tier0Guidance() ([]guidanceRow, error) {
-	rows, err := s.readDB.Query(`SELECT id, path, type, frontmatter FROM notes`)
+	return s.tier0GuidanceContext(context.Background())
+}
+
+func (s *Store) tier0GuidanceContext(ctx context.Context) ([]guidanceRow, error) {
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id, path, type, frontmatter FROM notes`)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +458,11 @@ type noteRow struct {
 }
 
 func (s *Store) noteList() ([]noteRow, error) {
-	rows, err := s.readDB.Query(`SELECT id, path, COALESCE(review_by,''), frontmatter FROM notes`)
+	return s.noteListContext(context.Background())
+}
+
+func (s *Store) noteListContext(ctx context.Context) ([]noteRow, error) {
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id, path, COALESCE(review_by,''), frontmatter FROM notes`)
 	if err != nil {
 		return nil, err
 	}
@@ -452,7 +491,11 @@ func (s *Store) noteList() ([]noteRow, error) {
 }
 
 func (s *Store) codeFilePaths() (map[string]bool, error) {
-	rows, err := s.readDB.Query(`SELECT path FROM code_files`)
+	return s.codeFilePathsContext(context.Background())
+}
+
+func (s *Store) codeFilePathsContext(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.readDB.QueryContext(ctx, `SELECT path FROM code_files`)
 	if err != nil {
 		return nil, err
 	}
@@ -522,9 +565,17 @@ func (s *Store) setCodeRoots(roots []string) error {
 }
 
 func (s *Store) codeRoots() []string {
+	roots, _ := s.codeRootsContext(context.Background())
+	return roots
+}
+
+func (s *Store) codeRootsContext(ctx context.Context) ([]string, error) {
 	var v string
-	if err := s.readDB.QueryRow(`SELECT value FROM meta WHERE key='code_roots'`).Scan(&v); err != nil {
-		return nil
+	if err := s.readDB.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='code_roots'`).Scan(&v); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
 	}
 	var out []string
 	for _, r := range strings.Split(v, "\n") {
@@ -532,7 +583,7 @@ func (s *Store) codeRoots() []string {
 			out = append(out, r)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // existsUnderRoots reports which refs name a file that really exists, matched the same
@@ -548,19 +599,62 @@ func (s *Store) codeRoots() []string {
 // Walked lazily and once per health run, only when there is at least one candidate, so a
 // clean vault pays nothing.
 func existsUnderRoots(roots []string, refs map[string]bool) map[string]bool {
+	found, _ := existsUnderRootsContext(context.Background(), roots, refs)
+	return found
+}
+
+func existsUnderRootsContext(ctx context.Context, roots []string, refs map[string]bool) (map[string]bool, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if ctx.Done() == nil {
+		return scanExistsUnderRoots(ctx, roots, refs)
+	}
+	// A stuck kernel directory read cannot be canceled. Isolate this purely
+	// read-only scan, just like vault.ReadFileContext; late results are private
+	// and never used to publish a partial (false dead-ref) report.
+	type result struct {
+		found map[string]bool
+		err   error
+	}
+	out := make(chan result, 1)
+	rootCopy := append([]string(nil), roots...)
+	refCopy := make(map[string]bool, len(refs))
+	for ref, value := range refs {
+		refCopy[ref] = value
+	}
+	go func() { found, err := scanExistsUnderRoots(ctx, rootCopy, refCopy); out <- result{found, err} }()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-out:
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return r.found, r.err
+	}
+}
+
+func scanExistsUnderRoots(ctx context.Context, roots []string, refs map[string]bool) (map[string]bool, error) {
 	found := make(map[string]bool, len(refs))
 	if len(refs) == 0 {
-		return found
+		return found, ctx.Err()
 	}
 	// Ask git as well as the filesystem. A code root is typically a SHARED working tree
 	// whose branch is whatever the last session checked out, so "not on disk right now"
 	// routinely means "on another branch", not "deleted". Checking the mainline too is
 	// what separates the two; without it, a file added an hour ago on main reads as rot.
 	for _, root := range roots {
-		markGitKnown(root, refs, found)
+		markGitKnownContext(ctx, root, refs, found)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 	}
 	for _, root := range roots {
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if err != nil {
 				return nil //nolint:nilerr // an unreadable dir must not fail the health run
 			}
@@ -583,7 +677,10 @@ func existsUnderRoots(roots []string, refs map[string]bool) map[string]bool {
 			return nil
 		})
 	}
-	return found
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return found, nil
 }
 
 // markGitKnown marks every ref that the repository at root knows about on its mainline.
@@ -594,6 +691,10 @@ func existsUnderRoots(roots []string, refs map[string]bool) map[string]bool {
 // through the usual mainline names and does nothing at all outside a git repo, so a
 // non-git code root keeps the plain filesystem behaviour.
 func markGitKnown(root string, refs map[string]bool, found map[string]bool) {
+	markGitKnownContext(context.Background(), root, refs, found)
+}
+
+func markGitKnownContext(ctx context.Context, root string, refs map[string]bool, found map[string]bool) {
 	allFound := true
 	for ref := range refs {
 		if !found[ref] {
@@ -610,7 +711,11 @@ func markGitKnown(root string, refs map[string]bool, found map[string]bool) {
 	// whose only mainline was a local `main` fell through to HEAD, which is exactly the
 	// branch that may be missing the file.
 	for _, rev := range []string{"origin/HEAD", "origin/main", "origin/master", "main", "master", "HEAD"} {
-		cmd := exec.Command("git", "-C", root, "ls-tree", "-r", "--name-only", rev)
+		if ctx.Err() != nil {
+			return
+		}
+		cmd := exec.CommandContext(ctx, "git", "-C", root, "ls-tree", "-r", "--name-only", rev)
+		cmd.WaitDelay = time.Second
 		out, err := cmd.Output()
 		if err != nil {
 			continue

@@ -65,7 +65,7 @@ var nonSyncGuards = map[string]string{
 		"CLI (`mesh conflicts resolve <sibling>`), not one that arrived over the network. The " +
 		"user may already read and delete their own files, so this is an ergonomics check, not " +
 		"a trust boundary. It could still delegate; that is a deliberate, separate decision.",
-	"internal/index/health.go:existsUnderRoots": "walks LOCAL source roots for the code " +
+	"internal/index/health.go:scanExistsUnderRoots": "walks LOCAL source roots for the code " +
 		"index and prunes .git/node_modules/vendor while walking. It decides what to READ off " +
 		"a directory the user configured, never what to write from a wire path.",
 }

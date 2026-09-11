@@ -356,7 +356,7 @@ during sync; completion triggers local discovery without requesting another sync
 Shutdown drains the active durable sync round before releasing the index owner.
 
 Startup still performs an authoritative full rebuild to catch offline edits and
-seed the incremental cache. Its log separates indexing from lifecycle-health time.
+seed the incremental cache. Its log separates indexing from lifecycle-health work.
 From v0.20, contradiction checks tokenize guidance once per pass and restrict
 comparisons to shared tags, preserving the existing findings and 0.6 similarity
 threshold. This reduces work at startup and on the five-minute health cadence
@@ -392,6 +392,33 @@ include mutex waits, queued operations, indexing and health. `index_full`,
 graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
+
+From v0.23, the owning watcher's lifecycle-health analysis runs in one background
+pass per Store, outside the reconciliation mutex. Slow note reads, source-tree
+walks and Git checks no longer hold up the next indexing callback. The normal
+single database writer still publishes the complete dead-reference, overdue and
+contradiction report atomically; there is no second writer. A newly created index
+can have no health report until the first background pass succeeds.
+
+Health attempts retain the five-minute cadence, coalesce while running, and retry
+failed/changed-input passes no sooner than thirty seconds later. Analysis has a
+two-minute cooperative deadline, including Git and cancellable reads; publication
+has a separate two-second budget within that deadline. Indexed note/code identity
+is checked again inside the publication transaction. Cancellation, changed inputs,
+ownership loss or failed publication preserves the previous report rather than
+replacing it with partial findings. `meta.health_completed_at` records successful
+background publication; `background_health` logs separate snapshot, analysis,
+contradiction and publication costs. Sustained edits or repeatedly slow analysis
+can keep that report stale; explicit health commands remain available.
+
+Store shutdown cancels and joins its health pass before closing database pools.
+A kernel filesystem read cannot be forcibly canceled: any late read-only result
+is isolated and discarded, never published. This change removes health analysis
+from the serial indexing path, not all CPU/I/O contention or the brief health
+publication transaction. Index persistence and code linking remain separate costs.
+These are cooperative budgets, not hard wall-clock guarantees: existing ownership
+metadata locks and kernel commit/fsync calls cannot be forcibly interrupted. Shutdown
+joins any admitted publication before closing its database, even if that takes longer.
 
 The `--watch` flag runs the live reindexer inside the server, so notes you (or a
 teammate) edit in your editor become searchable in the same session without a

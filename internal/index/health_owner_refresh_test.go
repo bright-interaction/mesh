@@ -16,8 +16,9 @@ import (
 // dashboard reads those rows and computes nothing. So the owning writer refreshes them
 // now: it is the one process that is both long-lived and allowed to write.
 
-// TestOwnerRefreshesHealthOnItsFirstPass: after the owner has reconciled once, a reader
-// (the dashboard, another process entirely) has findings to show.
+// TestOwnerRefreshesHealthOnItsFirstPass: the first reconcile schedules a report;
+// a reader has findings once that background pass completes, not necessarily when
+// indexing itself returns.
 func TestOwnerRefreshesHealthOnItsFirstPass(t *testing.T) {
 	dir := t.TempDir()
 	// review_by in the past: an overdue finding, deterministic and dependency-free.
@@ -34,6 +35,7 @@ func TestOwnerRefreshesHealthOnItsFirstPass(t *testing.T) {
 	if _, err := NewLiveIndexer(store, dir).Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
+	waitBackgroundHealth(t, store)
 
 	findings, err := store.ListHealth("overdue")
 	if err != nil {
@@ -63,6 +65,7 @@ func TestOwnerDoesNotRepeatTheHealthPassEveryTick(t *testing.T) {
 	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
+	waitBackgroundHealth(t, store)
 	if overdueCount(t, store) != 1 {
 		t.Fatal("the first pass should have recorded the overdue note")
 	}
@@ -87,13 +90,14 @@ func TestOwnerDoesNotRepeatTheHealthPassEveryTick(t *testing.T) {
 	}
 
 	// And when the cadence IS due it runs: same reconcile path, only the clock moved.
-	live.mu.Lock()
-	live.lastHealth = time.Now().Add(-2 * healthRefreshInterval)
-	live.mu.Unlock()
+	store.healthMu.Lock()
+	store.healthLastAttempt = time.Now().Add(-2 * healthRefreshInterval)
+	store.healthMu.Unlock()
 	writeFresh("nudge") // real work for the reconcile to do
 	if _, err := live.Reconcile(true); err != nil {
 		t.Fatal(err)
 	}
+	waitBackgroundHealth(t, store)
 	if n := overdueCount(t, store); n != 0 {
 		t.Fatalf("the fixed note is still reported as overdue (%d rows) after the interval passed, so what "+
 			"a reader sees would freeze at whatever the owner found when it started", n)
@@ -107,4 +111,19 @@ func overdueCount(t *testing.T, s *Store) int {
 		t.Fatal(err)
 	}
 	return len(f)
+}
+
+func waitBackgroundHealth(t *testing.T, s *Store) {
+	t.Helper()
+	s.healthMu.Lock()
+	done := s.healthDone
+	s.healthMu.Unlock()
+	if done == nil {
+		t.Fatal("health was not scheduled")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("health did not finish")
+	}
 }

@@ -88,10 +88,9 @@ type LiveIndexer struct {
 	store *Store
 	root  string
 
-	mu         sync.Mutex
-	cache      *NoteCache
-	seeded     bool
-	lastHealth time.Time // when this owner last refreshed the persisted health findings
+	mu     sync.Mutex
+	cache  *NoteCache
+	seeded bool
 }
 
 // healthRefreshInterval is how often the owning writer recomputes the lifecycle health
@@ -152,9 +151,9 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 		li.cache.Seed(notes)
 		li.seeded = true
 		indexDur := time.Since(start)
-		trace.Phase("health")
+		trace.Phase("schedule_health")
 		li.refreshHealthIfDue()
-		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", time.Since(start)-indexDur)
+		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", "background")
 		trace.Phase("read_dropped")
 		dropped, err := li.store.DroppedNotes() // recorded by ReindexFull
 		if err != nil {
@@ -170,7 +169,7 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 	}
 	rec, err := ReconcileIncremental(li.store, li.root, li.cache, !authoritative)
 	if err == nil {
-		trace.Phase("health")
+		trace.Phase("schedule_health")
 		li.refreshHealthIfDue()
 	}
 	return rec, err
@@ -197,9 +196,9 @@ func (li *LiveIndexer) ReconcilePaths(paths []string) (Reconciliation, error) {
 		li.cache.Seed(notes)
 		li.seeded = true
 		indexDur := time.Since(start)
-		trace.Phase("health")
+		trace.Phase("schedule_health")
 		li.refreshHealthIfDue()
-		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", time.Since(start)-indexDur)
+		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", "background")
 		trace.Phase("read_dropped")
 		dropped, err := li.store.DroppedNotes()
 		if err != nil {
@@ -209,7 +208,7 @@ func (li *LiveIndexer) ReconcilePaths(paths []string) (Reconciliation, error) {
 	}
 	rec, err := ReconcilePaths(li.store, li.root, li.cache, paths)
 	if err == nil {
-		trace.Phase("health")
+		trace.Phase("schedule_health")
 		li.refreshHealthIfDue()
 	}
 	return rec, err
@@ -233,22 +232,9 @@ func (li *LiveIndexer) drainOps() {
 	}
 }
 
-// refreshHealthIfDue recomputes the persisted health findings when they are older than
-// healthRefreshInterval. Called with li.mu held, from the one goroutine that reconciles,
-// so the passes can never overlap. Best effort: a health pass that fails must never fail
-// the reindex it rode in on, because the index is what retrieval depends on and the
-// findings are a lifecycle report about it.
+// refreshHealthIfDue only schedules work. Analysis must not hold li.mu or keep the
+// watcher from receiving its next changed path. The Store owns and joins the single
+// background pass; its normal writer still serializes the final health transaction.
 func (li *LiveIndexer) refreshHealthIfDue() {
-	if !li.lastHealth.IsZero() && time.Since(li.lastHealth) < healthRefreshInterval {
-		return
-	}
-	now := time.Now()
-	li.lastHealth = now
-	if _, err := li.store.ComputeHealth(li.root, now); err != nil {
-		slog.Warn("mesh: could not refresh the health findings", "err", err)
-		return
-	}
-	if _, err := li.store.ComputeContradictions(now); err != nil {
-		slog.Warn("mesh: could not refresh the contradiction findings", "err", err)
-	}
+	li.store.scheduleBackgroundHealth(li.root, nil)
 }
