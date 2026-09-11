@@ -31,11 +31,13 @@ func TestLongConflictCanBeListedAndResolved(t *testing.T) {
 	if err := os.WriteFile(sibling, []byte("mine"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runSub(t, conflictsListCmd(), root, "--json")
+	out, err := captureStdout(t, func() error { return listConflicts(root, true) })
 	if err != nil || !strings.Contains(out, filepath.Base(base)) {
 		t.Fatalf("list lost base: %s %v", out, err)
 	}
-	if _, err := runSub(t, conflictsResolveCmd(), sibling, root, "--keep-base"); err != nil {
+	cmd := conflictsResolveCmd()
+	cmd.SetArgs([]string{sibling, root, "--keep-base"})
+	if _, err := captureStdout(t, cmd.Execute); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(sibling); !os.IsNotExist(err) {
