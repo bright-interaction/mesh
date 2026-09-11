@@ -516,31 +516,77 @@ func (s *Server) load() error {
 // The parsed-note cache is deliberately left unseeded: it exists to make a REINDEX
 // incremental, and this server never reindexes.
 func (s *Server) refresh() (index.Reconciliation, error) {
-	s.reloadMu.Lock()
+	return s.refreshContext(context.Background())
+}
+
+func (s *Server) lockReloadContext(ctx context.Context) error {
+	if ctx.Done() == nil {
+		s.reloadMu.Lock()
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.reloadMu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if s.reloadMu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+func (s *Server) refreshContext(ctx context.Context) (index.Reconciliation, error) {
+	if err := s.lockReloadContext(ctx); err != nil {
+		return index.Reconciliation{}, err
+	}
 	defer s.reloadMu.Unlock()
-	g, err := s.store.LoadGraph()
+	g, err := s.store.LoadGraphContext(ctx)
 	if err != nil {
 		return index.Reconciliation{}, err
 	}
-	return s.installRefreshedGraph(g), nil
+	return s.installRefreshedGraph(ctx, g)
 }
 
-func (s *Server) refreshAtNoteVersion(noteID, notePath, noteHash string) (bool, error) {
-	s.reloadMu.Lock()
+func (s *Server) refreshAtNoteVersion(ctx context.Context, noteID, notePath, noteHash string) (bool, error) {
+	if err := s.lockReloadContext(ctx); err != nil {
+		return false, err
+	}
 	defer s.reloadMu.Unlock()
-	g, matched, err := s.store.LoadGraphAtNoteVersion(noteID, notePath, noteHash)
+	g, matched, err := s.store.LoadGraphAtNoteVersionContext(ctx, noteID, notePath, noteHash)
 	if err != nil || !matched {
 		return matched, err
 	}
-	s.installRefreshedGraph(g)
-	return true, nil
+	_, err = s.installRefreshedGraph(ctx, g)
+	return err == nil, err
 }
 
-func (s *Server) installRefreshedGraph(g *graph.Graph) index.Reconciliation {
+func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (index.Reconciliation, error) {
 	// Fingerprint the index we just loaded. A read error here costs the NEXT refresh its
 	// counts, never its correctness, so it must not fail the refresh: the graph is already
 	// good and the caller's notes are already queryable.
-	after, herr := s.store.NoteHashes()
+	after, herr := s.store.NoteHashesContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return index.Reconciliation{}, err
+	}
+	r, err := retrieve.NewFromEnvContext(ctx, s.store, g)
+	if err != nil {
+		return index.Reconciliation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return index.Reconciliation{}, err
+	}
 	// Reindexed carries the same meaning it does on the writable path: something actually
 	// changed. A refresh always swaps a graph in, but saying so every time would make the
 	// watcher log a line on every idle tick (and mesh_reindex claim a pass it did not
@@ -564,16 +610,24 @@ func (s *Server) installRefreshedGraph(g *graph.Graph) index.Reconciliation {
 			}
 		}
 		rec.Reindexed = first || rec.Any()
+	}
+	if err := ctx.Err(); err != nil {
+		return index.Reconciliation{}, err
+	}
+	if herr == nil {
 		s.viewHashes = after
 	}
-	s.swap(g)
-	return rec
+	s.mu.Lock()
+	s.graph, s.retriever = g, r
+	s.mu.Unlock()
+	return rec, nil
 }
 
 // ErrOwnerNotIndexing means the single owning writer did not index a just-written note
-// inside ownerIndexTimeout. The note IS durably on disk; only its indexing is missing,
-// which is a liveness failure of the owner (`mesh watch` / `mesh sync --watch` stopped),
-// not a durability failure of the write. Callers must say exactly that, because the one
+// inside ownerIndexTimeout, or this reader could not install the matching snapshot
+// within that same bound. The note IS durably on disk; its queryability is unconfirmed,
+// not its durability. This does not prove the owner stopped. Callers must say exactly
+// that, because the one
 // thing that must never happen here is reporting a failed write for a note that exists:
 // the agent retries and Mesh mints a near-duplicate.
 //
@@ -581,6 +635,16 @@ func (s *Server) installRefreshedGraph(g *graph.Graph) index.Reconciliation {
 // owner for the same reason, and two sentinels would mean errors.Is answering differently
 // on the two surfaces.
 var ErrOwnerNotIndexing = index.ErrOwnerNotIndexing
+
+// Keep the legacy stale-receipt classification without blaming the owner when
+// a busy reader, rather than a missing committed row, exhausted the wait.
+type acknowledgementTimeoutError struct{}
+
+func (acknowledgementTimeoutError) Error() string {
+	return "the note was saved, but this reader could not confirm its indexed version before the acknowledgement deadline; do not retry the write"
+}
+
+func (acknowledgementTimeoutError) Unwrap() error { return ErrOwnerNotIndexing }
 
 // ownerIndexTimeout bounds the wait for the owning writer. The value, and why it is that
 // value, live with the wait itself in internal/index.
@@ -598,19 +662,30 @@ const OwnerIndexBound = index.OwnerIndexBound
 // and a writer can reuse its slug before the owner sees the removal. In that window the
 // old row has the right id and path but the wrong retrieval hash, and accepting it would
 // return a false success receipt while queries still serve the deleted note's content.
-func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string) error {
+func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string) (result error) {
 	timeout := s.ownerIndexTimeout
 	if timeout <= 0 {
 		timeout = ownerIndexTimeout
 	}
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	defer func() {
+		if result != nil && ctx.Err() != nil {
+			if parent.Err() != nil {
+				result = parent.Err()
+			} else {
+				result = acknowledgementTimeoutError{}
+			}
+		}
+	}()
 	rel, err := filepath.Rel(s.vaultRoot, notePath)
 	if err != nil {
 		return err
 	}
 	rel = filepath.Clean(rel)
-	deadline := time.Now().Add(timeout)
 	for {
-		pn, perr := index.ParseFile(notePath)
+		pn, perr := index.ParseFileContext(ctx, notePath)
 		switch {
 		case perr == nil:
 			pn.Path = rel
@@ -618,7 +693,7 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string)
 			if s.beforeOwnerVersionRefresh != nil {
 				s.beforeOwnerVersionRefresh()
 			}
-			matched, rerr := s.refreshAtNoteVersion(noteID, rel, targetHash)
+			matched, rerr := s.refreshAtNoteVersion(ctx, noteID, rel, targetHash)
 			if rerr != nil {
 				return rerr
 			}
@@ -628,19 +703,19 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string)
 				// ParseFile and before the snapshot is installed. Re-read the path
 				// after publication and only acknowledge if it still names the exact
 				// version represented by that snapshot.
-				currentDB, derr := s.store.NoteVersionMatches(noteID, rel, targetHash)
+				currentDB, derr := s.store.NoteVersionMatchesContext(ctx, noteID, rel, targetHash)
 				if derr != nil {
 					return derr
 				}
 				if !currentDB {
 					break
 				}
-				current, cerr := index.ParseFile(notePath)
+				current, cerr := index.ParseFileContext(ctx, notePath)
 				switch {
 				case cerr == nil:
 					current.Path = rel
 					if index.RetrievalHash(current) == targetHash {
-						return nil
+						return ctx.Err()
 					}
 				case os.IsNotExist(cerr):
 					// The current path is now ahead of (or absent from) the
@@ -656,8 +731,8 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string)
 		default:
 			return perr
 		}
-		if time.Now().After(deadline) {
-			return ErrOwnerNotIndexing
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		timer := time.NewTimer(index.OwnerIndexPollInterval)
 		select {

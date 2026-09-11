@@ -1328,15 +1328,11 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 		// is structurally incapable of fixing it.
 		if ownerDown {
 			out["owner_down"] = true
-			out["warning"] = "The note IS saved at the path above, but it is NOT queryable yet: the " +
-				"single owning writer did not index it inside the wait. The usual cause is that " +
-				"`mesh watch` / `mesh sync --watch` is not running, so check that first; a busy " +
-				"owner can also miss its file-event window and pick the note up on its next " +
-				"periodic sweep instead, in which case it becomes queryable shortly on its own. " +
-				"Do NOT call this tool again: a retry creates a duplicate note. Do NOT call " +
-				"mesh_reindex either: this server is read-only, so a reindex only re-reads what " +
-				"the owner already wrote. If no owner is running, start one (or run `mesh index` " +
-				"once) and the note is indexed as soon as it does."
+			out["warning"] = "The note IS saved at the path above; queryability was not confirmed before the wait ended. " +
+				"The existing owner may be busy, or this reader's refresh may be delayed. " +
+				"Check the owner and index state before acting; owner_down is a legacy timeout flag, not proof of a missing owner. " +
+				"Do NOT retry this write or start a second index writer. Do NOT call mesh_reindex repeatedly to force indexing: " +
+				"this reader cannot make the owner index sooner. Once indexing catches up, read or search the saved note."
 		} else {
 			out["warning"] = "The note IS saved at the path above. Only the index refresh failed, " +
 				"so it is not queryable yet. Do NOT call this tool again: a retry creates a " +

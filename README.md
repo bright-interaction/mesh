@@ -365,6 +365,12 @@ without skipping checks, adding model calls, or weakening index validation.
 Retriever setup and graph refreshes do not call embedding models. Actual semantic
 queries validate vector width, and explicit health checks still probe reachability
 and dimensions. Local write acknowledgements do not need an embedding endpoint.
+From v0.21, the read-only MCP acknowledgement wait applies its existing
+deadline to refresh-lock acquisition, note reads, SQLite snapshots, and retriever
+construction too. A timeout preserves the saved note and returns an `index_stale`
+receipt; it does not prove the owner is down. Canceled construction leaves the
+previous graph/retriever pair intact. This bounds cooperative readback work, not
+the file's durable write, owner recovery, or the owning writer's indexing pass.
 That keeps a write-back's saved-and-queryable receipt independent of vault-wide
 discovery and network latency; periodic and remote-triggered passes still scan
 the vault as the convergence safety net.

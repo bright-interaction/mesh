@@ -36,7 +36,15 @@ func (d Drift) Any() bool { return len(d.Added)+len(d.Changed)+len(d.Removed) > 
 // gained, lost or changed, which is the only honest way it can report counts for a pass
 // it did not run itself.
 func (s *Store) NoteHashes() (map[string]string, error) {
-	rows, err := s.readDB.Query(`SELECT path, retrieval_hash FROM notes`)
+	return s.NoteHashesContext(context.Background())
+}
+
+// NoteHashesContext allows a refresh deadline to cover fingerprint loading too.
+func (s *Store) NoteHashesContext(ctx context.Context) (map[string]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.readDB.QueryContext(ctx, `SELECT path, retrieval_hash FROM notes`)
 	if err != nil {
 		return nil, err
 	}

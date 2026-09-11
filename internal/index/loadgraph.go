@@ -139,12 +139,26 @@ func (s *Store) LoadGraphAtNoteVersion(noteID, expectedPath, expectedHash string
 	return s.loadGraphAtNoteVersion(noteID, expectedPath, expectedHash, nil)
 }
 
+// LoadGraphAtNoteVersionContext keeps the version gate and graph on one snapshot,
+// with the caller's deadline covering connection acquisition and every SQL phase.
+func (s *Store) LoadGraphAtNoteVersionContext(ctx context.Context, noteID, expectedPath, expectedHash string) (*graph.Graph, bool, error) {
+	return s.loadGraphAtNoteVersionContext(ctx, noteID, expectedPath, expectedHash, nil)
+}
+
 // NoteVersionMatches reports whether the current committed notes row still names the
 // expected path and retrieval version. Keep path and hash in one query: two independent
 // getters could straddle an owner commit and manufacture a version that never existed.
 func (s *Store) NoteVersionMatches(noteID, expectedPath, expectedHash string) (bool, error) {
+	return s.NoteVersionMatchesContext(context.Background(), noteID, expectedPath, expectedHash)
+}
+
+// NoteVersionMatchesContext is the cancelable final publication check.
+func (s *Store) NoteVersionMatchesContext(ctx context.Context, noteID, expectedPath, expectedHash string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var path, hash string
-	err := s.readDB.QueryRow(`SELECT path, retrieval_hash FROM notes WHERE id = ?`, noteID).Scan(&path, &hash)
+	err := s.readDB.QueryRowContext(ctx, `SELECT path, retrieval_hash FROM notes WHERE id = ?`, noteID).Scan(&path, &hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -155,13 +169,20 @@ func (s *Store) NoteVersionMatches(noteID, expectedPath, expectedHash string) (b
 }
 
 func (s *Store) loadGraphAtNoteVersion(noteID, expectedPath, expectedHash string, afterVersionCheck func()) (*graph.Graph, bool, error) {
-	tx, err := s.readDB.Begin()
+	return s.loadGraphAtNoteVersionContext(context.Background(), noteID, expectedPath, expectedHash, afterVersionCheck)
+}
+
+func (s *Store) loadGraphAtNoteVersionContext(ctx context.Context, noteID, expectedPath, expectedHash string, afterVersionCheck func()) (*graph.Graph, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, false, err
 	}
 	defer tx.Rollback()
 	var path, hash string
-	err = tx.QueryRow(`SELECT path, retrieval_hash FROM notes WHERE id = ?`, noteID).Scan(&path, &hash)
+	err = tx.QueryRowContext(ctx, `SELECT path, retrieval_hash FROM notes WHERE id = ?`, noteID).Scan(&path, &hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -174,7 +195,7 @@ func (s *Store) loadGraphAtNoteVersion(noteID, expectedPath, expectedHash string
 	if afterVersionCheck != nil {
 		afterVersionCheck()
 	}
-	g, err := loadGraph(tx)
+	g, err := loadGraphContext(ctx, tx)
 	if err != nil {
 		return nil, false, err
 	}
