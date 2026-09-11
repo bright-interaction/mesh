@@ -393,6 +393,20 @@ graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
 
+From v0.27, a note edit refreshes only the added/changed/removed note IDs in the
+note-to-code bridge. It no longer rereads every note or replaces unrelated links.
+Full startup and code-index refreshes still rebuild all links, since symbol changes
+can affect any note. Both paths share the same title/raw-file token matching,
+ambiguity rules and writer-transaction replacement; no model calls or schema changes.
+The symbol resolver is rebuilt from current indexed symbols, not cached. Slow
+`note_code_links` traces separate metadata, resolution, file reads and persistence.
+On a synthetic 3,000-note / 12,000-symbol vault, single-note bridge refresh took
+6.7-7.0 ms versus 97.8-97.9 ms for full refresh, allocating 3.6 MB versus 109.4 MB
+(`BenchmarkCodeLinkRefresh`, Apple M3, two runs of three iterations). These are
+bridge-only measurements, not end-to-end writeback latency or a fix for the
+previous intermittent persistence stall. Linking remains a best-effort step after
+the note/FTS/graph commit; a full refresh repairs a previously failed bridge pass.
+
 From v0.26, slow persistence logs distinguish `index_write` queue wait from
 `index_transaction` authorization, SQLite begin, callback, commit/rollback and
 lease release. `persist_full` and `persist_incremental` separate notes/search,

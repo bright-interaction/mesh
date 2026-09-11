@@ -8,8 +8,10 @@ import (
 	"database/sql"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
@@ -63,12 +65,44 @@ func (s *Store) LinkNotesToCode(vaultRoot string) (int, error) {
 // LinkNotesToCodeContext is LinkNotesToCode with cooperative cancellation across its
 // SQL scans, note-file pass, symbol resolution, and final replacement transaction.
 func (s *Store) LinkNotesToCodeContext(ctx context.Context, vaultRoot string) (int, error) {
+	return s.linkNotesToCodeContext(ctx, vaultRoot, nil)
+}
+
+// linkChangedNotesToCode refreshes only changed IDs, including removed IDs whose
+// old links must disappear. Code-index changes and full reconciliation still use
+// LinkNotesToCode: a symbol change can change resolution for ANY note.
+func (s *Store) linkChangedNotesToCode(root string, upserts []*ParsedNote, removed []string) (int, error) {
+	ids := make(map[string]bool, len(upserts)+len(removed))
+	for _, pn := range upserts {
+		ids[effectiveID(pn)] = true
+	}
+	for _, id := range removed {
+		ids[id] = true
+	}
+	changed := make([]string, 0, len(ids))
+	for id := range ids {
+		changed = append(changed, id)
+	}
+	sort.Strings(changed)
+	return s.linkNotesToCodeContext(context.Background(), root, changed)
+}
+
+// A nil changed set means full rebuild; an empty non-nil set means no work.
+// Read current indexed metadata, not cached note titles or a cached symbol map.
+// Keep the same raw-file token semantics as the full rebuild (including spans in
+// frontmatter), and replace the selected links atomically through the writer.
+func (s *Store) linkNotesToCodeContext(ctx context.Context, vaultRoot string, changed []string) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	if changed != nil && len(changed) == 0 {
+		return 0, nil
+	}
+	trace := latency.Start("note_code_links", "symbols")
+	defer trace.End()
 	var symbolCount int
 	if err := s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM code_symbols`).Scan(&symbolCount); err != nil {
 		return 0, err
@@ -86,94 +120,38 @@ func (s *Store) LinkNotesToCodeContext(ctx context.Context, vaultRoot string) (i
 		_ = err
 		return 0, nil
 	}
-	rows, err := s.readDB.QueryContext(ctx, `SELECT id, path, title FROM notes`)
+	trace.Phase("notes")
+	notes, err := s.codeLinkNotesContext(ctx, changed)
 	if err != nil {
 		return 0, err
 	}
-	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
-	// stops every checkpoint from reclaiming past it. In a long-running daemon that
-	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
-	defer rows.Close()
-	type noteMeta struct{ id, path, title string }
-	var notes []noteMeta
-	for rows.Next() {
-		if err := ctx.Err(); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		var nm noteMeta
-		if err := rows.Scan(&nm.id, &nm.path, &nm.title); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		notes = append(notes, nm)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, err
-	}
-	rows.Close()
-
+	trace.Phase("resolve")
 	resolve, err := s.symbolResolverContext(ctx)
 	if err != nil {
 		return 0, err
 	}
-
-	type link struct{ noteID, symID, name string }
-	var links []link
-	for _, n := range notes {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		seen := map[string]bool{}
-		consider := func(tok string) error {
-			if err := ctx.Err(); err != nil {
+	trace.Phase("files")
+	links, err := resolveNoteCodeLinksContext(ctx, vaultRoot, notes, resolve)
+	if err != nil {
+		return 0, err
+	}
+	trace.Phase("persist")
+	err = s.WriteContext(ctx, func(tx *sql.Tx) error {
+		if changed == nil {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM note_code_links`); err != nil {
 				return err
 			}
-			tok = strings.TrimSpace(tok)
-			if seen[tok] || !distinctive(tok) {
-				return nil
+		} else {
+			del, err := tx.PrepareContext(ctx, `DELETE FROM note_code_links WHERE note_id=?`)
+			if err != nil {
+				return err
 			}
-			seen[tok] = true
-			syms := resolve(tok, 5)
-			// Precision gate: an unqualified (bare) token must resolve to EXACTLY ONE
-			// symbol to link. Common PascalCase words (Close, Server, Store, Config,
-			// Handler) name a method or type on many packages, so linking a note that
-			// merely says `Store` to every service's Store is noise. A qualified token
-			// (Type.Method) is already specific, so its capped matches link as before.
-			if !strings.Contains(tok, ".") && len(syms) != 1 {
-				return nil
-			}
-			for _, sym := range syms {
-				links = append(links, link{n.id, sym.id, sym.name})
-			}
-			return nil
-		}
-		// Title: scan every identifier-like token (the note's subject).
-		for _, tok := range identRe.FindAllString(n.title, -1) {
-			if err := consider(tok); err != nil {
-				return 0, err
-			}
-		}
-		// Body: only backtick code spans (prose is too noisy for a full scan).
-		body, readErr := vault.ReadFileContext(ctx, filepath.Join(vaultRoot, n.path))
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return 0, ctxErr
-		}
-		if readErr == nil {
-			if err := ctx.Err(); err != nil {
-				return 0, err
-			}
-			for _, m := range backtickRe.FindAllStringSubmatch(string(body), -1) {
-				if err := consider(m[1]); err != nil {
-					return 0, err
+			defer del.Close()
+			for _, id := range changed {
+				if _, err := del.ExecContext(ctx, id); err != nil {
+					return err
 				}
 			}
-		}
-	}
-	err = s.WriteContext(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM note_code_links`); err != nil {
-			return err
 		}
 		ins, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO note_code_links(note_id,symbol_id,name) VALUES(?,?,?)`)
 		if err != nil {
@@ -196,6 +174,113 @@ func (s *Store) LinkNotesToCodeContext(ctx context.Context, vaultRoot string) (i
 	var n int
 	_ = s.readDB.QueryRowContext(ctx, `SELECT count(*) FROM note_code_links`).Scan(&n)
 	return n, nil
+}
+
+type codeLinkNote struct{ id, path, title string }
+type noteCodeLink struct{ noteID, symID, name string }
+
+func (s *Store) codeLinkNotesContext(ctx context.Context, changed []string) ([]codeLinkNote, error) {
+	var notes []codeLinkNote
+	if changed != nil {
+		// Point lookups avoid a vault-wide metadata scan and SQLite's variable limit.
+		stmt, err := s.readDB.PrepareContext(ctx, `SELECT id, path, title FROM notes WHERE id=?`)
+		if err != nil {
+			return nil, err
+		}
+		defer stmt.Close()
+		for _, id := range changed {
+			var n codeLinkNote
+			if err := stmt.QueryRowContext(ctx, id).Scan(&n.id, &n.path, &n.title); err != nil {
+				if err == sql.ErrNoRows {
+					continue // deleted or quarantined note: delete its old links only
+				}
+				return nil, err
+			}
+			notes = append(notes, n)
+		}
+		return notes, nil
+	}
+	rows, err := s.readDB.QueryContext(ctx, `SELECT id, path, title FROM notes`)
+	if err != nil {
+		return nil, err
+	}
+	// A leaked *sql.Rows pins a WAL read snapshot for the life of the process, which
+	// stops every checkpoint from reclaiming past it. In a long-running daemon that
+	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
+	defer rows.Close()
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		var nm codeLinkNote
+		if err := rows.Scan(&nm.id, &nm.path, &nm.title); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		notes = append(notes, nm)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	return notes, nil
+}
+
+func resolveNoteCodeLinksContext(ctx context.Context, vaultRoot string, notes []codeLinkNote, resolve func(string, int) []symRow) ([]noteCodeLink, error) {
+	var links []noteCodeLink
+	for _, n := range notes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		seen := map[string]bool{}
+		consider := func(tok string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			tok = strings.TrimSpace(tok)
+			if seen[tok] || !distinctive(tok) {
+				return nil
+			}
+			seen[tok] = true
+			syms := resolve(tok, 5)
+			// Precision gate: an unqualified (bare) token must resolve to EXACTLY ONE
+			// symbol to link. Common PascalCase words (Close, Server, Store, Config,
+			// Handler) name a method or type on many packages, so linking a note that
+			// merely says `Store` to every service's Store is noise. A qualified token
+			// (Type.Method) is already specific, so its capped matches link as before.
+			if !strings.Contains(tok, ".") && len(syms) != 1 {
+				return nil
+			}
+			for _, sym := range syms {
+				links = append(links, noteCodeLink{n.id, sym.id, sym.name})
+			}
+			return nil
+		}
+		// Title: scan every identifier-like token (the note's subject).
+		for _, tok := range identRe.FindAllString(n.title, -1) {
+			if err := consider(tok); err != nil {
+				return nil, err
+			}
+		}
+		// Body: only backtick code spans (prose is too noisy for a full scan).
+		body, readErr := vault.ReadFileContext(ctx, filepath.Join(vaultRoot, n.path))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if readErr == nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			for _, m := range backtickRe.FindAllStringSubmatch(string(body), -1) {
+				if err := consider(m[1]); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return links, nil
 }
 
 type symRow struct{ id, name string }

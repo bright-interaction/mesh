@@ -109,6 +109,14 @@ func TestParseFilesContextCancelsWhileProductionReadIsStalled(t *testing.T) {
 }
 
 func TestLinkNotesToCodeContextCancelsStalledReadWithoutReplacingLinks(t *testing.T) {
+	for _, mode := range []string{"full", "delta"} {
+		t.Run(mode, func(t *testing.T) {
+			testLinkNotesToCodeCancellation(t, mode)
+		})
+	}
+}
+
+func testLinkNotesToCodeCancellation(t *testing.T, mode string) {
 	vaultRoot := t.TempDir()
 	notePath := filepath.Join(vaultRoot, "note.md")
 	note := "---\nid: note-x\ntype: note\n---\n# Link\nUses `DistinctiveSymbol`.\n"
@@ -145,7 +153,11 @@ func TestLinkNotesToCodeContextCancelsStalledReadWithoutReplacingLinks(t *testin
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := store.LinkNotesToCodeContext(ctx, vaultRoot)
+		var changed []string
+		if mode == "delta" {
+			changed = []string{"note-x"}
+		}
+		_, err := store.linkNotesToCodeContext(ctx, vaultRoot, changed)
 		done <- err
 	}()
 
