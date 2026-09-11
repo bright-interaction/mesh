@@ -116,6 +116,48 @@ func TestRunCarriesExactPathsForLocalChangeBurst(t *testing.T) {
 	}
 }
 
+func TestRefreshNudgeStaysLocalUnlessCombinedWithChange(t *testing.T) {
+	root := t.TempDir()
+	refresh, trigger := make(chan struct{}, 1), make(chan struct{}, 1)
+	passes := make(chan Pass, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{Root: root, Debounce: 40 * time.Millisecond, Refresh: refresh, Trigger: trigger,
+			OnReindex: func(p Pass) (Result, error) { passes <- p; return Result{}, nil }})
+	}()
+	t.Cleanup(func() { cancel(); <-done })
+	next := func() Pass {
+		t.Helper()
+		select {
+		case p := <-passes:
+			return p
+		case <-time.After(3 * time.Second):
+			t.Fatal("no pass")
+			return Pass{}
+		}
+	}
+	if p := next(); p.Reason != ReasonStartup {
+		t.Fatal(p)
+	}
+	refresh <- struct{}{}
+	if p := next(); p.Reason != ReasonRefresh {
+		t.Fatalf("completion became outbound change: %+v", p)
+	}
+	refresh <- struct{}{}
+	trigger <- struct{}{}
+	if p := next(); p.Reason != ReasonChange {
+		t.Fatalf("coalesced SSE lost its sync request: %+v", p)
+	}
+	refresh <- struct{}{}
+	if err := os.WriteFile(filepath.Join(root, "edit.md"), []byte("# edit"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if p := next(); p.Reason != ReasonChange {
+		t.Fatalf("coalesced edit lost its sync request: %+v", p)
+	}
+}
+
 func TestRunPeriodicReconcile(t *testing.T) {
 	dir := t.TempDir()
 	calls := make(chan struct{}, 64)

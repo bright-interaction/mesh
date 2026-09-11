@@ -4,18 +4,13 @@
 package main
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
-	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/merge"
-	"github.com/bright-interaction/mesh/internal/watch"
-	"github.com/bright-interaction/mesh/pkg/meshclient"
 )
 
 func TestLongConflictCanBeListedAndResolved(t *testing.T) {
@@ -46,42 +41,5 @@ func TestLongConflictCanBeListedAndResolved(t *testing.T) {
 	b, err := os.ReadFile(base)
 	if err != nil || string(b) != "base" {
 		t.Fatalf("base lost: %q %v", b, err)
-	}
-}
-
-func TestDiscoveryIndexesLocalNoteBeforeFailingSync(t *testing.T) {
-	for _, reason := range []string{watch.ReasonStartup, watch.ReasonTick, watch.ReasonChange} {
-		t.Run(reason, func(t *testing.T) {
-			root := t.TempDir()
-			store, err := index.Open(root)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer store.Close()
-			live := index.NewLiveIndexer(store, root)
-			if _, err := live.Reconcile(true); err != nil {
-				t.Fatal(err)
-			}
-			body := "---\nid: local-before-sync\ntype: note\ntitle: Local before sync\n---\nSaved locally.\n"
-			if err := os.WriteFile(filepath.Join(root, "local.md"), []byte(body), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			hubCalled := false
-			_, err = syncWatchPass(watch.Pass{Reason: reason}, true,
-				func(_ []string, authoritative bool) error { _, err := live.Reconcile(authoritative); return err },
-				func() (meshclient.Summary, error) {
-					hubCalled = true
-					if _, err := store.NotePath("local-before-sync"); err != nil {
-						t.Errorf("network began before local write was queryable: %v", err)
-					}
-					return meshclient.Summary{}, syscall.ENAMETOOLONG
-				})
-			if !hubCalled || !errors.Is(err, syscall.ENAMETOOLONG) {
-				t.Fatalf("sync failure hidden: %v", err)
-			}
-			if _, err := store.NotePath("local-before-sync"); err != nil {
-				t.Fatal(err)
-			}
-		})
 	}
 }

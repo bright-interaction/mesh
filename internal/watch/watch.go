@@ -52,11 +52,12 @@ const (
 	ReasonStartup = "startup" // first pass, before anything is known about the vault
 	ReasonChange  = "change"  // a debounced local edit, or an external Trigger nudge
 	ReasonTick    = "tick"    // the periodic safety net, with nothing observed to prompt it
+	ReasonRefresh = "refresh" // completed external work; discover files without requesting that work again
 )
 
 // Pass describes one reconcile the watcher is asking the callback to run.
 type Pass struct {
-	Reason string // one of ReasonStartup / ReasonChange / ReasonTick
+	Reason string // ReasonStartup / ReasonChange / ReasonTick / ReasonRefresh
 	// Authoritative selects the content-hash drift check (parses every note) over the
 	// mtime fast path (one stat per note). True on startup and on the periodic FULL pass.
 	Authoritative bool
@@ -77,6 +78,7 @@ type Options struct {
 	OnReindex     func(Pass) (Result, error) // drift-check + reindex, single-flight
 	Logf          func(string, ...any)       // progress sink; nil is silent
 	Trigger       <-chan struct{}            // optional external nudge (e.g. an SSE event); fires OnReindex like a local change
+	Refresh       <-chan struct{}            // optional completed-work nudge; emits ReasonRefresh unless merged with a real change
 }
 
 const defaultDebounce = 300 * time.Millisecond
@@ -143,6 +145,7 @@ func Run(ctx context.Context, opt Options) error {
 	defer debounce.Stop()
 	pendingPaths := map[string]struct{}{}
 	fullChange := false
+	needsSync := false
 
 	var tick <-chan time.Time
 	if opt.Reconcile > 0 {
@@ -161,6 +164,7 @@ func Run(ctx context.Context, opt Options) error {
 			}
 			switch {
 			case ev.Op&fsnotify.Create != 0 && isDir(ev.Name):
+				needsSync = true
 				// A new subdirectory: kqueue/inotify watch one dir at a time, so
 				// add it (and any children) to the watch set, then reconcile in
 				// case files landed inside before the watch was in place.
@@ -169,6 +173,7 @@ func Run(ctx context.Context, opt Options) error {
 				clear(pendingPaths)
 				resetTimer(debounce, opt.Debounce)
 			case ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && watched(w, ev.Name):
+				needsSync = true
 				// A watched directory went away: drop its now-dangling watch so we
 				// do not leak a descriptor, and reconcile so its notes leave the
 				// index promptly rather than waiting for the periodic tick.
@@ -177,6 +182,7 @@ func Run(ctx context.Context, opt Options) error {
 				clear(pendingPaths)
 				resetTimer(debounce, opt.Debounce)
 			case relevant(ev):
+				needsSync = true
 				if !fullChange {
 					pendingPaths[filepath.Clean(ev.Name)] = struct{}{}
 				}
@@ -193,6 +199,14 @@ func Run(ctx context.Context, opt Options) error {
 			// reconcile. A nil Trigger channel blocks forever, so this case is inert
 			// unless a caller wired one in.
 			fullChange = true
+			needsSync = true
+			clear(pendingPaths)
+			resetTimer(debounce, opt.Debounce)
+		case <-opt.Refresh:
+			// Completion must discover incoming/partially-applied files even if
+			// fsnotify missed them, but must not create a sync -> refresh -> sync
+			// feedback loop. A coalesced real edit/SSE still wins via needsSync.
+			fullChange = true
 			clear(pendingPaths)
 			resetTimer(debounce, opt.Debounce)
 		case <-debounce.C:
@@ -204,8 +218,13 @@ func Run(ctx context.Context, opt Options) error {
 				}
 				sort.Strings(paths)
 			}
-			reconcile(opt, logf, Pass{Reason: ReasonChange, Authoritative: false, Paths: paths})
+			reason := ReasonRefresh
+			if needsSync {
+				reason = ReasonChange
+			}
+			reconcile(opt, logf, Pass{Reason: reason, Authoritative: false, Paths: paths})
 			fullChange = false
+			needsSync = false
 			clear(pendingPaths)
 		case <-tick:
 			// Safety net: catches anything the event stream missed (a dropped event,

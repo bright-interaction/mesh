@@ -2214,36 +2214,13 @@ const defaultHubSync = 60 * time.Second
 // "authoritative", which silently meant "is this the periodic tick" until the tick stopped
 // being authoritative on every fire. That kind of coupling is invisible in a closure.
 func hubDue(reason string, last time.Time, interval time.Duration, now time.Time) bool {
+	if reason == watch.ReasonRefresh {
+		return false // a completed hub round is not a request for another one
+	}
 	if reason != watch.ReasonTick {
 		return true
 	}
 	return last.IsZero() || now.Sub(last) >= interval
-}
-
-// syncWatchPass orders one continuous-sync pass. For an exact local fsnotify
-// burst, the local index commit comes first so another process waiting to
-// acknowledge a write-back is never blocked on the network. The discovery pass
-// still runs after sync and therefore absorbs any notes the hub pulled. Passes
-// without exact paths discover local changes before the network too: a missed
-// event or an SSE nudge must not put a saved note behind a slow failing sync.
-func syncWatchPass(
-	p watch.Pass,
-	doHub bool,
-	reconcile func(paths []string, authoritative bool) error,
-	syncHub func() (meshclient.Summary, error),
-) (meshclient.Summary, error) {
-	var sum meshclient.Summary
-	var targetedErr, syncErr error
-	if len(p.Paths) > 0 {
-		targetedErr = reconcile(p.Paths, false)
-	} else if doHub {
-		targetedErr = reconcile(nil, p.Authoritative)
-	}
-	if doHub {
-		sum, syncErr = syncHub()
-	}
-	fullErr := reconcile(nil, p.Authoritative)
-	return sum, errors.Join(targetedErr, syncErr, fullErr)
 }
 
 func watchCmd() *cobra.Command {
@@ -2406,56 +2383,9 @@ func syncCmd() *cobra.Command {
 			}
 			defer store.Close()
 
-			// One sync round: push/pull via the hub, then reindex so search reflects
-			// the merged result. Reused by the one-shot path and the watch loop. The
-			// LiveIndexer makes the watch loop incremental (full seed on the first call,
-			// targeted updates after).
+			// The index callback is the sole SQLite writer. Hub sync runs separately
+			// so writes arriving during a network round stay locally queryable.
 			live := index.NewLiveIndexer(store, vaultDir)
-			// The periodic tick has two jobs with very different costs. Converging the
-			// LOCAL index is cheap and has to happen inside the write-back bound, because
-			// this daemon is the owning writer on a laptop and a note that missed its
-			// fsnotify event has nothing else to pick it up. Asking the hub for
-			// teammates' changes is a network round trip answering a different question,
-			// and SSE already delivers those in real time. So the tick now runs at the
-			// LOCAL cadence and the hub half keeps its own slower interval; anything
-			// driven by a real change (fsnotify, an SSE nudge, startup) still syncs
-			// immediately, which is every case where there is something to push.
-			var lastHub time.Time
-			syncOnce := func(p watch.Pass) (meshclient.Summary, error) {
-				// Only the periodic tick is rate-limited, so a cold start and any real
-				// change still sync at once. This reads Pass.Reason and NOT
-				// Pass.Authoritative: the two used to be the same thing, and inferring
-				// "this is the tick" from authoritative=true broke the instant the tick
-				// stopped hashing on every fire, turning a 60s hub round into an 8s one.
-				doHub := hubDue(p.Reason, lastHub, hubInterval, time.Now())
-				if doHub {
-					lastHub = time.Now()
-				}
-				// Reconcile the LOCAL index whether or not the hub round works (or runs).
-				// The index is derived from the markdown on disk and owes the hub nothing,
-				// so a DNS failure, an outage or a rejected token must never stop a
-				// locally written note from becoming searchable. This used to return on
-				// serr, which meant that for the whole of a hub outage the --watch daemon
-				// skipped EVERY reconcile (startup, the debounced file-change one and the
-				// 60s safety tick) while staying up and logging "reindex failed" once a
-				// minute. Observed on the live vault for hours at a time; it is the real
-				// cause of "the indexer stops picking up newly written notes".
-				return syncWatchPass(p, doHub, func(paths []string, authoritative bool) error {
-					if len(paths) > 0 {
-						_, err := live.ReconcilePaths(paths)
-						return err
-					}
-					_, err := live.Reconcile(authoritative)
-					return err
-				}, func() (meshclient.Summary, error) {
-					return meshclient.SyncVault(vaultDir)
-				})
-			}
-
-			// --watch: continuous reconcile driven by three sources, all funneled
-			// through the watcher's single-flight loop: local .md edits (fsnotify),
-			// the hub's SSE "head changed" nudges (Trigger), and a periodic safety
-			// tick. The startup reconcile does the initial sync.
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			abs, _ := filepath.Abs(vaultDir)
@@ -2464,44 +2394,27 @@ func syncCmd() *cobra.Command {
 				fmt.Printf("%s  "+format+"\n", append([]any{time.Now().Format("15:04:05")}, a...)...)
 			}
 			meshclient.Logf = logf // surface non-fatal stream diagnostics (e.g. auth rejections)
-			var receipts meshclient.WatchReceipts
 			nudge := make(chan struct{}, 1)
 			go func() {
 				if err := meshclient.StreamEvents(ctx, vaultDir, nudge); err != nil {
 					logf("event stream unavailable, falling back to periodic sync: %v", err)
 				}
 			}()
-			err = watch.Run(ctx, watch.Options{
-				Root:          vaultDir,
-				Debounce:      debounce,
-				Reconcile:     reconcile,
-				FullReconcile: fullReconcile,
-				Trigger:       nudge,
-				Logf:          logf,
+			err = runSyncWatch(ctx, watch.Options{
+				Root: vaultDir, Debounce: debounce, Reconcile: reconcile,
+				FullReconcile: fullReconcile, Trigger: nudge, Logf: logf,
 				OnReindex: func(p watch.Pass) (watch.Result, error) {
-					// Note: applying the hub's deltas writes .md files, which the
-					// watcher sees and debounces into one more reconcile. That follow-up
-					// is a guaranteed no-op (SyncVault re-hashes from disk and persists
-					// the new base, so the next computeOutbox is empty and the hub
-					// fast-forwards without a broadcast), so it converges in one extra
-					// idle round rather than looping. We accept that cheap round instead
-					// of threading self-written paths through the watcher.
-					sum, serr := syncOnce(p)
-					if serr != nil {
-						return watch.Result{}, serr
+					var rec index.Reconciliation
+					var err error
+					if len(p.Paths) > 0 {
+						rec, err = live.ReconcilePaths(p.Paths)
+					} else {
+						rec, err = live.Reconcile(p.Authoritative)
 					}
-					// Log a sync-centric line ourselves only when something moved, then
-					// return Reindexed:false so the watcher does not also log its
-					// generic reindex line. The lines come from the SAME renderer the
-					// one-shot path uses: these two had already drifted into two
-					// wordings of the same four lines, which is how one of them ends up
-					// with a fix the other never gets.
-					for _, line := range receipts.Lines(sum) {
-						logf("%s", line)
-					}
-					return watch.Result{Reindexed: false}, nil
+					return watch.Result{Added: rec.Added, Changed: rec.Changed, Removed: rec.Removed,
+						Reindexed: rec.Reindexed, Dur: rec.Dur}, err
 				},
-			})
+			}, hubInterval, func() (meshclient.Summary, error) { return meshclient.SyncVault(vaultDir) })
 			fmt.Println("stopped.")
 			return err
 		},

@@ -190,8 +190,9 @@ func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 }
 
 // NewFromEnvContext is NewFromEnv with cancellation threaded through every
-// potentially slow construction stage: ranker statistics, config I/O, vector
-// loading, the embedding dimension probe, and the optional pro HNSW build.
+// potentially slow local construction stage: ranker statistics, config I/O,
+// vector loading, and the optional pro HNSW build. Construction never calls a
+// model: queries validate returned dimensions; explicit health probes test it.
 func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) (*Retriever, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -290,7 +291,7 @@ func (r *Retriever) enableVectorsContext(ctx context.Context, emb meshcfg.Embedd
 	if fromEnv {
 		newEmbedder = embed.NewOperatorHTTP
 	}
-	ok, err := r.enableVectorsWithGateContext(ctx, newEmbedder(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs, hnswGate)
+	ok, err := r.configureVectorsContext(ctx, newEmbedder(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs, hnswGate, false)
 	if err != nil {
 		return err
 	}
@@ -504,8 +505,12 @@ func (r *Retriever) EmbedderProbe() error {
 	if r.emb == nil {
 		return nil
 	}
-	if r.emb.Dim() == 0 {
+	dim := r.emb.Dim()
+	if dim == 0 {
 		return fmt.Errorf("embedding endpoint unavailable: model %s returned no vector width", r.emb.Model())
+	}
+	if dim != r.vecDim {
+		return fmt.Errorf("embedding dimension mismatch: model %s reports %d, stored width is %d", r.emb.Model(), dim, r.vecDim)
 	}
 	return nil
 }
@@ -643,6 +648,10 @@ type contextDimmer interface {
 }
 
 func (r *Retriever) enableVectorsWithGateContext(ctx context.Context, e embed.Embedder, model string, storedDim int, vecs map[string][][]float32, hnswGate int) (bool, error) {
+	return r.configureVectorsContext(ctx, e, model, storedDim, vecs, hnswGate, true)
+}
+
+func (r *Retriever) configureVectorsContext(ctx context.Context, e embed.Embedder, model string, storedDim int, vecs map[string][][]float32, hnswGate int, probe bool) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -672,7 +681,7 @@ func (r *Retriever) enableVectorsWithGateContext(ctx context.Context, e embed.Em
 	// A 0 from Dim() means the probe failed (endpoint down); allow activation and let
 	// the per-query length guard in Retrieve catch any mismatch at retrieval time.
 	ed := 0
-	if d, ok := e.(contextDimmer); ok {
+	if d, ok := e.(contextDimmer); probe && ok {
 		var err error
 		ed, err = d.DimContext(ctx)
 		if err != nil {
@@ -681,7 +690,7 @@ func (r *Retriever) enableVectorsWithGateContext(ctx context.Context, e embed.Em
 			}
 			ed = 0 // legacy behavior: a failed probe activates and fails honestly on query
 		}
-	} else {
+	} else if probe {
 		ed = e.Dim()
 	}
 	if err := retrieveContextErr(ctx); err != nil {

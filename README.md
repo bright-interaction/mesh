@@ -349,7 +349,15 @@ it, and routes its write-backs through the owner. Exactly one process indexes
 either way, which is the point.
 
 Local file events carry their exact changed paths to that owner, and
-`mesh sync --watch` publishes them to the local index before contacting the hub.
+`mesh sync --watch` publishes them to the local index before requesting a hub
+round. From v0.19 onward, a separate serial sync worker keeps indexing responsive
+even when a previous hub call is slow. One queued follow-up coalesces edits made
+during sync; completion triggers local discovery without requesting another sync.
+Shutdown drains the active durable sync round before releasing the index owner.
+
+Retriever setup and graph refreshes do not call embedding models. Actual semantic
+queries validate vector width, and explicit health checks still probe reachability
+and dimensions. Local write acknowledgements do not need an embedding endpoint.
 That keeps a write-back's saved-and-queryable receipt independent of vault-wide
 discovery and network latency; periodic and remote-triggered passes still scan
 the vault as the convergence safety net.
