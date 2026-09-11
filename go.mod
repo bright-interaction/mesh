@@ -18,6 +18,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/getsentry/sentry-go v0.47.0
 	github.com/gomarkdown/markdown v0.0.0-20260614204949-e08cff860f76
+	github.com/klauspost/compress v1.19.1
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/spf13/cobra v1.8.1
 	github.com/spf13/pflag v1.0.5

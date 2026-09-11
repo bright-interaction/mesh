@@ -50,6 +50,9 @@ type syncState struct {
 	// computeOutbox forever (see JoinVault).
 	VaultID string `json:"vault_id,omitempty"`
 	HubURL  string `json:"hub_url,omitempty"`
+	// RequestZstd records a hub's standard Accept-Encoding advertisement. It is
+	// transport capability, not vault data; false preserves old-hub compatibility.
+	RequestZstd bool `json:"request_zstd,omitempty"`
 }
 
 func credPath(vaultDir string) string  { return filepath.Join(vaultDir, ".mesh", "credentials") }
@@ -1378,7 +1381,9 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 	if err != nil {
 		slog.Warn("sync: could not read the private team-reuse outbox; note sync continues", "err", err)
 	}
-	resp, err := New(creds.HubURL, creds.Token).Sync(syncproto.SyncRequest{
+	client := New(creds.HubURL, creds.Token)
+	client.UseZstdSyncRequests(state.RequestZstd)
+	resp, err := client.Sync(syncproto.SyncRequest{
 		BaseSHA: state.HeadSHA, Outbox: outbox, TombstoneSeq: state.TombSeq, ReuseEvents: reuseEvents,
 	})
 	if err != nil {
@@ -1531,11 +1536,12 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 		vaultID = creds.VaultID
 	}
 	if err := writeState(vaultDir, syncState{
-		HeadSHA: resp.HeadSHA,
-		Hashes:  current,
-		TombSeq: resp.TombstoneSeq,
-		VaultID: vaultID,
-		HubURL:  hubURL,
+		HeadSHA:     resp.HeadSHA,
+		Hashes:      current,
+		TombSeq:     resp.TombstoneSeq,
+		VaultID:     vaultID,
+		HubURL:      hubURL,
+		RequestZstd: resp.RequestZstd,
 	}); err != nil {
 		return Summary{}, err
 	}

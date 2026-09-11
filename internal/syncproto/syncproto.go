@@ -29,6 +29,9 @@ const (
 	// ProtoHeader carries ProtoVersion on every request for the hub's audit log,
 	// so a stale client is visible in the logs even on endpoints with no body.
 	ProtoHeader = "X-Mesh-Proto"
+	// SyncEncodingHeader is the standard response header a hub uses to advertise
+	// which content coding it accepts on a later sync request.
+	SyncEncodingHeader = "Accept-Encoding"
 )
 
 // JoinRequest redeems a one-time invite for a client token.
@@ -144,6 +147,9 @@ type SyncResponse struct {
 	// local copy; the edit simply did not land upstream. Older clients ignore this.
 	Rejected           []string `json:"rejected,omitempty"`
 	AckedReuseEventIDs []string `json:"acked_reuse_event_ids,omitempty"`
+	// RequestZstd is transport metadata learned from the response headers. It is
+	// persisted by the client but is not part of the JSON protocol.
+	RequestZstd bool `json:"-"`
 }
 
 // CurationJob is a hub-recorded marker that a path had a true conflict and would
