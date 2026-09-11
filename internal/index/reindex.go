@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
@@ -37,6 +38,8 @@ func ReindexFullContext(ctx context.Context, s *Store, root string) (*graph.Grap
 // nil in production and lets tests cancel at that exact boundary without racing a
 // polling goroutine against the best-effort post-commit work.
 func reindexFullContext(ctx context.Context, s *Store, root string, onPersisted func()) (*graph.Graph, []*ParsedNote, error) {
+	trace := latency.Start("index_full", "walk")
+	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -47,6 +50,7 @@ func reindexFullContext(ctx context.Context, s *Store, root string, onPersisted 
 	if err != nil {
 		return nil, nil, err
 	}
+	trace.Phase("parse")
 	notes, ferrs, err := ParseFilesContext(ctx, files, 0)
 	if err != nil {
 		return nil, nil, err
@@ -66,6 +70,7 @@ func reindexFullContext(ctx context.Context, s *Store, root string, onPersisted 
 	// paired one file's path with the other file's snippet. The loser also had no notes
 	// row, which every later DriftReport read as Added, so `mesh doctor` printed STALE
 	// forever over an index that was already byte-identical to a fresh one.
+	trace.Phase("id_claims")
 	incumbent, ierr := s.IDOwnersContext(ctx)
 	if ierr != nil {
 		if err := ctx.Err(); err != nil {
@@ -83,13 +88,16 @@ func reindexFullContext(ctx context.Context, s *Store, root string, onPersisted 
 	if err != nil {
 		return nil, nil, err
 	}
+	trace.Phase("graph")
 	g, _, err := BuildGraphContext(ctx, notes)
 	if err != nil {
 		return nil, nil, err
 	}
+	trace.Phase("communities")
 	if _, err := g.DetectCommunitiesContext(ctx, 0); err != nil {
 		return nil, nil, err
 	}
+	trace.Phase("persist")
 	if _, err := s.indexVaultContext(ctx, notes, g, dropped, true); err != nil {
 		return nil, nil, err
 	}
@@ -99,6 +107,7 @@ func reindexFullContext(ctx context.Context, s *Store, root string, onPersisted 
 	// The durable dropped set committed atomically with notes/graph above. Publish the
 	// same set in memory only after that commit, so cancellation can never pair an old
 	// note snapshot with a freshly-cleared dropped_notes table (or vice versa).
+	trace.Phase("publish_dropped")
 	s.publishDropped(root, dropped)
 	// Refresh the note<->code bridge. note_code_links was written ONLY by the code-index
 	// commands, never by a note reindex, so a note written after startup never linked to
@@ -106,6 +115,7 @@ func reindexFullContext(ctx context.Context, s *Store, root string, onPersisted 
 	// there is no code index: LinkNotesToCode returns immediately if code_symbols is
 	// empty, so a vault with the code index disabled pays nothing.
 	if ctx.Err() == nil {
+		trace.Phase("code_links")
 		_, _ = s.LinkNotesToCodeContext(ctx, root)
 	}
 	// Persist is the point of no return: once the new snapshot commits, the caller must

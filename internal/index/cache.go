@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/latency"
 )
 
 // NoteCache holds the last-parsed notes for a long-running indexer (the watcher /
@@ -113,12 +114,16 @@ func NewLiveIndexer(store *Store, root string) *LiveIndexer {
 // Full forces a complete reindex and (re)seeds the cache. Used after a write-back
 // that bypassed the watcher.
 func (li *LiveIndexer) Full() (*graph.Graph, error) {
+	trace := latency.Start("owner_full", "lock")
+	defer trace.End()
 	li.mu.Lock()
 	defer li.mu.Unlock()
+	trace.Phase("index")
 	g, notes, err := ReindexFull(li.store, li.root)
 	if err != nil {
 		return nil, err
 	}
+	trace.Phase("seed_cache")
 	li.cache.Seed(notes)
 	li.seeded = true
 	return g, nil
@@ -130,20 +135,27 @@ func (li *LiveIndexer) Full() (*graph.Graph, error) {
 // fast path (skip parsing mtime-unchanged files); pass true for the periodic
 // safety tick so a mtime-preserving edit is still caught.
 func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
+	trace := latency.Start("owner_reconcile", "lock")
+	defer trace.End()
 	li.mu.Lock()
 	defer li.mu.Unlock()
+	trace.Phase("drain_ops")
 	li.drainOps()
+	trace.Phase("index")
 	if !li.seeded {
 		start := time.Now()
 		g, notes, err := ReindexFull(li.store, li.root)
 		if err != nil {
 			return Reconciliation{}, err
 		}
+		trace.Phase("seed_cache")
 		li.cache.Seed(notes)
 		li.seeded = true
 		indexDur := time.Since(start)
+		trace.Phase("health")
 		li.refreshHealthIfDue()
 		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", time.Since(start)-indexDur)
+		trace.Phase("read_dropped")
 		dropped, err := li.store.DroppedNotes() // recorded by ReindexFull
 		if err != nil {
 			return Reconciliation{}, err
@@ -158,6 +170,7 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 	}
 	rec, err := ReconcileIncremental(li.store, li.root, li.cache, !authoritative)
 	if err == nil {
+		trace.Phase("health")
 		li.refreshHealthIfDue()
 	}
 	return rec, err
@@ -167,20 +180,27 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 // changed files by walking the whole vault. The caller must use Reconcile for
 // startup, periodic safety, directory, and remote-trigger passes.
 func (li *LiveIndexer) ReconcilePaths(paths []string) (Reconciliation, error) {
+	trace := latency.Start("owner_targeted", "lock")
+	defer trace.End()
 	li.mu.Lock()
 	defer li.mu.Unlock()
+	trace.Phase("drain_ops")
 	li.drainOps()
+	trace.Phase("index")
 	if !li.seeded {
 		start := time.Now()
 		g, notes, err := ReindexFull(li.store, li.root)
 		if err != nil {
 			return Reconciliation{}, err
 		}
+		trace.Phase("seed_cache")
 		li.cache.Seed(notes)
 		li.seeded = true
 		indexDur := time.Since(start)
+		trace.Phase("health")
 		li.refreshHealthIfDue()
 		slog.Info("mesh: startup reconciliation phases", "index", indexDur, "health", time.Since(start)-indexDur)
+		trace.Phase("read_dropped")
 		dropped, err := li.store.DroppedNotes()
 		if err != nil {
 			return Reconciliation{}, err
@@ -189,6 +209,7 @@ func (li *LiveIndexer) ReconcilePaths(paths []string) (Reconciliation, error) {
 	}
 	rec, err := ReconcilePaths(li.store, li.root, li.cache, paths)
 	if err == nil {
+		trace.Phase("health")
 		li.refreshHealthIfDue()
 	}
 	return rec, err

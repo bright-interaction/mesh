@@ -17,6 +17,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/relate"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/teamtelemetry"
@@ -1140,6 +1141,8 @@ func (s *Server) toolChangedSince(ctx context.Context, raw json.RawMessage) (any
 }
 
 func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType string) (any, *rpcError) {
+	trace := latency.Start("mcp_write", "validate")
+	defer trace.End()
 	// Cancellation is still reversible until CreateNote starts. Once CreateNote returns,
 	// the note is durable and must receive a success-with-staleness receipt rather than
 	// an error that invites a duplicate retry. Refuse a request that was already cancelled
@@ -1223,6 +1226,7 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	// text when the caller supplies none; an explicit list always wins, including an
 	// explicit decision to pass none that survives as an empty non-nil slice.
 	related := a.Related
+	trace.Phase("related")
 	if len(related) == 0 {
 		g, rt := s.snapshot()
 		related = relate.Derive(ctx, rt, g,
@@ -1236,6 +1240,7 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 		return nil, &rpcError{Code: codeInternalError, Message: "request cancelled before the note was written"}
 	}
 	writtenAt := time.Now()
+	trace.Phase("publish")
 	res, err := s.publishNote(ctx, vault.NewNoteSpec{
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
 		Related: related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
@@ -1279,6 +1284,7 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	// problem. So: succeed, and say the index is stale, so the caller knows to run
 	// mesh_reindex and knows not to retry the write.
 	var indexStale string
+	trace.Phase("acknowledge")
 	var ownerDown bool
 	if err := s.publishWriteBack(ctx, res.ID, res.Path); err != nil {
 		ownerDown = errors.Is(err, ErrOwnerNotIndexing)
@@ -1300,6 +1306,7 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	// FlywheelStats.WritesPer100Reads under-reports there; it is a telemetry number, not
 	// a correctness one, and paying a write lock per window to keep it exact is the
 	// contention this split exists to remove.
+	trace.Phase("telemetry")
 	_ = s.store.IncrMetric("writes", 1)
 	_ = s.store.RecordWriteback(res.ID, source)
 	writebackPath := res.Path

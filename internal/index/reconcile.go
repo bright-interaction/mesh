@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
@@ -75,6 +76,8 @@ func Reconcile(s *Store, root string) (Reconciliation, error) {
 // concurrent `mesh search` reader. The returned Graph is the in-memory one, so the
 // caller can swap it directly without a LoadGraph round-trip.
 func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast bool) (Reconciliation, error) {
+	trace := latency.Start("index_incremental", "discover_parse")
+	defer trace.End()
 	start := time.Now()
 	dd, err := s.DriftDeltaReport(root, mtimeFast)
 	if err != nil {
@@ -90,14 +93,18 @@ func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast boo
 	// frontmatter (or a duplicate id) produces no drift at all, so returning first is
 	// exactly how it stayed invisible: no log line, no DroppedNotes record, and
 	// mesh_health reporting a clean vault while the note was missing from the index.
+	trace.Phase("record_dropped")
 	s.recordDropped(root, dd.Dropped)
 	if !dd.Drift.Any() {
 		r.Dur = time.Since(start)
 		return r, nil
 	}
+	trace.Phase("graph")
 	cache.Apply(dd.Upserts, dd.RemovedIDs)
 	g, _ := BuildGraph(cache.Snapshot())
+	trace.Phase("communities")
 	g.DetectCommunities(0)
+	trace.Phase("persist")
 	if _, err := s.IndexVaultIncremental(dd.Upserts, dd.RemovedIDs, g); err != nil {
 		return Reconciliation{}, err
 	}
@@ -106,6 +113,7 @@ func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast boo
 	// this incremental path and note_code_links was only ever written by the code-index
 	// commands. Reached only when there IS a delta, and LinkNotesToCode returns
 	// immediately when the code index is empty, so a vault without one pays nothing.
+	trace.Phase("code_links")
 	_, _ = s.LinkNotesToCode(root)
 	r.Reindexed = true
 	r.Graph = g
@@ -123,6 +131,8 @@ func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast boo
 // Periodic, startup, directory, and remote-trigger passes must continue to use
 // ReconcileIncremental because their job is precisely to discover unknown drift.
 func ReconcilePaths(s *Store, root string, cache *NoteCache, paths []string) (Reconciliation, error) {
+	trace := latency.Start("index_targeted", "candidates")
+	defer trace.End()
 	start := time.Now()
 	if len(paths) == 0 {
 		return Reconciliation{Dur: time.Since(start)}, nil
@@ -175,6 +185,7 @@ func ReconcilePaths(s *Store, root string, cache *NoteCache, paths []string) (Re
 		return Reconciliation{Dur: time.Since(start)}, nil
 	}
 
+	trace.Phase("parse_claims")
 	current := cache.Snapshot()
 	byPath := make(map[string]*ParsedNote, len(current))
 	incumbent := make(map[string]string, len(current))
@@ -282,17 +293,22 @@ func ReconcilePaths(s *Store, root string, cache *NoteCache, paths []string) (Re
 		Removed: len(dd.Drift.Removed),
 		Dropped: len(dd.Dropped),
 	}
+	trace.Phase("record_dropped")
 	s.recordDropped(root, dd.Dropped)
 	if !dd.Drift.Any() {
 		r.Dur = time.Since(start)
 		return r, nil
 	}
+	trace.Phase("graph")
 	cache.Apply(dd.Upserts, dd.RemovedIDs)
 	g, _ := BuildGraph(cache.Snapshot())
+	trace.Phase("communities")
 	g.DetectCommunities(0)
+	trace.Phase("persist")
 	if _, err := s.IndexVaultIncremental(dd.Upserts, dd.RemovedIDs, g); err != nil {
 		return Reconciliation{}, err
 	}
+	trace.Phase("code_links")
 	_, _ = s.LinkNotesToCode(root)
 	r.Reindexed = true
 	r.Graph = g

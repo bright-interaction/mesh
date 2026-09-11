@@ -371,9 +371,27 @@ construction too. A timeout preserves the saved note and returns an `index_stale
 receipt; it does not prove the owner is down. Canceled construction leaves the
 previous graph/retriever pair intact. This bounds cooperative readback work, not
 the file's durable write, owner recovery, or the owning writer's indexing pass.
-That keeps a write-back's saved-and-queryable receipt independent of vault-wide
-discovery and network latency; periodic and remote-triggered passes still scan
-the vault as the convergence safety net.
+Targeted indexing avoids rediscovering a known changed path; note creation still
+scans vault-wide ID claims, and periodic/remote-triggered passes still scan the
+vault as the convergence safety net. This is not an end-to-end write latency SLO.
+
+From v0.22, slow note creation and owner indexing operations emit structured
+phase timings through the logger (stderr by default, never the JSON-RPC reply).
+Operations under one second remain silent. Longer operations log a summary when
+they return; work still in flight logs its active phase every ten seconds.
+`operation`, process `pid`, and process-local `trace_id` correlate progress with
+the summary. Labels are static: these records contain no note content, titles,
+paths, credentials, or raw errors. Nested operation times overlap; do not sum
+them. `returned` means the function returned, not that the write succeeded.
+
+Look for `note_plan.id_scan` before publication; `note_create` separates file
+claim/write/fsync and collision checks. `mcp_write` separates related-note lookup,
+publication, acknowledgement and telemetry. `owner_reconcile`/`owner_targeted`
+include mutex waits, queued operations, indexing and health. `index_full`,
+`index_incremental` and `index_targeted` break indexing into discovery/parsing,
+graph construction, communities, persistence and code linking. These diagnostics
+add no model calls and do not skip durability, collision or index-validation
+checks. They locate stalls; they do not fix them or impose new deadlines.
 
 The `--watch` flag runs the live reindexer inside the server, so notes you (or a
 teammate) edit in your editor become searchable in the same session without a

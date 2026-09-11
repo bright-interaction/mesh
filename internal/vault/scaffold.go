@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/bright-interaction/mesh/internal/latency"
 	"golang.org/x/text/unicode/norm"
 	"gopkg.in/yaml.v3"
 )
@@ -189,6 +190,8 @@ func createNoteContext(
 	claimedIDs func(context.Context, string) (map[string]string, error),
 	openFile func(string, int, os.FileMode) (*os.File, error),
 ) (*CreateResult, error) {
+	trace := latency.Start("note_create", "plan")
+	defer trace.End()
 	plan, err := planNoteContext(ctx, root, spec, claimedIDs)
 	if err != nil {
 		return nil, err
@@ -198,6 +201,7 @@ func createNoteContext(
 	}
 	// Do not create even an empty type directory until the cancellable whole-vault
 	// scan has completed. That keeps pre-publication cancellation side-effect free.
+	trace.Phase("mkdir")
 	if err := os.MkdirAll(plan.dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -214,6 +218,7 @@ func createNoteContext(
 	// any concurrent caller (mesh mcp --http, the hub's /mcp, internal/web/pending_api).
 	// O_EXCL makes the claim atomic, so a loser sees ErrExist and takes the next suffix.
 	for n := 1; n <= maxIDAttempts; n++ {
+		trace.Phase("render_validate")
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -244,6 +249,7 @@ func createNoteContext(
 			return nil, err
 		}
 
+		trace.Phase("claim_open")
 		f, err := openFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if errors.Is(err, os.ErrExist) {
 			continue // taken, by an earlier note or by a concurrent writer
@@ -251,7 +257,9 @@ func createNoteContext(
 		if err != nil {
 			return nil, err
 		}
+		trace.Phase("write")
 		if _, err := f.Write([]byte(content)); err != nil {
+			trace.Phase("claim_cleanup")
 			closeErr := f.Close()
 			return nil, errors.Join(err, closeErr, removeNoteClaim(path, plan.dir))
 		}
@@ -270,15 +278,20 @@ func createNoteContext(
 		// getting a success receipt). Durability is added around that claim, not instead
 		// of it. A failed write or fsync releases the claim rather than leaving a
 		// half-written note behind at an id the caller was told nothing about.
+		trace.Phase("file_sync")
 		if err := f.Sync(); err != nil {
+			trace.Phase("claim_cleanup")
 			closeErr := f.Close()
 			return nil, errors.Join(err, closeErr, removeNoteClaim(path, plan.dir))
 		}
+		trace.Phase("file_close")
 		if err := f.Close(); err != nil {
+			trace.Phase("claim_cleanup")
 			return nil, errors.Join(err, removeNoteClaim(path, plan.dir))
 		}
 		// The note is a NEW directory entry, so the data fsync alone does not make it
 		// reachable after a power cut. Fsync the directory too, after the file.
+		trace.Phase("directory_sync")
 		syncDir(plan.dir)
 		// Re-check for a racer in another directory now that our own file exists. The
 		// vault scan above is check-then-act ACROSS directories: two CreateNote calls for
@@ -294,14 +307,17 @@ func createNoteContext(
 		// suffix and the loop is bounded); it needs the two creates to land inside the
 		// microseconds between the other's create and its stat scan, and every retry
 		// re-rolls that timing.
+		trace.Phase("collision_check")
 		other, checkErr := otherFileNamedForIDContext(ctx, root, id, path)
 		if checkErr != nil {
+			trace.Phase("claim_cleanup")
 			// Cancellation after publication cannot return while our visible path is
 			// unresolved. The file is already closed and valid; remove it synchronously
 			// before surfacing cancellation, so no writer continues after this call.
 			return nil, errors.Join(checkErr, removeNoteClaim(path, plan.dir))
 		}
 		if other != "" {
+			trace.Phase("claim_cleanup")
 			if err := removeNoteClaim(path, plan.dir); err != nil {
 				return nil, err
 			}
@@ -357,6 +373,8 @@ func PrepareNoteContext(ctx context.Context, root string, spec NewNoteSpec) (*Pr
 }
 
 func planNoteContext(ctx context.Context, root string, spec NewNoteSpec, claimedIDs func(context.Context, string) (map[string]string, error)) (*notePlan, error) {
+	trace := latency.Start("note_plan", "validate")
+	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -396,6 +414,7 @@ func planNoteContext(ctx context.Context, root string, spec NewNoteSpec, claimed
 	} else {
 		fm.Do, fm.Dont, fm.Why = spec.Do, spec.Dont, spec.Why
 	}
+	trace.Phase("id_scan")
 	claimed, err := claimedIDs(ctx, root)
 	if err != nil {
 		return nil, err
