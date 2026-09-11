@@ -88,3 +88,10 @@ You are looking at `mesh ui`, the web app over one vault. The left rail:
 
 The viewer binds to `127.0.0.1` by default, so it is private to your machine. To
 expose it on a network, pass a token; you then sign in once with a session cookie.
+
+## Staying current
+
+Released builds check the public Go module tag at most once per day. If a newer
+Mesh release exists, this web app and `mesh tui` show the exact pinned command to
+install it. The check is silent when offline and does not send vault paths, notes,
+queries, or account data. Set `MESH_NO_UPDATE_CHECK=1` to disable it entirely.

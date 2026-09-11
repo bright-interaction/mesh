@@ -4,6 +4,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/updatecheck"
 )
 
 func testServer(t *testing.T) *httptest.Server {
@@ -61,7 +64,7 @@ func TestServerRoutes(t *testing.T) {
 
 	// SPA shell.
 	code, body, _ := get(t, ts, "/")
-	if code != 200 || !strings.Contains(body, "<canvas") {
+	if code != 200 || !strings.Contains(body, "<canvas") || !strings.Contains(body, `id="update-banner"`) {
 		t.Fatalf("/ should serve the SPA shell: %d", code)
 	}
 
@@ -96,6 +99,40 @@ func TestServerRoutes(t *testing.T) {
 	}
 	if code, _, _ := get(t, ts, "/assets/nope.js"); code != 404 {
 		t.Fatalf("unknown asset should 404, got %d", code)
+	}
+}
+
+func TestStatusCarriesAvailableUpdateForTheWebBanner(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "note.md"), []byte("---\nid: note\ntype: note\n---\n# Note\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, dir)
+	s, err := NewServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.updateCheck = func(context.Context, string) (updatecheck.Notice, error) {
+		return updatecheck.Notice{
+			Available: true, Current: "v0.11.0", Latest: "v0.12.0",
+			Command: "go install github.com/bright-interaction/mesh/cmd/mesh@v0.12.0",
+			URL:     "https://github.com/bright-interaction/mesh/tree/v0.12.0",
+		}, nil
+	}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Update updatecheck.Notice `json:"update"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Update.Available || body.Update.Latest != "v0.12.0" || !strings.Contains(body.Update.Command, "@v0.12.0") {
+		t.Fatalf("update = %+v", body.Update)
 	}
 }
 

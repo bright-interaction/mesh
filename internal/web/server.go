@@ -27,6 +27,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/shellpath"
+	"github.com/bright-interaction/mesh/internal/updatecheck"
 )
 
 //go:embed assets
@@ -85,6 +86,10 @@ type Server struct {
 	logins   *rateLimiter  // per-peer token bucket in front of POST /api/login
 	asks     *rateLimiter  // per-caller token bucket in front of POST /api/ask
 	askSlots chan struct{} // bounded in-flight LLM subprocesses/calls for POST /api/ask
+
+	// updateCheck is a testable seam around the fixed, cached public release check.
+	// It never affects serving: errors are omitted from status and the UI stays quiet.
+	updateCheck func(context.Context, string) (updatecheck.Notice, error)
 }
 
 type retrieverBuildFunc func(context.Context, *index.Store, *graph.Graph) (*retrieve.Retriever, error)
@@ -388,9 +393,10 @@ func newServerContext(ctx context.Context, vaultRoot string, store *index.Store,
 		logins: newRateLimiter(5.0/60.0, 5),
 		// POST /api/ask forks an LLM subprocess (or bills a BYOAI key) per call, so it is
 		// both rate limited (12/min, burst 4) and capped in flight.
-		asks:      newRateLimiter(12.0/60.0, 4),
-		askSlots:  make(chan struct{}, askMaxInFlight),
-		ownerWait: index.OwnerIndexBound,
+		asks:        newRateLimiter(12.0/60.0, 4),
+		askSlots:    make(chan struct{}, askMaxInFlight),
+		ownerWait:   index.OwnerIndexBound,
+		updateCheck: updatecheck.Default.Check,
 	}
 }
 
@@ -763,6 +769,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		edges, _ = s.store.CountContext(r.Context(), "edges")
 		vectors, _ = s.store.CountContext(r.Context(), "vectors")
 	}
+	var update updatecheck.Notice
+	if s.updateCheck != nil {
+		// The checker is capped at three seconds and cached for a day. A failure is
+		// deliberately invisible: update awareness must never make the local UI fail.
+		update, _ = s.updateCheck(r.Context(), buildinfo.ReleaseVer())
+	}
 	writeJSON(w, map[string]any{
 		"vault":  s.exposedVaultRoot(),
 		"counts": map[string]int{"notes": notes, "nodes": nodes, "edges": edges, "vectors": vectors},
@@ -774,6 +786,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"ann":    os.Getenv("MESH_HNSW_THRESHOLD") != "" && os.Getenv("MESH_HNSW_THRESHOLD") != "0",
 		},
 		"authRequired": s.auth.authRequired() || s.member != nil,
+		"update":       update,
 	})
 }
 

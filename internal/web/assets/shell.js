@@ -200,12 +200,38 @@
   }
 
   // live status in the rail foot.
+  function renderUpdate(u) {
+    const banner = document.getElementById("update-banner");
+    if (!banner || !u || !u.available || !u.latest) return;
+    let dismissed = "";
+    try { dismissed = sessionStorage.getItem("mesh-update-dismissed") || ""; } catch (_) {}
+    if (dismissed === u.latest) return;
+    const copy = document.getElementById("update-copy");
+    const command = document.getElementById("update-command");
+    const release = document.getElementById("update-release");
+    if (copy) copy.textContent = "Mesh " + u.latest + " is available (you have " + u.current + ").";
+    if (command) command.textContent = u.command || "";
+    if (release) release.href = u.url || "https://github.com/bright-interaction/mesh";
+    banner.hidden = false;
+    document.body.classList.add("update-available");
+  }
+
+  const updateDismiss = document.getElementById("update-dismiss");
+  if (updateDismiss) updateDismiss.addEventListener("click", () => {
+    const banner = document.getElementById("update-banner");
+    const latest = Mesh.status && Mesh.status.update && Mesh.status.update.latest;
+    if (latest) { try { sessionStorage.setItem("mesh-update-dismissed", latest); } catch (_) {} }
+    if (banner) banner.hidden = true;
+    document.body.classList.remove("update-available");
+  });
+
   async function loadStatus() {
     const foot = document.getElementById("rail-status");
     if (!foot) return;
     try {
       const s = await Mesh.api("/api/status");
       Mesh.status = s;
+      renderUpdate(s.update);
       const c = s.counts || {};
       const sig = s.signals || {};
       const dot = (k) => '<span class="sig ' + (sig[k] ? "on" : "") + '" title="' + k + (sig[k] ? " on" : " off") + '"></span>';

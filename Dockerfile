@@ -13,16 +13,17 @@
 FROM golang:1.26.6-alpine AS builder
 RUN apk add --no-cache git
 WORKDIR /app
-# The commit being built, stamped into buildinfo.Version below so `mesh version` and the
-# web app footer report the code that is actually running instead of the "dev" default.
+# The exact commit and release semver are stamped separately: diagnostics keep the SHA,
+# while update checks compare the semver read from VERSION.
 ARG MESH_GIT_SHA="dev"
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
+    MESH_RELEASE_VERSION="$(cat VERSION)" && \
     CGO_ENABLED=0 GOOS=linux go build \
-      -ldflags "-X github.com/bright-interaction/mesh/internal/buildinfo.Version=$MESH_GIT_SHA" \
+      -ldflags "-X github.com/bright-interaction/mesh/internal/buildinfo.Version=$MESH_GIT_SHA -X github.com/bright-interaction/mesh/internal/buildinfo.ReleaseVersion=$MESH_RELEASE_VERSION" \
       -o /mesh ./cmd/mesh
 
 # ---------- runtime stage ----------

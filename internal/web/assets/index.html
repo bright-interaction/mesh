@@ -13,6 +13,13 @@
   <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
+  <aside id="update-banner" class="update-banner" role="status" aria-live="polite" hidden>
+    <span id="update-copy"></span>
+    <code id="update-command"></code>
+    <a id="update-release" target="_blank" rel="noopener noreferrer">release</a>
+    <button id="update-dismiss" type="button" aria-label="Dismiss update notice">&times;</button>
+  </aside>
+
   <!-- Graph engine canvases (full-window; app.js owns these, IDs unchanged) -->
   <canvas id="stage"></canvas>
   <canvas id="stage3d" hidden></canvas>

@@ -33,4 +33,5 @@ var (
 	headerStyle   = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Padding(0, 1)
 	footerStyle   = lipgloss.NewStyle().Foreground(colorFaint).Padding(0, 1)
 	errStyle      = lipgloss.NewStyle().Foreground(colorErr)
+	updateStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#21180f")).Background(colorTier0).Bold(true).Padding(0, 1)
 )

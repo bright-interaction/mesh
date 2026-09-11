@@ -11,6 +11,7 @@ import (
 	"html"
 	"os"
 	"runtime/debug"
+	"strings"
 )
 
 // Version is the build version. Stamp it at build time with
@@ -20,6 +21,12 @@ import (
 // or override at runtime with MESH_VERSION. Defaults to "dev", which is then resolved
 // from the binary's embedded module version (see Ver).
 var Version = "dev"
+
+// ReleaseVersion is the semver release containing this build. Make/Docker builds
+// stamp it separately from Version so the footer can keep reporting the exact commit
+// while update checks still know which public release is running. `go install` builds
+// get the same value from debug.ReadBuildInfo instead.
+var ReleaseVersion = "dev"
 
 // License is the SPDX identifier of the Mesh core.
 const License = "LicenseRef-Mesh-Sustainable-Use-License"
@@ -48,6 +55,29 @@ func Ver() string {
 		}
 	}
 	return Version
+}
+
+// ReleaseVer returns the public semver identity used for update comparison. It is
+// intentionally separate from Ver: production images stamp Ver with a commit SHA.
+func ReleaseVer() string {
+	if v := os.Getenv("MESH_RELEASE_VERSION"); v != "" {
+		return v
+	}
+	if v := os.Getenv("MESH_VERSION"); strings.HasPrefix(v, "v") {
+		return v
+	}
+	if ReleaseVersion != "dev" {
+		return ReleaseVersion
+	}
+	if strings.HasPrefix(Version, "v") {
+		return Version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return ""
 }
 
 // SourceURL is the source-availability location for THIS version, from

@@ -4,10 +4,14 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/bright-interaction/mesh/internal/buildinfo"
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/updatecheck"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -28,6 +32,8 @@ type App struct {
 	focus         int
 	help          bool
 	lastErr       string
+	update        updatecheck.Notice
+	checkUpdate   func(context.Context, string) (updatecheck.Notice, error)
 
 	notes              []NoteRef
 	notesCur, notesOff int
@@ -50,7 +56,10 @@ func NewApp(be Backend) *App {
 	ti := textinput.New()
 	ti.Placeholder = "search the vault"
 	ti.Prompt = "/ "
-	a := &App{be: be, focus: focusNotes, search: ti, preview: viewport.New(0, 0)}
+	a := &App{
+		be: be, focus: focusNotes, search: ti, preview: viewport.New(0, 0),
+		checkUpdate: updatecheck.Default.Check,
+	}
 	a.notes = be.Notes()
 	return a
 }
@@ -70,7 +79,21 @@ func Run(vaultRoot string) error {
 	return err
 }
 
-func (a *App) Init() tea.Cmd { return nil }
+type updateMsg struct{ notice updatecheck.Notice }
+
+func (a *App) Init() tea.Cmd {
+	if a.checkUpdate == nil {
+		return nil
+	}
+	check := a.checkUpdate
+	current := buildinfo.ReleaseVer()
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		notice, _ := check(ctx, current)
+		return updateMsg{notice: notice}
+	}
+}
 
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -83,6 +106,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 	case tea.KeyMsg:
 		return a.handleKey(msg)
+	case updateMsg:
+		a.update = msg.notice
+		a.layout()
+		return a, nil
 	}
 	return a, nil
 }
@@ -227,6 +254,9 @@ func (a *App) layout() {
 		return
 	}
 	a.contentH = a.height - 2 // header + footer
+	if a.update.Available {
+		a.contentH-- // one persistent upgrade banner line
+	}
 	if a.contentH < 5 {
 		a.contentH = 5
 	}
@@ -257,7 +287,17 @@ func (a *App) View() string {
 	}
 	header := headerStyle.Render("mesh") + faintStyle.Render(fmt.Sprintf("  %d notes", len(a.notes)))
 	row := lipgloss.JoinHorizontal(lipgloss.Top, a.notesView(), a.resultsView(), a.previewView())
-	return lipgloss.JoinVertical(lipgloss.Left, header, row, a.footerView())
+	parts := []string{header}
+	if a.update.Available {
+		text := fmt.Sprintf("↑ Mesh %s available (running %s) · upgrade: %s", a.update.Latest, a.update.Current, a.update.Command)
+		bannerW := a.width - 2 // updateStyle adds one cell of padding on each side
+		if bannerW < 1 {
+			bannerW = 1
+		}
+		parts = append(parts, updateStyle.Width(bannerW).Render(capWidth(text, bannerW)))
+	}
+	parts = append(parts, row, a.footerView())
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 func (a *App) notesView() string {
@@ -366,6 +406,9 @@ func (a *App) helpView() string {
 		"",
 		faintStyle.Render("  the notes list is hub-first; results are the same ranked"),
 		faintStyle.Render("  cards the agent gets; the preview shows the note + its links."),
+	}
+	if a.update.Available {
+		lines = append(lines, "", tier0Style.Render("  update available: "+a.update.Latest), "  "+a.update.Command)
 	}
 	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAccent).Padding(1, 2)
 	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, box.Render(strings.Join(lines, "\n")))

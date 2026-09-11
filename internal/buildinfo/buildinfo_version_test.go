@@ -31,3 +31,23 @@ func TestVerPrecedence(t *testing.T) {
 		t.Errorf("Ver must never return %q to a user", got)
 	}
 }
+
+func TestReleaseVerKeepsSemverSeparateFromCommitIdentity(t *testing.T) {
+	origVersion, origRelease := Version, ReleaseVersion
+	t.Cleanup(func() { Version, ReleaseVersion = origVersion, origRelease })
+	t.Setenv("MESH_VERSION", "")
+	t.Setenv("MESH_RELEASE_VERSION", "")
+	Version = "43c76c970"
+	ReleaseVersion = "v0.11.0"
+	if got := Ver(); got != "43c76c970" {
+		t.Fatalf("Ver = %q, want exact build identity", got)
+	}
+	if got := ReleaseVer(); got != "v0.11.0" {
+		t.Fatalf("ReleaseVer = %q, want public semver", got)
+	}
+
+	t.Setenv("MESH_RELEASE_VERSION", "v0.12.0")
+	if got := ReleaseVer(); got != "v0.12.0" {
+		t.Fatalf("release env override = %q", got)
+	}
+}

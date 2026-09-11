@@ -38,6 +38,13 @@ make install            # builds a static binary to ~/.local/bin/mesh
 BIN=/usr/local/bin/mesh`. `make build` drops it in `./bin/mesh` instead if you
 would rather not install anything.
 
+Released builds check the public Go module tag at most once per 24 hours. When a
+newer version exists, `mesh tui` and `mesh ui` show a one-line upgrade banner with
+the exact pinned `go install ...@vX.Y.Z` command. The check is silent on network
+failure, never blocks the TUI from opening, and can be disabled with
+`MESH_NO_UPDATE_CHECK=1`. Developer builds and commit-SHA builds without a stamped
+release identity do not make the request.
+
 ## Quickstart
 
 This repository ships a small sample vault in `vault/`: the real decisions and

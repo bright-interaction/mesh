@@ -42,6 +42,51 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 
+.update-banner {
+  position: fixed;
+  top: 10px;
+  left: calc(var(--rail-w) + 16px);
+  right: 16px;
+  z-index: 18;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-height: 38px;
+  padding: 8px 40px 8px 14px;
+  color: #21180f;
+  background: #e0a86b;
+  border: 1px solid #f0c48f;
+  border-radius: 10px;
+  box-shadow: 0 12px 35px rgba(0,0,0,.35);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.update-banner[hidden] { display: none; }
+.update-banner code {
+  padding: 3px 7px;
+  color: #21180f;
+  background: rgba(255,255,255,.3);
+  border-radius: 5px;
+  font: 10.5px/1.4 var(--mono);
+  user-select: all;
+}
+.update-banner a { color: inherit; font-weight: 650; }
+.update-banner button {
+  position: absolute;
+  right: 10px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font-size: 20px;
+  cursor: pointer;
+}
+body.update-available #bar { top: 58px; }
+body.update-available .explorer { top: 110px; }
+body.update-available .panel-inner { padding-top: 72px; }
+
 #stage {
   position: fixed;
   inset: 0;
@@ -508,6 +553,7 @@ body.panel-active .empty { display: none; } /* never over a feature panel */
 
 @media (max-width: 720px) {
   :root { --rail-w: 56px; }
+  .update-banner { justify-content: flex-start; }
   .rail-brand .name, .rail-nav .nav { font-size: 0; }
   .rail-nav .nav { text-align: center; padding: 11px 0; }
   .rail-foot { display: none; }

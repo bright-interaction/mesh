@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/bright-interaction/mesh/internal/retrieve"
+	"github.com/bright-interaction/mesh/internal/updatecheck"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -211,4 +212,23 @@ func TestAppEmptySearchNoPanic(t *testing.T) {
 		t.Fatal("empty query should clear cards")
 	}
 	_ = a.View()
+}
+
+func TestUpdateBannerUsesOneRowAndNamesExactUpgrade(t *testing.T) {
+	a := NewApp(stubBackend{notes: []NoteRef{{ID: "a", Title: "A"}}})
+	a.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	before := a.contentH
+	a.Update(updateMsg{notice: updatecheck.Notice{
+		Available: true, Current: "v0.11.0", Latest: "v0.12.0",
+		Command: "go install github.com/bright-interaction/mesh/cmd/mesh@v0.12.0",
+	}})
+	if a.contentH != before-1 {
+		t.Fatalf("content height = %d, want one banner row below %d", a.contentH, before)
+	}
+	view := a.View()
+	for _, want := range []string{"v0.12.0 available", "go install", "@v0.12.0"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("update view missing %q:\n%s", want, view)
+		}
+	}
 }

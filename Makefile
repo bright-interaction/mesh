@@ -9,7 +9,8 @@ BIN ?= $(HOME)/.local/bin/mesh
 # commit that was actually built, instead of a hand-typed string that drifts from the
 # published source. Override with `make install MESH_GIT_SHA=v0.2.0` when cutting a tag.
 MESH_GIT_SHA ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
-LDFLAGS = -X github.com/bright-interaction/mesh/internal/buildinfo.Version=$(MESH_GIT_SHA)
+MESH_RELEASE_VERSION ?= $(shell cat VERSION 2>/dev/null || echo dev)
+LDFLAGS = -X github.com/bright-interaction/mesh/internal/buildinfo.Version=$(MESH_GIT_SHA) -X github.com/bright-interaction/mesh/internal/buildinfo.ReleaseVersion=$(MESH_RELEASE_VERSION)
 
 .PHONY: install build test vet tidy fmt clean
 
