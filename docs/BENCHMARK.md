@@ -51,6 +51,34 @@ To measure your own corpus, write 20 or so queries you actually ask, label the
 note ids that answer them, and run `mesh eval your-cases.json --vault /your/vault`
 with and without `--budget`.
 
+## Note identity planning
+
+v0.25 keeps the fresh-disk collision scan but uses four concurrent readers per
+scan, with results merged in traversal order. Head buffers start at 4 KiB and
+grow only as needed, retaining the 64 KiB identity-read ceiling. No model calls,
+metadata cache, or stale-index shortcut are introduced.
+
+```sh
+go test ./internal/vault -run '^$' -bench '^BenchmarkClaimedIDScan$' -benchtime=3x -count=3
+```
+
+On Apple M3 / Go 1.26.7, 2026-09-12, scanning 3,000 synthetic short notes:
+
+| Read strategy | Time per scan (three samples) | Allocated bytes per scan |
+|---|---:|---:|
+| Legacy serial, fixed 64 KiB buffers | 227–505 ms | 241.0 MB |
+| Serial, growing buffers | 142–211 ms | 56.7 MB |
+| Four readers, growing buffers | 70–113 ms | 56.7 MB |
+
+The old read/allocation shape is retained in the benchmark for reproduction.
+Allocation falls about 76%; latency samples are load-sensitive and are not a
+live-writeback guarantee. The benchmark excludes rendering, durable publication,
+watcher scheduling, indexing and reader acknowledgement. Long files that reach
+the ceiling can allocate more while growing than with a single fixed buffer.
+Scans still traverse the entire vault and hold path/result arrays linear in
+note count. Each cancelled scan may leave up to four kernel reads finishing
+privately; no late result or partial claim map is published.
+
 ## Incremental graph persistence
 
 v0.24 replaces the incremental graph-table wipe/reinsert with an exact row diff

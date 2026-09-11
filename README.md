@@ -393,6 +393,15 @@ graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
 
+From v0.25, note planning reads identity headers with at most four concurrent
+readers per scan and merges results in traversal order. Short notes no longer
+reserve the full 64 KiB head-read ceiling. The scan still checks fresh disk
+contents, including unindexed notes and metadata-preserving edits; it does not
+trust a stale index or metadata cache to declare an ID free. O_EXCL publication,
+fsync, cross-type collision checks and cancellation behavior are retained.
+This reduces planning work; it does not bound filesystem latency or prioritize
+writebacks over a running owner sweep.
+
 From v0.24, incremental and targeted indexing compare the whole rebuilt graph
 with the committed database and write only changed nodes and edges. This keeps
 global community and supersession changes correct while avoiding a full graph

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,6 +56,23 @@ func TestReadBytesContextCancellationDoesNotWaitForStalledRead(t *testing.T) {
 	case <-finished:
 	case <-time.After(2 * time.Second):
 		t.Fatal("late reader did not exit")
+	}
+}
+
+func TestGrowingHeadStopsAtLimitAndOnCancellation(t *testing.T) {
+	for _, limit := range []int{0, 4095, 4096, 4097, 65536} {
+		reader := strings.NewReader(strings.Repeat("x", limit+8))
+		data, err := readBoundedHead(context.Background(), reader, limit)
+		if err != nil || len(data) != limit || reader.Len() != 8 {
+			t.Fatalf("limit=%d length=%d unread=%d err=%v", limit, len(data), reader.Len(), err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader := &cancelOnRead{cancel: cancel}
+	data, err := readBoundedHead(ctx, reader, 65536)
+	if !errors.Is(err, context.Canceled) || data != nil || reader.calls != 1 {
+		t.Fatalf("read continued or published after cancel: bytes=%d calls=%d err=%v", len(data), reader.calls, err)
 	}
 }
 

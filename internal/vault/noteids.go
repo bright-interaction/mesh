@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -70,9 +71,14 @@ func noteIDForFileContext(ctx context.Context, path string) (id string, declared
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
+	id, declared = noteIDFromHead(key, head)
+	return id, declared, nil
+}
+
+func noteIDFromHead(key string, head []byte) (string, bool) {
 	fmText, _, had := SplitFrontmatter(string(head))
 	if !had {
-		return key, false, nil
+		return key, false
 	}
 	// Only the id is decoded. A note with, say, an unquoted colon in `updated:` fails to
 	// unmarshal as a whole, and asking for the full Frontmatter would throw away the id
@@ -81,12 +87,12 @@ func noteIDForFileContext(ctx context.Context, path string) (id string, declared
 		ID string `yaml:"id"`
 	}
 	if err := yaml.Unmarshal([]byte(fmText), &probe); err != nil {
-		return key, false, nil
+		return key, false
 	}
 	if id := strings.TrimSpace(probe.ID); id != "" {
-		return id, true, nil
+		return id, true
 	}
-	return key, false, nil
+	return key, false
 }
 
 // createNoteDirs is the complete, fixed set of destinations in which CreateNote can
@@ -338,13 +344,28 @@ func scanClaimedIDHolders(
 	walkDir func(string, fs.WalkDirFunc) error,
 	readID func(context.Context, string) (string, bool, error),
 ) (map[string]idHolder, error) {
+	return scanClaimedIDHoldersWorkers(ctx, root, walkDir, readID, idScanWorkers)
+}
+
+// Four readers overlap local filesystem latency without scaling open files or
+// concurrent YAML decoders with vault size. There is deliberately no metadata or
+// index cache: preserved mtimes, unindexed notes and custom folders still count.
+const idScanWorkers = 4
+
+func scanClaimedIDHoldersWorkers(
+	ctx context.Context,
+	root string,
+	walkDir func(string, fs.WalkDirFunc) error,
+	readID func(context.Context, string) (string, bool, error),
+	workers int,
+) (map[string]idHolder, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	out := map[string]idHolder{}
+	var paths []string
 	err := walkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -372,12 +393,54 @@ func scanClaimedIDHolders(
 		if !d.Type().IsRegular() {
 			return nil
 		}
-		id, declared, readErr := readID(ctx, path)
+		paths = append(paths, path)
+		return nil
+	})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	type result struct {
+		id       string
+		declared bool
+		err      error
+	}
+	results := make([]result, len(paths))
+	workers = min(max(workers, 1), len(paths))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			for i := start; i < len(paths); i += workers {
+				if ctx.Err() != nil {
+					return
+				}
+				id, declared, readErr := readID(ctx, paths[i])
+				results[i] = result{id, declared, readErr}
+				if readErr != nil {
+					return
+				}
+			}
+		}(worker)
+	}
+	// Each worker owns disjoint result slots; publish nothing before they finish.
+	// claimedIDHoldersWith isolates this whole read-only pass when cancellable,
+	// so a stalled filesystem cannot keep its caller waiting after cancellation.
+	wg.Wait()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	out := map[string]idHolder{}
+	for i, path := range paths {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		id, declared, readErr := results[i].id, results[i].declared, results[i].err
 		if readErr != nil {
-			return readErr
+			return out, readErr
 		}
 		if id == "" {
-			return nil
+			continue
 		}
 		rel := path
 		if r, rerr := filepath.Rel(root, path); rerr == nil {
@@ -394,8 +457,9 @@ func scanClaimedIDHolders(
 		if prev, taken := out[id]; !taken || (declared && !prev.declared) {
 			out[id] = idHolder{path: rel, declared: declared}
 		}
-		return nil
-	})
+		// Merge in traversal order, NEVER completion order. A faster reader
+		// must not change which declared duplicate is the incumbent.
+	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}

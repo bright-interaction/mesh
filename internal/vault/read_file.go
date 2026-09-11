@@ -90,13 +90,47 @@ func ReadFileHeadContext(ctx context.Context, path string, maxBytes int) ([]byte
 		}
 		defer f.Close()
 
-		head := make([]byte, maxBytes)
-		n, err := io.ReadFull(f, head)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			err = nil
-		}
-		return head[:n], err
+		return readBoundedHead(ctx, f, maxBytes)
 	})
+}
+
+// Most notes are much shorter than the 64 KiB identity-scan ceiling. Grow only
+// when a chunk fills, rather than allocating that ceiling for every note. Reads
+// still stop at exactly maxBytes, and ordinary partial-read errors are preserved.
+func readBoundedHead(ctx context.Context, r io.Reader, maxBytes int) ([]byte, error) {
+	head := make([]byte, min(maxBytes, 4096))
+	n := 0
+	for {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		read, err := r.Read(head[n:])
+		n += read
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+		}
+		// io.ReadFull historically treats a filled limit as success even if
+		// that read also returned EOF or another error.
+		if n == maxBytes {
+			return head, nil
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return head[:n], nil
+		}
+		if err != nil {
+			return head[:n], err
+		}
+		if n < len(head) {
+			continue
+		}
+		next := make([]byte, min(maxBytes, 2*len(head)))
+		copy(next, head)
+		head = next
+	}
 }
 
 type contextFileInfoResult struct {
