@@ -36,7 +36,7 @@ func TestCheckFindsNewReleaseAndCachesIt(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !got.Available || got.Latest != "v0.12.0" || !strings.Contains(got.Command, "@v0.12.0") {
+		if !got.Available || got.Latest != "v0.12.0" || got.PrebuiltCommand != "mesh upgrade" || !strings.Contains(got.Command, "@v0.12.0") {
 			t.Fatalf("notice = %+v", got)
 		}
 	}

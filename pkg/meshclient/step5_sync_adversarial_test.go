@@ -50,11 +50,11 @@ func TestSyncVaultRejectedDeleteStaysAbsentAndRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeState(vaultDir, syncState{
-		HeadSHA: "base", Hashes: map[string]string{rel: contentHash(old)}, HubURL: srv.URL,
+		HeadSHA: "base", Hashes: map[string]string{rel: contentHash(old)}, HubURL: srv.URL, VaultID: "vault",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -102,11 +102,11 @@ func TestSyncVaultIncomingDeleteDoesNotBaselineWindowEdit(t *testing.T) {
 		})
 	}))
 	defer srv.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeState(vaultDir, syncState{
-		HeadSHA: "base", Hashes: map[string]string{rel: contentHash(old)}, HubURL: srv.URL,
+		HeadSHA: "base", Hashes: map[string]string{rel: contentHash(old)}, HubURL: srv.URL, VaultID: "vault",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -189,10 +189,10 @@ func TestSyncVaultNeverPushesDeletesForInboundRootFiles(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeState(vaultDir, syncState{HeadSHA: "base", Hashes: map[string]string{}, HubURL: srv.URL}); err != nil {
+	if err := writeState(vaultDir, syncState{HeadSHA: "base", Hashes: map[string]string{}, HubURL: srv.URL, VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := SyncVault(vaultDir); err != nil {
@@ -322,7 +322,7 @@ func TestSyncVaultPullFirstRejectsRejectedWithoutTransmittedOutbox(t *testing.T)
 		})
 	}))
 	defer srv.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -939,11 +939,11 @@ func TestSyncVaultFailedResponseReplaysOutboxAfterRestart(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(syncproto.SyncResponse{HeadSHA: "accepted-head", TombstoneSeq: 4})
 	}))
 	defer srv.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeState(vaultDir, syncState{
-		HeadSHA: "base", Hashes: map[string]string{rel: contentHash(old)}, TombSeq: 3, HubURL: srv.URL,
+		HeadSHA: "base", Hashes: map[string]string{rel: contentHash(old)}, TombSeq: 3, HubURL: srv.URL, VaultID: "vault",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1009,10 +1009,10 @@ func TestSyncVaultSerializesConcurrentRoundsForOneVault(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(syncproto.SyncResponse{HeadSHA: fmt.Sprintf("head-%d", n)})
 	}))
 	defer srv.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeState(vaultDir, syncState{HeadSHA: "base", Hashes: map[string]string{}, HubURL: srv.URL}); err != nil {
+	if err := writeState(vaultDir, syncState{HeadSHA: "base", Hashes: map[string]string{}, HubURL: srv.URL, VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -39,11 +39,17 @@ BIN=/usr/local/bin/mesh`. `make build` drops it in `./bin/mesh` instead if you
 would rather not install anything.
 
 Released builds check the public Go module tag at most once per 24 hours. When a
-newer version exists, `mesh tui` and `mesh ui` show a one-line upgrade banner with
-the exact pinned `go install ...@vX.Y.Z` command. The check is silent on network
+newer version exists, `mesh tui` and `mesh ui` show a one-line upgrade banner.
+Prebuilt users can run `mesh upgrade [vault]`; Mesh downloads from that vault's
+joined hub, verifies the published SHA-256 and embedded release identity, then
+atomically replaces the client. Go users also get the exact pinned
+`go install ...@vX.Y.Z` command. The check is silent on network
 failure, never blocks the TUI from opening, and can be disabled with
 `MESH_NO_UPDATE_CHECK=1`. Developer builds and commit-SHA builds without a stamped
 release identity do not make the request.
+
+Use `mesh upgrade --check [vault]` for a read-only check. Automatic replacement
+currently supports macOS and Linux; Windows users receive the exact download URL.
 
 ## Quickstart
 

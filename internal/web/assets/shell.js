@@ -207,9 +207,11 @@
     try { dismissed = sessionStorage.getItem("mesh-update-dismissed") || ""; } catch (_) {}
     if (dismissed === u.latest) return;
     const copy = document.getElementById("update-copy");
+    const prebuilt = document.getElementById("update-prebuilt");
     const command = document.getElementById("update-command");
     const release = document.getElementById("update-release");
     if (copy) copy.textContent = "Mesh " + u.latest + " is available (you have " + u.current + ").";
+    if (prebuilt) prebuilt.textContent = u.prebuilt_command || "mesh upgrade";
     if (command) command.textContent = u.command || "";
     if (release) release.href = u.url || "https://github.com/bright-interaction/mesh";
     banner.hidden = false;

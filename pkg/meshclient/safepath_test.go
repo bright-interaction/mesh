@@ -395,11 +395,11 @@ func TestSyncVaultKeepsWindowEditDirty(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(syncproto.SyncResponse{HeadSHA: "head1"})
 	}))
 	defer srv.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeState(vaultDir, syncState{
-		HeadSHA: "base", Hashes: map[string]string{"notes/a.md": contentHash([]byte("v0\n"))}, HubURL: srv.URL,
+		HeadSHA: "base", Hashes: map[string]string{"notes/a.md": contentHash([]byte("v0\n"))}, HubURL: srv.URL, VaultID: "vault",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestSyncVaultKeepsWindowEditDirty(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(syncproto.SyncResponse{HeadSHA: "head2"})
 	}))
 	defer srv2.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv2.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv2.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 	st = readState(vaultDir)

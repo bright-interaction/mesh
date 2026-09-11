@@ -55,10 +55,10 @@ func TestSyncVaultBoundedBatchPushesTheRemainder(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(syncproto.SyncResponse{HeadSHA: fmt.Sprintf("head%d", len(rounds))})
 	}))
 	defer srv.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeState(vaultDir, syncState{HeadSHA: "base", Hashes: map[string]string{}, HubURL: srv.URL}); err != nil {
+	if err := writeState(vaultDir, syncState{HeadSHA: "base", Hashes: map[string]string{}, HubURL: srv.URL, VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -198,12 +198,12 @@ func TestSyncVaultProtectsDeferredNotesFromInboundDeltas(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
-	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t"}); err != nil {
+	if err := writeCredentials(vaultDir, credentials{HubURL: srv.URL, Token: "t", VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 	// A non-empty but GC'd base makes a real hub answer FullReconcile without
 	// triggering the unknown-base pull-first phase that this test does not target.
-	if err := writeState(vaultDir, syncState{HeadSHA: "gc-d-base", Hashes: map[string]string{}, HubURL: srv.URL}); err != nil {
+	if err := writeState(vaultDir, syncState{HeadSHA: "gc-d-base", Hashes: map[string]string{}, HubURL: srv.URL, VaultID: "vault"}); err != nil {
 		t.Fatal(err)
 	}
 

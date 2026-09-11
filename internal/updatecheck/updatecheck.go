@@ -36,11 +36,12 @@ const (
 // Notice is safe to render directly after using textContent (web) or ordinary
 // terminal text (TUI). Latest is accepted only when it is a valid Go semver.
 type Notice struct {
-	Available bool   `json:"available"`
-	Current   string `json:"current,omitempty"`
-	Latest    string `json:"latest,omitempty"`
-	Command   string `json:"command,omitempty"`
-	URL       string `json:"url,omitempty"`
+	Available       bool   `json:"available"`
+	Current         string `json:"current,omitempty"`
+	Latest          string `json:"latest,omitempty"`
+	Command         string `json:"command,omitempty"`
+	PrebuiltCommand string `json:"prebuilt_command,omitempty"`
+	URL             string `json:"url,omitempty"`
 }
 
 type cacheEntry struct {
@@ -157,11 +158,12 @@ func notice(current, latest string) Notice {
 		return Notice{Current: current, Latest: latest}
 	}
 	return Notice{
-		Available: true,
-		Current:   current,
-		Latest:    latest,
-		Command:   "go install " + modulePath + "@" + latest,
-		URL:       releaseBaseURL + latest,
+		Available:       true,
+		Current:         current,
+		Latest:          latest,
+		Command:         "go install " + modulePath + "@" + latest,
+		PrebuiltCommand: "mesh upgrade",
+		URL:             releaseBaseURL + latest,
 	}
 }
 

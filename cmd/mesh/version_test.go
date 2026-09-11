@@ -5,9 +5,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/buildinfo"
 )
 
 // runRoot executes the real root command with args and returns everything it wrote.
@@ -51,6 +54,19 @@ func TestVersionFlagMatchesCommand(t *testing.T) {
 	flagOut := strings.TrimSpace(runRoot(t, "--version"))
 	if cmdOut != flagOut {
 		t.Errorf("`mesh version` printed %q but `mesh --version` printed %q", cmdOut, flagOut)
+	}
+}
+
+func TestVersionJSONSeparatesBuildAndReleaseIdentity(t *testing.T) {
+	var got map[string]string
+	if err := json.Unmarshal([]byte(runRoot(t, "version", "--json")), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["name"] != "mesh" || got["build"] != buildVersionForTest() || got["go"] != runtime.Version() {
+		t.Fatalf("version JSON = %#v", got)
+	}
+	if got["release"] != buildinfo.ReleaseVer() {
+		t.Fatalf("release = %q, want %q", got["release"], buildinfo.ReleaseVer())
 	}
 }
 

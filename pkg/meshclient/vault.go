@@ -1293,6 +1293,7 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 	if err != nil {
 		return Summary{}, err
 	}
+	creds = hydrateLegacyVaultID(vaultDir, creds)
 	state := readState(vaultDir)
 	// Recover from an interrupted join produced by this or an older client. A base
 	// from another hub is never evidence about what the credential's hub has; the
@@ -1575,6 +1576,35 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 		return combineSummaries(sum, next), nil
 	}
 	return sum, nil
+}
+
+// hydrateLegacyVaultID upgrades credentials written before the hub returned a stable
+// vault identity. Without it, those long-lived joins never create a team-reuse outbox:
+// the privacy boundary scopes every event by vault id and deliberately drops events
+// when that id is unknown. Identification is best effort so an old or temporarily
+// unavailable /v1/vault endpoint cannot block ordinary note sync. The id becomes live
+// only after the private credential file is durably replaced.
+func hydrateLegacyVaultID(vaultDir string, creds credentials) credentials {
+	if creds.VaultID != "" {
+		return creds
+	}
+	vi, err := New(creds.HubURL, creds.Token).Vault()
+	if err != nil {
+		slog.Warn("sync: could not identify this legacy join; cross-user reuse telemetry remains disabled", "err", err)
+		return creds
+	}
+	vaultID := strings.TrimSpace(vi.VaultID)
+	if vaultID == "" {
+		slog.Warn("sync: hub returned no vault identity; cross-user reuse telemetry remains disabled")
+		return creds
+	}
+	next := creds
+	next.VaultID = vaultID
+	if err := writeCredentials(vaultDir, next); err != nil {
+		slog.Warn("sync: could not persist the joined vault identity; cross-user reuse telemetry remains disabled", "err", err)
+		return creds
+	}
+	return next
 }
 
 func combineSummaries(first, second Summary) Summary {

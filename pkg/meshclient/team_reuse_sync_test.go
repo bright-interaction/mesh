@@ -7,12 +7,57 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/syncproto"
 	"github.com/bright-interaction/mesh/internal/teamtelemetry"
 )
+
+func TestSyncHydratesLegacyJoinBeforeScopingTeamReuse(t *testing.T) {
+	var syncReq syncproto.SyncRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/vault":
+			_ = json.NewEncoder(w).Encode(syncproto.VaultInfo{VaultID: "team-stable", HeadSHA: "hub-head"})
+		case "/v1/sync":
+			if err := json.NewDecoder(r.Body).Decode(&syncReq); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(syncproto.SyncResponse{HeadSHA: "hub-head"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".mesh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCredentials(root, credentials{HubURL: ts.URL, Token: "legacy-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeState(root, syncState{HeadSHA: "legacy-head", Hashes: map[string]string{}, HubURL: ts.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SyncVault(root); err != nil {
+		t.Fatal(err)
+	}
+	if syncReq.BaseSHA != "" {
+		t.Fatalf("legacy unidentified base was trusted after identity appeared: %q", syncReq.BaseSHA)
+	}
+	creds, err := readCredentials(root)
+	if err != nil || creds.VaultID != "team-stable" || creds.Token != "legacy-token" {
+		t.Fatalf("hydrated credentials = %+v, err=%v", creds, err)
+	}
+	state := readState(root)
+	if state.VaultID != "team-stable" || state.HubURL != ts.URL {
+		t.Fatalf("hydrated state = %+v", state)
+	}
+}
 
 func TestSyncUploadsAndDeletesOnlyAcknowledgedReuseEvents(t *testing.T) {
 	var got syncproto.SyncRequest

@@ -220,13 +220,13 @@ func TestUpdateBannerUsesOneRowAndNamesExactUpgrade(t *testing.T) {
 	before := a.contentH
 	a.Update(updateMsg{notice: updatecheck.Notice{
 		Available: true, Current: "v0.11.0", Latest: "v0.12.0",
-		Command: "go install github.com/bright-interaction/mesh/cmd/mesh@v0.12.0",
+		Command: "go install github.com/bright-interaction/mesh/cmd/mesh@v0.12.0", PrebuiltCommand: "mesh upgrade",
 	}})
 	if a.contentH != before-1 {
 		t.Fatalf("content height = %d, want one banner row below %d", a.contentH, before)
 	}
 	view := a.View()
-	for _, want := range []string{"v0.12.0 available", "go install", "@v0.12.0"} {
+	for _, want := range []string{"v0.12.0 available", "mesh upgrade"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("update view missing %q:\n%s", want, view)
 		}

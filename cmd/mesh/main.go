@@ -61,6 +61,7 @@ func rootCmd() *cobra.Command {
 	root.SetVersionTemplate(versionLine() + "\n")
 	root.AddCommand(
 		versionCmd(),
+		upgradeCmd(),
 		initCmd(),
 		newCmd(),
 		indexCmd(),
@@ -109,15 +110,24 @@ func versionLine() string {
 }
 
 func versionCmd() *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	c := &cobra.Command{
 		Use:   "version",
 		Short: "Print the Mesh build version and Go runtime",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if asJSON {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]string{
+					"name": "mesh", "build": buildinfo.Ver(),
+					"release": buildinfo.ReleaseVer(), "go": runtime.Version(),
+				})
+			}
 			fmt.Fprintln(cmd.OutOrStdout(), versionLine())
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&asJSON, "json", false, "print machine-readable build and release identity")
+	return c
 }
 
 func initCmd() *cobra.Command {

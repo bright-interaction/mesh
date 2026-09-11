@@ -93,5 +93,7 @@ expose it on a network, pass a token; you then sign in once with a session cooki
 
 Released builds check the public Go module tag at most once per day. If a newer
 Mesh release exists, this web app and `mesh tui` show the exact pinned command to
-install it. The check is silent when offline and does not send vault paths, notes,
+install it. Prebuilt users can run `mesh upgrade [vault]`; it verifies both the
+hub's SHA-256 manifest and the downloaded binary's release identity before an
+atomic replacement. The check is silent when offline and does not send vault paths, notes,
 queries, or account data. Set `MESH_NO_UPDATE_CHECK=1` to disable it entirely.

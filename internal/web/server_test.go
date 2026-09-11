@@ -116,8 +116,9 @@ func TestStatusCarriesAvailableUpdateForTheWebBanner(t *testing.T) {
 	s.updateCheck = func(context.Context, string) (updatecheck.Notice, error) {
 		return updatecheck.Notice{
 			Available: true, Current: "v0.11.0", Latest: "v0.12.0",
-			Command: "go install github.com/bright-interaction/mesh/cmd/mesh@v0.12.0",
-			URL:     "https://github.com/bright-interaction/mesh/tree/v0.12.0",
+			Command:         "go install github.com/bright-interaction/mesh/cmd/mesh@v0.12.0",
+			PrebuiltCommand: "mesh upgrade",
+			URL:             "https://github.com/bright-interaction/mesh/tree/v0.12.0",
 		}, nil
 	}
 	rec := httptest.NewRecorder()
@@ -131,7 +132,7 @@ func TestStatusCarriesAvailableUpdateForTheWebBanner(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if !body.Update.Available || body.Update.Latest != "v0.12.0" || !strings.Contains(body.Update.Command, "@v0.12.0") {
+	if !body.Update.Available || body.Update.Latest != "v0.12.0" || body.Update.PrebuiltCommand != "mesh upgrade" || !strings.Contains(body.Update.Command, "@v0.12.0") {
 		t.Fatalf("update = %+v", body.Update)
 	}
 }

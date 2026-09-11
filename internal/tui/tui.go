@@ -289,7 +289,11 @@ func (a *App) View() string {
 	row := lipgloss.JoinHorizontal(lipgloss.Top, a.notesView(), a.resultsView(), a.previewView())
 	parts := []string{header}
 	if a.update.Available {
-		text := fmt.Sprintf("↑ Mesh %s available (running %s) · upgrade: %s", a.update.Latest, a.update.Current, a.update.Command)
+		command := a.update.PrebuiltCommand
+		if command == "" {
+			command = a.update.Command
+		}
+		text := fmt.Sprintf("↑ Mesh %s available (running %s) · upgrade: %s", a.update.Latest, a.update.Current, command)
 		bannerW := a.width - 2 // updateStyle adds one cell of padding on each side
 		if bannerW < 1 {
 			bannerW = 1
@@ -408,7 +412,8 @@ func (a *App) helpView() string {
 		faintStyle.Render("  cards the agent gets; the preview shows the note + its links."),
 	}
 	if a.update.Available {
-		lines = append(lines, "", tier0Style.Render("  update available: "+a.update.Latest), "  "+a.update.Command)
+		lines = append(lines, "", tier0Style.Render("  update available: "+a.update.Latest),
+			"  prebuilt: "+a.update.PrebuiltCommand, "  Go toolchain: "+a.update.Command)
 	}
 	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorAccent).Padding(1, 2)
 	return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, box.Render(strings.Join(lines, "\n")))
