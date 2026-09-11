@@ -2464,6 +2464,7 @@ func syncCmd() *cobra.Command {
 				fmt.Printf("%s  "+format+"\n", append([]any{time.Now().Format("15:04:05")}, a...)...)
 			}
 			meshclient.Logf = logf // surface non-fatal stream diagnostics (e.g. auth rejections)
+			var receipts meshclient.WatchReceipts
 			nudge := make(chan struct{}, 1)
 			go func() {
 				if err := meshclient.StreamEvents(ctx, vaultDir, nudge); err != nil {
@@ -2495,10 +2496,8 @@ func syncCmd() *cobra.Command {
 					// one-shot path uses: these two had already drifted into two
 					// wordings of the same four lines, which is how one of them ends up
 					// with a fix the other never gets.
-					if syncSummaryMoved(sum) {
-						for _, line := range syncSummaryLines(sum) {
-							logf("%s", line)
-						}
+					for _, line := range receipts.Lines(sum) {
+						logf("%s", line)
 					}
 					return watch.Result{Reindexed: false}, nil
 				},

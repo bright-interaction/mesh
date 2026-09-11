@@ -35,10 +35,54 @@ func TestRejectedLineNamesEveryReasonTheHubRefusesFor(t *testing.T) {
 	if !strings.Contains(rejLine, ".claude/settings.json") {
 		t.Errorf("the rejected line does not name the path the hub refused: %q", rejLine)
 	}
-	for _, reason := range []string{"no write permission", "scope", "too large", "not a .md note"} {
+	for _, reason := range []string{"reason not supplied", "no write permission", "scope", "too large", "not a .md note", "binary/NUL", "path alias"} {
 		if !strings.Contains(rejLine, reason) {
 			t.Errorf("the rejected line never mentions %q, so an operator hit by that refusal cannot tell why "+
 				"their note stayed local and will keep retrying it: %q", reason, rejLine)
+		}
+	}
+}
+
+func TestWatchReceiptsDeduplicatesOnlyUnchangedLocalProblems(t *testing.T) {
+	blocked := BlockedNote{Path: "bad.md", Reason: "contains NUL", Hash: "first"}
+	sum := Summary{Head: "head", Blocked: []BlockedNote{blocked}}
+	var watch WatchReceipts
+	first := strings.Join(watch.Lines(sum), "\n")
+	if !strings.Contains(first, "bad.md") || !strings.Contains(first, "NOT synced") {
+		t.Fatalf("first problem hidden: %s", first)
+	}
+	if got := watch.Lines(sum); len(got) != 0 {
+		t.Fatalf("unchanged problem spam: %q", got)
+	}
+	watch.Lines(Summary{}) // local-only indexing between hub rounds
+	if got := watch.Lines(sum); len(got) != 0 {
+		t.Fatalf("local tick reset deduplication: %q", got)
+	}
+	if got := strings.Join(sum.Lines(), "\n"); !strings.Contains(got, "bad.md") {
+		t.Fatal("one-shot receipt suppressed")
+	}
+	sum.Pushed = 1
+	got := strings.Join(watch.Lines(sum), "\n")
+	if !strings.Contains(got, "pushed 1") || !strings.Contains(got, "1 note(s) blocked") || strings.Contains(got, "bad.md") {
+		t.Fatalf("movement/count hidden or detail repeated: %s", got)
+	}
+	sum.Pushed = 0
+	sum.Blocked[0].Hash = "edited"
+	if got := strings.Join(watch.Lines(sum), "\n"); !strings.Contains(got, "bad.md") {
+		t.Fatal("edited problem hidden")
+	}
+	watch.Lines(Summary{Head: "head"}) // a completed hub round with no blocks
+	if got := watch.Lines(sum); len(got) == 0 {
+		t.Fatal("reappearing problem hidden")
+	}
+	var restarted WatchReceipts
+	if got := restarted.Lines(sum); len(got) == 0 {
+		t.Fatal("restart hides existing problem")
+	}
+	sum.Rejected = []string{"permission.md"}
+	for i := 0; i < 2; i++ {
+		if got := strings.Join(watch.Lines(sum), "\n"); !strings.Contains(got, "permission.md") {
+			t.Fatal("unknown server refusal suppressed")
 		}
 	}
 }

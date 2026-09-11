@@ -392,6 +392,15 @@ land). A standalone `mesh-curator` worker can reconcile non-trivial conflicts wi
 the team's own BYOAI model, committing the merged note back through the normal sync
 path (the hub itself stays AI-free).
 
+Before uploading, v0.18+ checks notes against the hub's content limits (1 MiB,
+no NUL bytes). Invalid notes stay untouched locally and are **not** marked
+synced; other notes and incoming changes continue syncing. `mesh sync` names
+each blocked path and its exact content problem. Correct the file to resume
+uploads automatically. The watcher reports unchanged content problems once per
+process, reports edited/reappearing problems again, and retains the outstanding
+count on subsequent sync receipts. This does not suppress unknown hub-side
+permission/scope rejections or change their retry behavior.
+
 The team dashboard separates actual cross-user reuse from the older
 same-user/later-session proxy. Agent-authored notes are attributed at their first
 hub publication; successful hosted MCP fetches count immediately, while local

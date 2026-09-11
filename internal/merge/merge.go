@@ -272,7 +272,19 @@ func appendMerge(base Version, hub, incoming []byte) ([]byte, bool) {
 // IsText reports whether content is small enough and free of NUL bytes to be a
 // mergeable markdown note (binaries are rejected; SPEC v1 has no blob support).
 func IsText(content []byte) bool {
-	return len(content) <= MaxNoteBytes && !bytes.Contains(content, []byte{0})
+	return TextRejectionReason(content) == ""
+}
+
+// TextRejectionReason is shared by the hub gate and client preflight. An empty
+// result means accepted; this does not parse or rewrite the note's content.
+func TextRejectionReason(content []byte) string {
+	if len(content) > MaxNoteBytes {
+		return fmt.Sprintf("exceeds the %d-byte note limit", MaxNoteBytes)
+	}
+	if bytes.Contains(content, []byte{0}) {
+		return "contains a NUL byte (0x00); use literal escapes for code examples"
+	}
+	return ""
 }
 
 // ---- blocks ----

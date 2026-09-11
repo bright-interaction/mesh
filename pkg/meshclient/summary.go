@@ -21,7 +21,11 @@ import "fmt"
 // notes must not read "pushed 4000" as convergence. It says what to do next, not just
 // a count.
 func (s Summary) Lines() []string {
-	lines := s.HeadlineLines()
+	return append(s.HeadlineLines(), s.detailLines()...)
+}
+
+func (s Summary) detailLines() []string {
+	var lines []string
 	for _, sib := range s.ConflictSiblings {
 		lines = append(lines, fmt.Sprintf("  conflict: hub version kept; your version saved at %s (resolve, then sync)", sib))
 	}
@@ -33,7 +37,10 @@ func (s Summary) Lines() []string {
 		// refuses anything outside the note tree and reports it in Rejected rather than
 		// dropping it silently. A refusal an operator cannot explain is a refusal they
 		// will retry forever, so the wording names every reason the hub actually uses.
-		lines = append(lines, fmt.Sprintf("  rejected by hub (no write permission, scope, too large, or not a .md note): %s -- kept local, will retry", rej))
+		lines = append(lines, fmt.Sprintf("  rejected by hub (reason not supplied; possible no write permission, scope, too large, binary/NUL content, not a .md note, or path alias): %s -- kept local, will retry", rej))
+	}
+	for _, note := range s.Blocked {
+		lines = append(lines, fmt.Sprintf("  blocked locally: %s -- %s; kept local and NOT synced; correct the file to resume uploads", note.Path, note.Reason))
 	}
 	return lines
 }
@@ -51,6 +58,9 @@ func (s Summary) HeadlineLines() []string {
 		lines = append(lines, fmt.Sprintf("  %d more changed note(s) are still queued and NOT on the hub yet "+
 			"(one round pushes a bounded batch); run `mesh sync` again to send them", s.Remaining))
 	}
+	if len(s.Blocked) > 0 {
+		lines = append(lines, fmt.Sprintf("  %d note(s) blocked by local content checks; NOT uploaded", len(s.Blocked)))
+	}
 	return lines
 }
 
@@ -60,7 +70,38 @@ func (s Summary) HeadlineLines() []string {
 // deferred tail is exactly what the operator needs to be told about.
 func (s Summary) Moved() bool {
 	return s.Pushed > 0 || s.Pulled > 0 || s.Conflicts > 0 ||
-		s.Remaining > 0 || len(s.Protected) > 0 || len(s.Rejected) > 0
+		s.Remaining > 0 || len(s.Protected) > 0 || len(s.Rejected) > 0 || len(s.Blocked) > 0
+}
+
+// WatchReceipts reports unchanged local content problems once, rather than on
+// every safety tick. It does not alter sync state or retries. One-shot callers
+// always use Summary.Lines and see every problem. A restart, changed bytes, or a
+// problem that disappears and returns produces a fresh diagnostic.
+type WatchReceipts struct {
+	blocked map[string]BlockedNote
+}
+
+func (r *WatchReceipts) Lines(sum Summary) []string {
+	// Local-only index ticks return a zero Summary. They provide no evidence
+	// that a blocked upload was fixed and must not clear the last hub receipt.
+	if sum.Head == "" && !sum.Moved() {
+		return nil
+	}
+	current := make(map[string]BlockedNote, len(sum.Blocked))
+	var fresh []BlockedNote
+	for _, note := range sum.Blocked {
+		current[note.Path] = note
+		if previous, ok := r.blocked[note.Path]; !ok || previous != note {
+			fresh = append(fresh, note)
+		}
+	}
+	r.blocked = current
+	headlines := sum.HeadlineLines() // keep the total outstanding count truthful
+	sum.Blocked = fresh
+	if !sum.Moved() {
+		return nil
+	}
+	return append(headlines, sum.detailLines()...)
 }
 
 // shortSHA abbreviates a commit sha for a receipt, and names the empty case rather

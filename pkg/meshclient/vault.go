@@ -120,12 +120,13 @@ type Summary struct {
 	Pulled           int
 	Conflicts        int
 	Head             string
-	ConflictSiblings []string // merge conflicts: our pushed version parked here
-	Protected        []string // external-editor race: incoming hub version parked here
-	Dropped          []string // full-reconcile: locals removed because deleted upstream
-	Rejected         []string // hub refused these (viewer/ACL/scope/oversize/unsupported path); kept dirty to retry
-	Remaining        int      // dirty notes deferred to the next round because the batch was bounded
-	Deferred         []string // exact vault-relative paths counted by Remaining; none reached the hub this round
+	ConflictSiblings []string      // merge conflicts: our pushed version parked here
+	Protected        []string      // external-editor race: incoming hub version parked here
+	Dropped          []string      // full-reconcile: locals removed because deleted upstream
+	Rejected         []string      // hub refused these (viewer/ACL/scope/oversize/unsupported path); kept dirty to retry
+	Blocked          []BlockedNote // invalid local content; not uploaded, stays dirty until corrected
+	Remaining        int           // dirty notes deferred to the next round because the batch was bounded
+	Deferred         []string      // exact vault-relative paths counted by Remaining; none reached the hub this round
 }
 
 func contentHash(b []byte) string {
@@ -1351,6 +1352,17 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 	for _, item := range outbox {
 		outboxOps[item.Path] = item.Op
 	}
+	// Content that cannot pass the hub's deterministic gate need not cross the
+	// network on every tick. Keep its operation and baseline: neither filtering
+	// nor an inbound delta may turn an unshared local edit into "synced" bytes.
+	// Unknown-base pulls quarantine tombstones first; validate only the survivors.
+	var blocked []BlockedNote
+	if !pullFirst {
+		outbox, blocked, err = preflightOutbox(outbox)
+		if err != nil {
+			return Summary{}, err
+		}
+	}
 	// Bound the push. The hub caps one request at maxSyncOutboxItems and answers 413 with
 	// "split the push into smaller batches", but the client had no batching, so a vault
 	// with more dirty notes than the cap 413'd on EVERY round and no state ever advanced:
@@ -1440,6 +1452,9 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 	for _, rel := range deferred {
 		protectOutbox(rel)
 	}
+	for _, note := range blocked {
+		protectOutbox(note.Path)
+	}
 	// Preserve our losing versions locally before deltas overwrite the paths.
 	unparked, err := writeConflictSiblings(vaultDir, resp.Conflicts)
 	if err != nil {
@@ -1509,6 +1524,9 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 	// hash, which for a deferred path is exactly the hash that would mark it synced.
 	// Proven by ablation: swapping these two lines puts the never-pushed remainder back.
 	keepDeferredDirty(current, state.Hashes, deferred)
+	for _, note := range blocked {
+		keepDeferredDirty(current, state.Hashes, []string{note.Path})
+	}
 	// Hub-rejected paths (viewer role, folder ACL, out-of-scope, or oversize/binary
 	// content) were NOT landed by the hub. Keep them dirty exactly like a parked path
 	// so the next sync re-attempts the push, and never record the local (un-landed)
@@ -1553,6 +1571,7 @@ func syncVaultRound(vaultDir string, allowPullFirst bool, suppressTombstones []s
 		return Summary{}, err
 	}
 	sum := Summary{Pushed: len(outbox) - len(resp.Rejected), Pulled: len(resp.Deltas), Conflicts: len(resp.Conflicts), Head: resp.HeadSHA, Dropped: dropped, Rejected: resp.Rejected}
+	sum.Blocked = blocked
 	// Tell the caller work remains, rather than letting a bounded batch look complete.
 	sum.Remaining = len(deferred)
 	sum.Deferred = append([]string(nil), deferred...)
@@ -1627,6 +1646,7 @@ func combineSummaries(first, second Summary) Summary {
 		Protected:        append(first.Protected, second.Protected...),
 		Dropped:          append(first.Dropped, second.Dropped...),
 		Rejected:         append(first.Rejected, second.Rejected...),
+		Blocked:          append([]BlockedNote(nil), second.Blocked...), // second round rechecks all surviving dirty notes
 		Remaining:        second.Remaining,
 		Deferred:         append([]string(nil), second.Deferred...),
 	}
