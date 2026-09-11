@@ -171,33 +171,8 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 		}
 
 		trace.Phase("upsert_notes_fts")
-		insNote, err := tx.Prepare(`INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-		if err != nil {
+		if err := upsertNoteRowsContext(context.Background(), tx, upserts); err != nil {
 			return err
-		}
-		defer insNote.Close()
-		insFTS, err := tx.Prepare(`INSERT INTO search_index(node_id,kind,anchor,title,body) VALUES(?,?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer insFTS.Close()
-
-		for _, pn := range upserts {
-			id, title, fmJSON, updated, reviewBy, source, scope, mtime, err := noteRowValues(pn)
-			if err != nil {
-				return err
-			}
-			// FTS5 has no PK upsert; delete the existing row (if any) then insert, so
-			// the body can never lag the note.
-			if _, err := tx.Exec(`DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
-				return err
-			}
-			if _, err := insNote.Exec(id, pn.Path, string(pn.FM.Type), title, retrievalHash(pn), fmJSON, mtime, updated, reviewBy, source, scope); err != nil {
-				return err
-			}
-			if _, err := insFTS.Exec("note:"+id, "note", "", title, searchText(pn)); err != nil {
-				return err
-			}
 		}
 
 		trace.Phase("graph")
@@ -208,6 +183,59 @@ func (s *Store) IndexVaultIncremental(upserts []*ParsedNote, removedIDs []string
 		return pruneOrphanVectors(tx)
 	})
 	return len(upserts), err
+}
+
+// upsertNoteRowsContext keeps note and search content in the same transaction.
+// Notes and their FTS rows are inserted/deleted atomically by every indexing path,
+// so an absent note has no old FTS row to remove. Probe the notes primary key
+// before insertion instead of scanning FTS5's UNINDEXED node_id for every addition.
+// Existing IDs (including a repeated upsert in this batch) still replace FTS rows.
+func upsertNoteRowsContext(ctx context.Context, tx *sql.Tx, upserts []*ParsedNote) error {
+	trace := latency.Start("persist_note_upserts", "prepare")
+	defer trace.End()
+	insNote, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO notes(id,path,type,title,retrieval_hash,frontmatter,mtime,updated,review_by,source,scope) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer insNote.Close()
+	insFTS, err := tx.PrepareContext(ctx, `INSERT INTO search_index(node_id,kind,anchor,title,body) VALUES(?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer insFTS.Close()
+	exists, err := tx.PrepareContext(ctx, `SELECT EXISTS(SELECT 1 FROM notes WHERE id=?)`)
+	if err != nil {
+		return err
+	}
+	defer exists.Close()
+	for _, pn := range upserts {
+		trace.Phase("derive")
+		id, title, fmJSON, updated, reviewBy, source, scope, mtime, err := noteRowValues(pn)
+		if err != nil {
+			return err
+		}
+		hash, body := retrievalHash(pn), searchText(pn)
+		trace.Phase("existing_note")
+		var present bool
+		if err := exists.QueryRowContext(ctx, id).Scan(&present); err != nil {
+			return err
+		}
+		if present {
+			trace.Phase("delete_fts")
+			if _, err := tx.ExecContext(ctx, `DELETE FROM search_index WHERE node_id=?`, "note:"+id); err != nil {
+				return err
+			}
+		}
+		trace.Phase("write_note")
+		if _, err := insNote.ExecContext(ctx, id, pn.Path, string(pn.FM.Type), title, hash, fmJSON, mtime, updated, reviewBy, source, scope); err != nil {
+			return err
+		}
+		trace.Phase("write_fts")
+		if _, err := insFTS.ExecContext(ctx, "note:"+id, "note", "", title, body); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // noteRowValues derives the notes-table column values for a parsed note. Shared by

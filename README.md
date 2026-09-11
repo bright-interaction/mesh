@@ -393,6 +393,20 @@ graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
 
+From v0.28, adding a new note checks the `notes` primary key inside the writer
+transaction and skips deleting a nonexistent FTS row. FTS5's `node_id` is
+`UNINDEXED`, so the former delete scanned the search table even for a new ID.
+Existing IDs still replace their search rows; removals and full rebuilds are
+unchanged. This relies on Mesh's atomic note/search persistence invariant, not a
+cached ID set. A full rebuild repairs independently damaged/orphaned search rows.
+No schema migration, search-ranking, model or durability changes are required.
+`persist_note_upserts` now separates derivation, existing-note lookup, search-row
+deletion, note writes and search writes. In `BenchmarkNewNoteUpsert` (3,000 notes
+with ~9 KB bodies, Apple M3, two runs of five iterations), retaining the old
+missing-key scan cost 6.8-9.3 ms versus 0.09-0.11 ms without it. Both arms run the
+same upsert and roll back each iteration; this isolates the avoided scan, not
+end-to-end writeback or the remaining cost of editing an existing note.
+
 From v0.27, a note edit refreshes only the added/changed/removed note IDs in the
 note-to-code bridge. It no longer rereads every note or replaces unrelated links.
 Full startup and code-index refreshes still rebuild all links, since symbol changes
