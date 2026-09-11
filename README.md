@@ -348,6 +348,12 @@ ownership instead; the MCP server notices, reads the index rather than writing
 it, and routes its write-backs through the owner. Exactly one process indexes
 either way, which is the point.
 
+Local file events carry their exact changed paths to that owner, and
+`mesh sync --watch` publishes them to the local index before contacting the hub.
+That keeps a write-back's saved-and-queryable receipt independent of vault-wide
+discovery and network latency; periodic and remote-triggered passes still scan
+the vault as the convergence safety net.
+
 The `--watch` flag runs the live reindexer inside the server, so notes you (or a
 teammate) edit in your editor become searchable in the same session without a
 restart. Watch progress goes to stderr; stdout stays the pure JSON-RPC stream.

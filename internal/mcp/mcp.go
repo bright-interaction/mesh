@@ -717,8 +717,31 @@ func (s *Server) publishWriteBack(ctx context.Context, noteID, notePath string) 
 		}
 		return s.awaitOwnerIndexed(ctx, noteID, notePath)
 	}
-	_, err := s.reconcileOnce(true)
-	return err
+	if _, err := s.reconcilePaths([]string{notePath}); err != nil {
+		return err
+	}
+	// The targeted pass can legitimately quarantine a malformed or duplicate
+	// file while still publishing other paths in the burst. For this tool's
+	// receipt, however, success means THESE exact bytes are queryable. Verify the
+	// committed version just as the read-only wait does, without reloading the
+	// graph the owning server already swapped in memory.
+	pn, err := index.ParseFile(notePath)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(s.vaultRoot, notePath)
+	if err != nil {
+		return err
+	}
+	pn.Path = filepath.Clean(rel)
+	matched, err := s.store.NoteVersionMatches(noteID, pn.Path, index.RetrievalHash(pn))
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return ErrOwnerNotIndexing
+	}
+	return nil
 }
 
 // reload fully re-indexes the vault and rebuilds the in-memory graph +
@@ -773,6 +796,28 @@ func (s *Server) reconcileOnce(authoritative bool) (index.Reconciliation, error)
 		slog.Warn("mesh mcp: could not drain owner op queue", "err", err)
 	}
 	rec, err := index.ReconcileIncremental(s.store, s.vaultRoot, s.cache, !authoritative)
+	if err != nil {
+		return rec, err
+	}
+	if rec.Reindexed {
+		s.swap(rec.Graph)
+	}
+	return rec, nil
+}
+
+// reconcilePaths publishes exact fsnotify/write-back paths through the owning
+// writer without a vault-wide discovery scan. Read-only servers never call this:
+// they wait for their owner and refresh the committed snapshot instead.
+func (s *Server) reconcilePaths(paths []string) (index.Reconciliation, error) {
+	if !s.owns() {
+		return s.reconcileOnce(false)
+	}
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	if _, err := s.store.DrainOps(); err != nil {
+		slog.Warn("mesh mcp: could not drain owner op queue", "err", err)
+	}
+	rec, err := index.ReconcilePaths(s.store, s.vaultRoot, s.cache, paths)
 	if err != nil {
 		return rec, err
 	}
@@ -847,7 +892,13 @@ func (s *Server) Watch(ctx context.Context, debounce, reconcile, fullReconcile t
 		FullReconcile: fullReconcile,
 		Logf:          logf,
 		OnReindex: func(p watch.Pass) (watch.Result, error) {
-			rec, err := s.reconcileOnce(p.Authoritative)
+			var rec index.Reconciliation
+			var err error
+			if len(p.Paths) > 0 && s.owns() {
+				rec, err = s.reconcilePaths(p.Paths)
+			} else {
+				rec, err = s.reconcileOnce(p.Authoritative)
+			}
 			if err != nil {
 				return watch.Result{}, err
 			}

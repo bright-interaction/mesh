@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // A vault root WITH A SPACE in it, which is the real deployment shape here: this estate's
@@ -190,19 +192,20 @@ func TestAppendNoteDoesNotLeakTheVaultRootOnEitherFailure(t *testing.T) {
 		{
 			name: "the note is written but the index refresh fails",
 			breakIt: func(t *testing.T, s *Server) string {
-				dir := filepath.Join(s.vaultRoot, "locked")
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					t.Fatal(err)
+				// Sabotage the exact file after its durable creation. The write-back
+				// path is targeted now, so an unrelated unreadable directory correctly
+				// cannot make this note's publication fail anymore.
+				s.notePublisher = func(ctx context.Context, spec vault.NewNoteSpec) (*vault.CreateResult, error) {
+					res, err := vault.CreateNoteContext(ctx, s.vaultRoot, spec)
+					if err == nil {
+						if chmodErr := os.Chmod(res.Path, 0o000); chmodErr != nil {
+							t.Fatal(chmodErr)
+						}
+						t.Cleanup(func() { _ = os.Chmod(res.Path, 0o644) })
+					}
+					return res, err
 				}
-				if err := os.WriteFile(filepath.Join(dir, "x.md"),
-					[]byte("---\nid: x\ntype: note\nwhen: 2026-01-01\n---\n# X\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Chmod(dir, 0o000); err != nil { // the reconcile walk trips on it
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-				return "locked"
+				return "leak-check.md"
 			},
 		},
 	}

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/mcp"
 	"github.com/bright-interaction/mesh/internal/watch"
+	"github.com/bright-interaction/mesh/pkg/meshclient"
 	"github.com/spf13/cobra"
 )
 
@@ -187,6 +189,50 @@ func TestHubRoundIsRateLimitedOnlyOnTheTick(t *testing.T) {
 		if got := hubDue(tc.reason, tc.last, defaultHubSync, now); got != tc.want {
 			t.Errorf("%s: hubDue = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestSyncWatchPassPublishesLocalPathsBeforeTheNetwork(t *testing.T) {
+	var order []string
+	p := watch.Pass{Reason: watch.ReasonChange, Paths: []string{"a.md"}}
+	_, err := syncWatchPass(p, true, func(paths []string, _ bool) error {
+		if len(paths) > 0 {
+			order = append(order, "targeted-index")
+		} else {
+			order = append(order, "post-sync-index")
+		}
+		return nil
+	}, func() (meshclient.Summary, error) {
+		order = append(order, "hub")
+		return meshclient.Summary{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"targeted-index", "hub", "post-sync-index"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("sync watch order = %v, want %v", order, want)
+	}
+}
+
+func TestSyncWatchPassStillReconcilesAfterHubFailure(t *testing.T) {
+	hubErr := errors.New("hub unavailable")
+	fullRan := false
+	_, err := syncWatchPass(watch.Pass{Reason: watch.ReasonTick}, true,
+		func(paths []string, _ bool) error {
+			if len(paths) != 0 {
+				t.Fatalf("tick unexpectedly carried targeted paths: %v", paths)
+			}
+			fullRan = true
+			return nil
+		},
+		func() (meshclient.Summary, error) { return meshclient.Summary{}, hubErr },
+	)
+	if !errors.Is(err, hubErr) {
+		t.Fatalf("hub error was not surfaced: %v", err)
+	}
+	if !fullRan {
+		t.Fatal("hub failure prevented the local reconcile")
 	}
 }
 

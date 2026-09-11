@@ -167,6 +167,125 @@ func TestIncrementalMatchesFullReindex(t *testing.T) {
 	}
 }
 
+// TestTargetedIncrementalMatchesFullReindex is the correctness oracle for the
+// fsnotify fast path. Exact-path discovery may skip the vault walk, but the
+// committed notes, FTS rows, graph, and vectors must still be identical to a
+// full reindex of the same final disk state.
+func TestTargetedIncrementalMatchesFullReindex(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, dir string) []string
+	}{
+		{"edit body", func(t *testing.T, dir string) []string {
+			write(t, dir, "a.md", "---\nid: a\ntype: decision\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: use modernc\n---\n# A\nnow links only [[c]] #core\n")
+			return []string{filepath.Join(dir, "a.md")}
+		}},
+		{"add resolves broken link", func(t *testing.T, dir string) []string {
+			write(t, dir, "d.md", "---\nid: d\ntype: note\nwhen: 2026-01-01\n---\n# D\nthe missing target #core\n")
+			return []string{filepath.Join(dir, "d.md")}
+		}},
+		{"remove", func(t *testing.T, dir string) []string {
+			rm(t, dir, "b.md")
+			return []string{filepath.Join(dir, "b.md")}
+		}},
+		{"id change", func(t *testing.T, dir string) []string {
+			write(t, dir, "c.md", "---\nid: c2\ntype: note\nwhen: 2026-01-01\n---\n# C\nstandalone note #misc\n")
+			return []string{filepath.Join(dir, "c.md")}
+		}},
+		{"rename", func(t *testing.T, dir string) []string {
+			old := filepath.Join(dir, "b.md")
+			body, _ := os.ReadFile(old)
+			rm(t, dir, "b.md")
+			if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			newPath := filepath.Join(dir, "sub", "b.md")
+			if err := os.WriteFile(newPath, body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return []string{old, newPath}
+		}},
+		{"invalid yaml", func(t *testing.T, dir string) []string {
+			write(t, dir, "b.md", "---\nid: [unterminated\ntype: gotcha\n---\n# B\nbroken\n")
+			return []string{filepath.Join(dir, "b.md")}
+		}},
+		{"symlink is not a note", func(t *testing.T, dir string) []string {
+			path := filepath.Join(dir, "c.md")
+			rm(t, dir, "c.md")
+			outside := filepath.Join(t.TempDir(), "outside.md")
+			if err := os.WriteFile(outside, []byte("---\nid: outside\ntype: note\n---\n# Outside\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, path); err != nil {
+				t.Fatal(err)
+			}
+			return []string{path}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeVault(t)
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			live := NewLiveIndexer(s, dir)
+			if _, err := live.Reconcile(true); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			seedVectors(t, s)
+
+			paths := tc.mutate(t, dir)
+			if _, err := live.ReconcilePaths(paths); err != nil {
+				t.Fatalf("targeted: %v", err)
+			}
+			got := snapshotTables(t, s)
+			if _, err := Reindex(s, dir); err != nil {
+				t.Fatalf("full reindex: %v", err)
+			}
+			want := snapshotTables(t, s)
+			if got != want {
+				t.Errorf("targeted != full reindex for %q\n--- targeted ---\n%s\n--- full ---\n%s", tc.name, got, want)
+			}
+		})
+	}
+}
+
+func TestTargetedReconcileReconsidersQuarantinedDuplicate(t *testing.T) {
+	dir := writeVault(t)
+	write(t, dir, "dup.md", "---\nid: b\ntype: note\nwhen: 2026-01-01\n---\n# Replacement B\npreviously quarantined\n")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	live := NewLiveIndexer(s, dir)
+	if _, err := live.Reconcile(true); err != nil {
+		t.Fatal(err)
+	}
+	if len(mustDropped(t, s)) != 1 {
+		t.Fatal("fixture did not quarantine the duplicate")
+	}
+
+	// Removing the incumbent reports only b.md, but the previously dropped dup.md
+	// must be reconsidered and promoted as the new owner in the same commit.
+	rm(t, dir, "b.md")
+	if _, err := live.ReconcilePaths([]string{filepath.Join(dir, "b.md")}); err != nil {
+		t.Fatal(err)
+	}
+	if d := mustDropped(t, s); len(d) != 0 {
+		t.Fatalf("quarantine did not clear after its incumbent disappeared: %+v", d)
+	}
+	var path string
+	if err := s.readDB.QueryRow(`SELECT path FROM notes WHERE id='b'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	if path != "dup.md" {
+		t.Fatalf("promoted duplicate path = %q, want dup.md", path)
+	}
+}
+
 // seedVectors stores one stub vector per current note with a matching note_hash, so
 // the oracle exercises the orphan-prune (delete) and stale-keep (edit) vector paths.
 func seedVectors(t *testing.T, s *Store) {

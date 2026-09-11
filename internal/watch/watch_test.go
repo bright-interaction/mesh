@@ -69,6 +69,53 @@ func TestRunReconcilesOnChange(t *testing.T) {
 	}
 }
 
+func TestRunCarriesExactPathsForLocalChangeBurst(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.md")
+	b := filepath.Join(dir, "b.md")
+	for _, path := range []string{a, b} {
+		if err := os.WriteFile(path, []byte("# seed\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	calls := make(chan Pass, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Run(ctx, Options{
+		Root:      dir,
+		Debounce:  40 * time.Millisecond,
+		Reconcile: 0,
+		OnReindex: func(p Pass) (Result, error) {
+			calls <- p
+			return Result{}, nil
+		},
+	})
+	if startup := <-calls; startup.Reason != ReasonStartup || len(startup.Paths) != 0 {
+		t.Fatalf("startup pass = %+v, want no targeted paths", startup)
+	}
+	if err := os.WriteFile(b, []byte("# b changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a, []byte("# a changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-calls:
+		want := []string{filepath.Clean(a), filepath.Clean(b)}
+		if p.Reason != ReasonChange || len(p.Paths) != len(want) {
+			t.Fatalf("change pass = %+v, want exact paths %v", p, want)
+		}
+		for i := range want {
+			if p.Paths[i] != want[i] {
+				t.Fatalf("change paths = %v, want %v", p.Paths, want)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for targeted change pass")
+	}
+}
+
 func TestRunPeriodicReconcile(t *testing.T) {
 	dir := t.TempDir()
 	calls := make(chan struct{}, 64)

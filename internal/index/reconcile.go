@@ -4,9 +4,15 @@
 package index
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // Reconciliation reports what a Reconcile did: the drift it found and, when it
@@ -100,6 +106,193 @@ func ReconcileIncremental(s *Store, root string, cache *NoteCache, mtimeFast boo
 	// this incremental path and note_code_links was only ever written by the code-index
 	// commands. Reached only when there IS a delta, and LinkNotesToCode returns
 	// immediately when the code index is empty, so a vault without one pays nothing.
+	_, _ = s.LinkNotesToCode(root)
+	r.Reindexed = true
+	r.Graph = g
+	r.Dur = time.Since(start)
+	return r, nil
+}
+
+// ReconcilePaths is the event-driven sibling of ReconcileIncremental. The
+// fsnotify watcher already knows which markdown paths changed; rediscovering that
+// fact with vault.Walk makes a one-note write-back pay one stat for every note in
+// the vault before it can be acknowledged. This path parses only the reported
+// files plus the previously quarantined files needed to preserve duplicate-id
+// ownership, then performs the same atomic note/FTS/graph commit.
+//
+// Periodic, startup, directory, and remote-trigger passes must continue to use
+// ReconcileIncremental because their job is precisely to discover unknown drift.
+func ReconcilePaths(s *Store, root string, cache *NoteCache, paths []string) (Reconciliation, error) {
+	start := time.Now()
+	if len(paths) == 0 {
+		return Reconciliation{Dur: time.Since(start)}, nil
+	}
+
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	candidates := map[string]string{} // vault-relative -> absolute
+	addCandidate := func(path string) error {
+		if strings.TrimSpace(path) == "" {
+			return nil
+		}
+		abs := path
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(rootAbs, abs)
+		}
+		abs = filepath.Clean(abs)
+		rel, err := filepath.Rel(rootAbs, abs)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("mesh: targeted reconcile path is outside the vault: %q", path)
+		}
+		if !strings.EqualFold(filepath.Ext(rel), ".md") || vault.IsConflictSibling(filepath.Base(rel)) {
+			return nil
+		}
+		candidates[filepath.Clean(rel)] = abs
+		return nil
+	}
+	for _, path := range paths {
+		if err := addCandidate(path); err != nil {
+			return Reconciliation{}, err
+		}
+	}
+
+	// A targeted pass must not forget existing parse/duplicate findings. It also
+	// needs to reconsider a quarantined duplicate when the incumbent is deleted or
+	// changes id; that file can become the rightful owner without receiving a new
+	// fsnotify event of its own.
+	previousDropped, err := s.DroppedNotes()
+	if err != nil {
+		return Reconciliation{}, err
+	}
+	for _, fe := range previousDropped {
+		if err := addCandidate(fe.Path); err != nil {
+			return Reconciliation{}, err
+		}
+	}
+	if len(candidates) == 0 {
+		return Reconciliation{Dur: time.Since(start)}, nil
+	}
+
+	current := cache.Snapshot()
+	byPath := make(map[string]*ParsedNote, len(current))
+	incumbent := make(map[string]string, len(current))
+	for _, pn := range current {
+		p := filepath.Clean(pn.Path)
+		byPath[p] = pn
+		incumbent[effectiveID(pn)] = p
+	}
+
+	type scannedFile struct {
+		rel string
+		pn  *ParsedNote
+		err error
+	}
+	rels := make([]string, 0, len(candidates))
+	for rel := range candidates {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	scanned := make([]scannedFile, 0, len(rels))
+	claims := make([]idClaim, 0, len(current)+len(rels))
+	for _, pn := range current {
+		p := filepath.Clean(pn.Path)
+		if _, targeted := candidates[p]; targeted {
+			continue
+		}
+		claims = append(claims, idClaim{ID: effectiveID(pn), Path: p})
+	}
+	for _, rel := range rels {
+		abs := candidates[rel]
+		fi, perr := os.Lstat(abs)
+		var pn *ParsedNote
+		switch {
+		case perr != nil:
+		case !fi.Mode().IsRegular():
+			// Match vault.Walk: a markdown-shaped symlink, FIFO, socket, or
+			// device is not a note. In particular, never follow a symlink out
+			// of the vault merely because fsnotify reported its name.
+			perr = os.ErrNotExist
+		default:
+			pn, perr = ParseFile(abs)
+		}
+		if perr != nil {
+			scanned = append(scanned, scannedFile{rel: rel, err: perr})
+			continue
+		}
+		pn.Path = rel
+		scanned = append(scanned, scannedFile{rel: rel, pn: pn})
+		claims = append(claims, idClaim{ID: effectiveID(pn), Path: rel})
+	}
+	owners := resolveIDOwners(claims, incumbent)
+
+	var dd DriftDelta
+	removed := map[string]bool{}
+	upserted := map[string]bool{}
+	for _, sf := range scanned {
+		old := byPath[sf.rel]
+		switch {
+		case sf.err != nil:
+			if os.IsNotExist(sf.err) {
+				if old != nil {
+					dd.Drift.Removed = append(dd.Drift.Removed, sf.rel)
+					removed[effectiveID(old)] = true
+				}
+				continue
+			}
+			if old != nil {
+				dd.Drift.Removed = append(dd.Drift.Removed, sf.rel)
+				removed[effectiveID(old)] = true
+			}
+			dd.Dropped = append(dd.Dropped, FileError{Path: sf.rel, Err: sf.err})
+		case owners[effectiveID(sf.pn)] != sf.rel:
+			dd.Dropped = append(dd.Dropped, FileError{Path: sf.rel, Err: duplicateIDErr(effectiveID(sf.pn), owners[effectiveID(sf.pn)])})
+			if old != nil {
+				dd.Drift.Removed = append(dd.Drift.Removed, sf.rel)
+				removed[effectiveID(old)] = true
+			}
+		case old == nil:
+			dd.Drift.Added = append(dd.Drift.Added, sf.rel)
+			dd.Upserts = append(dd.Upserts, sf.pn)
+			upserted[effectiveID(sf.pn)] = true
+		case retrievalHash(sf.pn) != retrievalHash(old):
+			dd.Drift.Changed = append(dd.Drift.Changed, sf.rel)
+			dd.Upserts = append(dd.Upserts, sf.pn)
+			upserted[effectiveID(sf.pn)] = true
+			if effectiveID(old) != effectiveID(sf.pn) {
+				removed[effectiveID(old)] = true
+			}
+		}
+	}
+	for id := range removed {
+		if !upserted[id] {
+			dd.RemovedIDs = append(dd.RemovedIDs, id)
+		}
+	}
+	sort.Strings(dd.Drift.Added)
+	sort.Strings(dd.Drift.Changed)
+	sort.Strings(dd.Drift.Removed)
+	sort.Strings(dd.RemovedIDs)
+	sort.Slice(dd.Dropped, func(i, j int) bool { return dd.Dropped[i].Path < dd.Dropped[j].Path })
+
+	r := Reconciliation{
+		Added:   len(dd.Drift.Added),
+		Changed: len(dd.Drift.Changed),
+		Removed: len(dd.Drift.Removed),
+		Dropped: len(dd.Dropped),
+	}
+	s.recordDropped(root, dd.Dropped)
+	if !dd.Drift.Any() {
+		r.Dur = time.Since(start)
+		return r, nil
+	}
+	cache.Apply(dd.Upserts, dd.RemovedIDs)
+	g, _ := BuildGraph(cache.Snapshot())
+	g.DetectCommunities(0)
+	if _, err := s.IndexVaultIncremental(dd.Upserts, dd.RemovedIDs, g); err != nil {
+		return Reconciliation{}, err
+	}
 	_, _ = s.LinkNotesToCode(root)
 	r.Reindexed = true
 	r.Graph = g

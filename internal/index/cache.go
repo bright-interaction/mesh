@@ -161,6 +161,35 @@ func (li *LiveIndexer) Reconcile(authoritative bool) (Reconciliation, error) {
 	return rec, err
 }
 
+// ReconcilePaths applies an fsnotify change burst without rediscovering the
+// changed files by walking the whole vault. The caller must use Reconcile for
+// startup, periodic safety, directory, and remote-trigger passes.
+func (li *LiveIndexer) ReconcilePaths(paths []string) (Reconciliation, error) {
+	li.mu.Lock()
+	defer li.mu.Unlock()
+	li.drainOps()
+	if !li.seeded {
+		start := time.Now()
+		g, notes, err := ReindexFull(li.store, li.root)
+		if err != nil {
+			return Reconciliation{}, err
+		}
+		li.cache.Seed(notes)
+		li.seeded = true
+		li.refreshHealthIfDue()
+		dropped, err := li.store.DroppedNotes()
+		if err != nil {
+			return Reconciliation{}, err
+		}
+		return Reconciliation{Added: len(notes), Reindexed: true, Graph: g, Dropped: len(dropped), Dur: time.Since(start)}, nil
+	}
+	rec, err := ReconcilePaths(li.store, li.root, li.cache, paths)
+	if err == nil {
+		li.refreshHealthIfDue()
+	}
+	return rec, err
+}
+
 // drainOps applies whatever a read-only surface queued for this owner, before the
 // reindex rather than after: a promote enqueues its bookkeeping AND writes the note
 // file, and the caller is waiting on both, so making it wait an extra reconcile for

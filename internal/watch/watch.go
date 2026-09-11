@@ -25,6 +25,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,6 +60,12 @@ type Pass struct {
 	// Authoritative selects the content-hash drift check (parses every note) over the
 	// mtime fast path (one stat per note). True on startup and on the periodic FULL pass.
 	Authoritative bool
+	// Paths is the exact set of markdown paths reported by fsnotify for a local
+	// change burst. It is empty for startup, periodic, directory, and external
+	// trigger passes, where the callback must discover drift across the vault.
+	// Paths are absolute and de-duplicated. Carrying them lets the owning writer
+	// publish a one-note write-back without walking every note first.
+	Paths []string
 }
 
 // Options configure a watch run.
@@ -134,6 +141,8 @@ func Run(ctx context.Context, opt Options) error {
 		<-debounce.C
 	}
 	defer debounce.Stop()
+	pendingPaths := map[string]struct{}{}
+	fullChange := false
 
 	var tick <-chan time.Time
 	if opt.Reconcile > 0 {
@@ -156,14 +165,21 @@ func Run(ctx context.Context, opt Options) error {
 				// add it (and any children) to the watch set, then reconcile in
 				// case files landed inside before the watch was in place.
 				_ = addWatches(w, opt.Root, logf)
+				fullChange = true
+				clear(pendingPaths)
 				resetTimer(debounce, opt.Debounce)
 			case ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && watched(w, ev.Name):
 				// A watched directory went away: drop its now-dangling watch so we
 				// do not leak a descriptor, and reconcile so its notes leave the
 				// index promptly rather than waiting for the periodic tick.
 				_ = w.Remove(ev.Name)
+				fullChange = true
+				clear(pendingPaths)
 				resetTimer(debounce, opt.Debounce)
 			case relevant(ev):
+				if !fullChange {
+					pendingPaths[filepath.Clean(ev.Name)] = struct{}{}
+				}
 				resetTimer(debounce, opt.Debounce)
 			}
 		case err, ok := <-w.Errors:
@@ -176,9 +192,21 @@ func Run(ctx context.Context, opt Options) error {
 			// local change: arm the debounce so a burst of nudges coalesces into one
 			// reconcile. A nil Trigger channel blocks forever, so this case is inert
 			// unless a caller wired one in.
+			fullChange = true
+			clear(pendingPaths)
 			resetTimer(debounce, opt.Debounce)
 		case <-debounce.C:
-			reconcile(opt, logf, Pass{Reason: ReasonChange, Authoritative: false})
+			var paths []string
+			if !fullChange {
+				paths = make([]string, 0, len(pendingPaths))
+				for path := range pendingPaths {
+					paths = append(paths, path)
+				}
+				sort.Strings(paths)
+			}
+			reconcile(opt, logf, Pass{Reason: ReasonChange, Authoritative: false, Paths: paths})
+			fullChange = false
+			clear(pendingPaths)
 		case <-tick:
 			// Safety net: catches anything the event stream missed (a dropped event,
 			// a same-second rename, a note written before our watches were in place).

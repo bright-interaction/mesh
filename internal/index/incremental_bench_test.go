@@ -90,3 +90,32 @@ func BenchmarkReconcileIncremental(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkReconcileTargeted measures the fsnotify/write-back hot path: the
+// changed path is already known, so discovery must not scale with vault size.
+func BenchmarkReconcileTargeted(b *testing.B) {
+	for _, n := range []int{100, 1000, 5000} {
+		b.Run(fmt.Sprintf("n%d", n), func(b *testing.B) {
+			dir := benchVault(b, n)
+			s, err := Open(dir)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer s.Close()
+			live := NewLiveIndexer(s, dir)
+			if _, err := live.Reconcile(true); err != nil {
+				b.Fatal(err)
+			}
+			path := filepath.Join(dir, "n0.md")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				editNote(b, dir, i, n)
+				b.StartTimer()
+				if _, err := live.ReconcilePaths([]string{path}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
