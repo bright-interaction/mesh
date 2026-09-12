@@ -601,6 +601,16 @@ These are cooperative budgets, not hard wall-clock guarantees: existing ownershi
 metadata locks and kernel commit/fsync calls cannot be forcibly interrupted. Shutdown
 joins any admitted publication before closing its database, even if that takes longer.
 
+From v0.35, `mesh mcp --http` handles SIGINT/SIGTERM by stopping new request admission and
+giving admitted requests 20 seconds to finish, including write-back receipts.
+After that grace period it cancels remaining requests and closes their connections,
+then still joins their handlers before stopping/joining the watcher and closing
+the store. Expiry is reported as a shutdown error. The 20 seconds bounds graceful
+HTTP draining, not total process exit: uninterruptible I/O and cleanup can take
+longer. Allow additional supervisor stop time; a forced kill can still interrupt
+a write or lose its response. A missing response does not prove a write failed:
+check the saved note before retrying. Stdio and the separate sync owner are unchanged.
+
 The `--watch` flag runs the live reindexer inside the server, so notes you (or a
 teammate) edit in your editor become searchable in the same session without a
 restart. Watch progress goes to stderr; stdout stays the pure JSON-RPC stream.

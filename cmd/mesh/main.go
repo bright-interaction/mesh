@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -2126,6 +2128,8 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 	if !netaddr.IsLoopback(addr) && token == "" {
 		return fmt.Errorf("refusing to bind %s without a token: set --token or MESH_MCP_TOKEN (fail-closed)", addr)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if doWatch {
 		stopWatch := startMCPBackgroundWatch(func(ctx context.Context) {
 			logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, "mesh watch: "+format+"\n", a...) }
@@ -2161,8 +2165,89 @@ func serveMCPHTTP(srv *mcp.Server, addr, token string, doWatch bool, debounce, r
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}
-	fmt.Fprintf(os.Stderr, "mesh mcp: serving HTTP at %s/mcp (auth: %v)\n", addr, token != "")
-	return httpSrv.ListenAndServe()
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "mesh mcp: serving HTTP at %s/mcp (auth: %v)\n", listener.Addr(), token != "")
+	return serveMCPHTTPListener(ctx, httpSrv, listener, mcpHTTPDrainGrace)
+}
+
+// Leave room for an admitted write's normal owner acknowledgement bound. This
+// bounds the graceful phase, not uninterruptible I/O or the subsequent joins.
+const mcpHTTPDrainGrace = 20 * time.Second
+
+// serveMCPHTTPListener owns listener and the HTTP server's request lifecycle.
+// The caller must stop/join its watcher and only then close the MCP store AFTER
+// this returns. MCP has no hijacked connections or detached HTTP handlers.
+func serveMCPHTTPListener(ctx context.Context, srv *http.Server, listener net.Listener, grace time.Duration) error {
+	// A termination signal stops admission, but must not cancel a write that can
+	// still finish normally. Only expiry of the graceful phase cancels requests.
+	requestCtx, cancelRequests := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelRequests()
+	srv.BaseContext = func(net.Listener) context.Context { return requestCtx }
+	drain := &mcpHTTPRequestDrain{}
+	srv.Handler = drain.wrap(srv.Handler)
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(listener) }()
+
+	var serveErr error
+	var shutdownErr error
+	select {
+	case serveErr = <-served:
+		// A fatal accept error can leave already-admitted handlers running.
+		drain.stop()
+		cancelRequests()
+		shutdownErr = srv.Close()
+	case <-ctx.Done():
+		drain.stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
+		shutdownErr = srv.Shutdown(shutdownCtx)
+		cancel()
+		if shutdownErr != nil {
+			// Close disconnects clients, but does NOT wait for their handlers.
+			cancelRequests()
+			shutdownErr = errors.Join(fmt.Errorf("mesh mcp HTTP drain: %w", shutdownErr), srv.Close())
+		}
+		// Serve returns ErrServerClosed as soon as Shutdown starts, not when
+		// it finishes. Wait here, never close the MCP store on that early return.
+		serveErr = <-served
+	}
+	drain.active.Wait()
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
+	}
+	return errors.Join(serveErr, shutdownErr)
+}
+
+// Serialize admission against stopping: no WaitGroup.Add may race a Wait after
+// the count reaches zero. Late requests on accepted connections never reach MCP.
+type mcpHTTPRequestDrain struct {
+	mu       sync.Mutex
+	stopping bool
+	active   sync.WaitGroup
+}
+
+func (d *mcpHTTPRequestDrain) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d.mu.Lock()
+		if d.stopping {
+			d.mu.Unlock()
+			w.Header().Set("Connection", "close")
+			http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		d.active.Add(1)
+		d.mu.Unlock()
+		defer d.active.Done()
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (d *mcpHTTPRequestDrain) stop() {
+	d.mu.Lock()
+	d.stopping = true
+	d.mu.Unlock()
 }
 
 // startMCPBackgroundWatch starts one watcher and returns a stop function that cancels
