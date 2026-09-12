@@ -461,6 +461,22 @@ tracking; a one-row UPDATE took 79–151 µs versus 59–84 µs (three runs of 5
 iterations). These are Apple M3 microbenchmarks, not full indexing timings.
 Avoiding repeated reader rebuilds is the intended tradeoff.
 
+From v0.33, full vector loads look up each note through its existing primary-key
+index instead of building a temporary retrieval-hash index. The original exact
+node-ID, current retrieval-hash and canonical-model filters remain; metadata and
+rows still share one cancellable read snapshot, with chunks ordered by index.
+The lookup slices the five-byte `note:` prefix as bytes to preserve unusual IDs,
+including embedded NULs, and still rejects other namespaces. No schema migration,
+owner restart, embedding call or change to acknowledgement checks is required.
+
+On an Apple M3 synthetic fixture with 3,000 notes and 2,350 768-dimensional
+vectors, full loads took 10–11 ms versus 12–13 ms with distinct hashes. With all
+notes sharing one hash, loads took 9.5–11.2 ms versus 875–942 ms: primary-key lookup
+avoids walking all same-hash candidates for each vector. Allocation was unchanged
+at about 22.3 MB/load. These microbenchmarks do not establish a live startup or
+acknowledgement SLO. Run `go test ./internal/index -run '^$' -bench
+'^BenchmarkVectorLookup$' -benchtime=3x -count=2` to compare both query strategies.
+
 From v0.29, reader-side traces distinguish acknowledgement polling from snapshot
 installation. `mcp_acknowledge` separates target parsing/hashing, version refresh,
 final database/file verification and poll waits. `mcp_refresh` and

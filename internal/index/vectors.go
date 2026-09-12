@@ -177,6 +177,19 @@ type vectorQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+// The extra primary-key predicate avoids a temporary index on retrieval_hash
+// (and many candidate matches when notes share a hash). Keep the original exact
+// node-ID predicate: a different namespace must never resolve to a note. Slice
+// bytes, not SQLite text characters, to preserve IDs containing embedded NULs.
+const liveVectorsQuery = `
+		SELECT v.node_id, v.embedding
+		FROM vectors v
+		JOIN notes n ON n.id = CAST(substr(CAST(v.node_id AS BLOB), 6) AS TEXT)
+		  AND v.node_id = 'note:' || n.id
+		WHERE v.note_hash = n.retrieval_hash
+		  AND v.model = (SELECT value FROM meta WHERE key='vector_model')
+		ORDER BY v.node_id, v.chunk_ix`
+
 func loadVectorsContext(ctx context.Context, q vectorQueryer, afterMeta func()) (model string, dim int, byNode map[string][][]float32, err error) {
 	if err := q.QueryRowContext(ctx, `SELECT value FROM meta WHERE key='vector_model'`).Scan(&model); err != nil && err != sql.ErrNoRows {
 		return "", 0, nil, err
@@ -193,13 +206,7 @@ func loadVectorsContext(ctx context.Context, q vectorQueryer, afterMeta func()) 
 		return "", 0, nil, err
 	}
 	byNode = map[string][][]float32{}
-	rows, err := q.QueryContext(ctx, `
-		SELECT v.node_id, v.embedding
-		FROM vectors v
-		JOIN notes n ON v.node_id = 'note:' || n.id
-		WHERE v.note_hash = n.retrieval_hash
-		  AND v.model = (SELECT value FROM meta WHERE key='vector_model')
-		ORDER BY v.node_id, v.chunk_ix`)
+	rows, err := q.QueryContext(ctx, liveVectorsQuery)
 	if err != nil {
 		return model, dim, byNode, err
 	}
