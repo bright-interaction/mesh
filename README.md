@@ -574,6 +574,14 @@ indexing still uses the authoritative full rewrite. No model calls or schema
 migration are added. See the [persistence benchmark](docs/BENCHMARK.md#incremental-graph-persistence)
 for the measured scope and reproduction command.
 
+From v0.36, graph comparison reuses SQL scan records and stores each edge key only once.
+In the 24,000-node/48,000-edge single-label-edit benchmark, this reduced allocated
+bytes from 41.9 MB to 28.7 MB per operation (about 31%) and removed about 72,000
+allocations. Three alternating 30-iteration runs on Apple M3 measured 70.2-84.3 ms
+before and 69.3-71.1 ms after; these are isolated persistence measurements, not an
+end-to-end writeback latency guarantee. Whole-graph comparison, nullable-row repair,
+changed-row-only writes, and atomic notes/search/graph publication are unchanged.
+
 From v0.23, the owning watcher's lifecycle-health analysis runs in one background
 pass per Store, outside the reconciliation mutex. Slow note reads, source-tree
 walks and Git checks no longer hold up the next indexing callback. The normal

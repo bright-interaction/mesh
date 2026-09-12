@@ -23,7 +23,8 @@ type graphNodeRow struct {
 type graphEdgeKey struct{ source, target, relation string }
 
 type graphEdgeRow struct {
-	graphEdgeKey
+	// The map key already owns source/target/relation. Keeping another copy in
+	// every value needlessly widens the full-graph comparison table.
 	confidence              string
 	confidenceScore, weight float64
 	sourceLoc               sql.NullString
@@ -63,7 +64,7 @@ func writeGraphDeltaContext(ctx context.Context, tx *sql.Tx, g *graph.Graph) err
 				return err
 			}
 			key := graphEdgeKey{e.Source, e.Target, e.Relation}
-			edges[key] = graphEdgeRow{key, e.Confidence, e.ConfidenceScore, e.Weight, graphText(e.SourceLoc)}
+			edges[key] = graphEdgeRow{e.Confidence, e.ConfidenceScore, e.Weight, graphText(e.SourceLoc)}
 		}
 	}
 	trace.Phase("nodes")
@@ -83,11 +84,13 @@ func diffGraphNodes(ctx context.Context, tx *sql.Tx, wanted map[string]graphNode
 	}
 	defer rows.Close()
 	var removed []string
+	// Scan replaces every field. Only owned strings/values escape into removed;
+	// no retained row points at this reusable scratch record.
+	var old graphNodeRow
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var old graphNodeRow
 		if err := rows.Scan(&old.id, &old.kind, &old.label, &old.noteID, &old.notePath, &old.anchor, &old.sourceLoc, &old.community, &old.attrs); err != nil {
 			return err
 		}
@@ -141,18 +144,19 @@ func diffGraphEdges(ctx context.Context, tx *sql.Tx, wanted map[graphEdgeKey]gra
 	}
 	defer rows.Close()
 	var removed []graphEdgeKey
+	var key graphEdgeKey
+	var old graphEdgeRow
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var old graphEdgeRow
-		if err := rows.Scan(&old.source, &old.target, &old.relation, &old.confidence, &old.confidenceScore, &old.weight, &old.sourceLoc); err != nil {
+		if err := rows.Scan(&key.source, &key.target, &key.relation, &old.confidence, &old.confidenceScore, &old.weight, &old.sourceLoc); err != nil {
 			return err
 		}
-		if next, ok := wanted[old.graphEdgeKey]; !ok {
-			removed = append(removed, old.graphEdgeKey)
+		if next, ok := wanted[key]; !ok {
+			removed = append(removed, key)
 		} else if next == old {
-			delete(wanted, old.graphEdgeKey)
+			delete(wanted, key)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -180,8 +184,8 @@ func diffGraphEdges(ctx context.Context, tx *sql.Tx, wanted map[graphEdgeKey]gra
 		return err
 	}
 	defer put.Close()
-	for _, e := range wanted {
-		if _, err := put.ExecContext(ctx, e.source, e.target, e.relation, e.confidence, e.confidenceScore, e.weight, e.sourceLoc); err != nil {
+	for key, e := range wanted {
+		if _, err := put.ExecContext(ctx, key.source, key.target, key.relation, e.confidence, e.confidenceScore, e.weight, e.sourceLoc); err != nil {
 			return err
 		}
 	}

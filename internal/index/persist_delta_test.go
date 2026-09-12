@@ -140,6 +140,75 @@ func TestGraphDeltaRepairsNullableRowsAndRemovesAll(t *testing.T) {
 	}
 }
 
+// Reusing scan storage must not alias retained deletion keys or carry nullable
+// metadata between rows. Compact edge values must still distinguish ALL three
+// key fields even when many edges share a source, target or relation.
+func TestGraphDeltaCompactRowsMatchFullWriter(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	fixture := func(revision int) *graph.Graph {
+		g := graph.New()
+		for i := 0; i < 24; i++ {
+			if revision > 0 && i%4 == 0 {
+				continue // several keys must survive scratch reuse until deletion
+			}
+			id := fmt.Sprintf("note:%d", i)
+			n := &graph.Node{ID: id, Kind: "note", Label: id, Community: i}
+			if i%2 == 0 {
+				n.NoteID, n.NotePath, n.Anchor, n.SourceLoc = id, id+".md", "anchor", "L9"
+				n.Attrs = map[string]any{"revision": revision, "body": "metadata\x00with unicode ä"}
+			}
+			if revision > 0 && i%3 == 0 {
+				n.Label = "changed " + id
+				n.Community += revision
+			}
+			g.AddNode(n)
+			for j, relation := range []string{"references", "contains", "references\x00tail"} {
+				for offset := 1; offset <= 2; offset++ {
+					e := graph.Edge{Source: id, Target: fmt.Sprintf("note:%d", (i+offset)%24), Relation: relation,
+						Confidence: "EXTRACTED", ConfidenceScore: float64(j) / 2, Weight: float64(offset)}
+					if j%2 == 0 {
+						e.SourceLoc = "source\x00" + id
+					}
+					if revision > 0 && j == 1 {
+						e.Confidence, e.Weight = "INFERRED", float64(revision)
+					}
+					g.AddEdge(e)
+				}
+			}
+		}
+		return g
+	}
+	if err := s.Write(func(tx *sql.Tx) error {
+		if err := writeGraphTables(tx, fixture(0)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE nodes SET note_id=NULL,note_path=NULL,anchor=NULL,source_loc=NULL,community=NULL,attrs=NULL WHERE community%2=0`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`UPDATE edges SET source_loc=NULL WHERE relation='contains'`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, revision := range []int{1, 2, 0} { // delete, update, then restore missing rows
+		g := fixture(revision)
+		if _, err := s.IndexVaultIncremental(nil, nil, g); err != nil {
+			t.Fatal(err)
+		}
+		got := snapshotTables(t, s)
+		if err := s.Write(func(tx *sql.Tx) error { return writeGraphTables(tx, g) }); err != nil {
+			t.Fatal(err)
+		}
+		if want := snapshotTables(t, s); got != want {
+			t.Fatalf("revision %d: compact delta differs from full writer\ngot:\n%s\nwant:\n%s", revision, got, want)
+		}
+	}
+}
+
 func TestGraphDeltaFailureRollsBackNotesFTSAndGraph(t *testing.T) {
 	dir := writeVault(t)
 	s, err := Open(dir)
