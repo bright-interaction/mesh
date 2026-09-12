@@ -415,6 +415,16 @@ the lightweight local checks. Hot replacement of an open database file is not a
 supported rebuild and requires a reader restart. There is no schema migration,
 new writer, longer acknowledgement deadline or weaker publication check.
 
+From v0.31, full reader graph loads preallocate their maps from node/edge counts
+read in the same SQLite snapshot, with hints capped at 65,536 entries per map.
+Larger graphs still grow normally. Row-scan scratch is reused without sharing
+mutable node attributes or edges. A synthetic 24,000-node / 48,000-edge benchmark
+allocated 58.5 MB/load instead of 69.3 MB/load (15.5% less); measured runtime was
+roughly 109–112 ms in both cases, so this is an allocation reduction, not a
+demonstrated latency improvement or end-to-end acknowledgement SLO. The capacity
+query is timed as `load_graph.capacity`. Database commits, including bookkeeping,
+still invalidate reuse; distinguishing them requires a separate freshness protocol.
+
 From v0.29, reader-side traces distinguish acknowledgement polling from snapshot
 installation. `mcp_acknowledge` separates target parsing/hashing, version refresh,
 final database/file verification and poll waits. `mcp_refresh` and

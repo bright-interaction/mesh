@@ -81,6 +81,19 @@ type Graph struct {
 
 func New() *Graph { return NewSized(0) }
 
+// NewWithCapacity uses actual node/edge counts rather than NewSized's estimates
+// from a note count. Hints do not limit growth; dangling edge endpoints and
+// graphs with no edges remain valid. Negative hints behave like zero.
+func NewWithCapacity(nodes, edges int) *Graph {
+	nodes, edges = max(0, nodes), max(0, edges)
+	return &Graph{
+		nodes:   make(map[string]*Node, nodes),
+		adj:     make(map[string][]Edge, min(nodes, edges)),
+		rev:     make(map[string][]Edge, min(nodes, edges)),
+		edgeSet: make(map[string]bool, edges),
+	}
+}
+
 // NewSized preallocates the maps for a graph expected to hold about n notes. A
 // note contributes roughly one note node plus a handful of heading/tag nodes and
 // edges, so the hints below avoid the repeated rehashing that dominates a

@@ -68,7 +68,7 @@ func loadGraphContext(ctx context.Context, q graphQueryer) (*graph.Graph, error)
 }
 
 func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes func()) (*graph.Graph, error) {
-	trace := latency.Start("load_graph", "nodes")
+	trace := latency.Start("load_graph", "capacity")
 	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
@@ -76,8 +76,38 @@ func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	g := graph.New()
+	// Count on the SAME read transaction as the scans (and acknowledgement
+	// version gate). These cheap counts avoid repeated map growth on full loads.
+	// Bound speculative allocation: large graphs can still grow normally and
+	// cancellation need not first reserve memory for the entire database.
+	counts, err := q.QueryContext(ctx, `SELECT (SELECT count(*) FROM nodes), (SELECT count(*) FROM edges)`)
+	if err != nil {
+		return nil, err
+	}
+	defer counts.Close() // also close explicitly before scanning the node rows
+	var nodes, edges int64
+	if !counts.Next() {
+		err := counts.Err()
+		counts.Close()
+		if err == nil {
+			err = errors.New("mesh: graph counts returned no row")
+		}
+		return nil, err
+	}
+	if err := counts.Scan(&nodes, &edges); err != nil {
+		counts.Close()
+		return nil, err
+	}
+	if err := counts.Close(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	const maxCapacityHint = 65536
+	g := graph.NewWithCapacity(int(min(nodes, maxCapacityHint)), int(min(edges, maxCapacityHint)))
 
+	trace.Phase("nodes")
 	nrows, err := q.QueryContext(ctx, `SELECT id, kind, label, COALESCE(note_id,''), COALESCE(note_path,''), COALESCE(anchor,''), COALESCE(source_loc,''), COALESCE(community,0), COALESCE(attrs,'') FROM nodes`)
 	if err != nil {
 		return nil, err
@@ -86,13 +116,13 @@ func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes 
 	// stops every checkpoint from reclaiming past it. In a long-running daemon that
 	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
 	defer nrows.Close()
+	var attrs string
 	for nrows.Next() {
 		if err := ctx.Err(); err != nil {
 			nrows.Close()
 			return nil, err
 		}
 		n := &graph.Node{}
-		var attrs string
 		if err := nrows.Scan(&n.ID, &n.Kind, &n.Label, &n.NoteID, &n.NotePath, &n.Anchor, &n.SourceLoc, &n.Community, &attrs); err != nil {
 			nrows.Close()
 			return nil, err
@@ -120,11 +150,13 @@ func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes 
 		return nil, err
 	}
 	defer erows.Close()
+	// Scan scratch is reused, but AddEdge copies the value into each adjacency
+	// list. No graph entry refers to this mutable buffer.
+	var e graph.Edge
 	for erows.Next() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		var e graph.Edge
 		if err := erows.Scan(&e.Source, &e.Target, &e.Relation, &e.Confidence, &e.ConfidenceScore, &e.Weight, &e.SourceLoc); err != nil {
 			return nil, err
 		}
