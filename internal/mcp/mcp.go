@@ -56,6 +56,15 @@ type Server struct {
 	// (path -> retrieval hash), so a read-only server can report what a refresh changed
 	// in its view. Guarded by reloadMu; nil until the first refresh.
 	viewHashes map[string]string
+	// Refresh reuse state is guarded by reloadMu. The monitor is connection-local;
+	// it must never be replaced while retaining a reusable version stamp.
+	changeMonitor       *index.ChangeMonitor
+	viewVersion         int64
+	viewConfig          [32]byte
+	viewReusable        bool
+	viewBuildComplete   bool
+	refreshClosed       bool
+	beforeReaderInstall func() // deterministic concurrent-commit test seam
 
 	// owner is the vault's owning-writer claim when THIS process elected itself (see
 	// NewOwningServer). nil on a read-only server and on the hub, which owns an index
@@ -345,6 +354,13 @@ func (s *Server) Close() error {
 	<-s.bg // never close the store under the initial background load/enrichment
 	s.opCancel()
 	<-s.opDone // never close the store under an in-flight owner-op reconcile
+	s.reloadMu.Lock()
+	s.refreshClosed, s.viewReusable = true, false
+	if s.changeMonitor != nil {
+		_ = s.changeMonitor.Close()
+		s.changeMonitor = nil
+	}
+	s.reloadMu.Unlock()
 	err := s.store.Close()
 	// Give the vault up AFTER the store is closed, so the next owner never starts
 	// indexing while this process still has a writable connection open.
@@ -484,6 +500,8 @@ func (s *Server) snapshot() (*graph.Graph, *retrieve.Retriever) {
 
 // swap atomically replaces the in-memory graph + retriever.
 func (s *Server) swap(g *graph.Graph) {
+	// All callers hold reloadMu. Owned rebuilds did not sample a monitor stamp.
+	s.viewReusable = false
 	r := retrieve.NewFromEnv(s.store, g)
 	s.mu.Lock()
 	s.graph = g
@@ -555,13 +573,34 @@ func (s *Server) refreshContext(ctx context.Context) (index.Reconciliation, erro
 		return index.Reconciliation{}, err
 	}
 	defer s.reloadMu.Unlock()
+	if s.refreshClosed {
+		return index.Reconciliation{}, errors.New("mesh: reader closed")
+	}
+	trace.Phase("freshness_check")
+	in, err := retrieve.LoadConfigInputs(ctx, s.store.MeshDir())
+	if err != nil {
+		return index.Reconciliation{}, err
+	}
+	version, valid := s.readerVersion(ctx)
+	fingerprint, reusable := in.Fingerprint()
+	if valid && reusable && s.viewReusable && version == s.viewVersion && fingerprint == s.viewConfig {
+		return index.Reconciliation{}, ctx.Err()
+	}
+	s.viewReusable = false
 	trace.Phase("load_graph")
 	g, err := s.store.LoadGraphContext(ctx)
 	if err != nil {
 		return index.Reconciliation{}, err
 	}
 	trace.Phase("install")
-	return s.installRefreshedGraph(ctx, g)
+	if s.beforeReaderInstall != nil {
+		s.beforeReaderInstall()
+	}
+	rec, err := s.installRefreshedGraph(ctx, g, in)
+	if err == nil {
+		s.rememberReaderVersion(ctx, version, valid, in)
+	}
+	return rec, err
 }
 
 func (s *Server) refreshAtNoteVersion(ctx context.Context, noteID, notePath, noteHash string) (bool, error) {
@@ -571,17 +610,34 @@ func (s *Server) refreshAtNoteVersion(ctx context.Context, noteID, notePath, not
 		return false, err
 	}
 	defer s.reloadMu.Unlock()
+	if s.refreshClosed {
+		return false, errors.New("mesh: reader closed")
+	}
+	// Acknowledgements still load the exact-version SQLite snapshot. Reuse only
+	// removes redundant ordinary refreshes, never this publication proof.
+	version, valid := s.readerVersion(ctx)
 	trace.Phase("load_versioned_graph")
 	g, matched, err := s.store.LoadGraphAtNoteVersionContext(ctx, noteID, notePath, noteHash)
 	if err != nil || !matched {
 		return matched, err
 	}
 	trace.Phase("install")
-	_, err = s.installRefreshedGraph(ctx, g)
+	in, err := retrieve.LoadConfigInputs(ctx, s.store.MeshDir())
+	if err != nil {
+		return false, err
+	}
+	s.viewReusable = false
+	if s.beforeReaderInstall != nil {
+		s.beforeReaderInstall()
+	}
+	_, err = s.installRefreshedGraph(ctx, g, in)
+	if err == nil {
+		s.rememberReaderVersion(ctx, version, valid, in)
+	}
 	return err == nil, err
 }
 
-func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (index.Reconciliation, error) {
+func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph, in *retrieve.ConfigInputs) (index.Reconciliation, error) {
 	trace := latency.Start("mcp_install_graph", "note_hashes")
 	defer trace.End()
 	// Fingerprint the index we just loaded. A read error here costs the NEXT refresh its
@@ -592,7 +648,7 @@ func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (ind
 		return index.Reconciliation{}, err
 	}
 	trace.Phase("retriever")
-	r, err := retrieve.NewFromEnvContext(ctx, s.store, g)
+	r, err := retrieve.NewFromInputsContext(ctx, s.store, g, in)
 	if err != nil {
 		return index.Reconciliation{}, err
 	}
@@ -635,6 +691,7 @@ func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (ind
 	trace.Phase("publish")
 	s.graph, s.retriever = g, r
 	s.mu.Unlock()
+	s.viewBuildComplete = herr == nil && r.RefreshReusable()
 	return rec, nil
 }
 

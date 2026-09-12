@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -123,6 +122,9 @@ type Retriever struct {
 	store  *index.Store
 	graph  *graph.Graph
 	ranker *graph.Ranker
+	// False when optional persisted state could not be read. The current
+	// lexical fallback remains usable, but ordinary refresh must retry later.
+	refreshReusable bool
 
 	emb         embed.Embedder
 	vecModel    string
@@ -166,8 +168,12 @@ func NewContext(ctx context.Context, store *index.Store, g *graph.Graph) (*Retri
 	if err != nil {
 		return nil, err
 	}
-	return &Retriever{store: store, graph: g, ranker: ranker, rerankBlend: rerankBlendDefault, qvec: map[string][]float32{}}, nil
+	return &Retriever{store: store, graph: g, ranker: ranker, refreshReusable: true, rerankBlend: rerankBlendDefault, qvec: map[string][]float32{}}, nil
 }
+
+// RefreshReusable reports whether construction loaded its optional persisted
+// inputs without a transient read failure. It does not probe any model.
+func (r *Retriever) RefreshReusable() bool { return r.refreshReusable }
 
 // SetWeights sets the fusion-weight defaults used when a retrieval does not pass
 // explicit Options weights (e.g. learned weights from `mesh tune`). Any value
@@ -195,6 +201,16 @@ func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 // vector loading, and the optional pro HNSW build. Construction never calls a
 // model: queries validate returned dimensions; explicit health probes test it.
 func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) (*Retriever, error) {
+	in, err := LoadConfigInputs(ctx, store.MeshDir())
+	if err != nil {
+		return nil, err
+	}
+	return NewFromInputsContext(ctx, store, g, in)
+}
+
+// NewFromInputsContext consumes exactly the configuration previously sampled by
+// the reader's freshness gate. It does not reread config or the environment.
+func NewFromInputsContext(ctx context.Context, store *index.Store, g *graph.Graph, in *ConfigInputs) (*Retriever, error) {
 	trace := latency.Start("retriever_build", "ranker")
 	defer trace.End()
 	if ctx == nil {
@@ -205,23 +221,17 @@ func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) 
 		return nil, err
 	}
 	trace.Phase("config")
-	cfg, err := meshcfg.LoadConfigContext(ctx, store.MeshDir())
-	if err != nil {
-		if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
-			return nil, ctxErr
-		}
-		cfg = meshcfg.Config{} // preserve the legacy lexical-only config fallback
-	}
+	cfg := in.cfg
 	trace.Phase("stored_vectors")
-	if err := r.enableVectorsContext(ctx, cfg.Embedding, cfg.Retrieval); err != nil {
+	if err := r.enableVectorsFromInputs(ctx, cfg.Embedding, cfg.Retrieval, in); err != nil {
 		return nil, err
 	}
 	if err := retrieveContextErr(ctx); err != nil {
 		return nil, err
 	}
 	trace.Phase("rerank_weights")
-	r.enableRerank(cfg.Retrieval)
-	r.loadWeights(cfg.Retrieval)
+	r.enableRerankFromInputs(cfg.Retrieval, in)
+	r.loadWeights(cfg.Retrieval, in.getenv)
 	if err := retrieveContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -231,9 +241,9 @@ func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) 
 // loadWeights applies fusion weights, env-first then the solo config file (0 means
 // "use the built-in default"). Env MESH_WEIGHT_* overrides the file, matching every
 // other knob's precedence.
-func (r *Retriever) loadWeights(rv meshcfg.Retrieval) {
+func (r *Retriever) loadWeights(rv meshcfg.Retrieval, getenv func(string) string) {
 	pick := func(env string, file float64) float64 {
-		if v, err := strconv.ParseFloat(os.Getenv(env), 64); err == nil && v >= 0 {
+		if v, err := strconv.ParseFloat(getenv(env), 64); err == nil && v >= 0 {
 			return v
 		}
 		if file >= 0 {
@@ -247,7 +257,7 @@ func (r *Retriever) loadWeights(rv meshcfg.Retrieval) {
 		pick("MESH_WEIGHT_VEC", rv.WeightVec),
 	)
 	r.freshHalfLife = rv.FreshnessHalfLifeDays
-	if v, err := strconv.Atoi(os.Getenv("MESH_FRESHNESS_HALFLIFE_DAYS")); err == nil && v >= 0 {
+	if v, err := strconv.Atoi(getenv("MESH_FRESHNESS_HALFLIFE_DAYS")); err == nil && v >= 0 {
 		r.freshHalfLife = v
 	}
 }
@@ -261,22 +271,29 @@ func (r *Retriever) enableVectors(emb meshcfg.Embedding, rv meshcfg.Retrieval) {
 }
 
 func (r *Retriever) enableVectorsContext(ctx context.Context, emb meshcfg.Embedding, rv meshcfg.Retrieval) error {
+	return r.enableVectorsFromInputs(ctx, emb, rv, &ConfigInputs{env: snapshotEnvironment()})
+}
+
+func (r *Retriever) enableVectorsFromInputs(ctx context.Context, emb meshcfg.Embedding, rv meshcfg.Retrieval, in *ConfigInputs) error {
 	if err := retrieveContextErr(ctx); err != nil {
 		return err
 	}
-	endpoint, fromEnv := envOrFile("MESH_EMBED_ENDPOINT", emb.Endpoint)
-	model := envOr("MESH_EMBED_MODEL", emb.Model)
+	endpoint, fromEnv := in.envOrFile("MESH_EMBED_ENDPOINT", emb.Endpoint)
+	model := in.envOr("MESH_EMBED_MODEL", emb.Model)
 	if endpoint == "" || model == "" {
 		return nil
 	}
 	vm, dim, vecs, err := r.store.LoadVectorsContext(ctx)
 	if err != nil || len(vecs) == 0 {
+		if err != nil {
+			r.refreshReusable = false
+		}
 		if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
 			return ctxErr
 		}
 		return nil
 	}
-	queryPrefix := envOr("MESH_EMBED_QUERY_PREFIX", emb.QueryPrefix)
+	queryPrefix := in.envOr("MESH_EMBED_QUERY_PREFIX", emb.QueryPrefix)
 	// key_env is a POINTER to a process secret, so it is resolved through the closed
 	// allow-list rather than read verbatim: a hand-edited config.toml that never passed
 	// through the web config API must not be able to aim this at MESH_UI_TOKEN and have
@@ -285,7 +302,7 @@ func (r *Retriever) enableVectorsContext(ctx context.Context, emb meshcfg.Embedd
 	// Optional ANN: build an HNSW index past the threshold (0/unset = brute force,
 	// the default; sub-5ms well past v1 scale). Env wins, then the config file.
 	hnswGate := 0
-	if v, err := strconv.Atoi(os.Getenv("MESH_HNSW_THRESHOLD")); err == nil && v > 0 {
+	if v, err := strconv.Atoi(in.getenv("MESH_HNSW_THRESHOLD")); err == nil && v > 0 {
 		hnswGate = v
 	} else if rv.HNSWThreshold > 0 {
 		hnswGate = rv.HNSWThreshold
@@ -297,7 +314,7 @@ func (r *Retriever) enableVectorsContext(ctx context.Context, emb meshcfg.Embedd
 	if fromEnv {
 		newEmbedder = embed.NewOperatorHTTP
 	}
-	ok, err := r.configureVectorsContext(ctx, newEmbedder(endpoint, model, os.Getenv(keyEnv)), vm, dim, vecs, hnswGate, false)
+	ok, err := r.configureVectorsContext(ctx, newEmbedder(endpoint, model, in.getenv(keyEnv)), vm, dim, vecs, hnswGate, false)
 	if err != nil {
 		return err
 	}
@@ -308,31 +325,18 @@ func (r *Retriever) enableVectorsContext(ctx context.Context, emb meshcfg.Embedd
 	return nil
 }
 
-// envOr returns the env var if set (non-empty), else the fallback.
-func envOr(key, fallback string) string {
-	v, _ := envOrFile(key, fallback)
-	return v
-}
-
-// envOrFile is envOr plus the PROVENANCE of the value it returned: true when it came
-// from the process environment, false when it came from the config file. That boolean is
-// load-bearing for BYOAI endpoints. An env var is operator input (no HTTP surface can
-// write the environment), so a localhost model server named there is allowed; the same
-// URL arriving through .mesh/config.toml could have been written by any caller of
-// PUT /api/config, so it stays behind the SSRF guard.
-func envOrFile(key, fallback string) (string, bool) {
-	if v := os.Getenv(key); v != "" {
-		return v, true
-	}
-	return fallback, false
-}
-
 // enableRerank turns on either a user-local subscription CLI (environment first,
 // then the per-user/per-vault config outside the project) or the legacy cross-
 // encoder endpoint (env-first, then solo config). No shared vault or project file
 // can force subscription egress. The model sees compact cards, never note bodies.
 func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
-	if b := os.Getenv("MESH_RERANK_BLEND"); b != "" {
+	in := &ConfigInputs{env: snapshotEnvironment()}
+	in.loadSubscription(context.Background(), filepath.Dir(r.store.MeshDir()))
+	r.enableRerankFromInputs(rv, in)
+}
+
+func (r *Retriever) enableRerankFromInputs(rv meshcfg.Retrieval, in *ConfigInputs) {
+	if b := in.getenv("MESH_RERANK_BLEND"); b != "" {
 		if v, err := strconv.ParseFloat(b, 64); err == nil && v >= 0 && v <= 1 {
 			r.rerankBlend = v
 		}
@@ -340,11 +344,11 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 		r.rerankBlend = rv.RerankBlend
 	}
 
-	agent := strings.ToLower(strings.TrimSpace(os.Getenv("MESH_RERANK_AGENT")))
-	model := strings.TrimSpace(os.Getenv("MESH_RERANK_MODEL"))
-	policy := strings.TrimSpace(os.Getenv("MESH_RERANK_POLICY"))
+	agent := strings.ToLower(strings.TrimSpace(in.getenv("MESH_RERANK_AGENT")))
+	model := strings.TrimSpace(in.getenv("MESH_RERANK_MODEL"))
+	policy := strings.TrimSpace(in.getenv("MESH_RERANK_POLICY"))
 	if agent == "" {
-		sub, enabled, _, err := rerank.LoadLocalSubscription(filepath.Dir(r.store.MeshDir()))
+		sub, enabled, err := in.sub, in.subEnabled, in.subErr
 		if err != nil {
 			r.rerankName = "subscription/local-config"
 			r.rerankSetup = err
@@ -361,7 +365,7 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 		}
 	}
 	if agent != "" && agent != "http" {
-		rr, err := rerank.NewConfiguredSubscriptionCLI(agent, model, policy)
+		rr, err := rerank.NewConfiguredSubscriptionCLIWithEnv(agent, model, policy, in.getenv)
 		if err != nil {
 			r.rerankName = "subscription/" + agent
 			r.rerankSetup = err
@@ -371,8 +375,8 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 		return
 	}
 
-	endpoint, fromEnv := envOrFile("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
-	endpointModel := envOr("MESH_RERANK_MODEL", rv.RerankModel)
+	endpoint, fromEnv := in.envOrFile("MESH_RERANK_ENDPOINT", rv.RerankEndpoint)
+	endpointModel := in.envOr("MESH_RERANK_MODEL", rv.RerankModel)
 	if endpoint == "" || endpointModel == "" {
 		return
 	}
@@ -385,7 +389,7 @@ func (r *Retriever) enableRerank(rv meshcfg.Retrieval) {
 	if fromEnv {
 		newReranker = rerank.NewOperatorHTTP
 	}
-	r.EnableRerank(newReranker(endpoint, endpointModel, os.Getenv(keyEnv)))
+	r.EnableRerank(newReranker(endpoint, endpointModel, in.getenv(keyEnv)))
 }
 
 // EnableRerank turns on the cross-encoder rerank stage. The reranker reorders the top-K

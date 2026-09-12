@@ -393,6 +393,28 @@ graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
 
+From v0.30, ordinary reader refreshes reuse the installed graph/retriever when
+both the database and the consumed retrieval configuration are unchanged.
+A dedicated read-only SQLite connection samples
+[`data_version`](https://www.sqlite.org/pragma.html#pragma_data_version) before and
+after construction; values are never compared across connections. Every database
+commit invalidates reuse, including graph/code-link, vector and telemetry writes.
+This is deliberately conservative, not a note-hashes-only cache. The monitor
+holds no transaction between samples and does not occupy the normal read pool.
+Queued callers recheck after acquiring the reload mutex, coalescing duplicate
+startup/watch refreshes. Exact-version acknowledgement graph loads are unchanged;
+a successful stable acknowledgement can prime the next ordinary refresh.
+
+Construction consumes an immutable snapshot of parsed configuration, environment
+and user-local subscription preferences; a fresh input comparison detects
+same-size/mtime edits without mislabelling a racing configuration read. No model
+is called. Config/monitor/optional-vector-read failures disable reuse, and a
+commit during construction forces another refresh on the next pass. Inputs and
+digests are not logged. `mcp_refresh.freshness_check` and `retriever_config` time
+the lightweight local checks. Hot replacement of an open database file is not a
+supported rebuild and requires a reader restart. There is no schema migration,
+new writer, longer acknowledgement deadline or weaker publication check.
+
 From v0.29, reader-side traces distinguish acknowledgement polling from snapshot
 installation. `mcp_acknowledge` separates target parsing/hashing, version refresh,
 final database/file verification and poll waits. `mcp_refresh` and

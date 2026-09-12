@@ -125,6 +125,22 @@ func NewConfiguredSubscriptionCLI(provider, model, policy string) (*CLI, error) 
 }
 
 func newSubscriptionCLI(provider, model, policy string) (*CLI, error) {
+	return NewConfiguredSubscriptionCLIWithEnv(provider, model, policy, os.Getenv)
+}
+
+// NewConfiguredSubscriptionCLIWithEnv consumes a caller-owned environment
+// snapshot, so refresh reuse compares the same limits that construction used.
+func NewConfiguredSubscriptionCLIWithEnv(provider, model, policy string, getenv func(string) string) (*CLI, error) {
+	envInt := func(name string, fallback, min, max int) int {
+		v, err := strconv.Atoi(strings.TrimSpace(getenv(name)))
+		if err != nil || v < min || v > max {
+			return fallback
+		}
+		return v
+	}
+	envDurationSeconds := func(name string, fallback time.Duration, min, max int) time.Duration {
+		return time.Duration(envInt(name, int(fallback/time.Second), min, max)) * time.Second
+	}
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	model = strings.TrimSpace(model)
 
@@ -387,19 +403,6 @@ func truncateUTF8(s string, maxBytes int) string {
 		cut--
 	}
 	return s[:cut]
-}
-
-func envInt(name string, fallback, min, max int) int {
-	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
-	if err != nil || v < min || v > max {
-		return fallback
-	}
-	return v
-}
-
-func envDurationSeconds(name string, fallback time.Duration, min, max int) time.Duration {
-	seconds := envInt(name, int(fallback/time.Second), min, max)
-	return time.Duration(seconds) * time.Second
 }
 
 func cloneResults(in []Result) []Result {
