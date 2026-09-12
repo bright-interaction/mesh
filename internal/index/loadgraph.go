@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/bright-interaction/mesh/internal/graph"
+	"github.com/bright-interaction/mesh/internal/latency"
 )
 
 // LoadGraph reconstructs the in-memory graph from the persisted nodes + edges
@@ -29,6 +30,8 @@ func (s *Store) LoadGraphContext(ctx context.Context) (*graph.Graph, error) {
 // loadGraphSnapshotContext keeps nodes and edges on one SQLite read snapshot. The hook
 // is a deterministic test seam after the node scan has established that snapshot.
 func (s *Store) loadGraphSnapshotContext(ctx context.Context, afterNodes func()) (*graph.Graph, error) {
+	trace := latency.Start("load_graph_snapshot", "begin_read")
+	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -40,10 +43,12 @@ func (s *Store) loadGraphSnapshotContext(ctx context.Context, afterNodes func())
 		return nil, err
 	}
 	defer tx.Rollback()
+	trace.Phase("graph")
 	g, err := loadGraphContextAfterNodes(ctx, tx, afterNodes)
 	if err != nil {
 		return nil, err
 	}
+	trace.Phase("commit_read")
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -63,6 +68,8 @@ func loadGraphContext(ctx context.Context, q graphQueryer) (*graph.Graph, error)
 }
 
 func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes func()) (*graph.Graph, error) {
+	trace := latency.Start("load_graph", "nodes")
+	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -107,6 +114,7 @@ func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes 
 		return nil, err
 	}
 
+	trace.Phase("edges")
 	erows, err := q.QueryContext(ctx, `SELECT source, target, relation, confidence, confidence_score, weight, COALESCE(source_loc,'') FROM edges`)
 	if err != nil {
 		return nil, err
@@ -123,6 +131,7 @@ func loadGraphContextAfterNodes(ctx context.Context, q graphQueryer, afterNodes 
 		g.AddEdge(e)
 	}
 	// Match BuildGraph: recompute degrees in a final pass so both paths agree exactly.
+	trace.Phase("degrees")
 	if err := g.RecomputeDegreesContext(ctx); err != nil {
 		return nil, err
 	}
@@ -173,6 +182,8 @@ func (s *Store) loadGraphAtNoteVersion(noteID, expectedPath, expectedHash string
 }
 
 func (s *Store) loadGraphAtNoteVersionContext(ctx context.Context, noteID, expectedPath, expectedHash string, afterVersionCheck func()) (*graph.Graph, bool, error) {
+	trace := latency.Start("load_versioned_graph", "begin_read")
+	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -181,6 +192,7 @@ func (s *Store) loadGraphAtNoteVersionContext(ctx context.Context, noteID, expec
 		return nil, false, err
 	}
 	defer tx.Rollback()
+	trace.Phase("version_check")
 	var path, hash string
 	err = tx.QueryRowContext(ctx, `SELECT path, retrieval_hash FROM notes WHERE id = ?`, noteID).Scan(&path, &hash)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -195,10 +207,12 @@ func (s *Store) loadGraphAtNoteVersionContext(ctx context.Context, noteID, expec
 	if afterVersionCheck != nil {
 		afterVersionCheck()
 	}
+	trace.Phase("graph")
 	g, err := loadGraphContext(ctx, tx)
 	if err != nil {
 		return nil, false, err
 	}
+	trace.Phase("commit_read")
 	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}

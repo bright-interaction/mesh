@@ -23,6 +23,7 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/retrieve"
 	"github.com/bright-interaction/mesh/internal/watch"
 )
@@ -548,31 +549,41 @@ func (s *Server) lockReloadContext(ctx context.Context) error {
 }
 
 func (s *Server) refreshContext(ctx context.Context) (index.Reconciliation, error) {
+	trace := latency.Start("mcp_refresh", "reload_lock")
+	defer trace.End()
 	if err := s.lockReloadContext(ctx); err != nil {
 		return index.Reconciliation{}, err
 	}
 	defer s.reloadMu.Unlock()
+	trace.Phase("load_graph")
 	g, err := s.store.LoadGraphContext(ctx)
 	if err != nil {
 		return index.Reconciliation{}, err
 	}
+	trace.Phase("install")
 	return s.installRefreshedGraph(ctx, g)
 }
 
 func (s *Server) refreshAtNoteVersion(ctx context.Context, noteID, notePath, noteHash string) (bool, error) {
+	trace := latency.Start("mcp_version_refresh", "reload_lock")
+	defer trace.End()
 	if err := s.lockReloadContext(ctx); err != nil {
 		return false, err
 	}
 	defer s.reloadMu.Unlock()
+	trace.Phase("load_versioned_graph")
 	g, matched, err := s.store.LoadGraphAtNoteVersionContext(ctx, noteID, notePath, noteHash)
 	if err != nil || !matched {
 		return matched, err
 	}
+	trace.Phase("install")
 	_, err = s.installRefreshedGraph(ctx, g)
 	return err == nil, err
 }
 
 func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (index.Reconciliation, error) {
+	trace := latency.Start("mcp_install_graph", "note_hashes")
+	defer trace.End()
 	// Fingerprint the index we just loaded. A read error here costs the NEXT refresh its
 	// counts, never its correctness, so it must not fail the refresh: the graph is already
 	// good and the caller's notes are already queryable.
@@ -580,6 +591,7 @@ func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (ind
 	if err := ctx.Err(); err != nil {
 		return index.Reconciliation{}, err
 	}
+	trace.Phase("retriever")
 	r, err := retrieve.NewFromEnvContext(ctx, s.store, g)
 	if err != nil {
 		return index.Reconciliation{}, err
@@ -593,6 +605,7 @@ func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (ind
 	// need), which is noise that hides the ticks that did bring something in. Unknown
 	// counts (the hash read failed) report true: we did swap, and under-reporting a real
 	// change is the worse error.
+	trace.Phase("reconcile_counts")
 	rec := index.Reconciliation{Reindexed: herr != nil}
 	if herr == nil {
 		first := s.viewHashes == nil
@@ -617,7 +630,9 @@ func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph) (ind
 	if herr == nil {
 		s.viewHashes = after
 	}
+	trace.Phase("publish_lock")
 	s.mu.Lock()
+	trace.Phase("publish")
 	s.graph, s.retriever = g, r
 	s.mu.Unlock()
 	return rec, nil
@@ -663,6 +678,8 @@ const OwnerIndexBound = index.OwnerIndexBound
 // old row has the right id and path but the wrong retrieval hash, and accepting it would
 // return a false success receipt while queries still serve the deleted note's content.
 func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string) (result error) {
+	trace := latency.Start("mcp_acknowledge", "setup")
+	defer trace.End()
 	timeout := s.ownerIndexTimeout
 	if timeout <= 0 {
 		timeout = ownerIndexTimeout
@@ -685,14 +702,17 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string)
 	}
 	rel = filepath.Clean(rel)
 	for {
+		trace.Phase("parse_target")
 		pn, perr := index.ParseFileContext(ctx, notePath)
 		switch {
 		case perr == nil:
 			pn.Path = rel
+			trace.Phase("target_hash")
 			targetHash := index.RetrievalHash(pn)
 			if s.beforeOwnerVersionRefresh != nil {
 				s.beforeOwnerVersionRefresh()
 			}
+			trace.Phase("version_refresh")
 			matched, rerr := s.refreshAtNoteVersion(ctx, noteID, rel, targetHash)
 			if rerr != nil {
 				return rerr
@@ -703,6 +723,7 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string)
 				// ParseFile and before the snapshot is installed. Re-read the path
 				// after publication and only acknowledge if it still names the exact
 				// version represented by that snapshot.
+				trace.Phase("verify_database")
 				currentDB, derr := s.store.NoteVersionMatchesContext(ctx, noteID, rel, targetHash)
 				if derr != nil {
 					return derr
@@ -710,6 +731,7 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string)
 				if !currentDB {
 					break
 				}
+				trace.Phase("verify_file")
 				current, cerr := index.ParseFileContext(ctx, notePath)
 				switch {
 				case cerr == nil:
@@ -734,6 +756,7 @@ func (s *Server) awaitOwnerIndexed(ctx context.Context, noteID, notePath string)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		trace.Phase("poll_wait")
 		timer := time.NewTimer(index.OwnerIndexPollInterval)
 		select {
 		case <-ctx.Done():

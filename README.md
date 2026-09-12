@@ -393,6 +393,21 @@ graph construction, communities, persistence and code linking. These diagnostics
 add no model calls and do not skip durability, collision or index-validation
 checks. They locate stalls; they do not fix them or impose new deadlines.
 
+From v0.29, reader-side traces distinguish acknowledgement polling from snapshot
+installation. `mcp_acknowledge` separates target parsing/hashing, version refresh,
+final database/file verification and poll waits. `mcp_refresh` and
+`mcp_version_refresh` separate the reload mutex, graph loading and installation;
+`mcp_install_graph` separates note fingerprints, retriever construction,
+reconciliation counts and publication lock/swap. `load_graph_snapshot` and
+`load_versioned_graph` show read-transaction acquisition, version checking where
+applicable, graph loading and transaction completion. `load_graph` splits node,
+edge and degree work; `retriever_build` splits ranker construction, configuration,
+stored vectors (including optional ANN construction), and reranker/weight setup.
+Construction does not call a model. The same silent-under-one-second and static,
+content-free logging rules apply; nested times overlap and cannot be summed.
+This is diagnostic coverage, not a latency fix: the acknowledgement deadline,
+single-snapshot version gate and final current-file checks are unchanged.
+
 From v0.28, adding a new note checks the `notes` primary key inside the writer
 transaction and skips deleting a nonexistent FTS row. FTS5's `node_id` is
 `UNINDEXED`, so the former delete scanned the search table even for a new ID.

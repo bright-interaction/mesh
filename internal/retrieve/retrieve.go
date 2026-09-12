@@ -22,6 +22,7 @@ import (
 	"github.com/bright-interaction/mesh/internal/embed"
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/index"
+	"github.com/bright-interaction/mesh/internal/latency"
 	"github.com/bright-interaction/mesh/internal/meshcfg"
 	"github.com/bright-interaction/mesh/internal/rerank"
 	"github.com/bright-interaction/mesh/internal/vault"
@@ -194,6 +195,8 @@ func NewFromEnv(store *index.Store, g *graph.Graph) *Retriever {
 // vector loading, and the optional pro HNSW build. Construction never calls a
 // model: queries validate returned dimensions; explicit health probes test it.
 func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) (*Retriever, error) {
+	trace := latency.Start("retriever_build", "ranker")
+	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -201,6 +204,7 @@ func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) 
 	if err != nil {
 		return nil, err
 	}
+	trace.Phase("config")
 	cfg, err := meshcfg.LoadConfigContext(ctx, store.MeshDir())
 	if err != nil {
 		if ctxErr := retrieveContextErr(ctx); ctxErr != nil {
@@ -208,12 +212,14 @@ func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) 
 		}
 		cfg = meshcfg.Config{} // preserve the legacy lexical-only config fallback
 	}
+	trace.Phase("stored_vectors")
 	if err := r.enableVectorsContext(ctx, cfg.Embedding, cfg.Retrieval); err != nil {
 		return nil, err
 	}
 	if err := retrieveContextErr(ctx); err != nil {
 		return nil, err
 	}
+	trace.Phase("rerank_weights")
 	r.enableRerank(cfg.Retrieval)
 	r.loadWeights(cfg.Retrieval)
 	if err := retrieveContextErr(ctx); err != nil {
