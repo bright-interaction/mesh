@@ -20,6 +20,39 @@ type fifoOpenResult struct {
 	err  error
 }
 
+func TestCodeRefreshReceiptCancelsWhileReadStalled(t *testing.T) {
+	_, reader, _ := codeRefreshFixture(t)
+	id := "0123456789abcdef0123456789abcdef"
+	path, err := reader.codeRefreshReceipt(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ready := openFIFOTestWriter(path)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- reader.AwaitCodeRefresh(ctx, id, time.Minute) }()
+	writer := waitFIFOTestWriter(t, ready)
+	defer writer.Close()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("receipt wait: %v, want context cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("receipt wait remained blocked on the filesystem")
+	}
+	_ = writer.Close()
+	waitFIFOTestReaderClosed(t, path)
+}
+
 // openFIFOTestWriter starts a writer whose successful open is also the deterministic
 // proof that the production reader has opened the other end and is stalled waiting for
 // bytes. The caller must close the returned file to let the isolated read finish.

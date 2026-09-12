@@ -6,6 +6,11 @@ You edit plain markdown in your IDE. Your agent (Claude Code, Codex) searches it
 
 It is one Go binary, no cgo, no external services. Retrieving from Mesh is cheaper than having the agent read whole files: it returns ranked cards (title + the matched snippet + why it surfaced) and packs the best bundle that fits a token budget, so the agent reads one note instead of three.
 
+Source-code indexing also supports `mesh code reindex <vault> --through-owner`:
+a deterministic, acknowledged refresh without stopping the live index owner.
+See [source freshness](docs/source-freshness.md) for the owner upgrade requirement
+and the opt-in workspace catch-up timer for server-side merges.
+
 ## Honest scope
 
 - **The core, zero models:** cheap card-based retrieval (FTS + graph-BM25 + tier-0, pure Go, no inference, near-zero CPU) plus the agent write-back flywheel, in a single no-glue binary. `mesh_search` hands the agent ranked cards (title + snippet + why); **the agent reads the cards and picks** the 1-2 notes worth fetching. A capable coding agent is already a stronger relevance judge than any bolt-on reranker, so for the agent consumer the agent *is* the reranker, free. This is the whole product for an agent.

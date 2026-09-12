@@ -1514,6 +1514,9 @@ func codeReindexCmd() *cobra.Command {
 	var rootsFlag []string
 	var langsFlag string
 	var full bool
+	var throughOwner bool
+	var wait time.Duration
+	var expectRoot string
 	c := &cobra.Command{
 		Use:   "reindex [vault]",
 		Short: "Walk the configured code roots and refresh the source-code index (incremental; --full rebuilds)",
@@ -1525,6 +1528,30 @@ func codeReindexCmd() *cobra.Command {
 			}
 			if err := vault.RequireRoot(root); err != nil {
 				return err
+			}
+			if throughOwner {
+				if cmd.Flags().Changed("root") || cmd.Flags().Changed("languages") || cmd.Flags().Changed("full") || wait <= 0 {
+					return fmt.Errorf("--through-owner uses only [code] config, accepts no root/languages/full overrides, and requires --wait > 0")
+				}
+				store, writable, closeStore, err := openOneShotCurrentOrReadOnly(root, "mesh code refresh")
+				if err != nil {
+					return err
+				}
+				defer closeStore()
+				id, err := store.EnqueueCodeRefresh(expectRoot)
+				if err != nil {
+					return err
+				}
+				if writable {
+					if _, err := store.DrainOpsContext(cmd.Context()); err != nil {
+						return err
+					}
+				}
+				if err := store.AwaitCodeRefresh(cmd.Context(), id, wait); err != nil {
+					return err
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), "code refresh acknowledged by index owner: "+id)
+				return nil
 			}
 			store, closeStore, err := openOneShotCurrent(root, "mesh code reindex")
 			if err != nil {
@@ -1567,6 +1594,9 @@ func codeReindexCmd() *cobra.Command {
 	c.Flags().StringSliceVar(&rootsFlag, "root", nil, "code root to index (repeatable); overrides config")
 	c.Flags().StringVar(&langsFlag, "languages", "", "comma list of language tags (default: config or all)")
 	c.Flags().BoolVar(&full, "full", false, "wipe and rebuild the whole index instead of the incremental mtime-drift refresh")
+	c.Flags().BoolVar(&throughOwner, "through-owner", false, "queue a full refresh of [code] config roots through the index owner and require its completion receipt")
+	c.Flags().DurationVar(&wait, "wait", time.Minute, "maximum wait for an owner-routed refresh acknowledgement")
+	c.Flags().StringVar(&expectRoot, "expect-root", "", "with --through-owner, require this to be the sole configured code root (does not override config)")
 	return c
 }
 

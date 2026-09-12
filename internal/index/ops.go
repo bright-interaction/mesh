@@ -59,6 +59,9 @@ type Op struct {
 	// OpAddPending: the complete idempotent pending-note upsert. A pointer keeps
 	// malformed/missing payloads distinguishable from a deliberately empty field.
 	Pending *PendingNote `json:"pending,omitempty"`
+	// CodeConfig binds a refresh to the observed [code] config without letting the
+	// request override the owner's roots or language policy.
+	CodeConfig string `json:"code_config,omitempty"`
 }
 
 // ReuseEvent is one note fetched in a later session than it was authored in: the atom
@@ -241,6 +244,10 @@ func (s *Store) drainOpsContextWithTelemetry(ctx context.Context, listFiles list
 		return 0, err
 	}
 	applied := 0
+	var codeRefreshErr error
+	var codeReceiptErr error
+	var refreshedConfig string
+	codeRefreshed := false
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
 			return applied, err
@@ -297,6 +304,52 @@ func (s *Store) drainOpsContextWithTelemetry(ctx context.Context, listFiles list
 			}
 		}
 		switch op.Kind {
+		case OpCodeRefresh:
+			if !codeRefreshID(op.ID) {
+				slog.Warn("mesh: dropping invalid code refresh request", "file", name)
+				_ = removeFile(path)
+				continue
+			}
+			// A backlog/burst requests one current snapshot, not N full parses.
+			// Failures stay queued but cannot starve unrelated bookkeeping ops.
+			if !codeRefreshed {
+				if op.CodeConfig == s.codeRefreshRetryConfig && time.Now().Before(s.codeRefreshRetryAfter) {
+					codeRefreshErr = s.checkCodeRefreshConfig(op.CodeConfig)
+					if codeRefreshErr == nil {
+						codeRefreshErr = s.codeRefreshRetryErr
+					}
+				} else {
+					codeRefreshErr = s.runCodeRefresh(ctx, op.CodeConfig)
+					if codeRefreshErr != nil && !errors.Is(codeRefreshErr, errCodeRefreshConfigChanged) {
+						s.deferCodeRefreshRetry(op.CodeConfig, codeRefreshErr)
+					} else if codeRefreshErr == nil {
+						s.codeRefreshRetryAfter = time.Time{}
+						s.codeRefreshRetryErr = nil
+					}
+				}
+				if errors.Is(codeRefreshErr, errCodeRefreshConfigChanged) {
+					slog.Warn("mesh: discarding obsolete code refresh without acknowledgement", "file", name)
+					_ = removeFile(path)
+					codeReceiptErr = errors.Join(codeReceiptErr, codeRefreshErr)
+					codeRefreshErr = nil
+					continue
+				}
+				refreshedConfig = op.CodeConfig
+				codeRefreshed = true
+			}
+			if op.CodeConfig != refreshedConfig {
+				// A different configuration needs a new pass, not this receipt.
+				continue
+			}
+			if codeRefreshErr != nil {
+				continue
+			}
+			err = s.ackCodeRefresh(ctx, op.ID)
+			if err != nil {
+				s.deferCodeRefreshRetry(op.CodeConfig, err)
+				codeReceiptErr = errors.Join(codeReceiptErr, err)
+				continue
+			}
 		case OpDeletePending:
 			err = s.DeletePendingContext(ctx, op.ID)
 		case OpRecordWriteback:
@@ -346,7 +399,7 @@ func (s *Store) drainOpsContextWithTelemetry(ctx context.Context, listFiles list
 		}
 		applied++
 	}
-	return applied, nil
+	return applied, errors.Join(codeRefreshErr, codeReceiptErr)
 }
 
 func newOpsDrainGate() chan struct{} {

@@ -42,6 +42,11 @@ type Store struct {
 	// filesystem/SQLite drain already in progress. DrainOpsContext holds the sole token
 	// from listing the queue through effect commit and file removal.
 	opsDrainGate chan struct{}
+	// Guarded by opsDrainGate. A failed optional source refresh must not repeat
+	// its full scan on every note event while the operational fault persists.
+	codeRefreshRetryAfter  time.Time
+	codeRefreshRetryConfig string
+	codeRefreshRetryErr    error
 
 	closeOnce sync.Once // Close is idempotent: a second close(s.done) would panic
 	closeErr  error     // the first Close's result, replayed to later callers
