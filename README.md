@@ -469,13 +469,31 @@ The lookup slices the five-byte `note:` prefix as bytes to preserve unusual IDs,
 including embedded NULs, and still rejects other namespaces. No schema migration,
 owner restart, embedding call or change to acknowledgement checks is required.
 
-On an Apple M3 synthetic fixture with 3,000 notes and 2,350 768-dimensional
+At v0.33, on an Apple M3 synthetic fixture with 3,000 notes and 2,350 768-dimensional
 vectors, full loads took 10–11 ms versus 12–13 ms with distinct hashes. With all
 notes sharing one hash, loads took 9.5–11.2 ms versus 875–942 ms: primary-key lookup
 avoids walking all same-hash candidates for each vector. Allocation was unchanged
 at about 22.3 MB/load. These microbenchmarks do not establish a live startup or
 acknowledgement SLO. Run `go test ./internal/index -run '^$' -bench
 '^BenchmarkVectorLookup$' -benchtime=3x -count=2` to compare both query strategies.
+
+From v0.34, vector row scans borrow the driver's byte buffer until decoding is
+finished, avoiding an intermediate copy. Only independently allocated float
+slices enter the retriever; borrowed bytes never survive the next row or close.
+Cancellation checks and deferred row closure release the borrowed-buffer read
+hold and discard canceled partial results. Metadata/row snapshot consistency,
+chunk order, exact vector bits and stale/orphan/model filtering are unchanged.
+No schema migration, owner restart or model call is required.
+
+The same 2,350-vector fixture now allocates about 15.0 MB/load instead of 22.3 MB
+(33% less), with about 14,205 allocations instead of 21,253. Allocation profiles
+confirm the scan's intermediate `bytes.Clone` is gone; SQLite's BLOB allocation
+and the final float storage remain. Alternating 50-iteration runs measured
+9.3–16.4 ms versus 11.2–11.7 ms for the prior loader, so this is not a demonstrated
+latency improvement or an end-to-end acknowledgement SLO. Reproduce the current
+loader with `go test ./internal/index -run '^$' -bench
+'^BenchmarkVectorLookup$/^shared_hash=false$/^primary=true$' -benchtime=50x`;
+use a v0.33 checkout for the old allocation baseline.
 
 From v0.29, reader-side traces distinguish acknowledgement polling from snapshot
 installation. `mcp_acknowledge` separates target parsing/hashing, version refresh,

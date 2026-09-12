@@ -214,15 +214,22 @@ func loadVectorsContext(ctx context.Context, q vectorQueryer, afterMeta func()) 
 	// stops every checkpoint from reclaiming past it. In a long-running daemon that
 	// grows the WAL without bound and starves other processes' writes into SQLITE_BUSY.
 	defer rows.Close()
+	var id string
+	var blob sql.RawBytes
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return model, dim, nil, err
 		}
-		var id string
-		var blob []byte
 		if err := rows.Scan(&id, &blob); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return model, dim, nil, ctxErr
+			}
 			return model, dim, byNode, err
 		}
+		// Borrow the driver's bytes only until decoding finishes. decodeVecContext
+		// allocates independent float storage; no borrowed bytes escape to byNode.
+		// Next/Scan/Close may invalidate blob. On cancellation, deferred Close also
+		// releases database/sql's RawBytes read hold before returning to the caller.
 		vec, err := decodeVecContext(ctx, blob)
 		if err != nil {
 			return model, dim, nil, err
