@@ -13,18 +13,24 @@ import (
 	"github.com/bright-interaction/mesh/internal/vault"
 )
 
-// ChangeMonitor samples SQLite's connection-local data_version. Its pinned,
-// read-only connection never writes or holds a transaction between samples.
-// Every external commit invalidates it, including code/vector-only changes and
-// harmless telemetry writes. Values are comparable ONLY on this monitor.
+// ChangeMonitor owns a pinned read-only connection with no transaction between
+// samples. Version samples SQLite's connection-local data_version, invalidated
+// by every external commit. ReaderVersion can instead use the validated optional
+// retrieval tracker to ignore bookkeeping. Values compare ONLY on this monitor.
 // See https://www.sqlite.org/pragma.html#pragma_data_version.
 type ChangeMonitor struct {
-	db       *sql.DB
-	conn     *sql.Conn
-	once     sync.Once
-	err      error
-	path     string
-	identity os.FileInfo
+	db                      *sql.DB
+	conn                    *sql.Conn
+	once                    sync.Once
+	err                     error
+	path                    string
+	identity                os.FileInfo
+	revisionChecked         bool
+	revisionSchema          int64
+	revisionValid           bool
+	revisionModeKnown       bool
+	revisionModeTracked     bool
+	afterRevisionValidation func() // deterministic schema/revision snapshot test seam
 }
 
 // ErrMonitorIndexReplaced disables reuse until the reader is restarted. Hot

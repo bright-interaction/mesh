@@ -397,8 +397,9 @@ From v0.30, ordinary reader refreshes reuse the installed graph/retriever when
 both the database and the consumed retrieval configuration are unchanged.
 A dedicated read-only SQLite connection samples
 [`data_version`](https://www.sqlite.org/pragma.html#pragma_data_version) before and
-after construction; values are never compared across connections. Every database
-commit invalidates reuse, including graph/code-link, vector and telemetry writes.
+after construction; values are never compared across connections. In v0.30–v0.31,
+every database commit invalidates reuse, including graph/code-link, vector and
+telemetry writes.
 This is deliberately conservative, not a note-hashes-only cache. The monitor
 holds no transaction between samples and does not occupy the normal read pool.
 Queued callers recheck after acquiring the reload mutex, coalescing duplicate
@@ -409,11 +410,11 @@ Construction consumes an immutable snapshot of parsed configuration, environment
 and user-local subscription preferences; a fresh input comparison detects
 same-size/mtime edits without mislabelling a racing configuration read. No model
 is called. Config/monitor/optional-vector-read failures disable reuse, and a
-commit during construction forces another refresh on the next pass. Inputs and
+relevant commit during construction forces another refresh on the next pass. Inputs and
 digests are not logged. `mcp_refresh.freshness_check` and `retriever_config` time
 the lightweight local checks. Hot replacement of an open database file is not a
-supported rebuild and requires a reader restart. There is no schema migration,
-new writer, longer acknowledgement deadline or weaker publication check.
+supported rebuild and requires a reader restart. Those v0.30 changes require no
+schema migration, new writer, longer deadline or weaker publication check.
 
 From v0.31, full reader graph loads preallocate their maps from node/edge counts
 read in the same SQLite snapshot, with hints capped at 65,536 entries per map.
@@ -422,8 +423,43 @@ mutable node attributes or edges. A synthetic 24,000-node / 48,000-edge benchmar
 allocated 58.5 MB/load instead of 69.3 MB/load (15.5% less); measured runtime was
 roughly 109–112 ms in both cases, so this is an allocation reduction, not a
 demonstrated latency improvement or end-to-end acknowledgement SLO. The capacity
-query is timed as `load_graph.capacity`. Database commits, including bookkeeping,
-still invalidate reuse; distinguishing them requires a separate freshness protocol.
+query is timed as `load_graph.capacity`.
+
+From v0.32, an optional persisted retrieval revision lets ordinary reader refreshes
+reuse their graph/retriever after bookkeeping-only commits. The owning writable
+opener installs one derived singleton table and 30
+[SQLite AFTER triggers](https://www.sqlite.org/lang_createtrigger.html), atomically.
+The base schema version stays unchanged: existing notes, vectors, telemetry and
+pending candidates are not rewritten. Old readers still work; new readers with
+an old owner/database fall back to whole-database invalidation until an upgraded
+writer installs the tracker. Activation therefore requires upgrading/restarting
+the owner, not just the MCP reader. Never start a second writer to install it.
+
+Triggers cover notes, nodes, edges, vectors, corpus stats, code tables, note/code
+links and metadata (except `health_completed_at`). They also run for writes from
+older processes that know nothing about this protocol. Usage/reuse counters,
+health findings, dropped/pending notes and FTS tables are read live and do not
+invalidate cached graph/retriever state. FTS is not an in-memory retrieval cache.
+Adding cached database inputs requires reviewing the tracking protocol.
+
+Readers validate the exact tracker definitions when SQLite's schema version
+changes, then sample the epoch/revision on that same short read snapshot. Missing,
+altered or additional persistent triggers, invalid/missing revision rows and read errors prevent
+targeted reuse; schema/epoch changes invalidate it. Canonical partial installs
+can be repaired by the owning opener with a new epoch; unrecognized definitions
+are left untouched. Tracker rows and SQLite's schema counter are reserved, not
+operator-editable metadata. No snapshot is held between samples. Model/config handling,
+exact-version acknowledgement loads and final publication checks stay unchanged.
+Content-free logs report `reader freshness tracking` mode `retrieval_revision_v1`
+or the conservative `data_version` fallback.
+
+On a synthetic 3,000-node graph, a real metric commit plus refresh took
+0.37–0.41 ms with tracking versus 7.64–8.44 ms without, allocating about 29 KB
+versus 5.39 MB. This is not a live acknowledgement SLO. Triggers have write cost:
+an isolated 1,000-row UPDATE took 0.95–1.08 ms versus 0.36–0.49 ms without
+tracking; a one-row UPDATE took 79–151 µs versus 59–84 µs (three runs of 50
+iterations). These are Apple M3 microbenchmarks, not full indexing timings.
+Avoiding repeated reader rebuilds is the intended tradeoff.
 
 From v0.29, reader-side traces distinguish acknowledgement polling from snapshot
 installation. `mcp_acknowledge` separates target parsing/hashing, version refresh,

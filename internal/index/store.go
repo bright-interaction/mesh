@@ -1201,7 +1201,9 @@ func ensureSchemaOn(ctx context.Context, db schemaConnection, allowRebuild, dbEx
 		}
 		schemaMismatch = derivedErr != nil
 		if derivedErr == nil && len(invalidKept) == 0 && currentKeep == keepShapeVersion {
-			return nil // exact current schema: opening it must perform no DDL
+			// The base shape is current. Install the optional reader tracker once;
+			// subsequent opens of a complete install perform no DDL or row writes.
+			return ensureReaderRevision(ctx, db)
 		}
 	}
 	if !allowRebuild && (schemaMismatch || len(invalidKept) != 0 || keptStampMismatch) {
@@ -1253,7 +1255,10 @@ func ensureSchemaOn(ctx context.Context, db schemaConnection, allowRebuild, dbEx
 		`INSERT INTO meta(key,value) VALUES('keep_shape_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 		fmt.Sprint(keepShapeVersion),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureReaderRevision(ctx, db)
 }
 
 // dropSchemaObject removes an expected schema object by the type SQLite says it has.

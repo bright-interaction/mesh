@@ -59,7 +59,7 @@ type Server struct {
 	// Refresh reuse state is guarded by reloadMu. The monitor is connection-local;
 	// it must never be replaced while retaining a reusable version stamp.
 	changeMonitor       *index.ChangeMonitor
-	viewVersion         int64
+	viewVersion         index.ReaderVersion
 	viewConfig          [32]byte
 	viewReusable        bool
 	viewBuildComplete   bool
