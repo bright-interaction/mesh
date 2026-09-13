@@ -1,0 +1,36 @@
+import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { sha256, shippedSources, shippedAssets, validateArchive, canonicalArchive } from './archive.mjs';
+
+const root = fileURLToPath(new URL('../', import.meta.url));
+const args = process.argv.slice(2);
+if (args.some(arg => arg !== '--allow-dirty')) throw new Error('Only --allow-dirty is supported for local development builds');
+const allowDirty = args.includes('--allow-dirty');
+const run = (exe, args) => execFileSync(exe, args, { cwd: root, stdio: 'inherit' });
+run(process.execPath, ['scripts/build.mjs']);
+const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+if (!/^\d+\.\d+\.\d+$/.test(pkg.version)) throw new Error('Release packaging requires a stable semver version');
+const source = JSON.parse(await readFile(path.join(root, 'media/source.json'), 'utf8'));
+if (!/^[0-9a-f]{40}$/.test(source.base_commit) || (!allowDirty && source.dirty !== false)) throw new Error('Commit source before release packaging; --allow-dirty is only for local checks');
+const expected = { name: pkg.name, publisher: pkg.publisher, version: pkg.version, commit: source.base_commit, contents: {} };
+for (const [entry, file] of [['extension/package.json', 'package.json'], ['extension/media/source.json', 'media/source.json'], ['extension/readme.md', 'README.md'], ['extension/LICENSE.txt', 'LICENSE'], ...shippedSources.map(n => ['extension/src/' + n, 'src/' + n]), ...shippedAssets.map(n => ['extension/media/' + n, 'media/' + n])]) expected.contents[entry] = await readFile(path.join(root, file));
+const temp = await mkdtemp(path.join(tmpdir(), 'mesh-vsix-build-'));
+try {
+  const raw = path.join(temp, 'raw.vsix');
+  run(process.execPath, ['node_modules/@vscode/vsce/vsce', 'package', '--no-dependencies', '--allow-missing-repository', '--out', raw]);
+  const bytes = canonicalArchive(validateArchive(await readFile(raw), expected, allowDirty));
+  validateArchive(bytes, expected, allowDirty);
+  const file = `mesh-workspace-${pkg.version}.vsix`;
+  const release = path.join(root, 'release');
+  await mkdir(release, { recursive: true });
+  await writeFile(path.join(release, file), bytes);
+  const manifest = { schema: 1, extension: pkg.publisher + '.' + pkg.name, version: pkg.version, source_commit: source.base_commit, dirty: source.dirty, file, bytes: bytes.length, sha256: sha256(bytes) };
+  await writeFile(path.join(release, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  await writeFile(path.join(release, 'SHA256SUMS'), `${manifest.sha256}  ${file}\n`);
+  console.log(JSON.stringify(manifest));
+} finally {
+  await rm(temp, { recursive: true, force: true }); // exact build-created temporary directory
+}

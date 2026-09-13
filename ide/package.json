@@ -2,7 +2,7 @@
   "name": "mesh-workspace",
   "displayName": "Mesh",
   "description": "Your shared knowledge graph, search and notes inside the editor.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "bright-interaction",
   "license": "SEE LICENSE IN LICENSE",
   "engines": { "vscode": "^1.96.0" },
@@ -41,6 +41,11 @@
   "scripts": {
     "build": "bun scripts/build.mjs",
     "test": "bun test test",
-    "package": "bun run build && bunx --bun @vscode/vsce@3.6.2 package --no-dependencies --allow-missing-repository --out mesh-workspace-0.2.0.vsix"
+    "package": "bun scripts/package.mjs",
+    "ci": "bun scripts/ci.mjs"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.6.2",
+    "fflate": "0.8.2"
   }
 }

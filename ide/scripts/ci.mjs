@@ -1,0 +1,18 @@
+import { execFileSync } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { sha256 } from './archive.mjs';
+const root = fileURLToPath(new URL('../', import.meta.url));
+const args = process.argv.slice(2);
+if (args.some(arg => arg !== '--allow-dirty')) throw new Error('Unexpected CI argument');
+const run = args => execFileSync(process.execPath, args, { cwd: root, stdio: 'inherit' });
+run(['audit', '--audit-level=high']);
+run(['scripts/build.mjs']);
+run(['test', 'test']);
+run(['scripts/package.mjs', ...args]);
+const first = JSON.parse(await readFile(new URL('../release/manifest.json', import.meta.url), 'utf8'));
+const hash = sha256(await readFile(new URL('../release/' + first.file, import.meta.url)));
+run(['scripts/package.mjs', ...args]);
+const second = JSON.parse(await readFile(new URL('../release/manifest.json', import.meta.url), 'utf8'));
+if (JSON.stringify(first) !== JSON.stringify(second) || hash !== sha256(await readFile(new URL('../release/' + second.file, import.meta.url)))) throw new Error('VSIX is not byte-reproducible');
+console.log('PASS IDE tests, exact archive inventory/source checks and byte-reproducible VSIX packaging');
