@@ -100,6 +100,9 @@ func (s *Server) ensureFresh(ctx context.Context) error {
 			return err
 		}
 		if before == after {
+			if err := webContextErr(ctx); err != nil {
+				return err
+			}
 			s.publishGraph(g) // also invalidates vectors/retriever, including vector-only commits
 			s.viewVersion, s.viewReusable = after, true
 			return nil

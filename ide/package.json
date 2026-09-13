@@ -2,24 +2,35 @@
   "name": "mesh-workspace",
   "displayName": "Mesh",
   "description": "Your shared knowledge graph, search and notes inside the editor.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "bright-interaction",
   "license": "SEE LICENSE IN LICENSE",
   "engines": { "vscode": "^1.96.0" },
   "categories": ["Other"],
   "extensionKind": ["ui"],
   "main": "./src/extension.js",
-  "activationEvents": ["onWebviewPanel:mesh.workspace"],
+  "activationEvents": ["onStartupFinished", "onWebviewPanel:mesh.workspace"],
   "capabilities": { "untrustedWorkspaces": { "supported": false } },
   "contributes": {
     "commands": [
       { "command": "mesh.open", "title": "Open", "category": "Mesh", "icon": "$(symbol-misc)" },
       { "command": "mesh.refresh", "title": "Refresh View", "category": "Mesh" },
-      { "command": "mesh.configureServer", "title": "Set Local Viewer URL", "category": "Mesh" }
+      { "command": "mesh.configureServer", "title": "Set Local Viewer URL", "category": "Mesh" },
+      { "command": "mesh.configureStartup", "title": "Configure Viewer Startup", "category": "Mesh" }
     ],
     "configuration": {
       "title": "Mesh",
       "properties": {
+        "mesh.startup": {
+          "type": "object", "scope": "machine", "default": { "enabled": false },
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "binary": { "type": "string" },
+            "vault": { "type": "string" }
+          },
+          "description": "Opt-in, user-level read-only startup. Configure with Mesh: Configure Viewer Startup. Only absolute local executable/vault paths are accepted; workspace overrides are ignored. Existing listeners are never stopped."
+        },
         "mesh.viewerUrl": {
           "type": "string", "default": "http://127.0.0.1:7474", "scope": "machine",
           "description": "Local Mesh web viewer URL. Root URLs also try /app. Only the user-level value is used; workspace settings cannot redirect your vault requests. No index owner is started."
@@ -30,6 +41,6 @@
   "scripts": {
     "build": "bun scripts/build.mjs",
     "test": "bun test test",
-    "package": "bun run build && bunx --bun @vscode/vsce@3.6.2 package --no-dependencies --allow-missing-repository --out mesh-workspace-0.1.0.vsix"
+    "package": "bun run build && bunx --bun @vscode/vsce@3.6.2 package --no-dependencies --allow-missing-repository --out mesh-workspace-0.2.0.vsix"
   }
 }

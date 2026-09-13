@@ -59,18 +59,23 @@ function getJSON(url, signal, { timeout = 15000, maxBytes = MAX_BYTES } = {}) {
 }
 class MeshClient {
   constructor(base, transport = getJSON) { this.base = viewerURL(base); this.transport = transport; this.resolved = null; }
+  async connect(signal) {
+    let base = this.base;
+    let status = await this.transport(base + '/api/status', signal);
+    if (status.status === 404 && new URL(base).pathname === '/') {
+      base += '/app'; status = await this.transport(base + '/api/status', signal);
+    }
+    if (status.status !== 200) throw new Error('Mesh viewer unavailable or locked.');
+    const data = JSON.parse(status.body);
+    if (!data || typeof data.counts !== 'object' || data.counts === null || Array.isArray(data.counts)) throw new Error('This endpoint is not a Mesh viewer');
+    if (signal?.aborted) throw new Error('Viewer request aborted');
+    this.resolved = base;
+    return status;
+  }
   async request(raw, signal) {
     const route = readPath(raw);
     if (!this.resolved) {
-      let base = this.base;
-      let status = await this.transport(base + '/api/status', signal);
-      if (status.status === 404 && new URL(base).pathname === '/') {
-        base += '/app'; status = await this.transport(base + '/api/status', signal);
-      }
-      if (status.status !== 200) throw new Error('Mesh viewer unavailable or locked. Check its URL in Mesh: Set Local Viewer URL.');
-      const data = JSON.parse(status.body);
-      if (!data || typeof data.counts !== 'object' || data.counts === null) throw new Error('This endpoint is not a Mesh viewer');
-      this.resolved = base;
+      const status = await this.connect(signal);
       if (route === '/api/status') return status;
     }
     return this.transport(this.resolved + route, signal);

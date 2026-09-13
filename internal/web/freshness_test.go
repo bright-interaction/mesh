@@ -5,6 +5,7 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,147 @@ func freshRequest(s *Server, route string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, route, nil))
 	return w
+}
+
+func TestViewerStartupLoadsOnceAndFirstReadReusesGraph(t *testing.T) {
+	dir := t.TempDir()
+	seedIndex(t, dir)
+	loads := 0
+	s, err := newReadOnlyServerContext(context.Background(), dir, func(ctx context.Context, s *Server) (*graph.Graph, error) {
+		loads++
+		return s.store.LoadGraphContext(ctx)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	s.updateCheck = nil
+	startupGraph := s.graph
+	if loads != 1 || startupGraph == nil || !s.viewReusable || s.changeMonitor == nil {
+		t.Fatalf("startup did not publish one stamped graph: loads=%d reusable=%v", loads, s.viewReusable)
+	}
+	for _, route := range []string{"/api/status", "/graph.json", "/api/status"} {
+		if w := freshRequest(s, route); w.Code != 200 {
+			t.Fatalf("%s: %d %s", route, w.Code, w.Body.String())
+		}
+	}
+	if loads != 1 || s.graph != startupGraph {
+		t.Fatalf("unchanged first reads repeated startup load: loads=%d", loads)
+	}
+}
+
+func TestViewerStartupBracketsExternalCommit(t *testing.T) {
+	for _, continuous := range []bool{false, true} {
+		t.Run(fmt.Sprintf("continuous-writes=%v", continuous), func(t *testing.T) {
+			dir := t.TempDir()
+			seedIndex(t, dir)
+			loads := 0
+			var opened *Server
+			s, err := newReadOnlyServerContext(context.Background(), dir, func(ctx context.Context, current *Server) (*graph.Graph, error) {
+				opened = current
+				g, err := current.store.LoadGraphContext(ctx)
+				if err != nil {
+					return nil, err
+				}
+				loads++
+				if loads == 1 || continuous {
+					writeNote(t, dir, "startup-race.md", fmt.Sprintf("---\nid: startup-race\ntype: note\nwhen: 2026-01-01\n---\n# Startup race\nrevision %d\n", loads))
+					seedIndex(t, dir)
+				}
+				return g, nil
+			})
+			if continuous {
+				if err == nil || s != nil || opened == nil || !opened.viewClosed || opened.viewReusable || opened.graph != nil || loads != 2 {
+					t.Fatalf("unstable startup published graph or leaked server: err=%v loads=%d", err, loads)
+				}
+				assertStartupReaderClosed(t, opened)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			if _, found := s.graph.Node("note:startup-race"); loads != 2 || !found || !s.viewReusable {
+				t.Fatalf("startup blessed earlier graph: loads=%d found=%v reusable=%v", loads, found, s.viewReusable)
+			}
+			if w := freshRequest(s, "/graph.json"); w.Code != 200 || loads != 2 || !strings.Contains(w.Body.String(), "startup-race") {
+				t.Fatalf("stable startup was not reused: status=%d loads=%d", w.Code, loads)
+			}
+		})
+	}
+}
+
+func assertStartupReaderClosed(t *testing.T, s *Server) {
+	t.Helper()
+	if s.changeMonitor == nil {
+		t.Fatal("test did not exercise an opened monitor")
+	}
+	if _, err := s.changeMonitor.ReaderVersion(context.Background()); !errors.Is(err, sql.ErrConnDone) {
+		t.Fatalf("startup monitor was not closed: %v", err)
+	}
+	if _, err := s.store.LoadGraphContext(context.Background()); err == nil || !strings.Contains(err.Error(), "database is closed") {
+		t.Fatalf("startup read store was not closed: %v", err)
+	}
+}
+
+func TestViewerCanceledStartupClosesMonitorAndStore(t *testing.T) {
+	for _, returnGraph := range []bool{false, true} {
+		t.Run(fmt.Sprintf("loader-returns-graph=%v", returnGraph), func(t *testing.T) {
+			dir := t.TempDir()
+			seedIndex(t, dir)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var opened *Server
+			s, err := newReadOnlyServerContext(ctx, dir, func(ctx context.Context, current *Server) (*graph.Graph, error) {
+				opened = current
+				g, err := current.store.LoadGraphContext(ctx)
+				if err != nil {
+					return nil, err
+				}
+				cancel()
+				if returnGraph {
+					return g, nil // cancellation must be checked even if a loader returns success
+				}
+				return nil, ctx.Err()
+			})
+			if !errors.Is(err, context.Canceled) || s != nil || opened == nil || !opened.viewClosed || opened.viewReusable || opened.graph != nil {
+				t.Fatalf("canceled startup published graph or leaked server: %v", err)
+			}
+			assertStartupReaderClosed(t, opened)
+		})
+	}
+}
+
+func TestViewerStartupFailsClosedForReplacedIndex(t *testing.T) {
+	dir := t.TempDir()
+	seedIndex(t, dir)
+	db := filepath.Join(dir, ".mesh", "mesh.db")
+	backup := db + ".test-backup"
+	var opened *Server
+	s, err := newReadOnlyServerContext(context.Background(), dir, func(ctx context.Context, current *Server) (*graph.Graph, error) {
+		opened = current
+		g, err := current.store.LoadGraphContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Rename(db, backup); err != nil {
+			return nil, err
+		}
+		t.Cleanup(func() { _ = os.Rename(backup, db) })
+		if err := os.WriteFile(db, []byte("replacement"), 0600); err != nil {
+			return nil, err
+		}
+		return g, nil
+	})
+	if !errors.Is(err, index.ErrMonitorIndexReplaced) || s != nil || opened == nil || !opened.viewClosed || opened.viewReusable || opened.graph != nil {
+		t.Fatalf("startup accepted replacement index: %v", err)
+	}
+	// Restore the original identity so the monitor probe checks connection
+	// closure, not its earlier identity guard.
+	if err := os.Rename(backup, db); err != nil {
+		t.Fatal(err)
+	}
+	assertStartupReaderClosed(t, opened)
 }
 
 func TestViewerReadsObserveExternalOwnerCommits(t *testing.T) {
@@ -74,7 +216,8 @@ func TestViewerReadsObserveExternalOwnerCommits(t *testing.T) {
 
 func TestViewerFreshnessSharesReloadAndReusesUnchangedGraph(t *testing.T) {
 	s, _ := cfgServer(t)
-	loads := 0 // graph gate serializes all callers
+	s.viewReusable = false // exercise one shared refresh after the stamped startup load
+	loads := 0             // graph gate serializes all callers
 	s.loadFreshGraph = func(ctx context.Context) (*graph.Graph, error) { loads++; return s.store.LoadGraphContext(ctx) }
 	var wg sync.WaitGroup
 	for range 12 {
@@ -99,6 +242,7 @@ func TestViewerFreshnessSharesReloadAndReusesUnchangedGraph(t *testing.T) {
 
 func TestViewerFreshnessNeverLabelsEarlierGraphWithLaterRevision(t *testing.T) {
 	s, dir := cfgServer(t)
+	s.viewReusable = false
 	loads := 0
 	s.loadFreshGraph = func(ctx context.Context) (*graph.Graph, error) {
 		g, err := s.store.LoadGraphContext(ctx)
@@ -122,13 +266,14 @@ func TestViewerFreshnessNeverLabelsEarlierGraphWithLaterRevision(t *testing.T) {
 }
 
 func TestViewerFreshnessFailsClosedForReplacedIndex(t *testing.T) {
-	for _, warm := range []bool{false, true} {
-		t.Run(fmt.Sprintf("monitor-warmed=%v", warm), func(t *testing.T) {
+	for _, recreate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("monitor-recreated=%v", recreate), func(t *testing.T) {
 			s, dir := cfgServer(t)
-			if warm {
-				if err := s.ensureFresh(context.Background()); err != nil {
+			if recreate {
+				if err := s.changeMonitor.Close(); err != nil {
 					t.Fatal(err)
 				}
+				s.changeMonitor = nil
 			}
 			db := filepath.Join(dir, ".mesh", "mesh.db")
 			backup := db + ".test-backup"
@@ -181,6 +326,7 @@ func TestViewerVectorOnlyCommitInvalidatesRetriever(t *testing.T) {
 
 func TestViewerRefreshCancellationReleasesGateWithoutPublishing(t *testing.T) {
 	s, _ := cfgServer(t)
+	s.viewReusable = false
 	started := make(chan struct{})
 	s.loadFreshGraph = func(ctx context.Context) (*graph.Graph, error) {
 		close(started)
@@ -219,7 +365,13 @@ func TestViewerReadinessIsAuthenticatedAndTruthful(t *testing.T) {
 	s, dir := cfgServer(t)
 	s.updateCheck = nil
 	s.auth.token = "test-only-token"
-	if w := freshRequest(s, "/api/status"); w.Code != 401 || s.changeMonitor != nil {
+	loads := 0
+	s.viewReusable = false
+	s.loadFreshGraph = func(ctx context.Context) (*graph.Graph, error) {
+		loads++
+		return s.store.LoadGraphContext(ctx)
+	}
+	if w := freshRequest(s, "/api/status"); w.Code != 401 || loads != 0 || s.viewReusable {
 		t.Fatal("unauthorized request probed the index")
 	}
 	s.auth.token = ""

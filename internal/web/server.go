@@ -263,8 +263,14 @@ func NewServer(vaultRoot string) (*Server, error) {
 }
 
 // NewServerContext is NewServer with caller-controlled cancellation for the graph
-// load. The read-only store is closed before a cancellation is returned.
+// load. The monitor and read-only store are closed before a cancellation is returned.
 func NewServerContext(ctx context.Context, vaultRoot string) (*Server, error) {
+	return newReadOnlyServerContext(ctx, vaultRoot, nil)
+}
+
+// The loader seam lets startup tests observe the same revision-bracketed load as
+// request refreshes, without mutable package globals or a second startup read.
+func newReadOnlyServerContext(ctx context.Context, vaultRoot string, load func(context.Context, *Server) (*graph.Graph, error)) (*Server, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -279,12 +285,17 @@ func NewServerContext(ctx context.Context, vaultRoot string) (*Server, error) {
 	if identityErr != nil {
 		return nil, startupFailure(ctx, identityErr, store.Close())
 	}
-	g, err := store.LoadGraphContext(ctx)
-	if err != nil {
-		return nil, startupFailure(ctx, err, store.Close())
-	}
-	s := newServerContext(ctx, vaultRoot, store, g)
+	s := newServerContext(ctx, vaultRoot, store, nil)
 	s.indexIdentity = identity
+	if load != nil {
+		s.loadFreshGraph = func(ctx context.Context) (*graph.Graph, error) { return load(ctx, s) }
+	}
+	// Pin the monitor to the original reader identity and bracket the initial
+	// graph load with revision samples. The first unchanged request can now
+	// reuse this graph instead of loading the entire index a second time.
+	if err := s.ensureFresh(ctx); err != nil {
+		return nil, startupFailure(ctx, err, s.Close())
+	}
 	return s, nil
 }
 
