@@ -1,6 +1,7 @@
 import { test, expect } from 'bun:test';
 import { zipSync } from 'fflate';
 import { canonicalArchive, validateArchive, sha256, shippedAssets, shippedSources } from '../scripts/archive.mjs';
+import { releasePlan } from '../scripts/release-plan.mjs';
 
 function fixture() {
   const bytes = value => Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
@@ -14,13 +15,29 @@ function fixture() {
   return { files, expected };
 }
 
+test('release handoff validates the exact clean bundle and emits draft-only arguments without execution', () => {
+  const { files, expected } = fixture();
+  const bytes = canonicalArchive(files);
+  const info = { schema: 1, extension: 'bright-interaction.mesh-workspace', version: expected.version, source_commit: expected.commit, dirty: false, file: `mesh-workspace-${expected.version}.vsix`, bytes: bytes.length, sha256: sha256(bytes) };
+  const sums = `${info.sha256}  ${info.file}\n`;
+  const plan = releasePlan(info, bytes, sums, expected);
+  expect(plan.repository).toBe('bright-interaction/mesh'); expect(plan.tag).toBe('ide-v0.2.1');
+  expect(plan.draft_command).toContain('--draft'); expect(plan.draft_command).toContain('--verify-tag'); expect(plan.draft_command).toContain('--latest=false');
+  expect(plan.draft_command).not.toContain('--clobber'); expect(plan.draft_command).not.toContain('--target');
+  for (const patch of [{ dirty: true }, { source_commit: 'b'.repeat(40) }, { sha256: '0'.repeat(64) }, { file: '../bad.vsix' }]) expect(() => releasePlan({ ...info, ...patch }, bytes, sums, expected)).toThrow();
+  expect(() => releasePlan(info, bytes, 'wrong sums', expected)).toThrow();
+  files['extension/src/extension.js'] = Buffer.from('different runtime');
+  const changed = canonicalArchive(files), tampered = { ...info, bytes: changed.length, sha256: sha256(changed) };
+  expect(() => releasePlan(tampered, changed, `${tampered.sha256}  ${tampered.file}\n`, expected)).toThrow('source content');
+});
+
 test('canonical VSIX ignores original order and ZIP timestamps', () => {
   const { files, expected } = fixture();
   const reversed = Object.fromEntries(Object.entries(files).reverse());
   const first = canonicalArchive(validateArchive(zipSync(files, { mtime: new Date(2020, 1, 2) }), expected));
   const second = canonicalArchive(validateArchive(zipSync(reversed, { mtime: new Date(2025, 7, 8) }), expected));
   expect(first.equals(second)).toBe(true);
-  expect(Object.keys(validateArchive(first, expected))).toHaveLength(23);
+  expect(Object.keys(validateArchive(first, expected))).toHaveLength(25);
 });
 
 test('archive gate rejects missing, unexpected and traversal paths', () => {

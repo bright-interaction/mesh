@@ -2,7 +2,7 @@
   "name": "mesh-workspace",
   "displayName": "Mesh",
   "description": "Your shared knowledge graph, search and notes inside the editor.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "bright-interaction",
   "license": "SEE LICENSE IN LICENSE",
   "engines": { "vscode": "^1.96.0" },
@@ -16,7 +16,8 @@
       { "command": "mesh.open", "title": "Open", "category": "Mesh", "icon": "$(symbol-misc)" },
       { "command": "mesh.refresh", "title": "Refresh View", "category": "Mesh" },
       { "command": "mesh.configureServer", "title": "Set Local Viewer URL", "category": "Mesh" },
-      { "command": "mesh.configureStartup", "title": "Configure Viewer Startup", "category": "Mesh" }
+      { "command": "mesh.configureStartup", "title": "Configure Viewer Startup", "category": "Mesh" },
+      { "command": "mesh.checkUpdates", "title": "Check for IDE Updates", "category": "Mesh" }
     ],
     "configuration": {
       "title": "Mesh",
@@ -42,7 +43,8 @@
     "build": "bun scripts/build.mjs",
     "test": "bun test test",
     "package": "bun scripts/package.mjs",
-    "ci": "bun scripts/ci.mjs"
+    "ci": "bun scripts/ci.mjs",
+    "release:plan": "bun scripts/release-plan.mjs"
   },
   "devDependencies": {
     "@vscode/vsce": "3.6.2",

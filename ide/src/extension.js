@@ -7,9 +7,12 @@ const { MeshClient, viewerURL } = require('./client');
 const { ViewerLifecycle, launchSpec } = require('./lifecycle');
 const { Broker } = require('./broker');
 const { renderView } = require('./view');
+const { updateCommand } = require('./update-command');
 const DEFAULT = 'http://127.0.0.1:7474';
 let deactivateCurrent;
 function activate(context) {
+  const updates = updateCommand(vscode, context.extension.packageJSON.version);
+  context.subscriptions.push(updates, vscode.commands.registerCommand('mesh.checkUpdates', updates.run));
   let panel, broker, listener, lifecycle, ready = false;
   const deliveredReads = new Set();
   const global = key => vscode.workspace.getConfiguration('mesh').inspect(key)?.globalValue;

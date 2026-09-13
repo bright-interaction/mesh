@@ -13,7 +13,7 @@ exports.run = async () => {
   assert(extension, 'Mesh extension missing');
   const api = await extension.activate();
   const commands = await vscode.commands.getCommands(true);
-  for (const command of ['mesh.open', 'mesh.refresh', 'mesh.configureServer', 'mesh.configureStartup']) assert(commands.includes(command));
+  for (const command of ['mesh.open', 'mesh.refresh', 'mesh.configureServer', 'mesh.configureStartup', 'mesh.checkUpdates']) assert(commands.includes(command));
   const ready = async () => {
     for (let i = 0; i < 300; i++) {
       const d = api.diagnostics();
