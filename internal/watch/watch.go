@@ -83,6 +83,47 @@ type Options struct {
 
 const defaultDebounce = 300 * time.Millisecond
 
+// changeBatch records observed events, not when a filesystem write happened.
+// A refresh may precede a delayed fsnotify event in a separate pass; it must
+// never erase an outbound sync request already observed in this batch.
+type changeBatch struct {
+	paths           map[string]struct{}
+	full, needsSync bool
+}
+
+func (b *changeBatch) change(path string) {
+	b.needsSync = true
+	if path == "" {
+		b.refresh()
+	} else if !b.full {
+		if b.paths == nil {
+			b.paths = make(map[string]struct{})
+		}
+		b.paths[filepath.Clean(path)] = struct{}{}
+	}
+}
+
+func (b *changeBatch) refresh() {
+	b.full = true
+	clear(b.paths)
+}
+
+func (b *changeBatch) take() Pass {
+	p := Pass{Reason: ReasonRefresh}
+	if b.needsSync {
+		p.Reason = ReasonChange
+	}
+	if !b.full {
+		for path := range b.paths {
+			p.Paths = append(p.Paths, path)
+		}
+		sort.Strings(p.Paths)
+	}
+	b.full, b.needsSync = false, false
+	clear(b.paths)
+	return p
+}
+
 // DefaultFullReconcile is how often the safety tick runs the AUTHORITATIVE pass, which
 // parses and content-hashes every note in the vault. The tick itself has to stay frequent
 // (a note that missed its file event must be indexed before a reader gives up at
@@ -143,9 +184,7 @@ func Run(ctx context.Context, opt Options) error {
 		<-debounce.C
 	}
 	defer debounce.Stop()
-	pendingPaths := map[string]struct{}{}
-	fullChange := false
-	needsSync := false
+	var pending changeBatch
 
 	var tick <-chan time.Time
 	if opt.Reconcile > 0 {
@@ -164,28 +203,21 @@ func Run(ctx context.Context, opt Options) error {
 			}
 			switch {
 			case ev.Op&fsnotify.Create != 0 && isDir(ev.Name):
-				needsSync = true
 				// A new subdirectory: kqueue/inotify watch one dir at a time, so
 				// add it (and any children) to the watch set, then reconcile in
 				// case files landed inside before the watch was in place.
 				_ = addWatches(w, opt.Root, logf)
-				fullChange = true
-				clear(pendingPaths)
+				pending.change("")
 				resetTimer(debounce, opt.Debounce)
 			case ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 && watched(w, ev.Name):
-				needsSync = true
 				// A watched directory went away: drop its now-dangling watch so we
 				// do not leak a descriptor, and reconcile so its notes leave the
 				// index promptly rather than waiting for the periodic tick.
 				_ = w.Remove(ev.Name)
-				fullChange = true
-				clear(pendingPaths)
+				pending.change("")
 				resetTimer(debounce, opt.Debounce)
 			case relevant(ev):
-				needsSync = true
-				if !fullChange {
-					pendingPaths[filepath.Clean(ev.Name)] = struct{}{}
-				}
+				pending.change(ev.Name)
 				resetTimer(debounce, opt.Debounce)
 			}
 		case err, ok := <-w.Errors:
@@ -198,34 +230,16 @@ func Run(ctx context.Context, opt Options) error {
 			// local change: arm the debounce so a burst of nudges coalesces into one
 			// reconcile. A nil Trigger channel blocks forever, so this case is inert
 			// unless a caller wired one in.
-			fullChange = true
-			needsSync = true
-			clear(pendingPaths)
+			pending.change("")
 			resetTimer(debounce, opt.Debounce)
 		case <-opt.Refresh:
 			// Completion must discover incoming/partially-applied files even if
 			// fsnotify missed them, but must not create a sync -> refresh -> sync
 			// feedback loop. A coalesced real edit/SSE still wins via needsSync.
-			fullChange = true
-			clear(pendingPaths)
+			pending.refresh()
 			resetTimer(debounce, opt.Debounce)
 		case <-debounce.C:
-			var paths []string
-			if !fullChange {
-				paths = make([]string, 0, len(pendingPaths))
-				for path := range pendingPaths {
-					paths = append(paths, path)
-				}
-				sort.Strings(paths)
-			}
-			reason := ReasonRefresh
-			if needsSync {
-				reason = ReasonChange
-			}
-			reconcile(opt, logf, Pass{Reason: reason, Authoritative: false, Paths: paths})
-			fullChange = false
-			needsSync = false
-			clear(pendingPaths)
+			reconcile(opt, logf, pending.take())
 		case <-tick:
 			// Safety net: catches anything the event stream missed (a dropped event,
 			// a same-second rename, a note written before our watches were in place).

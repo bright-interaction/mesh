@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -116,45 +117,115 @@ func TestRunCarriesExactPathsForLocalChangeBurst(t *testing.T) {
 	}
 }
 
+func TestChangeBatchRefreshCoalescing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		events []string
+		want   Pass
+	}{
+		{"refresh only", []string{"refresh", "refresh"}, Pass{Reason: ReasonRefresh}},
+		{"refresh then edit", []string{"refresh", "b.md"}, Pass{Reason: ReasonChange}},
+		{"edit then refresh", []string{"b.md", "refresh"}, Pass{Reason: ReasonChange}},
+		{"refresh then trigger", []string{"refresh", ""}, Pass{Reason: ReasonChange}},
+		{"trigger then refresh", []string{"", "refresh"}, Pass{Reason: ReasonChange}},
+		{"sorted unique paths", []string{"b.md", "a.md", "b.md"}, Pass{Reason: ReasonChange, Paths: []string{"a.md", "b.md"}}},
+		{"trigger clears paths", []string{"a.md", "", "b.md"}, Pass{Reason: ReasonChange}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var batch changeBatch
+			for _, event := range tc.events {
+				if event == "refresh" {
+					batch.refresh()
+				} else {
+					batch.change(event)
+				}
+			}
+			if got := batch.take(); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+			batch.refresh()
+			if got := batch.take(); !reflect.DeepEqual(got, Pass{Reason: ReasonRefresh}) {
+				t.Fatalf("previous batch leaked into refresh: %+v", got)
+			}
+			batch.change("later.md")
+			if got := batch.take(); !reflect.DeepEqual(got, Pass{Reason: ReasonChange, Paths: []string{"later.md"}}) {
+				t.Fatalf("later event lost after refresh: %+v", got)
+			}
+		})
+	}
+}
+
 func TestRefreshNudgeStaysLocalUnlessCombinedWithChange(t *testing.T) {
-	root := t.TempDir()
-	refresh, trigger := make(chan struct{}, 1), make(chan struct{}, 1)
-	passes := make(chan Pass, 8)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- Run(ctx, Options{Root: root, Debounce: 40 * time.Millisecond, Refresh: refresh, Trigger: trigger,
-			OnReindex: func(p Pass) (Result, error) { passes <- p; return Result{}, nil }})
-	}()
-	t.Cleanup(func() { cancel(); <-done })
-	next := func() Pass {
-		t.Helper()
-		select {
-		case p := <-passes:
-			return p
-		case <-time.After(3 * time.Second):
-			t.Fatal("no pass")
-			return Pass{}
+	for _, delayEdit := range []bool{false, true} {
+		name := "immediate edit"
+		if delayEdit {
+			name = "edit after refresh completes"
 		}
-	}
-	if p := next(); p.Reason != ReasonStartup {
-		t.Fatal(p)
-	}
-	refresh <- struct{}{}
-	if p := next(); p.Reason != ReasonRefresh {
-		t.Fatalf("completion became outbound change: %+v", p)
-	}
-	refresh <- struct{}{}
-	trigger <- struct{}{}
-	if p := next(); p.Reason != ReasonChange {
-		t.Fatalf("coalesced SSE lost its sync request: %+v", p)
-	}
-	refresh <- struct{}{}
-	if err := os.WriteFile(filepath.Join(root, "edit.md"), []byte("# edit"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if p := next(); p.Reason != ReasonChange {
-		t.Fatalf("coalesced edit lost its sync request: %+v", p)
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			refresh, trigger := make(chan struct{}, 1), make(chan struct{}, 1)
+			passes := make(chan Pass, 8)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				done <- Run(ctx, Options{Root: root, Debounce: 40 * time.Millisecond, Refresh: refresh, Trigger: trigger,
+					OnReindex: func(p Pass) (Result, error) { passes <- p; return Result{}, nil }})
+			}()
+			t.Cleanup(func() { cancel(); <-done })
+			next := func() Pass {
+				t.Helper()
+				select {
+				case p := <-passes:
+					return p
+				case <-time.After(3 * time.Second):
+					t.Fatal("no pass")
+					return Pass{}
+				}
+			}
+			if p := next(); p.Reason != ReasonStartup {
+				t.Fatal(p)
+			}
+			refresh <- struct{}{}
+			if p := next(); p.Reason != ReasonRefresh {
+				t.Fatalf("completion became outbound change: %+v", p)
+			}
+			refresh <- struct{}{}
+			trigger <- struct{}{}
+			// Channel sends and filesystem notification delivery are not atomic with
+			// the debounce timer. On a loaded host a refresh can legitimately finish
+			// before the change is observed. Assert the outbound request is preserved;
+			// TestChangeBatchRefreshCoalescing pins same-batch priority without timing.
+			nextChange := func() Pass {
+				t.Helper()
+				deadline := time.NewTimer(3 * time.Second)
+				defer deadline.Stop()
+				for {
+					select {
+					case p := <-passes:
+						if p.Reason == ReasonChange {
+							return p
+						}
+						if p.Reason != ReasonRefresh {
+							t.Fatalf("unexpected pass: %+v", p)
+						}
+					case <-deadline.C:
+						t.Fatal("change lost its sync request")
+						return Pass{}
+					}
+				}
+			}
+			nextChange()
+			refresh <- struct{}{}
+			if delayEdit {
+				if p := next(); p.Reason != ReasonRefresh {
+					t.Fatalf("completion became outbound change: %+v", p)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(root, "edit.md"), []byte("# edit"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			nextChange()
+		})
 	}
 }
 
