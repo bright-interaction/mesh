@@ -70,6 +70,14 @@ type Server struct {
 	retrieverGeneration uint64        // guarded by mu; config invalidation can keep the same graph pointer
 	graphUpdateGate     chan struct{} // one token; spans rebuild/load through graph publication
 	reindexStore        owningReindexFunc
+	// Read-only revision tracking, guarded by graphUpdateGate. A monitor never
+	// writes schema or acquires index ownership.
+	changeMonitor  *index.ChangeMonitor
+	indexIdentity  os.FileInfo // pinned before opening the reader, never adopted from a later file
+	viewVersion    index.ReaderVersion
+	viewReusable   bool
+	viewClosed     bool
+	loadFreshGraph func(context.Context) (*graph.Graph, error) // optional deterministic refresh test seam
 
 	// afterPendingFilePublished is a deterministic test seam at the durable boundary of
 	// a pending promotion. Production leaves it nil.
@@ -263,15 +271,21 @@ func NewServerContext(ctx context.Context, vaultRoot string) (*Server, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	identity, identityErr := os.Stat(filepath.Join(vaultRoot, ".mesh", "mesh.db"))
 	store, err := index.OpenReadOnly(vaultRoot)
 	if err != nil {
 		return nil, err
+	}
+	if identityErr != nil {
+		return nil, startupFailure(ctx, identityErr, store.Close())
 	}
 	g, err := store.LoadGraphContext(ctx)
 	if err != nil {
 		return nil, startupFailure(ctx, err, store.Close())
 	}
-	return newServerContext(ctx, vaultRoot, store, g), nil
+	s := newServerContext(ctx, vaultRoot, store, g)
+	s.indexIdentity = identity
+	return s, nil
 }
 
 func startupFailure(ctx context.Context, startupErr, cleanupErr error) error {
@@ -329,6 +343,10 @@ func newOwningServerContext(ctx context.Context, vaultRoot string, reindex ownin
 	cleanup := func(startupErr error) error {
 		return startupFailure(ctx, startupErr, errors.Join(store.Close(), owner.Release()))
 	}
+	identity, err := os.Stat(filepath.Join(vaultRoot, ".mesh", "mesh.db"))
+	if err != nil {
+		return nil, cleanup(err)
+	}
 	g, err := reindex(ctx, store, vaultRoot)
 	if err != nil {
 		return nil, cleanup(err)
@@ -354,6 +372,7 @@ func newOwningServerContext(ctx context.Context, vaultRoot string, reindex ownin
 		return nil, cleanup(err)
 	}
 	s := newServerContext(ctx, vaultRoot, store, g)
+	s.indexIdentity = identity
 	s.owner = owner
 	opCtx, opCancel := context.WithCancel(s.lifetimeContext())
 	s.ownerOpCancel = opCancel
@@ -412,7 +431,17 @@ func (s *Server) Close() error {
 		s.ownerOpCancel()
 		<-s.ownerOpDone // never close the store under an in-flight queue transaction
 	}
-	storeErr := s.store.Close()
+	release, err := s.acquireGraphUpdate(context.Background())
+	if err != nil {
+		return err
+	}
+	s.viewClosed = true
+	var monitorErr error
+	if s.changeMonitor != nil {
+		monitorErr = s.changeMonitor.Close()
+	}
+	release()
+	storeErr := errors.Join(monitorErr, s.store.Close())
 	if s.owner == nil {
 		return storeErr
 	}
@@ -620,7 +649,15 @@ func (s *Server) routes() []route {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	for _, rt := range s.routes() {
-		mux.HandleFunc(rt.pattern, rt.h)
+		handler := rt.h
+		// These routes consume the cached graph/retriever. Authenticate first
+		// (the outer guard below), then observe external owner commits before
+		// reading. Assets/docs and mutation-only routes need no freshness probe.
+		switch rt.pattern {
+		case "GET /graph.json", "GET /api/status", "GET /api/search", "GET /api/note/{id}", "GET /api/dashboard", "POST /api/ask":
+			handler = s.freshRead(handler)
+		}
+		mux.HandleFunc(rt.pattern, handler)
 	}
 	var h http.Handler
 	if s.member != nil {
@@ -777,6 +814,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]any{
 		"vault":  s.exposedVaultRoot(),
+		"viewer": s.viewerReadiness(r),
 		"counts": map[string]int{"notes": notes, "nodes": nodes, "edges": edges, "vectors": vectors},
 		"signals": map[string]bool{
 			"fts":    true,

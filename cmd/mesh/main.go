@@ -2657,7 +2657,7 @@ func uiCmd() *cobra.Command {
 			if hubDB == "" {
 				hubDB = os.Getenv("MESH_UI_HUB_DB")
 			}
-			if !ownIndex {
+			if !cmd.Flags().Changed("own-index") {
 				ownIndex = os.Getenv("MESH_UI_OWN_INDEX") == "1"
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
