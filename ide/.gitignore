@@ -1,0 +1,5 @@
+/media/
+/*.vsix
+/LICENSE
+/node_modules/
+/test-results/

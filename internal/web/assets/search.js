@@ -39,6 +39,15 @@
 
     const q = inner.querySelector("#srch-q");
     const results = inner.querySelector("#srch-results");
+    if (M.searchOnSubmit) {
+      const submit = document.createElement("button");
+      submit.className = "btn";
+      submit.type = "button";
+      submit.textContent = "Search";
+      submit.addEventListener("click", run);
+      q.parentElement.appendChild(submit);
+      results.textContent = "Press Enter or Search. Your existing Mesh retrieval settings apply.";
+    }
     let timer, lastSeq = 0;
 
     async function run() {
@@ -87,7 +96,11 @@
       }
     }
 
+    q.addEventListener("keydown", (event) => {
+      if (M.searchOnSubmit && event.key === "Enter") { event.preventDefault(); run(); }
+    });
     q.addEventListener("input", () => {
+      if (M.searchOnSubmit) return;
       clearTimeout(timer);
       timer = setTimeout(run, 250);
     });

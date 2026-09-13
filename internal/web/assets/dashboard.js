@@ -115,7 +115,7 @@
             '<p style="font-size:.8rem;color:#6e7681;margin-top:.3rem">Run <code>mesh health</code> or the mesh_health tool for details.</p>');
 
       const pending = d.pending_review || 0;
-      const reviewNudge = pending > 0
+      const reviewNudge = pending > 0 && !M.readOnlyViewer
         ? '<div style="border:1px solid #3a2516;background:#1a160e;border-radius:12px;padding:.8rem 1.1rem;margin-top:1rem;font-size:.9rem;color:#fb923c">' +
           n(pending) + ' auto-extracted note' + (pending === 1 ? "" : "s") + ' awaiting review &middot; open the <b>Review</b> tab to keep or discard them</div>'
         : "";

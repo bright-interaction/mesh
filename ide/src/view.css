@@ -1,0 +1,13 @@
+/* Editor-specific layout, leaving the browser viewer unchanged. */
+.srch-box { display: flex; align-items: center; gap: 8px; }
+.srch-box input { min-width: 0; flex: 1; }
+.srch-box .btn { flex: none; }
+#overlay { left: var(--rail-w); pointer-events: none; }
+@media (max-width: 900px) {
+  :root { --rail-w: 112px; }
+  #rail { padding: 16px 8px; }
+  .rail-brand .name { font-size: 13px; }
+  .rail-nav .nav { font-size: 12px; text-align: left; padding: 9px 8px; }
+  #bar { flex-wrap: wrap; gap: 8px; }
+  #bar .stats { display: none; }
+}
