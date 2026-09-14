@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/rerank"
@@ -200,6 +201,14 @@ func TestRunGateBeatsBaselineOnLongNotes(t *testing.T) {
 	r := retrieve.New(s, lg)
 
 	rep := RunGate(s, r, dir, []Case{{Query: "modernc sqlite storage", Relevant: []string{"storage"}}}, 400)
+	if !rep.Valid || len(rep.Errors) != 0 {
+		t.Fatalf("valid fixture rejected: %+v", rep)
+	}
+	for _, latency := range []LatencySummary{rep.MeshLatency, rep.LocalMeshLatency, rep.FTSTop1Latency, rep.FTSTop3Latency} {
+		if latency.Samples != 1 || latency.MedianMillis <= 0 || latency.P95Millis != latency.MedianMillis {
+			t.Fatalf("missing single-query latency: %+v", latency)
+		}
+	}
 	if rep.MeshSurfaced != 1 {
 		t.Errorf("mesh should surface the relevant note, got %d/%d", rep.MeshSurfaced, rep.N)
 	}
@@ -222,5 +231,100 @@ func TestRunGateBeatsBaselineOnLongNotes(t *testing.T) {
 	}
 	if econ.RerankCostWin || econ.RerankPass {
 		t.Fatalf("a quality-neutral 50-token second call incorrectly passed economics: %+v", econ)
+	}
+	// A selected body disappearing must not become a free, successful read.
+	if err := os.Remove(filepath.Join(dir, "a.md")); err != nil {
+		t.Fatal(err)
+	}
+	broken := RunGate(s, r, dir, []Case{{Query: "modernc sqlite storage", Relevant: []string{"storage"}}}, 400)
+	if broken.Valid || broken.Pass || broken.RerankPass || broken.SurfacingWin || broken.AnswerWin || broken.NaiveCostWin || len(broken.Errors) == 0 {
+		t.Fatalf("unreadable body produced a verdict: %+v", broken)
+	}
+	if broken.MeshLatency.Samples != 0 {
+		t.Fatal("failed case included in latency distribution")
+	}
+}
+
+func TestRunGateInvalidInputsAndRetrievalErrors(t *testing.T) {
+	dir := t.TempDir()
+	s, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	g, err := s.LoadGraph()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := retrieve.New(s, g)
+	for _, cases := range [][]Case{nil, {{Query: "sqlite"}}, {{Relevant: []string{"x"}}}, {{Query: "sqlite", Relevant: []string{" "}}}} {
+		rep := RunGate(s, r, dir, cases, 400)
+		if rep.Valid || rep.Pass || len(rep.Errors) == 0 {
+			t.Fatalf("invalid labels accepted: %+v", rep)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := []Case{{Query: "sqlite", Relevant: []string{"x"}}}
+	rep := RunGateContext(ctx, s, r, dir, cases, 400)
+	if rep.Valid || !strings.Contains(strings.Join(rep.Errors, " "), "canceled") || len(rep.Cases) != 0 {
+		t.Fatalf("cancellation ignored: %+v", rep)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rep = RunGate(s, r, dir, cases, 400)
+	if rep.Valid || rep.Pass || !strings.Contains(strings.Join(rep.Errors, " "), "fts retrieval") {
+		t.Fatalf("retrieval error hidden: %+v", rep)
+	}
+}
+
+func TestLatencySummaryUsesMedianAndNearestRankP95(t *testing.T) {
+	values := []float64{100, 2, 4, 8}
+	got := summarizeLatency(values)
+	if got.Samples != 4 || got.MedianMillis != 6 || got.P95Millis != 100 || values[0] != 100 {
+		t.Fatalf("bad summary or mutated input: %+v %v", got, values)
+	}
+	if got := summarizeLatency(nil); got != (LatencySummary{}) {
+		t.Fatalf("empty sample claims latency: %+v", got)
+	}
+}
+
+type delayedReranker struct{ accountingReranker }
+
+func (d delayedReranker) RerankCandidatesMeasured(ctx context.Context, query string, candidates []rerank.Candidate) ([]rerank.Result, rerank.CallStats, error) {
+	time.Sleep(25 * time.Millisecond)
+	return d.accountingReranker.RerankCandidatesMeasured(ctx, query, candidates)
+}
+
+func TestConfiguredLatencyIncludesModelTime(t *testing.T) {
+	dir := t.TempDir()
+	var notes []*index.ParsedNote
+	for _, id := range []string{"one", "two", "three"} {
+		rel := id + ".md"
+		body := "---\nid: " + id + "\ntype: note\n---\n# Storage\nsqlite storage engine\n"
+		if err := os.WriteFile(filepath.Join(dir, rel), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		n, err := index.Parse(rel, []byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		notes = append(notes, n)
+	}
+	s, err := index.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	g, _ := index.BuildGraph(notes)
+	if _, err := s.IndexVault(notes, g); err != nil {
+		t.Fatal(err)
+	}
+	r := retrieve.New(s, g)
+	r.EnableRerank(delayedReranker{})
+	rep := RunGate(s, r, dir, []Case{{Query: "sqlite storage", Relevant: []string{"one"}}}, 400)
+	if !rep.Valid || rep.RerankCalls != 1 || rep.MeshLatency.MedianMillis < 25 {
+		t.Fatalf("model time excluded: %+v", rep)
 	}
 }

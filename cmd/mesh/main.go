@@ -526,6 +526,7 @@ func evalCmd() *cobra.Command {
 	var vaultDir, casesFile string
 	var budget int
 	var requireRerankWin bool
+	var jsonOutput bool
 	c := &cobra.Command{
 		Use:   "eval <cases.json>",
 		Short: "Gate 1: measure Mesh retrieval vs the read-top-3-FTS baseline on a labelled query set",
@@ -554,43 +555,68 @@ func evalCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			rep := eval.RunGate(store, retrieve.NewFromEnv(store, g), vaultDir, cases, budget)
-
-			pf := func(b bool) string {
-				if b {
-					return "PASS"
+			retriever, err := retrieve.NewFromEnvContext(cmd.Context(), store, g)
+			if err != nil {
+				return err
+			}
+			rep := eval.RunGateContext(cmd.Context(), store, retriever, vaultDir, cases, budget)
+			if jsonOutput {
+				if err := json.NewEncoder(cmd.OutOrStdout()).Encode(rep); err != nil {
+					return err
 				}
-				return "FAIL"
 			}
-			fmt.Printf("Gate 1: Mesh vs FTS baselines  (vault: %s, %d cases, budget %d, tokenizer: estimate)\n", vaultDir, rep.N, budget)
-			fmt.Printf("  surfacing recall @K=%d:   mesh %d/%d   fts %d/%d\n", 20, rep.MeshSurfaced, rep.N, rep.FTSSurfaced, rep.N)
-			fmt.Printf("  answer@1 (one body read): mesh %d/%d   fts-top1 %d/%d\n", rep.MeshAnswer1, rep.N, rep.FTSAnswer1, rep.N)
-			fmt.Printf("  tokens median:  mesh %.0f   fts-top1 %.0f (matched)   fts-top3 %.0f (naive)\n", rep.MeshMedian, rep.FTSTop1Median, rep.FTSTop3Median)
-			fmt.Printf("  tokens mean:    mesh %.0f   fts-top1 %.0f             fts-top3 %.0f\n", rep.MeshMean, rep.FTSTop1Mean, rep.FTSTop3Mean)
-			fmt.Printf("  sub-claims: surfacing>=fts %s | answer@1>=fts-top1 %s | cheaper-than-naive-top3 %s\n",
-				pf(rep.SurfacingWin), pf(rep.AnswerWin), pf(rep.NaiveCostWin))
-			if rep.Pass {
-				fmt.Println("  VERDICT: PASS (all three sub-claims hold)")
-			} else {
-				fmt.Println("  VERDICT: PARTIAL (see sub-claims; matched fts-top1 cost shows the card overhead honestly)")
+			if !rep.Valid {
+				return fmt.Errorf("evaluation INVALID; no efficiency verdict: %s", strings.Join(rep.Errors, "; "))
 			}
 
-			if rep.RerankEvaluated {
-				fmt.Printf("\nRerank economics: subscription/endpoint vs the identical local Mesh ranking\n")
-				fmt.Printf("  recall@5:              reranked %d/%d   local %d/%d\n", rep.RerankTop5Surfaced, rep.N, rep.LocalMeshSurfaced, rep.N)
-				fmt.Printf("  answer@1:              reranked %d/%d   local %d/%d\n", rep.MeshAnswer1, rep.N, rep.LocalMeshAnswer1, rep.N)
-				fmt.Printf("  combined tokens median: reranked %.0f   local %.0f\n", rep.CombinedMedian, rep.LocalMeshMedian)
-				fmt.Printf("  combined tokens mean:   reranked %.0f   local %.0f\n", rep.CombinedMean, rep.LocalMeshMean)
-				fmt.Printf("  model use:             %d calls, %d cache hits, %d fallbacks, %d accounted tokens (%d provider-reported calls)\n",
-					rep.RerankCalls, rep.RerankCacheHits, rep.RerankFallbacks, rep.RerankTokens, rep.ProviderReportedCalls)
-				fmt.Printf("  economics gate: quality>=local %s | combined-median<local %s | no-fallbacks %s\n",
-					pf(rep.RerankQualityWin), pf(rep.RerankCostWin), pf(rep.RerankFallbacks == 0))
-				if rep.RerankPass {
-					fmt.Println("  RERANK VERDICT: PASS (the second call earns its token cost)")
+			if !jsonOutput {
+				pf := func(b bool) string {
+					if b {
+						return "PASS"
+					}
+					return "FAIL"
+				}
+				fmt.Printf("Gate 1: Mesh vs FTS baselines  (vault: %s, %d cases, budget %d, tokenizer: estimate)\n", vaultDir, rep.N, budget)
+				fmt.Printf("  surfacing recall @K=%d:   mesh %d/%d   fts %d/%d\n", 20, rep.MeshSurfaced, rep.N, rep.FTSSurfaced, rep.N)
+				fmt.Printf("  answer@1 (one body read): mesh %d/%d   fts-top1 %d/%d\n", rep.MeshAnswer1, rep.N, rep.FTSAnswer1, rep.N)
+				fmt.Printf("  tokens median:  mesh %.0f   fts-top1 %.0f (matched)   fts-top3 %.0f (naive)\n", rep.MeshMedian, rep.FTSTop1Median, rep.FTSTop3Median)
+				fmt.Printf("  tokens mean:    mesh %.0f   fts-top1 %.0f             fts-top3 %.0f\n", rep.MeshMean, rep.FTSTop1Mean, rep.FTSTop3Mean)
+				fmt.Printf("  latency ms (%s):\n", rep.LatencyMethod)
+				for _, arm := range []struct {
+					name    string
+					latency eval.LatencySummary
+				}{
+					{"fts-top1", rep.FTSTop1Latency}, {"fts-top3", rep.FTSTop3Latency},
+					{"local Mesh", rep.LocalMeshLatency}, {"configured Mesh", rep.MeshLatency},
+				} {
+					fmt.Printf("    %-16s median %.3f  p95 %.3f  samples %d\n", arm.name, arm.latency.MedianMillis, arm.latency.P95Millis, arm.latency.Samples)
+				}
+				fmt.Printf("  sub-claims: surfacing>=fts %s | answer@1>=fts-top1 %s | cheaper-than-naive-top3 %s\n",
+					pf(rep.SurfacingWin), pf(rep.AnswerWin), pf(rep.NaiveCostWin))
+				if rep.Pass {
+					fmt.Println("  VERDICT: PASS (all three sub-claims hold)")
 				} else {
-					fmt.Println("  RERANK VERDICT: FAIL (keep this reranker opt-in; it has not earned default routing)")
+					fmt.Println("  VERDICT: PARTIAL (see sub-claims; matched fts-top1 cost shows the card overhead honestly)")
 				}
-			} else if requireRerankWin {
+
+				if rep.RerankEvaluated {
+					fmt.Printf("\nRerank economics: subscription/endpoint vs the identical local Mesh ranking\n")
+					fmt.Printf("  recall@5:              reranked %d/%d   local %d/%d\n", rep.RerankTop5Surfaced, rep.N, rep.LocalMeshSurfaced, rep.N)
+					fmt.Printf("  answer@1:              reranked %d/%d   local %d/%d\n", rep.MeshAnswer1, rep.N, rep.LocalMeshAnswer1, rep.N)
+					fmt.Printf("  combined tokens median: reranked %.0f   local %.0f\n", rep.CombinedMedian, rep.LocalMeshMedian)
+					fmt.Printf("  combined tokens mean:   reranked %.0f   local %.0f\n", rep.CombinedMean, rep.LocalMeshMean)
+					fmt.Printf("  model use:             %d calls, %d cache hits, %d fallbacks, %d accounted tokens (%d provider-reported calls)\n",
+						rep.RerankCalls, rep.RerankCacheHits, rep.RerankFallbacks, rep.RerankTokens, rep.ProviderReportedCalls)
+					fmt.Printf("  economics gate: quality>=local %s | combined-median<local %s | no-fallbacks %s\n",
+						pf(rep.RerankQualityWin), pf(rep.RerankCostWin), pf(rep.RerankFallbacks == 0))
+					if rep.RerankPass {
+						fmt.Println("  RERANK VERDICT: PASS (the second call earns its token cost)")
+					} else {
+						fmt.Println("  RERANK VERDICT: FAIL (keep this reranker opt-in; it has not earned default routing)")
+					}
+				}
+			}
+			if requireRerankWin && !rep.RerankEvaluated {
 				return fmt.Errorf("--require-rerank-win needs a configured MESH_RERANK_AGENT or endpoint")
 			}
 			if !rep.Pass {
@@ -605,6 +631,7 @@ func evalCmd() *cobra.Command {
 	c.Flags().StringVar(&vaultDir, "vault", ".", "vault root")
 	c.Flags().IntVar(&budget, "budget", 0, "token budget for the Mesh arm (0 = unbudgeted)")
 	c.Flags().BoolVar(&requireRerankWin, "require-rerank-win", false, "fail unless configured rerank beats local Mesh on quality and combined token median")
+	c.Flags().BoolVar(&jsonOutput, "json", false, "emit the evaluation report as JSON (including validity, errors and latency); preserve failing exit status")
 	return c
 }
 

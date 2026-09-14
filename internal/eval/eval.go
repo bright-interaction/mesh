@@ -12,9 +12,13 @@ package eval
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/bright-interaction/mesh/internal/index"
 	"github.com/bright-interaction/mesh/internal/retrieve"
@@ -31,7 +35,9 @@ const surfaceK = 20
 
 // CaseResult holds the per-query outcome across the three arms.
 type CaseResult struct {
-	Query string
+	Query                                                     string
+	Errors                                                    []string
+	FTSTop1Millis, FTSTop3Millis, LocalMeshMillis, MeshMillis float64
 	// Surfacing recall at equal K: does a relevant id appear in the candidate set?
 	MeshSurfaced bool
 	FTSSurfaced  bool
@@ -55,8 +61,12 @@ type CaseResult struct {
 
 // Report aggregates the run.
 type Report struct {
-	Cases []CaseResult
-	N     int
+	LatencyMethod                                                 string
+	Cases                                                         []CaseResult
+	N                                                             int
+	Valid                                                         bool
+	Errors                                                        []string
+	FTSTop1Latency, FTSTop3Latency, LocalMeshLatency, MeshLatency LatencySummary
 
 	MeshSurfaced, FTSSurfaced                               int // surfacing recall (equal K)
 	MeshAnswer1, FTSAnswer1                                 int // answer@1
@@ -79,22 +89,89 @@ type Report struct {
 	Pass         bool // all three hold
 }
 
-func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases []Case, budget int) Report {
-	rep := Report{N: len(cases)}
-	var mesh, fts1, fts3, localMesh, combined []int
+// Latencies include retrieval, packing/model work and the bodies each arm reads.
+// Arms run sequentially (FTS, local, configured); caches are not reset. These
+// are observed warm-process timings, not cold-start or production SLO claims.
+type LatencySummary struct {
+	Samples                 int
+	MedianMillis, P95Millis float64
+}
 
-	for _, c := range cases {
+func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases []Case, budget int) Report {
+	return RunGateContext(context.Background(), store, r, vaultRoot, cases, budget)
+}
+
+func RunGateContext(ctx context.Context, store *index.Store, r *retrieve.Retriever, vaultRoot string, cases []Case, budget int) Report {
+	rep := Report{
+		N:             len(cases),
+		LatencyMethod: "retrieval + packing/model work + body reads; sequential FTS/local/configured; caches not reset; excludes setup; successful cases only; nearest-rank p95",
+	}
+	var mesh, fts1, fts3, localMesh, combined []int
+	var meshMS, localMS, fts1MS, fts3MS []float64
+	if len(cases) == 0 {
+		rep.Errors = append(rep.Errors, "no labelled cases")
+	}
+
+	for caseIndex, c := range cases {
+		if err := ctx.Err(); err != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("evaluation interrupted: %v", err))
+			break
+		}
+		labelled := len(c.Relevant) > 0
+		for _, id := range c.Relevant {
+			if strings.TrimSpace(id) == "" {
+				labelled = false
+			}
+		}
+		if strings.TrimSpace(c.Query) == "" || !labelled {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("case %d: query and relevant labels are required", caseIndex+1))
+			continue
+		}
 		want := map[string]bool{}
 		for _, id := range c.Relevant {
 			want["note:"+id] = true
 		}
 
-		fts, _ := store.Search(context.Background(), c.Query, surfaceK)
-		localCards, _ := r.Retrieve(context.Background(), c.Query, retrieve.Options{Budget: budget, NoRerank: true})
+		cr := CaseResult{Query: c.Query}
+		record := func(arm string, err error) {
+			if err != nil {
+				cr.Errors = append(cr.Errors, fmt.Sprintf("%s: %v", arm, err))
+			}
+		}
+		readBody := func(arm, relPath string) int {
+			tokens, err := bodyTokens(vaultRoot, relPath)
+			record(arm+" body", err)
+			return tokens
+		}
+		started := time.Now()
+		fts, err := store.Search(ctx, c.Query, surfaceK)
+		record("fts retrieval", err)
+		if len(fts) > 0 {
+			cr.FTSTop1Tokens = readBody("fts", fts[0].Path)
+		}
+		cr.FTSTop1Millis = elapsedMillis(started)
+		cr.FTSTop3Tokens = cr.FTSTop1Tokens
+		for i := 1; i < 3 && i < len(fts); i++ {
+			cr.FTSTop3Tokens += readBody("fts", fts[i].Path)
+		}
+		cr.FTSTop3Millis = elapsedMillis(started)
+		started = time.Now()
+		localCards, err := r.Retrieve(ctx, c.Query, retrieve.Options{Budget: budget, NoRerank: true})
+		record("local retrieval", err)
+		if len(localCards) > 0 {
+			cr.LocalMeshTokens = retrieve.TotalTokens(localCards) + readBody("local", localCards[0].Path)
+		}
+		cr.LocalMeshMillis = elapsedMillis(started)
 		var economics retrieve.Economics
-		cards, _ := r.Retrieve(context.Background(), c.Query, retrieve.Options{Budget: budget, Economics: &economics})
-
-		cr := CaseResult{Query: c.Query, RerankRoute: economics.Route}
+		started = time.Now()
+		cards, err := r.Retrieve(ctx, c.Query, retrieve.Options{Budget: budget, Economics: &economics})
+		record("configured retrieval", err)
+		if len(cards) > 0 {
+			cr.MeshTokens = retrieve.TotalTokens(cards) + readBody("configured", cards[0].Path)
+		}
+		cr.MeshMillis = elapsedMillis(started)
+		record("evaluation context", ctx.Err())
+		cr.RerankRoute = economics.Route
 
 		// Surfacing recall at equal K.
 		for i, h := range fts {
@@ -130,23 +207,26 @@ func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases 
 		// Answer@1: the one body each arm reads.
 		if len(fts) > 0 {
 			cr.FTSAnswer1 = want[fts[0].NodeID]
-			cr.FTSTop1Tokens = bodyTokens(vaultRoot, fts[0].Path)
-		}
-		for i := 0; i < 3 && i < len(fts); i++ {
-			cr.FTSTop3Tokens += bodyTokens(vaultRoot, fts[i].Path)
 		}
 		if len(cards) > 0 {
 			cr.MeshAnswer1 = want[cards[0].NodeID]
-			cr.MeshTokens = retrieve.TotalTokens(cards) + bodyTokens(vaultRoot, cards[0].Path)
 		}
 		if len(localCards) > 0 {
 			cr.LocalMeshAnswer1 = want[localCards[0].NodeID]
-			cr.LocalMeshTokens = retrieve.TotalTokens(localCards) + bodyTokens(vaultRoot, localCards[0].Path)
 		}
 		cr.RerankTokens = economics.ModelTokens()
 		cr.CombinedTokens = cr.MeshTokens + cr.RerankTokens
 
 		rep.Cases = append(rep.Cases, cr)
+		for _, failure := range cr.Errors {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("case %d: %s", caseIndex+1, failure))
+		}
+		if len(cr.Errors) == 0 {
+			meshMS = append(meshMS, cr.MeshMillis)
+			localMS = append(localMS, cr.LocalMeshMillis)
+			fts1MS = append(fts1MS, cr.FTSTop1Millis)
+			fts3MS = append(fts3MS, cr.FTSTop3Millis)
+		}
 		if cr.MeshSurfaced {
 			rep.MeshSurfaced++
 		}
@@ -195,29 +275,50 @@ func RunGate(store *index.Store, r *retrieve.Retriever, vaultRoot string, cases 
 	rep.FTSTop3Mean, rep.FTSTop3Median = mean(fts3), median(fts3)
 	rep.LocalMeshMean, rep.LocalMeshMedian = mean(localMesh), median(localMesh)
 	rep.CombinedMean, rep.CombinedMedian = mean(combined), median(combined)
+	rep.Valid = len(rep.Errors) == 0 && rep.N > 0
+	rep.MeshLatency, rep.LocalMeshLatency = summarizeLatency(meshMS), summarizeLatency(localMS)
+	rep.FTSTop1Latency, rep.FTSTop3Latency = summarizeLatency(fts1MS), summarizeLatency(fts3MS)
 	rep.RerankEvaluated = r.RerankActive()
 	if rep.RerankEvaluated {
-		rep.RerankQualityWin = rep.RerankTop5Surfaced >= rep.LocalMeshSurfaced && rep.MeshAnswer1 >= rep.LocalMeshAnswer1
-		rep.RerankCostWin = rep.CombinedMedian < rep.LocalMeshMedian
+		rep.RerankQualityWin = rep.Valid && rep.RerankTop5Surfaced >= rep.LocalMeshSurfaced && rep.MeshAnswer1 >= rep.LocalMeshAnswer1
+		rep.RerankCostWin = rep.Valid && rep.CombinedMedian < rep.LocalMeshMedian
 		rep.RerankPass = rep.RerankQualityWin && rep.RerankCostWin && rep.RerankFallbacks == 0
 	}
 
-	rep.SurfacingWin = rep.MeshSurfaced >= rep.FTSSurfaced
-	rep.AnswerWin = rep.MeshAnswer1 >= rep.FTSAnswer1
-	rep.NaiveCostWin = rep.MeshMedian < rep.FTSTop3Median
+	rep.SurfacingWin = rep.Valid && rep.MeshSurfaced >= rep.FTSSurfaced
+	rep.AnswerWin = rep.Valid && rep.MeshAnswer1 >= rep.FTSAnswer1
+	rep.NaiveCostWin = rep.Valid && rep.MeshMedian < rep.FTSTop3Median
 	rep.Pass = rep.SurfacingWin && rep.AnswerWin && rep.NaiveCostWin
 	return rep
 }
 
-func bodyTokens(vaultRoot, relPath string) int {
-	if relPath == "" {
-		return 0
+func bodyTokens(vaultRoot, relPath string) (int, error) {
+	if !filepath.IsLocal(relPath) {
+		return 0, fmt.Errorf("invalid vault-relative note path %q", relPath)
 	}
 	data, err := os.ReadFile(filepath.Join(vaultRoot, relPath))
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return retrieve.EstimateTokens(string(data))
+	return retrieve.EstimateTokens(string(data)), nil
+}
+
+func elapsedMillis(start time.Time) float64 {
+	return float64(time.Since(start)) / float64(time.Millisecond)
+}
+
+func summarizeLatency(values []float64) LatencySummary {
+	if len(values) == 0 {
+		return LatencySummary{}
+	}
+	s := append([]float64(nil), values...)
+	sort.Float64s(s)
+	n := len(s)
+	median := s[n/2]
+	if n%2 == 0 {
+		median = (s[n/2-1] + s[n/2]) / 2
+	}
+	return LatencySummary{Samples: n, MedianMillis: median, P95Millis: s[int(math.Ceil(0.95*float64(n)))-1]}
 }
 
 func mean(xs []int) float64 {
