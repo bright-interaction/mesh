@@ -36,23 +36,24 @@ type cfgField struct {
 // envFor maps a config key to the env var that overrides it. key_env fields map to
 // "" (the file holds the var name; nothing overrides the name itself).
 var envFor = map[string]string{
-	"embedding.endpoint":     "MESH_EMBED_ENDPOINT",
-	"embedding.model":        "MESH_EMBED_MODEL",
-	"embedding.dim":          "MESH_EMBED_DIM",
-	"embedding.key_env":      "",
-	"embedding.query_prefix": "MESH_EMBED_QUERY_PREFIX",
-	"embedding.doc_prefix":   "MESH_EMBED_DOC_PREFIX",
-	"retrieval.weight_fts":   "MESH_WEIGHT_FTS",
-	"retrieval.weight_graph": "MESH_WEIGHT_GRAPH",
-	"retrieval.weight_vec":   "MESH_WEIGHT_VEC",
-	"rerank.endpoint":        "MESH_RERANK_ENDPOINT",
-	"rerank.model":           "MESH_RERANK_MODEL",
-	"rerank.key_env":         "",
-	"rerank.blend":           "MESH_RERANK_BLEND",
-	"ann.hnsw_threshold":     "MESH_HNSW_THRESHOLD",
-	"secret_bridge.base_url": "MESH_SECRET_BRIDGE_URL",
-	"secret_bridge.key_env":  "",
-	"secret_bridge.agent_id": "MESH_SECRET_BRIDGE_AGENT_ID",
+	"embedding.endpoint":      "MESH_EMBED_ENDPOINT",
+	"embedding.model":         "MESH_EMBED_MODEL",
+	"embedding.dim":           "MESH_EMBED_DIM",
+	"embedding.key_env":       "",
+	"embedding.query_prefix":  "MESH_EMBED_QUERY_PREFIX",
+	"embedding.doc_prefix":    "MESH_EMBED_DOC_PREFIX",
+	"retrieval.weight_fts":    "MESH_WEIGHT_FTS",
+	"retrieval.weight_graph":  "MESH_WEIGHT_GRAPH",
+	"retrieval.weight_vec":    "MESH_WEIGHT_VEC",
+	"retrieval.fetch_workers": "MESH_FETCH_WORKERS",
+	"rerank.endpoint":         "MESH_RERANK_ENDPOINT",
+	"rerank.model":            "MESH_RERANK_MODEL",
+	"rerank.key_env":          "",
+	"rerank.blend":            "MESH_RERANK_BLEND",
+	"ann.hnsw_threshold":      "MESH_HNSW_THRESHOLD",
+	"secret_bridge.base_url":  "MESH_SECRET_BRIDGE_URL",
+	"secret_bridge.key_env":   "",
+	"secret_bridge.agent_id":  "MESH_SECRET_BRIDGE_AGENT_ID",
 }
 
 func (s *Server) effectiveConfig(ctx context.Context) ([]cfgField, error) {
@@ -85,6 +86,7 @@ func (s *Server) effectiveConfig(ctx context.Context) ([]cfgField, error) {
 		{"retrieval.weight_fts", "Keyword weight", "Ranking (advanced)", "number", num(rv.WeightFTS), "How much exact keyword matches count toward ranking. Blank = the tuned default. Most people never change these."},
 		{"retrieval.weight_graph", "Link weight", "Ranking (advanced)", "number", num(rv.WeightGraph), "How much a note's links and closeness to your query count toward ranking. Blank = default."},
 		{"retrieval.weight_vec", "Meaning weight", "Ranking (advanced)", "number", num(rv.WeightVec), "How much meaning-based similarity counts. Only has an effect when semantic search is on. Blank = default."},
+		{"retrieval.fetch_workers", "Batch fetch workers", "Fetching (advanced)", "number", ival(rv.FetchWorkers), "Concurrent file-read workers per batch: integer 1 to 16. Blank = 2. File changes apply to the next batch. Workers exit before each request returns. More workers can increase disk contention; this is not a server-wide concurrency limit."},
 		{"rerank.endpoint", "Endpoint", "Reranker (optional)", "text", rv.RerankEndpoint, "URL of a reranker service that re-scores the top hits for a sharper #1 result. Leave blank to skip reranking."},
 		{"rerank.model", "Model", "Reranker (optional)", "text", rv.RerankModel, "The rerank model your endpoint serves."},
 		{"rerank.key_env", "Key env var", "Reranker (optional)", "keyref", rv.RerankKeyEnv, "Name of the environment variable holding the reranker's API key."},
@@ -99,6 +101,9 @@ func (s *Server) effectiveConfig(ctx context.Context) ([]cfgField, error) {
 		f := cfgField{Key: d.key, Label: d.label, Group: d.group, Kind: d.kind, Help: d.help, Value: d.file, Source: "default", Editable: true}
 		if d.file != "" {
 			f.Source = "file"
+		}
+		if d.key == "retrieval.fetch_workers" && d.file == "" {
+			f.Value = strconv.Itoa(meshcfg.DefaultFetchWorkers)
 		}
 		if env := envFor[d.key]; env != "" {
 			if v := os.Getenv(env); v != "" {
@@ -357,6 +362,16 @@ func applyConfigField(c *meshcfg.Config, key, v string) error {
 			return err
 		}
 		c.Retrieval.WeightVec = f
+	case "retrieval.fetch_workers":
+		if v == "" {
+			c.Retrieval.FetchWorkers = 0
+			break
+		}
+		n, err := meshcfg.ParseFetchWorkers(v)
+		if err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+		c.Retrieval.FetchWorkers = n
 	case "rerank.endpoint":
 		if err := meshcfg.CheckEndpointURL(key, v); err != nil {
 			return err

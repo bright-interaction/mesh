@@ -52,6 +52,52 @@ type Retrieval struct {
 	// wins. Tier-0 (decisions/gotchas/post-mortems) + entities/concepts/maps never
 	// decay; only note/status notes do, floored so an old note is demoted, not buried.
 	FreshnessHalfLifeDays int
+	// FetchWorkers bounds concurrent file reads per batch request. Zero means the
+	// setting is absent (use DefaultFetchWorkers), never an unbounded worker pool.
+	// MESH_FETCH_WORKERS overrides the file. Both accept only 1..MaxFetchWorkers.
+	FetchWorkers int
+}
+
+const (
+	DefaultFetchWorkers = 2
+	MaxFetchWorkers     = 16
+)
+
+// ParseFetchWorkers validates an explicit worker count. Blank/zero are not
+// explicit settings; callers may omit the file key to restore the default.
+func ParseFetchWorkers(value string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || n < 1 || n > MaxFetchWorkers {
+		return 0, fmt.Errorf("fetch workers must be an integer between 1 and %d", MaxFetchWorkers)
+	}
+	return n, nil
+}
+
+// FetchWorkersContext resolves the worker limit for one batch. The file is read
+// afresh, so updates affect the next request without retaining background workers
+// or restarting the server. A process environment override takes precedence.
+func FetchWorkersContext(ctx context.Context, meshDir string) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if raw := os.Getenv("MESH_FETCH_WORKERS"); raw != "" {
+		n, err := ParseFetchWorkers(raw)
+		if err != nil {
+			return 0, fmt.Errorf("MESH_FETCH_WORKERS: %w", err)
+		}
+		return n, nil
+	}
+	c, err := LoadConfigContext(ctx, meshDir)
+	if err != nil {
+		return 0, err
+	}
+	if c.Retrieval.FetchWorkers != 0 {
+		return c.Retrieval.FetchWorkers, nil
+	}
+	return DefaultFetchWorkers, nil
 }
 
 // Code is the [code] section: the opt-in source-code index. Index gates it on; Roots are the repos to walk (separate from the
@@ -151,6 +197,12 @@ func LoadConfigContext(ctx context.Context, meshDir string) (Config, error) {
 		HNSWThreshold:         int(sectionFloat(body, "ann", "hnsw_threshold")),
 		FreshnessHalfLifeDays: int(sectionFloat(body, "retrieval", "freshness_half_life_days")),
 	}
+	if raw, present := sectionValue(body, "retrieval", "fetch_workers"); present {
+		c.Retrieval.FetchWorkers, err = ParseFetchWorkers(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("retrieval.fetch_workers: %w", err)
+		}
+	}
 	c.Code = Code{
 		Index:     sectionBool(body, "code", "index"),
 		Roots:     sectionList(body, "code", "roots"),
@@ -187,6 +239,10 @@ weight_vec = %g
 # Age-decay non-institutional notes in ranking (0 = off). Tier-0 + entities/concepts
 # never decay. Env MESH_FRESHNESS_HALFLIFE_DAYS wins.
 freshness_half_life_days = %d
+# File-read workers per batch, 1..16 (absent = 2). Requests always join their
+# workers before returning. More workers may increase disk contention.
+# MESH_FETCH_WORKERS overrides this setting; file changes affect the next batch.
+%s
 
 [rerank]
 # Cross-encoder rerank (BYOAI). Empty endpoint/model = off. Env MESH_RERANK_* wins.
@@ -226,7 +282,10 @@ agent_id = %q
 // Save writes the [embedding] section, preserving any other sections already in the
 // file. Kept for the `mesh embed` caller; new callers should use SaveConfig.
 func Save(meshDir string, e Embedding) error {
-	cfg, _ := LoadConfig(meshDir)
+	cfg, err := LoadConfig(meshDir)
+	if err != nil {
+		return err
+	}
 	cfg.Embedding = e
 	return SaveConfig(meshDir, cfg)
 }
@@ -286,6 +345,15 @@ func saveConfigContextWith(ctx context.Context, meshDir string, c Config, hooks 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Preserve "absent" as an omitted key. Serializing the internal zero sentinel
+	// would make a generated config indistinguishable from invalid explicit input.
+	fetchWorkers := ""
+	if c.Retrieval.FetchWorkers != 0 {
+		if _, err := ParseFetchWorkers(strconv.Itoa(c.Retrieval.FetchWorkers)); err != nil {
+			return fmt.Errorf("retrieval.fetch_workers: %w", err)
+		}
+		fetchWorkers = fmt.Sprintf("fetch_workers = %d\n", c.Retrieval.FetchWorkers)
+	}
 	// key_env vars are NAMES of env vars, never secrets, and the set of names they may
 	// point at is closed (see keyenv.go). Anything outside the allow-list is reset to the
 	// field's default rather than persisted, so SaveConfig can never write a config.toml
@@ -305,7 +373,7 @@ func saveConfigContextWith(ctx context.Context, meshDir string, c Config, hooks 
 	e, rv := c.Embedding, c.Retrieval
 	body := fmt.Sprintf(configTemplate,
 		e.Endpoint, e.Model, e.Dim, e.KeyEnv, e.QueryPrefix, e.DocPrefix,
-		rv.WeightFTS, rv.WeightGraph, rv.WeightVec, rv.FreshnessHalfLifeDays,
+		rv.WeightFTS, rv.WeightGraph, rv.WeightVec, rv.FreshnessHalfLifeDays, fetchWorkers,
 		rv.RerankEndpoint, rv.RerankModel, rv.RerankKeyEnv, rv.RerankBlend,
 		rv.HNSWThreshold,
 		c.Code.Index, strings.Join(c.Code.Roots, ","), strings.Join(c.Code.Languages, ","),
@@ -502,6 +570,12 @@ func sectionFloat(toml, section, key string) float64 {
 // named [section]. Section-aware so a future section reusing a key name cannot
 // shadow another's. Not a general TOML parser.
 func sectionString(toml, section, key string) string {
+	value, _ := sectionValue(toml, section, key)
+	return value
+}
+
+// sectionValue also distinguishes an absent key from an explicitly blank value.
+func sectionValue(toml, section, key string) (string, bool) {
 	cur := ""
 	for _, line := range strings.Split(toml, "\n") {
 		line = strings.TrimSpace(line)
@@ -519,7 +593,7 @@ func sectionString(toml, section, key string) string {
 		if !ok || strings.TrimSpace(k) != key {
 			continue
 		}
-		return strings.Trim(strings.TrimSpace(v), `"`)
+		return strings.Trim(strings.TrimSpace(v), `"`), true
 	}
-	return ""
+	return "", false
 }

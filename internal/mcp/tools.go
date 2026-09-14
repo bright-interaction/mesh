@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bright-interaction/mesh/internal/hooks"
 	"github.com/bright-interaction/mesh/internal/index"
@@ -49,11 +50,22 @@ func ToolSpecs() []map[string]any {
 		},
 		{
 			"name":        "mesh_fetch",
-			"description": "Fetch a note by id, optionally limited to one heading anchor; use only when its search card is insufficient.",
+			"description": "Fetch a note by id; an optional unique heading anchor includes bounded safety-context excerpts and an incomplete-context warning. Use only when its search card is insufficient.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"id"},
 				"properties": map[string]any{"id": str, "anchor": str},
+			}),
+		},
+		{
+			"name":        "mesh_fetch_many",
+			"description": "Batch-fetch 1-16 note/anchor items; deduplicates notes and sections. Workers exit before return. Budget 256-32000 response tokens (default 8000); omitted lists input indices excluded by budget.",
+			"inputSchema": obj(map[string]any{
+				"type": "object", "required": []string{"items"},
+				"properties": map[string]any{
+					"items":  obj(map[string]any{"type": "array", "minItems": 1, "maxItems": 16, "items": obj(map[string]any{"type": "object", "required": []string{"id"}, "properties": map[string]any{"id": str, "anchor": str}})}),
+					"budget": intp,
+				},
 			}),
 		},
 		{
@@ -226,6 +238,7 @@ const (
 var toolScopeClass = map[string]toolClass{
 	"mesh_search":         classFiltered,
 	"mesh_fetch":          classFiltered,
+	"mesh_fetch_many":     classFiltered,
 	"mesh_god_nodes":      classFiltered,
 	"mesh_changed_since":  classFiltered,
 	"mesh_neighbors":      classFiltered,
@@ -266,6 +279,8 @@ func (s *Server) handleToolsCall(ctx context.Context, params json.RawMessage) (a
 		return s.toolSearch(ctx, p.Arguments)
 	case "mesh_fetch":
 		return s.toolFetch(ctx, p.Arguments)
+	case "mesh_fetch_many":
+		return s.toolFetchMany(ctx, p.Arguments)
 	case "mesh_god_nodes":
 		return s.toolGodNodes(ctx, p.Arguments)
 	case "mesh_changed_since":
@@ -926,19 +941,66 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 	if err != nil {
 		return nil, internalErr(err)
 	}
-	body := string(data)
+	body, rerr := s.formatFetchDocument(ctx, a.ID, rel, string(data), []string{a.Anchor})
+	if rerr != nil {
+		return nil, rerr
+	}
+	s.recordFetch(ctx, a.ID, rel)
+	return rawText(body), nil
+}
+
+// Formatting is shared by single and batch fetch. Batch calls this once per
+// authorized note, combining sections without repeating the safety envelope.
+func (s *Server) formatFetchDocument(ctx context.Context, id, rel, body string, anchors []string) (string, *rpcError) {
 	// Provenance is read from the WHOLE file, before any anchor slicing: an anchored
 	// fetch cuts the frontmatter off, and that is exactly the case where the agent
 	// would otherwise get a bare span of third-party prose with nothing saying so.
 	src, srcURL := frontmatterProvenance(body)
-	if a.Anchor != "" {
-		sec, ok := sectionByAnchor(body, a.Anchor)
-		if !ok {
-			return nil, &rpcError{Code: codeInvalidParams, Message: fmt.Sprintf(
-				"note %q has no section with anchor %q; available anchors: %s",
-				a.ID, a.Anchor, strings.Join(anchorsOf(body), ", "))}
+	whole := len(anchors) == 0
+	for _, anchor := range anchors {
+		whole = whole || anchor == ""
+	}
+	if !whole {
+		type span struct {
+			text       string
+			start, end int
 		}
-		body = sec
+		var spans []span
+		for _, anchor := range anchors {
+			sec, start, end, matches := resolveAnchorSpan(body, anchor)
+			if matches > 1 {
+				return "", &rpcError{Code: codeInvalidParams, Message: "ambiguous heading anchor; request a unique heading or explicitly fetch the full note"}
+			}
+			if matches == 0 {
+				return "", &rpcError{Code: codeInvalidParams, Message: fmt.Sprintf(
+					"note %q has no section with anchor %q; available anchors: %s",
+					id, anchor, strings.Join(anchorsOf(body), ", "))}
+			}
+			// A parent already contains its nested sections, and legacy/current
+			// aliases can resolve to identical spans. Return each span only once.
+			covered := false
+			for _, existing := range spans {
+				covered = covered || (existing.start <= start && existing.end >= end)
+			}
+			if !covered {
+				kept := spans[:0]
+				for _, existing := range spans {
+					if !(start <= existing.start && end >= existing.end) {
+						kept = append(kept, existing)
+					}
+				}
+				spans = append(kept, span{sec, start, end})
+			}
+		}
+		prefix, rerr := s.sectionContext(ctx, id, rel, body)
+		if rerr != nil {
+			return "", rerr
+		}
+		var sections []string
+		for _, span := range spans {
+			sections = append(sections, span.text)
+		}
+		body = prefix + strings.Join(sections, "\n\n")
 	}
 	// Connector-ingested text is data, not instructions. Wrap it in the envelope the
 	// contract describes so the agent has an explicit boundary. The frontmatter source
@@ -952,21 +1014,26 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 	if strings.HasPrefix(src, importSourcePrefix) {
 		body = wrapUntrusted(src, srcURL, body)
 	}
+	return body, nil
+}
+
+// Called only for content actually returned; speculative/budget-omitted reads
+// must not fabricate reuse or win search attribution based on worker completion.
+func (s *Server) recordFetch(ctx context.Context, id, rel string) {
 	now := time.Now()
-	_ = s.store.IncrMetric("fetches", 1)            // ROI telemetry (best-effort)
-	_ = s.store.IncrMetric("fetch:"+a.ID, 1)        // per-note reuse (most-reused list)
-	_ = s.store.RecordReuse(a.ID, flywheelReuseGap) // flywheel: a later fetch = the next run inheriting it
-	observeTeamReuse(ctx, a.ID, filepath.ToSlash(rel), now)
+	_ = s.store.IncrMetric("fetches", 1)          // ROI telemetry (best-effort)
+	_ = s.store.IncrMetric("fetch:"+id, 1)        // per-note reuse (most-reused list)
+	_ = s.store.RecordReuse(id, flywheelReuseGap) // flywheel: a later fetch = the next run inheriting it
+	observeTeamReuse(ctx, id, filepath.ToSlash(rel), now)
 	// Only the trusted local stdio transport may enqueue an event for later sync.
 	// A bare shared HTTP MCP has no authenticated logical reader, so attributing its
 	// requests to the machine's sync credential would fabricate cross-user reuse.
 	// Ordinary reference notes are excluded too: only agent write-backs participate
 	// in the team flywheel.
-	if localOperator(ctx) && s.store.IsAgentAuthoredNote(a.ID) {
-		_ = teamtelemetry.RecordForJoinedVault(s.vaultRoot, a.ID, now)
+	if localOperator(ctx) && s.store.IsAgentAuthoredNote(id) {
+		_ = teamtelemetry.RecordForJoinedVault(s.vaultRoot, id, now)
 	}
-	s.recordAttributedFetch(ctx, a.ID)
-	return rawText(body), nil
+	s.recordAttributedFetch(ctx, id)
 }
 
 const searchAttributionWindow = 10 * time.Minute
@@ -1449,27 +1516,124 @@ func endsPath(c byte) bool {
 // cross-session proxy that works for both the solo CLI and the long-lived hub).
 const flywheelReuseGap = 600 // seconds (10 min)
 
+// Bound the added context, not the requested section. These are excerpts, never
+// a promise that every warning elsewhere in the document has been discovered.
+const sectionContextMaxBytes = 4096
+const sectionContextNotice = "Mesh section context: excerpts only; other sections omitted. Fetch more context before acting on incomplete or truncated guidance.\n"
+
+type sectionContextEnvelope struct {
+	IncompleteContext bool              `json:"incomplete_context"`
+	ContextTruncated  bool              `json:"context_truncated"`
+	Fields            map[string]string `json:"fields"`
+}
+
+func (s *Server) sectionContext(ctx context.Context, id, rel, doc string) (string, *rpcError) {
+	fmText, _, _ := vault.SplitFrontmatter(doc)
+	fm, _, err := vault.ParseFrontmatter([]byte(fmText))
+	if err != nil || vault.UnterminatedFrontmatter(doc) {
+		return "", &rpcError{Code: codeInvalidParams, Message: "invalid note metadata; explicitly fetch the full note to inspect it"}
+	}
+	metadata, err := s.store.NoteMetadataFor(ctx, []string{"note:" + id})
+	if err != nil {
+		return "", internalErr(err)
+	}
+	m, found := metadata["note:"+id]
+	sf := scopeFromCtx(ctx)
+	if !found || m.Path != rel || (sf != nil && !vault.ScopeAllowsCSV(m.Scope, sf.AllowedRead)) {
+		return "", &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: id}
+	}
+	fields := map[string]string{
+		"status": fm.Status, "severity": fm.Severity, "review_by": fm.ReviewBy,
+		"do": fm.Do, "dont": fm.Dont, "supersedes": strings.Join(fm.Supersedes, ", "),
+	}
+	// The source file may have no retirement mark at all. Resolve the current
+	// incoming relation without exposing the existence of a fenced replacement.
+	if m.SupersededBy != "" && m.SupersederPath != "" && (sf == nil || vault.ScopeAllowsCSV(m.SupersederScope, sf.AllowedRead)) {
+		fields["superseded_by"] = m.SupersededBy
+	}
+	lines, markers, headings := anchorDocumentLines(doc)
+	end := len(lines)
+	for i := range markers {
+		if _, ok := vault.ParseATXHeading(markers[i], headings[i]); ok {
+			end = i
+			break
+		}
+	}
+	fields["preamble"] = strings.TrimSpace(strings.Join(lines[:end], "\n"))
+	return encodeSectionContext(fields), nil
+}
+
+func encodeSectionContext(fields map[string]string) string {
+	envelope := sectionContextEnvelope{IncompleteContext: true, Fields: make(map[string]string)}
+	for key, value := range fields {
+		if value == "" {
+			continue
+		}
+		limit := 512
+		if key == "preamble" {
+			limit = 1024
+		}
+		clipped := clipSectionContext(value, limit)
+		envelope.ContextTruncated = envelope.ContextTruncated || clipped != value
+		envelope.Fields[key] = clipped
+	}
+	// JSON escaping can expand individual bytes sixfold. Bound the serialized
+	// header including the notice, not merely the unescaped string lengths.
+	for {
+		data, _ := json.Marshal(envelope) // only bools and strings; cannot fail
+		if len(sectionContextNotice)+len(data)+2 <= sectionContextMaxBytes {
+			return sectionContextNotice + string(data) + "\n\n"
+		}
+		envelope.ContextTruncated = true
+		for key, value := range envelope.Fields {
+			envelope.Fields[key] = clipSectionContext(value, len(value)/2)
+		}
+	}
+}
+
+func clipSectionContext(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	for limit > 0 && !utf8.RuneStart(value[limit]) {
+		limit--
+	}
+	return value[:limit]
+}
+
 // sectionByAnchor returns the markdown of the heading section whose slug matches
 // anchor (from that heading until the next heading of the same or higher level), and
-// whether such a heading existed. A miss must NOT fall back to the whole note: this is a
+// whether that heading resolved uniquely. A miss must NOT fall back to the whole note: this is a
 // narrowing function, and returning its unnarrowed input turned one wrong character in an
 // anchor into a multi-megabyte reply that no caller asked for and none can afford.
 func sectionByAnchor(body, anchor string) (string, bool) {
+	section, matches := resolveAnchorSection(body, anchor)
+	return section, matches == 1
+}
+
+// An exact current slug wins over legacy aliases, but duplicate matches within
+// the winning namespace are ambiguous and must never silently choose a section.
+func resolveAnchorSection(body, anchor string) (string, int) {
+	section, _, _, matches := resolveAnchorSpan(body, anchor)
+	return section, matches
+}
+
+func resolveAnchorSpan(body, anchor string) (string, int, int, int) {
 	lines, markerLines, headingLines := anchorDocumentLines(body)
 	anchor = norm.NFC.String(anchor)
 	if anchor == "" {
-		return "", false
+		return "", 0, 0, 0
 	}
 
 	// Search every current anchor before accepting a legacy alias. Otherwise the legacy
 	// slug of an earlier Unicode heading can shadow the exact current slug of a later
 	// heading, returning a valid but entirely wrong section.
-	start, level := findAnchorHeading(markerLines, headingLines, anchor, false)
+	start, level, matches := findAnchorHeading(markerLines, headingLines, anchor, false)
 	if start < 0 {
-		start, level = findAnchorHeading(markerLines, headingLines, anchor, true)
+		start, level, matches = findAnchorHeading(markerLines, headingLines, anchor, true)
 	}
-	if start < 0 {
-		return "", false
+	if matches != 1 {
+		return "", 0, 0, matches
 	}
 	end := len(lines)
 	for i := start + 1; i < len(markerLines); i++ {
@@ -1478,7 +1642,7 @@ func sectionByAnchor(body, anchor string) (string, bool) {
 			break
 		}
 	}
-	return strings.Join(lines[start:end], "\n"), true
+	return strings.Join(lines[start:end], "\n"), start, end, 1
 }
 
 // anchorsOf lists the slugs a note actually offers, so an anchor miss can name the real
@@ -1506,7 +1670,8 @@ func anchorDocumentLines(doc string) (original, markerLines, headingLines []stri
 	return strings.Split(body, "\n"), strings.Split(markers, "\n"), strings.Split(headings, "\n")
 }
 
-func findAnchorHeading(markerLines, headingLines []string, anchor string, legacy bool) (start, level int) {
+func findAnchorHeading(markerLines, headingLines []string, anchor string, legacy bool) (start, level, matches int) {
+	start = -1
 	for i := range markerLines {
 		heading, ok := vault.ParseATXHeading(markerLines[i], headingLines[i])
 		if !ok {
@@ -1517,10 +1682,13 @@ func findAnchorHeading(markerLines, headingLines []string, anchor string, legacy
 			candidate = slugifyLegacy(heading.VisibleText)
 		}
 		if candidate == anchor {
-			return i, heading.Level
+			if start < 0 {
+				start, level = i, heading.Level
+			}
+			matches++
 		}
 	}
-	return -1, 0
+	return start, level, matches
 }
 
 // slugifyLegacy reproduces the slug Mesh emitted before vault.Slugify learned to fold

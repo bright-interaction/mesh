@@ -17,7 +17,76 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bright-interaction/mesh/internal/meshcfg"
 )
+
+func TestConfigFetchWorkers(t *testing.T) {
+	t.Setenv("MESH_FETCH_WORKERS", "")
+	s, dir := cfgServer(t)
+	h := s.Handler()
+	assertField := func(value, source string, editable bool) {
+		t.Helper()
+		code, got := doJSON(t, h, "GET", "/api/config", "")
+		if code != http.StatusOK {
+			t.Fatalf("GET config = %d", code)
+		}
+		for _, fi := range got["fields"].([]any) {
+			f := fi.(map[string]any)
+			if f["key"] == "retrieval.fetch_workers" {
+				if f["value"] != value || f["source"] != source || f["editable"] != editable || f["kind"] != "number" {
+					t.Fatalf("fetch_workers = %+v; want %s/%s/%v", f, value, source, editable)
+				}
+				return
+			}
+		}
+		t.Fatal("fetch_workers setting missing")
+	}
+	assertField("2", "default", true)
+	for _, value := range []string{"1", "4", "16"} {
+		body := fmt.Sprintf(`{"updates":{"retrieval.fetch_workers":%q}}`, value)
+		if code, _ := doJSON(t, h, "PUT", "/api/config", body); code != http.StatusOK {
+			t.Fatalf("PUT workers %s = %d", value, code)
+		}
+		assertField(value, "file", true)
+		if workers, err := meshcfg.FetchWorkersContext(context.Background(), filepath.Join(dir, ".mesh")); err != nil || fmt.Sprint(workers) != value {
+			t.Fatalf("fresh batch config = %d, %v", workers, err)
+		}
+	}
+	// Editing another setting preserves the worker count.
+	if code, _ := doJSON(t, h, "PUT", "/api/config", `{"updates":{"embedding.model":"changed"}}`); code != http.StatusOK {
+		t.Fatalf("PUT unrelated setting = %d", code)
+	}
+	assertField("16", "file", true)
+	before, err := os.ReadFile(filepath.Join(dir, ".mesh", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"0", "-1", "17", "1.5", "NaN", "many", "999999999999999999999999"} {
+		body := fmt.Sprintf(`{"updates":{"retrieval.fetch_workers":%q}}`, value)
+		if code, _ := doJSON(t, h, "PUT", "/api/config", body); code != http.StatusBadRequest {
+			t.Fatalf("PUT invalid workers %q = %d", value, code)
+		}
+	}
+	after, err := os.ReadFile(filepath.Join(dir, ".mesh", "config.toml"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("invalid requests changed config: %v", err)
+	}
+	t.Setenv("MESH_FETCH_WORKERS", "8")
+	assertField("8", "env", false)
+	if code, _ := doJSON(t, h, "PUT", "/api/config", `{"updates":{"retrieval.fetch_workers":"4"}}`); code != http.StatusConflict {
+		t.Fatalf("PUT environment-locked workers = %d", code)
+	}
+	t.Setenv("MESH_FETCH_WORKERS", "")
+	if code, _ := doJSON(t, h, "PUT", "/api/config", `{"updates":{"retrieval.fetch_workers":" "}}`); code != http.StatusOK {
+		t.Fatalf("PUT blank worker reset = %d", code)
+	}
+	assertField("2", "default", true)
+	cfg, err := meshcfg.LoadConfig(filepath.Join(dir, ".mesh"))
+	if err != nil || cfg.Retrieval.FetchWorkers != 0 || cfg.Embedding.Model != "changed" {
+		t.Fatalf("blank reset lost other config: %+v, %v", cfg, err)
+	}
+}
 
 func cfgServer(t *testing.T) (*Server, string) {
 	t.Helper()

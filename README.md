@@ -345,6 +345,46 @@ Mesh speaks MCP (JSON-RPC) over stdio. Point your agent at:
 
 The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note or one heading by anchor), `mesh_god_nodes` (the hub map to orient), `mesh_changed_since` (deltas on resume), and the write-back tools `mesh_append_note` / `mesh_write_entity`. `mesh_append_note` also accepts `type: map`; an overview in `why` plus `related` entry points renders as a readable front-door page rather than an empty scaffold. The retrieval contract (how to query cheaply, and to write back when done) is served as the MCP `initialize` instructions and the `mesh://contract` resource, so any agent uses it well without extra prompting.
 
+### Bounded batch fetches and worker settings
+
+`mesh_fetch_many` accepts 1–16 `items` with a note `id` and optional heading
+`anchor`, plus a response-token `budget` (default 8000; range 256–32000).
+Repeated notes are read once; duplicate and nested sections share one safety
+header. An explicit whole-note request subsumes sections of that note. Results
+follow first-note input order and list their original input indices; `omitted`
+lists indices excluded by the budget. Whole results are omitted rather than
+cutting safety text. `unavailable` is an opaque read/permission/anchor failure;
+`too_large` means the note exceeds the batch's byte limits (1 MiB source,
+128 KiB rendered per-note text).
+
+The advanced **Batch fetch workers** web setting controls request-local concurrency.
+Alternatively, edit `<vault>/.mesh/config.toml`:
+
+```toml
+[retrieval]
+fetch_workers = 2
+```
+
+The default is **2**, with an allowed range of **1–16**. Omit the key (or clear
+the web field) to restore the default. `MESH_FETCH_WORKERS=4` in the Mesh
+process environment overrides the file and locks the web field. File changes
+apply to the next batch; changing a running process's environment requires
+restarting it through your normal operator workflow. Invalid explicit values
+are rejected. A batch uses no more workers than its number of distinct notes;
+the response's `workers_used` field reports that actual count.
+
+Workers are created for the request and **all exit before it returns**. There is
+no idle pool. Cancellation stops queued work and joins in-flight reads. The
+five-second timeout is cooperative: a blocked filesystem operation can delay
+return, but no request worker is abandoned. This limit is **per request**, not a
+global cap across concurrent users. No model/extractor children are started.
+
+More workers are not automatically faster for a larger vault: independent note
+count, storage latency and contention matter. Benchmark complete requests before
+raising the limit. Anchored results contain bounded safety-context excerpts and
+explicit incomplete/truncated-context signals; they do not guarantee that all
+relevant warnings elsewhere in the note have been fetched.
+
 That is the whole setup. The server elects itself the vault's **owning writer**
 when nothing else holds the vault (a claim in `<vault>/.mesh/owner.lock`), so a
 note it writes back is queryable immediately and no separate daemon is needed.
