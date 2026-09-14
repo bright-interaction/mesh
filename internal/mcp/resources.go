@@ -29,7 +29,7 @@ func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage
 	}
 	switch p.URI {
 	case "mesh://contract":
-		return contents(p.URI, "text/markdown", contractText), nil
+		return contents(p.URI, "text/markdown", contractResourceText), nil
 	case "mesh://community":
 		g, _ := s.snapshot()
 		b, _ := json.Marshal(map[string]any{"communities": communityOverview(g, 50, scopeFromCtx(ctx))})

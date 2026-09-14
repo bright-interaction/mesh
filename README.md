@@ -347,6 +347,33 @@ The agent then gets: `mesh_search` (fused, budget-aware), `mesh_fetch` (a note o
 
 ### Bounded batch fetches and worker settings
 
+Start with search cards and stop if they suffice. Fetch one missing heading with
+`mesh_fetch`; batch several known needed sections with `mesh_fetch_many`, especially
+overlapping sections. Fetch the relevant guidance before acting on a restriction;
+a search snippet is not complete operational context. Whole-note batches are not
+automatically cheaper or faster.
+
+Set a total response allowance and call limit before retrieval. For batch omissions,
+map indices to that request's inputs and allow at most one prioritized follow-up
+for still-needed sections within the remaining allowance. Below the 256-token
+minimum, or if that follow-up still lacks required facts, stop and report the gap.
+Never repeat successful items, silently increase the allowance, or bypass the cap
+with a single fetch. `unavailable`/`too_large` are not budget omissions and do not
+trigger automatic fallback. Preserve safety warnings and untrusted-content envelopes.
+Use a one-item batch when a server-enforced response cap is needed; single fetch
+has no such budget parameter.
+
+The compact startup instructions point to `mesh://contract` for the full policy.
+This is agent guidance, not a server-enforced whole-task quota. Count search and
+contract responses too; separately reserve JSON-RPC/request/instruction/output
+overhead rather than equating batch receipts with total model usage.
+
+The scripted retrieval-journey checks reuse the HTTP evaluation harness. Run
+`go test ./internal/mcp -run '^TestRetrievalJourney'` for correctness; opt into
+measurements with `MESH_RETRIEVAL_JOURNEY_EVAL=1 go test ./internal/mcp -run
+'^TestRetrievalJourneyEvaluation$' -count=1 -v`. These measure fixed client
+decisions, not model adherence, and do not impose timing thresholds in CI.
+
 `mesh_fetch_many` accepts 1–16 `items` with a note `id` and optional heading
 `anchor`, plus a response-token `budget` (default 8000; range 256–32000).
 Repeated notes are read once; duplicate and nested sections share one safety
