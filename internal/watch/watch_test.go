@@ -70,50 +70,138 @@ func TestRunReconcilesOnChange(t *testing.T) {
 	}
 }
 
-func TestRunCarriesExactPathsForLocalChangeBurst(t *testing.T) {
-	dir := t.TempDir()
-	a := filepath.Join(dir, "a.md")
-	b := filepath.Join(dir, "b.md")
-	for _, path := range []string{a, b} {
-		if err := os.WriteFile(path, []byte("# seed\n"), 0o644); err != nil {
-			t.Fatal(err)
+func TestRunCarriesExactPathsForLocalChanges(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		name := "back-to-back writes"
+		if split {
+			name = "write after first pass"
 		}
-	}
-
-	calls := make(chan Pass, 8)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go Run(ctx, Options{
-		Root:      dir,
-		Debounce:  40 * time.Millisecond,
-		Reconcile: 0,
-		OnReindex: func(p Pass) (Result, error) {
-			calls <- p
-			return Result{}, nil
-		},
-	})
-	if startup := <-calls; startup.Reason != ReasonStartup || len(startup.Paths) != 0 {
-		t.Fatalf("startup pass = %+v, want no targeted paths", startup)
-	}
-	if err := os.WriteFile(b, []byte("# b changed\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(a, []byte("# a changed\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case p := <-calls:
-		want := []string{filepath.Clean(a), filepath.Clean(b)}
-		if p.Reason != ReasonChange || len(p.Paths) != len(want) {
-			t.Fatalf("change pass = %+v, want exact paths %v", p, want)
-		}
-		for i := range want {
-			if p.Paths[i] != want[i] {
-				t.Fatalf("change paths = %v, want %v", p.Paths, want)
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			a, b := filepath.Join(dir, "a.md"), filepath.Join(dir, "b.md")
+			for _, path := range []string{a, b} {
+				if err := os.WriteFile(path, []byte("# seed\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
 			}
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for targeted change pass")
+
+			calls := make(chan Pass, 8)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			var runErr error // read only after done closes
+			go func() {
+				defer close(done)
+				runErr = Run(ctx, Options{
+					Root: dir, Debounce: 40 * time.Millisecond,
+					Reconcile: 0, // no safety-net scan may mask a missed path
+					OnReindex: func(p Pass) (Result, error) {
+						select {
+						case calls <- p:
+						case <-ctx.Done(): // cleanup cannot block on a full calls buffer
+						}
+						return Result{}, nil
+					},
+				})
+			}()
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case <-done:
+					if runErr != nil {
+						t.Errorf("Run returned error: %v", runErr)
+					}
+				case <-time.After(3 * time.Second):
+					t.Error("Run did not return after ctx cancel")
+				}
+			})
+			next := func(deadline <-chan time.Time, what string) Pass {
+				t.Helper()
+				select {
+				case p := <-calls:
+					return p
+				case <-done:
+					t.Fatalf("Run exited before %s: %v", what, runErr)
+				case <-deadline:
+					t.Fatalf("timed out waiting for %s", what)
+				}
+				return Pass{}
+			}
+			startupDeadline := time.NewTimer(3 * time.Second)
+			defer startupDeadline.Stop()
+			if p := next(startupDeadline.C, "startup"); p.Reason != ReasonStartup || !p.Authoritative || len(p.Paths) != 0 {
+				t.Fatalf("unexpected startup pass: %+v", p)
+			}
+
+			written, seen := map[string]bool{}, map[string]bool{}
+			write := func(path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("# changed\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				written[path] = true
+			}
+			waitCoverage := func() {
+				t.Helper()
+				deadline := time.NewTimer(3 * time.Second)
+				defer deadline.Stop()
+				for len(seen) != len(written) {
+					// One deadline for the whole delivery phase, not a fresh timeout
+					// per callback: repeated events cannot hide a missing path.
+					p := next(deadline.C, "all written paths")
+					t.Logf("change pass: %+v", p)
+					if p.Reason != ReasonChange || p.Authoritative || len(p.Paths) == 0 {
+						t.Fatalf("expected targeted, non-authoritative change: %+v", p)
+					}
+					for i, path := range p.Paths {
+						if !written[path] || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+							t.Fatalf("unexpected path %q; written=%v", path, written)
+						}
+						if i > 0 && p.Paths[i-1] >= path {
+							t.Fatalf("paths are not sorted and unique: %v", p.Paths)
+						}
+						seen[path] = true
+					}
+				}
+			}
+			// Filesystem delivery is not atomic with the debounce timer. The split
+			// case forces a legal boundary by observing b's pass before writing a,
+			// rather than sleeping and hoping the scheduler produces that ordering.
+			write(b)
+			if split {
+				waitCoverage()
+			}
+			write(a)
+			waitCoverage()
+		})
+	}
+}
+
+func TestChangeBatchExactPathsAcrossPasses(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		batches [][]string
+		want    [][]string
+	}{
+		{"coalesced", [][]string{{"b.md", "a.md", "b.md"}, {"later.md"}}, [][]string{{"a.md", "b.md"}, {"later.md"}}},
+		{"split", [][]string{{"b.md"}, {"a.md"}, {"b.md"}}, [][]string{{"b.md"}, {"a.md"}, {"b.md"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var batch changeBatch
+			var passes []Pass
+			for i, events := range tc.batches {
+				for _, path := range events {
+					batch.change(path)
+				}
+				passes = append(passes, batch.take())
+				// Recheck earlier passes too: later batches must not mutate them.
+				for j, p := range passes {
+					want := Pass{Reason: ReasonChange, Paths: tc.want[j]}
+					if !reflect.DeepEqual(p, want) {
+						t.Fatalf("after batch %d, pass %d = %+v, want %+v", i, j, p, want)
+					}
+				}
+			}
+		})
 	}
 }
 
