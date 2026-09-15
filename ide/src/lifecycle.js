@@ -3,7 +3,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
-const { viewerURL } = require('./client');
+const { viewerURL, isRemote } = require('./client');
 
 function failure(code) { return Object.assign(new Error(code), { code }); }
 function readiness(data, vault) {
@@ -15,7 +15,7 @@ function readiness(data, vault) {
 }
 function launchSpec(options, inherited = process.env) {
   const u = new URL(viewerURL(options.url));
-  if (u.pathname !== '/' || !u.port || Number(u.port) < 1) throw failure('STARTUP_SETTINGS');
+  if (u.protocol !== 'http:' || u.pathname !== '/' || !u.port || Number(u.port) < 1) throw failure('STARTUP_SETTINGS');
   if (!path.isAbsolute(options.binary || '') || !path.isAbsolute(options.vault || '')) throw failure('STARTUP_SETTINGS');
   if (!fs.statSync(options.binary).isFile() || !fs.statSync(options.vault).isDirectory()) throw failure('STARTUP_SETTINGS');
   fs.accessSync(options.binary, fs.constants.X_OK);
@@ -60,7 +60,7 @@ class ViewerLifecycle {
     const controller = this.controller = new AbortController();
     let delay = 30000;
     try {
-      if (!['connected', 'legacy'].includes(this.state.kind)) this.emit({ kind: this.child ? 'starting' : 'connecting', detail: 'Connecting to the local viewer…' });
+      if (!['connected', 'legacy'].includes(this.state.kind)) this.emit({ kind: this.child ? 'starting' : 'connecting', detail: 'Connecting to Mesh…' });
       const response = await this.client.connect(controller.signal);
       if (!current()) return;
       const state = readiness(JSON.parse(response.body), this.options.vault);
@@ -72,10 +72,11 @@ class ViewerLifecycle {
       if (!current()) return;
       this.failures++;
       delay = Math.min(30000, 1000 * 2 ** Math.min(this.failures - 1, 5));
-      let detail = ({ WRONG_VAULT: 'Wrong vault. Check Mesh startup settings.', INCOMPATIBLE: 'Unsupported viewer API. Upgrade Mesh or change its URL.', UNSAFE_CHILD: 'Started viewer did not confirm read-only mode and was stopped.' })[error.code] || 'Viewer unavailable. Use Mesh: Refresh View to retry or configure startup.';
+      let detail = ({ AUTH_REQUIRED: 'Mesh requires an access key. Use Mesh: Sign In to Remote Viewer.', ACCESS_DENIED: 'Mesh denied access. Check the permissions of your Mesh access key.', WRONG_VAULT: 'Wrong vault. Check Mesh startup settings.', INCOMPATIBLE: 'Unsupported viewer API. Upgrade Mesh or change its URL.', UNSAFE_CHILD: 'Started viewer did not confirm read-only mode and was stopped.' })[error.code] || 'Viewer unavailable. Use Mesh: Refresh View to retry or Mesh: Set Viewer URL.';
+      if (['AUTH_REQUIRED', 'ACCESS_DENIED'].includes(error.code)) delay = null;
       if (this.child && this.childDeadline && this.now() >= this.childDeadline) {
         this.stopChild(); detail = 'Viewer startup timed out. Check the binary and vault.';
-      } else if (error.code === 'ECONNREFUSED' && !this.child && this.options.autoStart) {
+      } else if (error.code === 'ECONNREFUSED' && !this.child && this.options.autoStart && !isRemote(this.options.url)) {
         this.starts = this.starts.filter(t => this.now() - t < 600000);
         if (this.starts.length >= 3) detail = 'Automatic startup paused after three attempts in ten minutes.';
         else {
@@ -97,7 +98,7 @@ class ViewerLifecycle {
       this.emit({ kind: this.child ? 'starting' : 'offline', detail });
     } finally {
       this.busy = false;
-      if (!this.disposed && this.visible) this.schedule(epoch === this.epoch ? delay : 0);
+      if (!this.disposed && this.visible && (epoch !== this.epoch || delay !== null)) this.schedule(epoch === this.epoch ? delay : 0);
     }
   }
   stopChild() { const child = this.child; this.child = undefined; this.childDeadline = undefined; child?.kill('SIGTERM'); }

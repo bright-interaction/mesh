@@ -12,11 +12,13 @@ async function withServer(handler, check) {
   finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 }
 
-test('viewer URLs allow only HTTP numeric loopback and simple base paths', () => {
+test('viewer URLs allow HTTPS or HTTP numeric loopback and simple base paths', () => {
+  expect(viewerURL('https://mesh.cloudrebellion.tech/app/')).toBe('https://mesh.cloudrebellion.tech/app');
+  expect(viewerURL('https://127.0.0.1/app')).toBe('https://127.0.0.1/app');
   expect(viewerURL('http://127.0.0.1:7474/')).toBe('http://127.0.0.1:7474');
   expect(viewerURL('http://127.0.0.1:7474/app/')).toBe('http://127.0.0.1:7474/app');
   expect(viewerURL('http://[::1]:7474/app')).toBe('http://[::1]:7474/app');
-  for (const value of [null, '', 'http://localhost:7474', 'https://127.0.0.1', 'http://192.168.1.2', 'http://127.0.0.1.evil.invalid', 'http://user:secret@127.0.0.1', 'http://127.0.0.1/?x=1', 'http://127.0.0.1/#key', 'http://127.0.0.1/app%2fother', 'file:///tmp/view', 'http://127.0.0.1/' + 'a'.repeat(513)]) {
+  for (const value of [null, '', 'http://localhost:7474', 'https://example.org/a/../app', 'https://user:key@example.org/app', 'https://example.org/app?key=secret', 'https://example.org/%2e%2e/app', 'https://example.org/app#key', 'https://example.org/ app', 'http://192.168.1.2', 'http://127.0.0.1.evil.invalid', 'http://user:secret@127.0.0.1', 'http://127.0.0.1/?x=1', 'http://127.0.0.1/#key', 'http://127.0.0.1/app%2fother', 'file:///tmp/view', 'http://127.0.0.1/' + 'a'.repeat(513)]) {
     expect(() => viewerURL(value)).toThrow();
   }
 });

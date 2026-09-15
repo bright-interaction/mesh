@@ -16,7 +16,7 @@ function childProcess() { const child = new EventEmitter(); child.kills = []; ch
 function harness(connect = async () => response(), options = {}, start = () => childProcess()) {
   let time = 1000000, id = 0;
   const timers = new Map(), states = [], signals = [], children = [];
-  const lifecycle = new ViewerLifecycle({ connect: signal => { signals.push(signal); return connect(signal); } }, { vault, autoStart: true, ...options }, state => states.push(state), {
+  const lifecycle = new ViewerLifecycle({ connect: signal => { signals.push(signal); return connect(signal); } }, { url: 'http://127.0.0.1:7476', vault, autoStart: true, ...options }, state => states.push(state), {
     now: () => time,
     setTimer: (fn, delay) => { const handle = ++id; timers.set(handle, { fn, delay }); return handle; },
     clearTimer: handle => timers.delete(handle),
@@ -47,6 +47,28 @@ test('startup uses an absolute executable and vault with literal arguments and s
       ...['http://127.0.0.1:7476/app', 'http://127.0.0.1:0', 'http://127.0.0.1', 'http://localhost:7476', 'http://0.0.0.0:7476', 'http://192.168.1.2:7476', 'https://127.0.0.1:7476', 'http://user:secret@127.0.0.1:7476', 'http://127.0.0.1:7476/?x=1'].map(url => ({ url })),
     ]) expect(() => launchSpec({ ...valid, ...options }, {})).toThrow();
   } finally { fs.rmdirSync(target); fs.rmdirSync(root); }
+});
+
+test('HTTPS refusal never starts a process, even with stale local startup opt-in', async () => {
+  const h = harness(async () => { throw error('ECONNREFUSED'); }, { url: 'https://mesh.example:7476', autoStart: true });
+  await h.lifecycle.check();
+  expect(h.children).toHaveLength(0);
+  expect(h.lifecycle.starts).toHaveLength(0);
+  h.lifecycle.dispose();
+});
+
+test('auth failures show actionable guidance and stop polling until explicit retry', async () => {
+  for (const code of ['AUTH_REQUIRED', 'ACCESS_DENIED']) {
+    const h = harness(async () => { throw error(code); }, { url: 'https://mesh.example/app' });
+    await h.lifecycle.check();
+    expect(h.children).toHaveLength(0);
+    expect(h.timers.size).toBe(0);
+    expect(h.lifecycle.state.detail).toContain(code === 'AUTH_REQUIRED' ? 'Sign In' : 'permissions');
+    expect(h.lifecycle.state.detail).not.toContain('private');
+    h.lifecycle.retry();
+    expect(h.timers.size).toBe(1);
+    h.lifecycle.dispose();
+  }
 });
 
 test('readiness checks pinned vault identity and the supported viewer metadata contract', () => {
