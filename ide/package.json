@@ -43,7 +43,8 @@
   },
   "scripts": {
     "build": "bun scripts/build.mjs",
-    "test": "bun test test",
+    "test": "bun test ./test",
+    "test:https": "bun test ./integration/https.test.js",
     "package": "bun scripts/package.mjs",
     "ci": "bun scripts/ci.mjs",
     "release:plan": "bun scripts/release-plan.mjs"

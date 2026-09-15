@@ -32,10 +32,12 @@ The shipped viewer assets are bundled in the extension. A bounded host bridge al
 
 ## Build and test
 
+The additional **`bun run test:https`** integration check requires `openssl` on PATH. It creates disposable certificates and loopback-only servers, checks trusted/untrusted TLS plus authenticated reads, redirects, cancellation and sign-out, then removes its fixture files. Trust is limited to its child process; system trust and production credentials are untouched. It runs with Bun by default. Set `MESH_IDE_NODE_BIN` to a Node-compatible executable (including VS Code's executable on desktop) to verify the extension's actual runtime: `MESH_IDE_NODE_BIN="/Applications/Visual Studio Code.app/Contents/MacOS/Code" bun run test:https` on macOS. This is separate from the default unit/package gate, whose CI image does not declare OpenSSL; fixture success is not a production sign-in receipt.
+
 ```sh
 bun install --frozen-lockfile
 bun run build
-bun test test
+bun run test
 bun run package
 bun run ci
 ```
