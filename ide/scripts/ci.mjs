@@ -8,7 +8,7 @@ if (args.some(arg => arg !== '--allow-dirty')) throw new Error('Unexpected CI ar
 const run = args => execFileSync(process.execPath, args, { cwd: root, stdio: 'inherit' });
 run(['audit', '--audit-level=high']);
 run(['scripts/build.mjs']);
-run(['test', 'test']);
+run(['test', './test']);
 run(['scripts/package.mjs', ...args]);
 const first = JSON.parse(await readFile(new URL('../release/manifest.json', import.meta.url), 'utf8'));
 const hash = sha256(await readFile(new URL('../release/' + first.file, import.meta.url)));
