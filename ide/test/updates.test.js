@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
+
 import { test, expect } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';

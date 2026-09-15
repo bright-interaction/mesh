@@ -33,6 +33,9 @@ const (
 	maxCLITitleChars     = 180
 	maxCLIReasonChars    = 120
 	maxCLICacheEntries   = 256
+	maxCLIStdoutBytes    = 64 << 10
+	maxCLIStderrBytes    = 64 << 10
+	cliWaitDelay         = 250 * time.Millisecond
 )
 
 // DefaultSubscriptionModel is the deliberately small model Mesh pins when its
@@ -99,7 +102,8 @@ type CLI struct {
 	policy       string
 	cooldown     time.Duration
 
-	mu        sync.Mutex
+	admitOnce sync.Once
+	admission chan struct{}
 	cache     map[[sha256.Size]byte][]Result
 	openUntil time.Time
 	openErr   string
@@ -109,6 +113,50 @@ type CLI struct {
 // This prevents a usage-limit or authentication failure from spawning another
 // costly CLI session on every search during the same outage.
 var ErrCircuitOpen = errors.New("subscription reranker circuit open")
+
+var errCLIOutputLimit = errors.New("subscription CLI output limit exceeded")
+
+// Each stream has one os/exec copy goroutine. Run joins those goroutines before
+// inspecting buffers. Overflow cancels the command immediately, not after EOF.
+type cliCapture struct {
+	buf      bytes.Buffer
+	limit    int
+	overflow bool
+	cancel   context.CancelFunc
+}
+
+func (b *cliCapture) Len() int       { return b.buf.Len() }
+func (b *cliCapture) String() string { return b.buf.String() }
+
+func (b *cliCapture) Write(p []byte) (int, error) {
+	remaining := b.limit - b.Len()
+	if len(p) > remaining {
+		n, _ := b.buf.Write(p[:remaining])
+		b.overflow = true
+		b.cancel()
+		return n, errCLIOutputLimit
+	}
+	return b.buf.Write(p)
+}
+
+// Acquire is lazy so test/custom CLI values keep their zero-value behavior.
+// The token protects both provider admission and cache/circuit state.
+func (c *CLI) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.admitOnce.Do(func() { c.admission = make(chan struct{}, 1) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case c.admission <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-c.admission
+			return err
+		}
+		return nil
+	}
+}
 
 // NewSubscriptionCLI builds a safe, no-API-key reranker for an already logged-in
 // provider CLI. Supported providers are "codex" and "claude". Model may be
@@ -207,6 +255,9 @@ func (c *CLI) ResultLimit() int { return c.resultCap }
 func (c *CLI) RerankPolicy() string { return c.policy }
 
 func (c *CLI) Probe(context.Context) error {
+	if err := cliProcessSupported(); err != nil {
+		return err
+	}
 	if len(c.argv) == 0 {
 		return fmt.Errorf("subscription reranker has no command")
 	}
@@ -235,6 +286,9 @@ func (c *CLI) RerankCandidates(ctx context.Context, query string, candidates []C
 
 func (c *CLI) RerankCandidatesMeasured(ctx context.Context, query string, candidates []Candidate) ([]Result, CallStats, error) {
 	var stats CallStats
+	if err := ctx.Err(); err != nil {
+		return nil, stats, err
+	}
 	if len(candidates) == 0 {
 		return nil, stats, nil
 	}
@@ -257,11 +311,13 @@ func (c *CLI) RerankCandidatesMeasured(ctx context.Context, query string, candid
 	}
 	key := sha256.Sum256([]byte(c.Model() + "\x00" + prompt))
 
-	// Serialize calls and recheck under the same lock. Besides making the tiny
+	// Serialize calls and recheck after cancellable admission. Besides making the tiny
 	// cache race-free, this collapses simultaneous identical searches to one
 	// subscription request instead of creating a quota burst.
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.acquire(ctx); err != nil {
+		return nil, stats, err
+	}
+	defer func() { <-c.admission }()
 	if hit, ok := c.cache[key]; ok {
 		stats.CacheHit = true
 		return cloneResults(hit), stats, nil
@@ -276,6 +332,9 @@ func (c *CLI) RerankCandidatesMeasured(ctx context.Context, query string, candid
 	started := time.Now()
 	out, diagnostic, err := c.run(ctx, prompt)
 	stats.Duration = time.Since(started)
+	if ctx.Err() != nil {
+		return nil, stats, ctx.Err() // Never publish/cache a cancelled call or open its circuit.
+	}
 	if tokens, ok := providerTokenUsage(diagnostic); ok {
 		stats.ProviderTokens = tokens
 		stats.ProviderReported = true
@@ -289,6 +348,9 @@ func (c *CLI) RerankCandidatesMeasured(ctx context.Context, query string, candid
 	}
 	stats.OutputTokens = tokenize.Count(out)
 	results, err := parseRanking(out, len(compact))
+	if ctx.Err() != nil {
+		return nil, stats, ctx.Err()
+	}
 	if err != nil {
 		c.openUntil = time.Now().Add(c.cooldown)
 		c.openErr = "invalid strict JSON"
@@ -304,6 +366,15 @@ func (c *CLI) RerankCandidatesMeasured(ctx context.Context, query string, candid
 }
 
 func (c *CLI) run(parent context.Context, prompt string) (string, string, error) {
+	if err := parent.Err(); err != nil {
+		return "", "", err
+	}
+	if err := cliProcessSupported(); err != nil {
+		return "", "", err
+	}
+	if len(c.argv) == 0 {
+		return "", "", errors.New("subscription reranker has no command")
+	}
 	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
 
@@ -314,24 +385,34 @@ func (c *CLI) run(parent context.Context, prompt string) (string, string, error)
 	defer os.RemoveAll(dir)
 
 	cmd := exec.CommandContext(ctx, c.argv[0], c.argv[1:]...)
+	configureCLIProcess(cmd)
+	cmd.WaitDelay = cliWaitDelay
 	cmd.Dir = dir
 	cmd.Env = llm.SubprocessEnv()
 	cmd.Stdin = strings.NewReader(prompt)
-	var stdout, stderr bytes.Buffer
+	stdout := cliCapture{limit: maxCLIStdoutBytes, cancel: cancel}
+	stderr := cliCapture{limit: maxCLIStderrBytes, cancel: cancel}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return "", stderr.String(), ctx.Err()
-		}
+	runErr := cmd.Run()
+	// Also kill same-group descendants after a successful direct-child exit;
+	// they may have closed their streams and escaped Wait's pipe accounting.
+	cleanupErr := stopCLIProcess(cmd)
+	if parent.Err() != nil {
+		return "", stderr.String(), errors.Join(parent.Err(), cleanupErr)
+	}
+	if stdout.overflow || stderr.overflow {
+		return "", stderr.String(), errors.Join(errCLIOutputLimit, cleanupErr)
+	}
+	if ctx.Err() != nil {
+		return "", stderr.String(), errors.Join(ctx.Err(), cleanupErr)
+	}
+	if err := errors.Join(runErr, cleanupErr); err != nil {
 		detail := truncateUTF8(strings.TrimSpace(stderr.String()), 500)
 		if detail == "" {
 			detail = err.Error()
 		}
 		return "", stderr.String(), fmt.Errorf("%s CLI failed: %s", c.provider, detail)
-	}
-	if stdout.Len() > maxRerankResponseBytes {
-		return "", stderr.String(), fmt.Errorf("%s CLI output exceeded %d bytes", c.provider, maxRerankResponseBytes)
 	}
 	return strings.TrimSpace(stdout.String()), stderr.String(), nil
 }

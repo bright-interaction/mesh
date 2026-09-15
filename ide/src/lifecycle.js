@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+// Copyright (C) 2026 Bright Interaction AB
+
 'use strict';
 const path = require('node:path');
 const fs = require('node:fs');

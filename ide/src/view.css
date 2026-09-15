@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
+ * Copyright (C) 2026 Bright Interaction AB
+ */
+
 /* Editor-specific layout, leaving the browser viewer unchanged. */
 .srch-box { display: flex; align-items: center; gap: 8px; }
 .srch-box input { min-width: 0; flex: 1; }
