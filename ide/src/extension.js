@@ -13,7 +13,7 @@ const DEFAULT = 'http://127.0.0.1:7474';
 let deactivateCurrent;
 function activate(context) {
   const updates = updateCommand(vscode, context.extension.packageJSON.version);
-  context.subscriptions.push(updates, vscode.commands.registerCommand('mesh.checkUpdates', updates.run));
+  context.subscriptions.push(updates, vscode.commands.registerCommand('mesh.checkUpdates', updates.run), vscode.commands.registerCommand('mesh.updateNow', updates.run));
   let panel, broker, listener, lifecycle, ready = false;
   const auth = new RemoteAuth(context.secrets);
   let signInController, signingIn = false;

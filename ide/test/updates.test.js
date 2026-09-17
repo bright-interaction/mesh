@@ -2,13 +2,13 @@
 import { test, expect } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, writeFile, readFile, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, symlink, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const { compare, manifest, verifyBytes, readBounded, checkUpdate, downloadUpdate } = require('../src/updates');
-const { updateCommand } = require('../src/update-command');
+const { updateCommand, stageUpdate } = require('../src/update-command');
 const data = Buffer.from('fixture VSIX');
 const info = { schema: 1, extension: 'bright-interaction.mesh-workspace', version: '0.2.3', source_commit: 'a'.repeat(40), dirty: false, file: 'mesh-workspace-0.2.3.vsix', bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') };
 const base = 'https://github.com/bright-interaction/mesh/releases/download/ide-v0.2.3/';
@@ -143,4 +143,95 @@ test('cancelling download prevents saving late completion', async () => {
   for (let i = 0; i < 20 && !release; i++) await Promise.resolve();
   expect(release).toBeDefined(); cancel(); release(); await task;
   expect(fixture.log.writes).toHaveLength(0); expect(fixture.log.errors).toHaveLength(0);
+});
+
+function installUI(overrides = {}) {
+  const events = [];
+  const h = ui({ stage: async () => ({ file: '/fixture/private/update.vsix', cleanup: async () => { events.push('cleanup'); } }), ...overrides });
+  h.vscode.window.showInformationMessage = async (message, ...buttons) => {
+    h.log.messages.push(message);
+    if (buttons.includes('Update now')) return 'Update now';
+    if (buttons.includes('Reload window')) { events.push('reload-prompt'); return 'Reload window'; }
+  };
+  h.vscode.window.showWarningMessage = async message => h.log.messages.push(message);
+  h.vscode.commands = { executeCommand: async (name, uri) => { events.push(name); if (uri) expect(uri).toEqual({ scheme: 'file', fsPath: '/fixture/private/update.vsix' }); } };
+  return { ...h, events };
+}
+test('Update now installs only the staged local VSIX, cleans up, then explicitly reloads', async () => {
+  const h = installUI();
+  await h.command.run();
+  expect(h.events).toEqual(['workbench.extensions.installExtension', 'cleanup', 'reload-prompt', 'workbench.action.reloadWindow']);
+  expect(h.log.writes).toHaveLength(0);
+  expect(h.log.downloads).toBe(1);
+  expect(h.log.errors).toHaveLength(0);
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url)));
+  expect(pkg.contributes.commands.find(c => c.command === 'mesh.updateNow').enablement).toBe('isWorkspaceTrusted');
+  expect(pkg.contributes.menus['editor/title']).toContainEqual({ command: 'mesh.updateNow', when: "activeWebviewPanelId == 'mesh.workspace'", group: 'navigation' });
+});
+test('Later defers reload and another Update now offers reload without another download/install', async () => {
+  const h = installUI();
+  h.vscode.window.showInformationMessage = async (_, ...buttons) => buttons.includes('Update now') ? 'Update now' : 'Later';
+  await h.command.run(); await h.command.run();
+  expect(h.events).toEqual(['workbench.extensions.installExtension', 'cleanup']);
+  expect(h.log.checks).toBe(1); expect(h.log.downloads).toBe(1);
+});
+test('failed verification or staging cannot install; installer failure never reloads and cleans up', async () => {
+  for (const failure of ['download', 'stage', 'install']) {
+    const h = installUI(failure === 'download' ? { download: async () => { throw new Error('private-detail'); } } : failure === 'stage' ? { stage: async () => { throw new Error('private-detail'); } } : {});
+    if (failure === 'install') h.vscode.commands.executeCommand = async () => { h.events.push('failed-install'); throw new Error('private-detail'); };
+    await h.command.run();
+    expect(h.events).toEqual(failure === 'install' ? ['failed-install', 'cleanup'] : []);
+    expect(h.log.errors).toHaveLength(1);
+    expect(h.log.errors[0]).not.toContain('private-detail');
+    if (failure === 'install') expect(h.log.errors[0]).toContain('did not confirm');
+  }
+});
+test('disposal during staging cleans up without installing or reloading', async () => {
+  let finish;
+  const h = installUI({ stage: async () => new Promise(resolve => { finish = () => resolve({ file: '/fixture/private/update.vsix', cleanup: async () => h.events.push('cleanup') }); }) });
+  const task = h.command.run();
+  for (let i = 0; i < 30 && !finish; i++) await Promise.resolve();
+  expect(finish).toBeDefined(); h.command.dispose(); finish(); await task;
+  expect(h.events).toEqual(['cleanup']);
+});
+test('installer is noncancellable, duplicate calls coalesce, cleanup waits for its completion', async () => {
+  let finish;
+  const h = installUI();
+  h.vscode.commands.executeCommand = async () => { h.events.push('install'); await new Promise(resolve => { finish = resolve; }); };
+  const progress = h.vscode.window.withProgress;
+  h.vscode.window.withProgress = async (opts, fn) => {
+    if (opts.title === 'Installing Mesh IDE…') expect(opts.cancellable).toBe(false);
+    return progress(opts, fn);
+  };
+  const task = h.command.run();
+  for (let i = 0; i < 30 && !finish; i++) await Promise.resolve();
+  expect(finish).toBeDefined();
+  await h.command.run(); h.command.dispose();
+  expect(h.events).toEqual(['install']); finish(); await task;
+  expect(h.events).toEqual(['install', 'cleanup']);
+});
+test('trust lost after consent prevents download and reload failure retains installed status', async () => {
+  const h = installUI();
+  h.vscode.window.showInformationMessage = async () => { h.vscode.workspace.isTrusted = false; return 'Update now'; };
+  await h.command.run(); expect(h.log.downloads).toBe(0); expect(h.events).toEqual([]);
+  const h2 = installUI();
+  h2.vscode.commands.executeCommand = async name => { if (name.endsWith('reloadWindow')) throw new Error('private'); };
+  await h2.command.run();
+  expect(h2.log.errors[0]).toContain('was installed');
+  expect(h2.log.errors[0]).not.toContain('No update was installed');
+});
+test('staging uses private unique files, rechecks bytes, and removes only its own directory', async () => {
+  await expect(stageUpdate(info, Buffer.from('bad'))).rejects.toThrow('checksum');
+  const a = await stageUpdate(info, data), b = await stageUpdate(info, data);
+  try {
+    expect(a.file).not.toBe(b.file);
+    expect(await readFile(a.file)).toEqual(data);
+    if (process.platform !== 'win32') {
+      expect((await stat(a.file)).mode & 0o777).toBe(0o600);
+      expect((await stat(path.dirname(a.file))).mode & 0o777).toBe(0o700);
+    }
+    await a.cleanup();
+    await expect(stat(a.file)).rejects.toThrow();
+    expect(await readFile(b.file)).toEqual(data);
+  } finally { await a.cleanup(); await b.cleanup(); }
 });
