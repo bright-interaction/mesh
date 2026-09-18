@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 'use strict';
 const path = require('node:path');
 const fs = require('node:fs');

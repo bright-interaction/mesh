@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 const { test, expect } = require('bun:test');
 const fs = require('node:fs');
 const { renderView } = require('../src/view');

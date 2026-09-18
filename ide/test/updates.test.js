@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 import { test, expect } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';

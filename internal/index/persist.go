@@ -437,5 +437,17 @@ func retrievalHash(pn *ParsedNote) string {
 		h.Write([]byte{0})
 		h.Write([]byte(s))
 	}
+	// Health-control frontmatter is persisted in the JSON frontmatter column and
+	// changes the live dead-reference result. Hash both the whole-note opt-out and
+	// its per-path variant, otherwise editing only an exemption is invisible to the
+	// incremental drift check and the owner keeps reporting stale findings.
+	if pn.FM.ExpectDeadRefs {
+		h.Write([]byte{0})
+		h.Write([]byte("expect_dead_refs=true"))
+	}
+	for _, s := range pn.FM.ExpectDeadRefPaths {
+		h.Write([]byte{0})
+		h.Write([]byte(s))
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }

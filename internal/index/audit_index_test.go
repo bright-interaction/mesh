@@ -104,6 +104,20 @@ func TestRetrievalHashCoversPersistedFrontmatterFields(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:   "dead-ref path exemption added",
+			before: "id: a\ntype: note\nwhen: \"2026-01-01\"\n",
+			after:  "id: a\ntype: note\nwhen: \"2026-01-01\"\nexpect_dead_ref_paths:\n  - internal/handlers/synthetic.go\n",
+			verify: func(t *testing.T, s *Store) {
+				var fm string
+				if err := s.readDB.QueryRow(`SELECT frontmatter FROM notes WHERE id='a'`).Scan(&fm); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(fm, "internal/handlers/synthetic.go") {
+					t.Errorf("notes.frontmatter lost expect_dead_ref_paths after incremental reconcile: %s", fm)
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {

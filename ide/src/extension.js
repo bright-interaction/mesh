@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 'use strict';
 const vscode = require('vscode');
 const fs = require('node:fs');

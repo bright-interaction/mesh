@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 'use strict';
 const http = require('node:http');
 const MAX_BYTES = 16 * 1024 * 1024;

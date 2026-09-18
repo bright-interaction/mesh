@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 'use strict';
 const { test, expect } = require('bun:test');
 const fs = require('node:fs');
