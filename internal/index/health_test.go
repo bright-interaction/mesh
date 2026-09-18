@@ -131,7 +131,10 @@ func TestHealthContradiction(t *testing.T) {
 	b := writeNote(t, dir, "gotchas/b.md", "---\nid: b\ntype: gotcha\nwhen: 2026-01-01\ntags: [deploy]\ndo: open a pull request\ndont: force push to deploy quickly ever\nwhy: safety\n---\n# B\n")
 	// An unrelated gotcha (different tag, no overlap) must not be flagged.
 	c := writeNote(t, dir, "gotchas/c.md", "---\nid: c\ntype: gotcha\nwhen: 2026-01-01\ntags: [logging]\ndo: use structured logs\ndont: print to stdout\nwhy: clarity\n---\n# C\n")
-	notes := []*ParsedNote{a, b, c}
+	// Scaffolded post-mortems may still carry placeholders. They share the deploy
+	// tag but must not become contradictory with real guidance.
+	d := writeNote(t, dir, "post-mortems/d.md", "---\nid: d\ntype: post-mortem\nwhen: 2026-01-01\ntags: [deploy]\ndo: TODO\ndont: TODO\nwhy: pending\n---\n# D\n")
+	notes := []*ParsedNote{a, b, c, d}
 	g, _ := BuildGraph(notes)
 
 	s, err := Open(dir)
@@ -153,6 +156,9 @@ func TestHealthContradiction(t *testing.T) {
 	for _, f := range findings {
 		if f.NoteID == "c" {
 			t.Errorf("note c should not be flagged as a contradiction")
+		}
+		if f.NoteID == "d" {
+			t.Errorf("placeholder guidance should not be flagged as a contradiction")
 		}
 		if f.Issue != "contradiction" {
 			t.Errorf("issue = %q, want contradiction", f.Issue)

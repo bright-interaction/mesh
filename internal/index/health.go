@@ -320,10 +320,14 @@ func (s *Store) tier0GuidanceContext(ctx context.Context) ([]guidanceRow, error)
 			Tags []string `json:"Tags"`
 		}
 		_ = json.Unmarshal([]byte(fmJSON), &fm)
-		if fm.Do == "" && fm.Dont == "" {
+		do, dont := normalizeGuidance(fm.Do), normalizeGuidance(fm.Dont)
+		if do == "" && dont == "" {
 			continue
 		}
-		out = append(out, guidanceRow{id: id, path: path, do: fm.Do, dont: fm.Dont, tags: fm.Tags})
+		out = append(out, guidanceRow{
+			id: id, path: path,
+			do: do, dont: dont, tags: fm.Tags,
+		})
 	}
 	return out, rows.Err()
 }
@@ -350,6 +354,19 @@ func tokenSet(s string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// normalizeGuidance removes scaffold placeholders before contradiction analysis.
+// Notes created from the post-mortem template may still carry TODO/TBD values in
+// do/dont; treating those literals as guidance makes every note sharing a tag
+// appear contradictory with every other scaffolded note.
+func normalizeGuidance(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "todo", "tbd", "n/a", "na", "none", "-":
+		return ""
+	default:
+		return s
+	}
 }
 
 var stopWord = map[string]bool{"the": true, "and": true, "for": true, "you": true, "use": true, "not": true, "with": true, "this": true, "that": true, "are": true, "but": true}
