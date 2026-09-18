@@ -2385,6 +2385,9 @@ func watchCmd() *cobra.Command {
 				return err
 			}
 			defer owner.Release()
+			if err := owner.MarkStarting(); err != nil {
+				return err
+			}
 			store, err := index.OpenOwned(root, owner)
 			if err != nil {
 				return err
@@ -2403,6 +2406,7 @@ func watchCmd() *cobra.Command {
 			// Incremental: the first reconcile seeds the cache (full), later ones parse
 			// only changed files and rebuild the graph in memory.
 			live := index.NewLiveIndexer(store, root)
+			startupReady := false
 			err = watch.Run(ctx, watch.Options{
 				Root:          root,
 				Debounce:      debounce,
@@ -2419,6 +2423,12 @@ func watchCmd() *cobra.Command {
 					}
 					if err != nil {
 						return watch.Result{}, err
+					}
+					if p.Reason == watch.ReasonStartup && !startupReady {
+						if err := owner.MarkReady(); err != nil {
+							return watch.Result{}, err
+						}
+						startupReady = true
 					}
 					return watch.Result{
 						Added:     rec.Added,
@@ -2519,6 +2529,9 @@ func syncCmd() *cobra.Command {
 				return err
 			}
 			defer owner.Release()
+			if err := owner.MarkStarting(); err != nil {
+				return err
+			}
 			store, err := index.OpenOwned(vaultDir, owner)
 			if err != nil {
 				return err
@@ -2528,6 +2541,7 @@ func syncCmd() *cobra.Command {
 			// The index callback is the sole SQLite writer. Hub sync runs separately
 			// so writes arriving during a network round stay locally queryable.
 			live := index.NewLiveIndexer(store, vaultDir)
+			startupReady := false
 			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			abs, _ := filepath.Abs(vaultDir)
@@ -2552,6 +2566,11 @@ func syncCmd() *cobra.Command {
 						rec, err = live.ReconcilePaths(p.Paths)
 					} else {
 						rec, err = live.Reconcile(p.Authoritative)
+					}
+					if err == nil && p.Reason == watch.ReasonStartup && !startupReady {
+						if err = owner.MarkReady(); err == nil {
+							startupReady = true
+						}
 					}
 					return watch.Result{Added: rec.Added, Changed: rec.Changed, Removed: rec.Removed,
 						Reindexed: rec.Reindexed, Dur: rec.Dur}, err

@@ -120,6 +120,54 @@ func TestMCPYieldsToARunningOwner(t *testing.T) {
 	}
 }
 
+func TestMCPWaitsForDeclaredOwnerStartupReadiness(t *testing.T) {
+	dir := t.TempDir()
+	seedVaultFiles(t, dir)
+	seedIndex(t, dir)
+	declared, err := index.AcquireOwnerLock(filepath.Join(dir, ".mesh"), "mesh watch (test)", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer declared.Release()
+	if err := declared.MarkStarting(); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan struct {
+		srv *Server
+		err error
+	}, 1)
+	go func() {
+		srv, err := NewOwningServer(dir, "mesh mcp (test)")
+		result <- struct {
+			srv *Server
+			err error
+		}{srv: srv, err: err}
+	}()
+	select {
+	case got := <-result:
+		if got.srv != nil {
+			_ = got.srv.Close()
+		}
+		t.Fatalf("MCP opened during declared startup pass: err=%v", got.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := declared.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("MCP after owner readiness: %v", got.err)
+		}
+		defer got.srv.Close()
+		if got.srv.OwnsIndex() {
+			t.Fatal("MCP took ownership from a ready declared owner")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MCP did not open after owner published readiness")
+	}
+}
+
 func TestMCPElectionRetriesWhenOwnerExitsAfterReadOnlyOpen(t *testing.T) {
 	dir := t.TempDir()
 	seedVaultFiles(t, dir)

@@ -35,6 +35,11 @@ import (
 // the agent retries and Mesh mints a near-duplicate.
 var ErrOwnerNotIndexing = errors.New("the change was saved but the owning writer did not apply it in time; it is NOT queryable yet")
 
+// ErrOwnerNotReady means a live owner has not completed its initial full pass, or the
+// owner disappeared before publishing readiness. Read-only startup callers use it to
+// retry election/open rather than probing a database while its first write is active.
+var ErrOwnerNotReady = errors.New("the owning writer has not completed its initial index pass")
+
 const (
 	// OwnerIndexPollInterval is how often a read-only surface checks whether the owner
 	// has landed a change.
@@ -62,7 +67,45 @@ const (
 	// is also why the periodic sweep is pinned UNDER this bound (see cmd/mesh): a sweep
 	// interval above it is precisely the case where a healthy owner reads as down.
 	OwnerIndexBound = 10 * time.Second
+	// OwnerStartupBound covers a cold full pass on a large vault. It is deliberately
+	// separate from OwnerIndexBound: the latter is the write-back receipt SLA, while this
+	// one protects read-only startup from opening the index mid-rebuild.
+	OwnerStartupBound = 2 * time.Minute
 )
+
+// AwaitOwnerReady waits until the live owner publishes completion of its first full
+// reconciliation. A missing owner returns ErrOwnerNotReady so callers may elect a new
+// one; a timeout returns the same sentinel with the durable owner still observable.
+func AwaitOwnerReady(ctx context.Context, meshDir string, timeout time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = OwnerStartupBound
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, live := OwnerReady(meshDir)
+		if live {
+			return nil
+		}
+		if _, ownerLive := OwnerStatus(meshDir); !ownerLive {
+			return ErrOwnerNotReady
+		}
+		select {
+		case <-waitCtx.Done():
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return ErrOwnerNotReady
+		case <-time.After(OwnerIndexPollInterval):
+		}
+	}
+}
 
 // AwaitNoteIndexed blocks until the owning writer has indexed noteID.
 //

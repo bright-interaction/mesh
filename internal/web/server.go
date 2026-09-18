@@ -278,6 +278,13 @@ func newReadOnlyServerContext(ctx context.Context, vaultRoot string, load func(c
 		return nil, err
 	}
 	identity, identityErr := os.Stat(filepath.Join(vaultRoot, ".mesh", "mesh.db"))
+	if _, starting := index.OwnerStarting(filepath.Join(vaultRoot, ".mesh")); starting {
+		if err := index.AwaitOwnerReady(ctx, filepath.Join(vaultRoot, ".mesh"), index.OwnerStartupBound); err != nil {
+			if _, live := index.OwnerStatus(filepath.Join(vaultRoot, ".mesh")); live {
+				return nil, err
+			}
+		}
+	}
 	store, err := index.OpenReadOnly(vaultRoot)
 	if err != nil {
 		return nil, err
@@ -344,6 +351,9 @@ func newOwningServerContext(ctx context.Context, vaultRoot string, reindex ownin
 	if err != nil {
 		return nil, err
 	}
+	if err := owner.MarkStarting(); err != nil {
+		return nil, startupFailure(ctx, err, owner.Release())
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, startupFailure(ctx, err, owner.Release())
 	}
@@ -360,6 +370,9 @@ func newOwningServerContext(ctx context.Context, vaultRoot string, reindex ownin
 	}
 	g, err := reindex(ctx, store, vaultRoot)
 	if err != nil {
+		return nil, cleanup(err)
+	}
+	if err := owner.MarkReady(); err != nil {
 		return nil, cleanup(err)
 	}
 	// Apply anything a reader queued for an owner before this process started. Normally

@@ -30,11 +30,12 @@ import (
 //
 // So ownership is now a claim a process makes, in a file every writer checks:
 //
-//	<vault>/.mesh/owner.lock   JSON: pid, host, role, preemptible, started_at
+//	<vault>/.mesh/owner.lock   JSON: pid, host, role, preemptible, started_at,
+//	                            startup_pending, ready_at
 //
-// The file's own mtime is the heartbeat (os.Chtimes, no rewrite), so a reader never sees
-// a half-written claim and this never becomes another byte writer to make durable. The
-// contents are written once, at acquisition.
+// The file's own mtime is the heartbeat (os.Chtimes); claim/readiness transitions use an
+// fsynced temp-file rename, so a reader never sees a half-written claim and this never
+// becomes another byte writer during the steady-state heartbeat.
 //
 // Liveness, in order of confidence:
 //   - same host: ask the OS whether the pid is still there (processAlive). A dead owner's
@@ -72,6 +73,14 @@ type OwnerInfo struct {
 	// Preemptible marks an opportunistic claim (mesh mcp) that a declared owner may take.
 	Preemptible bool  `json:"preemptible"`
 	StartedAt   int64 `json:"started_at"`
+	// ReadyAt is published after the owner's first full reconciliation has committed.
+	// A live claim without it is still starting; read-only surfaces must not load the
+	// SQLite file in that window because schema/index startup work may still be in flight.
+	ReadyAt int64 `json:"ready_at,omitempty"`
+	// StartupPending is set by long-lived owners immediately before opening/rebuilding
+	// the index. It is separate from ReadyAt so older/manual claims remain compatible:
+	// only an owner that explicitly advertises a startup pass makes readers wait.
+	StartupPending bool `json:"startup_pending,omitempty"`
 	// Nonce identifies THIS claim, not the process that made it. Held compares it,
 	// because pid + host + start time do not distinguish two claims made by one process
 	// (a `mesh ui --own-index` inside the same binary as an elected `mesh mcp`, or any
@@ -130,6 +139,92 @@ type OwnerLock struct {
 // Every other error is a real filesystem failure.
 func AcquireOwnerLock(meshDir, role string, preemptible bool) (*OwnerLock, error) {
 	return acquireOwnerLock(meshDir, role, preemptible, !preemptible)
+}
+
+func (l *OwnerLock) updateInfo(update func(*OwnerInfo)) error {
+	if l == nil {
+		return ErrOwnerHeld
+	}
+	return withExistingOwnerMetadataLock(filepath.Dir(l.path), func() error {
+		info, live := readOwner(l.path)
+		if !live || info.Nonce == "" || info.Nonce != l.info.Nonce {
+			return ErrOwnerHeld
+		}
+		update(&info)
+		body, err := json.Marshal(info)
+		if err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(filepath.Dir(l.path), ".owner.lock.ready-*")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName)
+		if err := tmp.Chmod(0o600); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+		if _, err := tmp.Write(body); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			return err
+		}
+		if err := os.Rename(tmpName, l.path); err != nil {
+			return err
+		}
+		// Persist the directory entry as well as the claim bytes. This is a tiny
+		// metadata update, but readiness must not claim success across a power loss
+		// that leaves the old owner JSON behind.
+		dir, err := os.Open(filepath.Dir(l.path))
+		if err != nil {
+			return err
+		}
+		syncErr := dir.Sync()
+		closeErr := dir.Close()
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// MarkStarting advertises that this owner is about to perform its first full pass.
+// The update is atomic, so readers either see the old claim or the startup marker.
+func (l *OwnerLock) MarkStarting() error {
+	return l.updateInfo(func(info *OwnerInfo) {
+		info.StartupPending = true
+		info.ReadyAt = 0
+	})
+}
+
+// MarkReady publishes that this owner has completed its initial reconciliation. The
+// update is atomic under the same metadata guard used for claims.
+func (l *OwnerLock) MarkReady() error {
+	return l.updateInfo(func(info *OwnerInfo) {
+		info.StartupPending = false
+		if info.ReadyAt == 0 {
+			info.ReadyAt = time.Now().Unix()
+		}
+	})
+}
+
+// OwnerReady reports whether the live owner has completed its first full pass.
+func OwnerReady(meshDir string) (OwnerInfo, bool) {
+	info, live := OwnerStatus(meshDir)
+	return info, live && info.ReadyAt > 0
+}
+
+// OwnerStarting reports whether a live owner explicitly advertised a startup pass.
+func OwnerStarting(meshDir string) (OwnerInfo, bool) {
+	info, live := OwnerStatus(meshDir)
+	return info, live && info.StartupPending
 }
 
 // AcquireOneShotOwnerLock claims an idle vault for a bounded database operation. It

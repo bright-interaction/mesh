@@ -156,10 +156,28 @@ func NewServer(vaultRoot string) (*Server, error) {
 // reader behaviour on its own; see owns.
 func NewOwningServer(vaultRoot, role string) (*Server, error) {
 	meshDir := filepath.Join(vaultRoot, ".mesh")
-	deadline := time.Now().Add(ownerIndexTimeout)
+	deadline := time.Now().Add(index.OwnerStartupBound)
 	for {
 		lock, err := index.AcquireOwnerLock(meshDir, role, true)
 		if errors.Is(err, index.ErrOwnerHeld) {
+			// A declared owner can publish its claim before its first full pass. Do not
+			// open the read-only connection against that in-flight rebuild: wait for the
+			// explicit readiness marker, then verify the claim is still live.
+			if _, starting := index.OwnerStarting(meshDir); starting {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return nil, index.ErrOwnerNotReady
+				}
+				if werr := index.AwaitOwnerReady(context.Background(), meshDir, remaining); werr != nil {
+					if _, live := index.OwnerStatus(meshDir); !live {
+						continue
+					}
+					if time.Now().After(deadline) {
+						return nil, werr
+					}
+					continue
+				}
+			}
 			store, oerr := index.OpenReadOnly(vaultRoot)
 			if oerr == nil {
 				if afterMCPReadOnlyOpen != nil {
@@ -189,6 +207,10 @@ func NewOwningServer(vaultRoot, role string) (*Server, error) {
 			continue
 		}
 		if err != nil {
+			return nil, err
+		}
+		if err := lock.MarkStarting(); err != nil {
+			_ = lock.Release()
 			return nil, err
 		}
 		if beforeMCPOwnedOpen != nil {
@@ -282,6 +304,11 @@ func newServerWithStoreTimeout(vaultRoot string, store *index.Store, owner *inde
 			fmt.Fprintf(os.Stderr, "mesh mcp: %v\n", s.readyErr)
 			close(s.ready)
 			return
+		}
+		if s.owns() && s.owner != nil {
+			if err := s.owner.MarkReady(); err != nil {
+				slog.Warn("mesh mcp: could not publish owner readiness", "err", err)
+			}
 		}
 		if s.ownerRole != "" {
 			// Start the queue wake path as soon as the index is servable. Backfill and

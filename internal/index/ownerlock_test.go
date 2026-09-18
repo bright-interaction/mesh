@@ -4,6 +4,7 @@
 package index
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -149,6 +150,38 @@ func TestReleaseLeavesNoOwner(t *testing.T) {
 	}
 	if err := lock.Release(); err != nil {
 		t.Errorf("a second release must be a no-op, got %v", err)
+	}
+}
+
+func TestOwnerStartupReadinessIsPublishedAtomically(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := AcquireOwnerLock(dir, "mesh watch", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	if err := lock.MarkStarting(); err != nil {
+		t.Fatalf("mark starting: %v", err)
+	}
+	if _, starting := OwnerStarting(dir); !starting {
+		t.Fatal("startup marker was not visible to a reader")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := AwaitOwnerReady(ctx, dir, 20*time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AwaitOwnerReady before first pass = %v, want context deadline", err)
+	}
+	if err := lock.MarkReady(); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if _, starting := OwnerStarting(dir); starting {
+		t.Fatal("startup marker remained after readiness")
+	}
+	if _, ready := OwnerReady(dir); !ready {
+		t.Fatal("ready marker was not visible to a reader")
+	}
+	if err := AwaitOwnerReady(context.Background(), dir, time.Second); err != nil {
+		t.Fatalf("AwaitOwnerReady after first pass: %v", err)
 	}
 }
 
