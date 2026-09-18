@@ -182,17 +182,21 @@ func (l *OwnerLock) updateInfo(update func(*OwnerInfo)) error {
 		// Persist the directory entry as well as the claim bytes. This is a tiny
 		// metadata update, but readiness must not claim success across a power loss
 		// that leaves the old owner JSON behind.
-		dir, err := os.Open(filepath.Dir(l.path))
-		if err != nil {
-			return err
-		}
-		syncErr := dir.Sync()
-		closeErr := dir.Close()
-		if err := errors.Join(syncErr, closeErr); err != nil {
+		if err := ownerSyncDir(filepath.Dir(l.path)); err != nil {
 			return err
 		}
 		return nil
 	})
+}
+
+func ownerSyncDir(dirPath string) error {
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
 // MarkStarting advertises that this owner is about to perform its first full pass.
