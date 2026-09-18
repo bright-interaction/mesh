@@ -41,7 +41,22 @@ var codePathRe = regexp.MustCompile(`[A-Za-z0-9_./-]+\.(?:go|ts|tsx|js|jsx|svelt
 // dead_ref detection skips them so the finding stays actionable.
 func isChangelogNote(id string) bool {
 	id = strings.ToLower(strings.TrimSpace(id))
-	return id == "log" || strings.HasSuffix(id, "-log")
+	if id == "log" || strings.HasSuffix(id, "-log") {
+		return true
+	}
+	// Large vaults split append-only entity logs into numbered pages (for example,
+	// `dockyard-log-p01`). Their source paths are historical by definition too, but
+	// the page suffix means the old exact `-log` check missed them.
+	marker := strings.LastIndex(id, "-log-p")
+	if marker < 0 || marker+len("-log-p") == len(id) {
+		return false
+	}
+	for _, r := range id[marker+len("-log-p"):] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ComputeHealth runs ScanHealth and replaces the note_health rows for the two issue

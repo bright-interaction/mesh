@@ -92,8 +92,9 @@ func TestHealthChangelogDeadRefExempt(t *testing.T) {
 
 	// Same dead reference (internal/foo/ghost.go is gone) in a changelog and a real note.
 	changelog := writeNote(t, dir, "entities/service-log.md", "---\nid: service-log\ntype: note\nwhen: 2026-01-01\n---\n# Changelog\n2026-05: retired internal/foo/ghost.go.\n")
+	pageChangelog := writeNote(t, dir, "entities/service-log-p01.md", "---\nid: service-log-p01\ntype: entity\nwhen: 2026-01-01\n---\n# Changelog page\n2026-05: retired internal/foo/ghost.go.\n")
 	realNote := writeNote(t, dir, "gotchas/live.md", "---\nid: live-note\ntype: gotcha\nwhen: 2026-01-01\ndo: x\ndont: y\nwhy: z\n---\n# Live\nThe handler is at internal/foo/ghost.go.\n")
-	notes := []*ParsedNote{changelog, realNote}
+	notes := []*ParsedNote{changelog, pageChangelog, realNote}
 	g, _ := BuildGraph(notes)
 
 	s, err := Open(dir)
@@ -118,6 +119,9 @@ func TestHealthChangelogDeadRefExempt(t *testing.T) {
 	}
 	if got["service-log"] == "dead_ref" {
 		t.Error("a changelog's historical file reference must not be flagged as dead_ref")
+	}
+	if got["service-log-p01"] == "dead_ref" {
+		t.Error("a numbered changelog page's historical file reference must not be flagged as dead_ref")
 	}
 	if got["live-note"] != "dead_ref" {
 		t.Errorf("a live note referencing a gone file should still flag dead_ref, got %q", got["live-note"])
