@@ -60,3 +60,37 @@ func (s *Server) rememberReaderVersion(ctx context.Context, before index.ReaderV
 	}
 	s.viewVersion, s.viewConfig, s.viewReusable = after, fingerprint, true
 }
+
+// reuseAcknowledgement runs only under reloadMu. The installed graph/retriever
+// was built wholly inside viewVersion (see rememberReaderVersion). If that same
+// monitor still reports viewVersion before AND after the exact path/hash query,
+// the query describes the already-installed snapshot, without rebuilding it.
+// Notes, code/graph links, vectors, schema and retrieval configuration all retain
+// the ordinary refresh invalidation contract. Probe failure is never success.
+// The caller must still verify the final database row and current file bytes.
+func (s *Server) reuseAcknowledgement(ctx context.Context, before index.ReaderVersion, valid bool, noteID, notePath, noteHash string) (matched, reused bool, err error) {
+	if !valid || !s.viewReusable || before != s.viewVersion {
+		return false, false, nil
+	}
+	inputs, err := retrieve.LoadConfigInputs(ctx, s.store.MeshDir())
+	if err != nil {
+		return false, false, err
+	}
+	fingerprint, reusable := inputs.Fingerprint()
+	if !reusable || fingerprint != s.viewConfig {
+		return false, false, nil
+	}
+	monitor := s.changeMonitor
+	matched, err = s.store.NoteVersionMatchesContext(ctx, noteID, notePath, noteHash)
+	if err != nil {
+		return false, false, err
+	}
+	if s.afterCachedNoteVersion != nil {
+		s.afterCachedNoteVersion()
+	}
+	after, valid := s.readerVersion(ctx)
+	if !valid || !s.viewReusable || s.changeMonitor != monitor || after != before {
+		return false, false, ctx.Err()
+	}
+	return matched, true, ctx.Err()
+}

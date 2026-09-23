@@ -250,8 +250,11 @@ func TestReaderRefreshProbeFailureAndCancellationDoNotReuse(t *testing.T) {
 }
 
 func TestAcknowledgementRetainsVersionProofAndPrimesOrdinaryRefresh(t *testing.T) {
-	srv, _, path := refreshFixture(t)
+	srv, owner, path := refreshFixture(t)
 	g, _ := srv.snapshot()
+	// A different database revision cannot reuse the old snapshot even when
+	// the target note's own path/hash have not changed.
+	setRefreshLabel(t, owner, "Changed graph metadata")
 	if err := srv.awaitOwnerIndexed(context.Background(), "note", path); err != nil {
 		t.Fatal(err)
 	}

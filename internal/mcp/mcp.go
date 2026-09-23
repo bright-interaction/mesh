@@ -58,13 +58,14 @@ type Server struct {
 	viewHashes map[string]string
 	// Refresh reuse state is guarded by reloadMu. The monitor is connection-local;
 	// it must never be replaced while retaining a reusable version stamp.
-	changeMonitor       *index.ChangeMonitor
-	viewVersion         index.ReaderVersion
-	viewConfig          [32]byte
-	viewReusable        bool
-	viewBuildComplete   bool
-	refreshClosed       bool
-	beforeReaderInstall func() // deterministic concurrent-commit test seam
+	changeMonitor          *index.ChangeMonitor
+	viewVersion            index.ReaderVersion
+	viewConfig             [32]byte
+	viewReusable           bool
+	viewBuildComplete      bool
+	refreshClosed          bool
+	beforeReaderInstall    func() // deterministic concurrent-commit test seam
+	afterCachedNoteVersion func() // deterministic acknowledgement proof race seam
 
 	// owner is the vault's owning-writer claim when THIS process elected itself (see
 	// NewOwningServer). nil on a read-only server and on the hub, which owns an index
@@ -643,9 +644,18 @@ func (s *Server) refreshAtNoteVersion(ctx context.Context, noteID, notePath, not
 	if s.refreshClosed {
 		return false, errors.New("mesh: reader closed")
 	}
-	// Acknowledgements still load the exact-version SQLite snapshot. Reuse only
-	// removes redundant ordinary refreshes, never this publication proof.
+	// A previous refresh/acknowledgement may already have installed this exact
+	// version. Reuse needs the same monitored database revision on BOTH sides of
+	// the note-version check; a matching id or cached note hash alone is not proof.
+	trace.Phase("cached_version_check")
 	version, valid := s.readerVersion(ctx)
+	matched, reused, err := s.reuseAcknowledgement(ctx, version, valid, noteID, notePath, noteHash)
+	if err != nil || reused {
+		return matched, err
+	}
+	// A failed monitor probe in the reuse path may have closed its connection.
+	// Establish the fallback build's stamp on the monitor it will actually use.
+	version, valid = s.readerVersion(ctx)
 	trace.Phase("load_versioned_graph")
 	g, matched, err := s.store.LoadGraphAtNoteVersionContext(ctx, noteID, notePath, noteHash)
 	if err != nil || !matched {
