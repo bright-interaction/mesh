@@ -63,7 +63,7 @@ test('auth failures show actionable guidance and stop polling until explicit ret
     await h.lifecycle.check();
     expect(h.children).toHaveLength(0);
     expect(h.timers.size).toBe(0);
-    expect(h.lifecycle.state.detail).toContain(code === 'AUTH_REQUIRED' ? 'Sign In' : 'permissions');
+    expect(h.lifecycle.state.detail).toContain(code === 'AUTH_REQUIRED' ? 'Mesh: Connect' : 'permissions');
     expect(h.lifecycle.state.detail).not.toContain('private');
     h.lifecycle.retry();
     expect(h.timers.size).toBe(1);

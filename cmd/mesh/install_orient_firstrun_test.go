@@ -23,7 +23,7 @@ import (
 // TestOrientNeverCreatesAnIndex pins the SessionStart hook against index.Open's
 // create-on-absence behaviour.
 //
-// corruptIndexError prints its own repair ("rm -f mesh.db mesh.db-wal mesh.db-shm"), and
+// corruptIndexError historically printed a manual database-deletion repair, and
 // the operator who followed it got an empty 225KB database back on their very next
 // session, because SessionStart -> `mesh orient` opened writable and index.Open CREATES.
 // From then on the vault was indistinguishable from an indexed one: `mesh search` said

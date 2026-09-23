@@ -5,8 +5,11 @@ package index
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/bright-interaction/mesh/internal/vault"
 )
 
 // maxDocChars caps the text sent per candidate to a reranker. A cross-encoder
@@ -28,6 +31,31 @@ type NoteMetadata struct {
 	SupersededBy    string
 	SupersederPath  string
 	SupersederScope string
+	MissingGuidance []string
+}
+
+// Only read the three guidance fields, not the complete frontmatter or note body.
+// These values share the identity/ACL snapshot, including on the reranker path.
+const guidanceFieldsSQL = `CASE WHEN json_valid(n.frontmatter)
+  THEN json_extract(n.frontmatter, '$.Do', '$.Dont', '$.Why') ELSE '[]' END`
+
+func missingGuidance(kind, fieldsJSON string) []string {
+	if !vault.NoteType(kind).RequiresFlywheel() {
+		return nil
+	}
+	var fields [3]string
+	if err := json.Unmarshal([]byte(fieldsJSON), &fields); err != nil {
+		// Invalid stored guidance is not evidence of a complete note.
+		fields = [3]string{}
+	}
+	var missing []string
+	for i, name := range []string{"do", "dont", "why"} {
+		text, _ := vault.StripComments(fields[i])
+		if vault.Unfilled(text) {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 // NoteDocument pairs rerankable text with the note metadata read in the SAME SQL
@@ -63,7 +91,8 @@ func (s *Store) noteMetadataBatch(ctx context.Context, ids []string, out map[str
 	placeholders, args := noteIDArgs(ids)
 	rows, err := s.readDB.QueryContext(ctx, `
 SELECT 'note:' || n.id, n.id, n.path, n.type, n.title, n.scope,
-       COALESCE(sup.id, ''), COALESCE(sup.path, ''), COALESCE(sup.scope, '')
+       COALESCE(sup.id, ''), COALESCE(sup.path, ''), COALESCE(sup.scope, ''),
+       `+guidanceFieldsSQL+`
 FROM notes n
 LEFT JOIN nodes gn ON gn.id = 'note:' || n.id
 LEFT JOIN notes sup ON sup.id = CASE
@@ -77,12 +106,15 @@ WHERE 'note:' || n.id IN (`+placeholders+`)`, args...)
 	defer rows.Close()
 	for rows.Next() {
 		var m NoteMetadata
+		var guidance string
 		if err := rows.Scan(
 			&m.NodeID, &m.NoteID, &m.Path, &m.Type, &m.Title, &m.Scope,
 			&m.SupersededBy, &m.SupersederPath, &m.SupersederScope,
+			&guidance,
 		); err != nil {
 			return err
 		}
+		m.MissingGuidance = missingGuidance(m.Type, guidance)
 		out[m.NodeID] = m
 	}
 	return rows.Err()
@@ -99,7 +131,7 @@ func (s *Store) NoteDocuments(ctx context.Context, ids []string) (map[string]Not
 	rows, err := s.readDB.QueryContext(ctx, `
 SELECT si.node_id, n.id, n.path, n.type, n.title, n.scope,
        COALESCE(sup.id, ''), COALESCE(sup.path, ''), COALESCE(sup.scope, ''),
-       si.body
+       si.body, `+guidanceFieldsSQL+`
 FROM search_index si
 JOIN notes n ON si.node_id = 'note:' || n.id
 LEFT JOIN nodes gn ON gn.id = si.node_id
@@ -114,14 +146,15 @@ WHERE si.node_id IN (`+placeholders+`)`, args...)
 	defer rows.Close()
 	for rows.Next() {
 		var d NoteDocument
-		var body string
+		var body, guidance string
 		if err := rows.Scan(
 			&d.NodeID, &d.NoteID, &d.Path, &d.Type, &d.Title, &d.Scope,
 			&d.SupersededBy, &d.SupersederPath, &d.SupersederScope,
-			&body,
+			&body, &guidance,
 		); err != nil {
 			return nil, err
 		}
+		d.MissingGuidance = missingGuidance(d.Type, guidance)
 		d.Text = boundedDocument(d.Title, body)
 		out[d.NodeID] = d
 	}

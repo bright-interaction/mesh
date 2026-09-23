@@ -42,36 +42,18 @@ func lineAfter(t *testing.T, text, marker string) string {
 	return strings.TrimSpace(rest)
 }
 
-// TestCorruptIndexRemedySurvivesAVaultPathWithASpace is the nastiest half of the
-// shell-quoting defect, because it fails SILENTLY.
-//
-// The by-hand repair used to render as `rm -f <db> <db>-wal <db>-shm` with the path
-// interpolated raw. Under a vault like `~/Documents/My Notes` that is six operands, none
-// of which exist. rm -f says nothing about a missing operand and exits 0, so the operator
-// reads a clean run as "index cleared", re-runs Mesh, and meets the identical corruption
-// error with no idea why the repair did not take.
-//
-// The assertion is what a shell makes of the line: exactly the three files Mesh itself
-// would delete, no more and no fewer.
+// The supported repair must retain its vault-path quoting. Unguarded manual
+// deletion advice is intentionally absent: it bypasses ownership and omits backup precautions.
 func TestCorruptIndexRemedySurvivesAVaultPathWithASpace(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "My Notes")
 	dbPath := filepath.Join(root, ".mesh", "mesh.db")
 
 	msg := corruptIndexError(root, dbPath, errors.New("file is not a database (26)")).Error()
 
-	got := shellArgs(t, "rm -f "+lineAfter(t, msg, "by hand: rm -f "))
-	want := indexFiles(dbPath)
-	if len(got) != len(want)+2 { // "rm" and "-f" are arguments here too
-		t.Fatalf("the shell read the repair as %d operands, not the %d files it names:\n  printed: %s\n  sh saw: %q",
-			len(got)-2, len(want), lineAfter(t, msg, "by hand: "), got)
-	}
-	for i, w := range want {
-		if got[i+2] != w {
-			t.Errorf("operand %d: sh saw %q, want %q (printed: %s)", i, got[i+2], w, lineAfter(t, msg, "by hand: "))
-		}
+	if strings.Contains(msg, "rm -f") {
+		t.Fatal("repair bypasses the owner's guarded rebuild")
 	}
 
-	// The rebuild command on the line above has to survive the same shell.
 	repair := lineAfter(t, msg, "repair:  mesh index ")
 	if i := strings.Index(repair, "   ("); i >= 0 {
 		repair = strings.TrimSpace(repair[:i])

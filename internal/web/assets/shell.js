@@ -77,7 +77,8 @@
     if (!el || !el.classList.contains("hidden")) return;
     el.classList.remove("hidden");
     el.setAttribute("aria-hidden", "false");
-    const inp = document.getElementById("login-key");
+    const account = document.getElementById("login-account");
+    const inp = account && !account.hidden ? document.getElementById("login-account-link") : document.getElementById("login-key");
     if (inp) setTimeout(() => inp.focus(), 60);
   }
   Mesh.showLogin = showLogin;
@@ -85,6 +86,16 @@
   function wireLogin() {
     const form = document.getElementById("login-form");
     if (!form) return;
+    const link = document.getElementById("login-account-link");
+    if (link && link.dataset.signIn) {
+      const target = new URL(link.dataset.signIn, location.href);
+      if (target.origin === location.origin && target.pathname === "/auth/oidc/login") {
+        link.href = target.href;
+        document.getElementById("login-account").hidden = false;
+        document.getElementById("login-key-option").open = false;
+        document.getElementById("login-sub").textContent = "Sign in with your team's account to continue.";
+      }
+    }
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const inp = document.getElementById("login-key");

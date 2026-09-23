@@ -344,7 +344,12 @@ func (a *App) resultsView() string {
 		if c.Tier0 {
 			marker = tier0Style.Render("* ")
 		}
-		title := truncate(c.Title, innerW-4)
+		title := c.Title
+		if len(c.MissingGuidance) > 0 {
+			marker = tier0Style.Render("! ")
+			title = "[incomplete] " + title
+		}
+		title = truncate(title, innerW-4)
 		var row string
 		if i == a.cardsCur {
 			row = marker + selectedStyle.Render(title)

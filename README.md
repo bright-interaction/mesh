@@ -14,10 +14,23 @@ and the opt-in workspace catch-up timer for server-side merges.
 ## Honest scope
 
 - **The core, zero models:** cheap card-based retrieval (FTS + graph-BM25 + tier-0, pure Go, no inference, near-zero CPU) plus the agent write-back flywheel, in a single no-glue binary. `mesh_search` hands the agent ranked cards (title + snippet + why); **the agent reads the cards and picks** the 1-2 notes worth fetching. A capable coding agent is already a stronger relevance judge than any bolt-on reranker, so for the agent consumer the agent *is* the reranker, free. This is the whole product for an agent.
+
 - **Optional BYOAI add-ons (off by default; Ollama is never required):**
   - **Vectors (`mesh embed`)** lift recall on paraphrase queries where keyword search breaks (13/20 -> 19/20 on the private corpus behind `docs/BENCHMARK.md`; read that file's caveats before quoting the number). Worth turning on when queries paraphrase the notes; can point at a cloud endpoint for zero local CPU, or be skipped (FTS keyword recall is already 23/25).
   - **Rerank** lifts top-1 precision for a consumer that *trusts the top result without reading the cards*. Use either a local/cloud cross-encoder, or let an already-authenticated Codex/Claude subscription rank 12 compact cards with its cheapest suitable model and return only the best 5. The subscription path needs no API key and no Ollama; it never scans the vault or receives full note bodies. See `docs/BENCHMARK.md` for the measured cross-encoder arm.
 - **Also shipped:** a keyboard TUI (`mesh tui`) and a browser app (`mesh ui`) over the same index, plus the client side of sovereign team sync (`mesh join` / `mesh sync` / `mesh conflicts`). The team-sync **server** those talk to is the commercial product and is not in this repository, see [LICENSING.md](LICENSING.md). All optional; the solo, local core stands alone.
+
+Search cards flag unfilled `do`/`dont`/`why` fields on decisions, gotchas and
+post-mortems as `MissingGuidance`. The warning survives compact token packing;
+CLI, TUI and web search mark the result as incomplete. Tier-0 describes the note
+type, not verified truth. A populated note is not automatically current or correct:
+fetch its evidence and check supersession before relying on it.
+
+Imported text uses `[[untrusted-external-content ...]]` provenance markers that
+remain literal inside MCP search/batch JSON. Case/spacing variants of forged
+current or legacy markers are neutralized. Imported card text, including titles,
+is still untrusted data: these cues do not grant authority or guarantee resistance
+to prompt injection. Access checks remain independent of model behavior.
 
 ## Install
 
@@ -157,34 +170,33 @@ mesh index my-vault
 so both are a **dry run unless you pass `--apply`**. They also exit non-zero if any
 file failed, so a partial rewrite never reads as success in a script.
 
-## Recovery: the index is derived, so it is always safe to delete
+## Recovery: preserve database-only state before rebuilding
 
-`.mesh/mesh.db` is built from your markdown. The markdown is the source of truth and
-nothing lives only in the index, so deleting it never loses a note.
+Published notes stay in Markdown, but **not everything in `.mesh/` is derived**.
+`.mesh/mesh.db` also holds pending review notes, usage/reuse history and stored
+embeddings. Deleting it loses those records. Connection grants, sync state,
+credentials and queued operations elsewhere in `.mesh/` are not disposable either.
 
 If a command reports `file is not a database (26)` or `database disk image is malformed
-(11)`, the index file is corrupt. Those are SQLite's two ways of saying the same thing:
-26 means the file is not SQLite at all (something wrote over it), 11 means the header is
-fine and a page inside it is not (a crash mid-write, a bad sector, a copy taken while a
-write was in flight). Both are handled the same way. Rebuild it:
+(11)`, preserve the evidence and verify the failure before repairing. Stop the
+relevant vault services with operator approval and take a consistent protected
+backup. Prefer a verified restore into a separate directory. Never delete a live
+database or its WAL files by hand. See [backup and recovery](docs/RECOVERY.md).
+
+If no usable database backup exists, an explicitly accepted Markdown-only recovery
+can rebuild search and note links, but cannot recover database-only records:
 
 ```
-mesh index my-vault                # detects the corrupt file, discards it, rebuilds
+mesh index my-vault                # discards a corrupt database; see loss warning above
 ```
 
-Or do it by hand, which is the same thing:
-
-```
-rm -f my-vault/.mesh/mesh.db my-vault/.mesh/mesh.db-wal my-vault/.mesh/mesh.db-shm
-mesh index my-vault
-```
-
-Two related failures that are **not** corruption and must not be fixed by deleting
+Related failures that are **not** corruption and must not be fixed by deleting
 anything:
 
 - `database is locked (SQLITE_BUSY)` means another mesh process (usually a
   `mesh sync --watch` or `mesh mcp --watch` daemon) holds the write lock. Wait and
-  retry, or stop the daemon. A full reindex only holds it for a few seconds.
+  retry and inspect the owner's progress; stopping that service needs operator
+  approval. Elapsed time alone is not evidence of corruption.
 - `no index at <path>` means there is no database yet. Run `mesh index <vault>`.
 - `index schema mismatch` means the database was written by a different version of Mesh.
   The index is derived, so Mesh rebuilds rather than migrating, and only a WRITABLE open
@@ -887,7 +899,9 @@ go build ./...
 go test ./...
 ```
 
-No cgo. Storage is pure-Go `modernc.org/sqlite` in WAL mode; the `.mesh/` index is a derived, deletable artifact, the markdown is the source of truth.
+No cgo. Storage is pure-Go `modernc.org/sqlite` in WAL mode. Markdown is the source
+of truth for published notes; `.mesh/` also contains state that cannot be rebuilt
+from those notes. See [backup and recovery](docs/RECOVERY.md).
 
 ## License & editions
 

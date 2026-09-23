@@ -285,6 +285,11 @@ func TestIndexRebuildsCorruptDatabase(t *testing.T) {
 	if !strings.Contains(out, "was corrupt and unreadable") {
 		t.Errorf("index deleted the database without telling the operator:\n%s", out)
 	}
+	for _, want := range []string{"pending review notes", "usage/reuse history", "not recovered from Markdown"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("index did not disclose recovery loss %q:\n%s", want, out)
+		}
+	}
 
 	store, openErr := index.Open(dir)
 	if openErr != nil {

@@ -101,6 +101,9 @@ type Server struct {
 	// global state (which would race across parallel tests); production never sets it.
 	ownerIndexTimeout time.Duration
 	notePublisher     NotePublisher
+	// writePrepareTimeout bounds reversible write preparation before publication.
+	// Zero selects the production default; tests shorten it without global mutation.
+	writePrepareTimeout time.Duration
 	// Deterministic test seam immediately before the atomic expected-version graph
 	// snapshot. Production leaves it nil.
 	beforeOwnerVersionRefresh func()
@@ -344,9 +347,9 @@ func (s *Server) WaitReady() error {
 	return s.readyErr
 }
 
-// awaitReady blocks until the initial background load finishes. Early tool
-// calls (a client may fire one right after the handshake) wait for the index
-// rather than racing a nil graph.
+// awaitReady blocks until the initial background load finishes. Graph-dependent
+// calls wait for the index rather than racing a nil graph; known-note fetches
+// use the opened store and current file without this graph-only dependency.
 func (s *Server) awaitReady(ctx context.Context) *rpcError {
 	select {
 	case <-s.ready:
@@ -1173,8 +1176,10 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	case "tools/list":
 		return s.handleToolsList(), nil
 	case "tools/call":
-		if rerr := s.awaitReady(ctx); rerr != nil {
-			return nil, rerr
+		if toolCallNeedsGraph(req.Params) {
+			if rerr := s.awaitReady(ctx); rerr != nil {
+				return nil, rerr
+			}
 		}
 		return s.handleToolsCall(ctx, req.Params)
 	case "resources/list":
@@ -1187,6 +1192,22 @@ func (s *Server) dispatch(ctx context.Context, req request) (any, *rpcError) {
 	default:
 		return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found", Data: req.Method}
 	}
+}
+
+// Fetching a known note needs the opened store and current file, not the global
+// graph/retriever. Both fetch handlers enforce indexed and current-file scope,
+// confinement, cancellation and safety context themselves. A slow or failed
+// graph load must not prevent those independent reads. Every other tool (and
+// any unknown or malformed call) retains the existing startup gate; normal
+// tool classification and argument validation still run in handleToolsCall.
+func toolCallNeedsGraph(params json.RawMessage) bool {
+	var call struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(params, &call); err != nil {
+		return true
+	}
+	return call.Name != "mesh_fetch" && call.Name != "mesh_fetch_many"
 }
 
 func (s *Server) handleInitialize(ctx context.Context, params json.RawMessage) any {

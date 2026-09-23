@@ -7,8 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -252,14 +250,10 @@ func (s *Server) fetchBatchGroup(ctx context.Context, g batchFetchGroup) batchFe
 	if ctx.Err() != nil {
 		return result
 	}
-	if sf != nil {
-		// A file's scope can change before its index update. Require BOTH the
-		// persisted authorization and current frontmatter to allow this read.
-		fmText, _, _ := vault.SplitFrontmatter(string(body))
-		fm, _, err := vault.ParseFrontmatter([]byte(fmText))
-		if err != nil || vault.UnterminatedFrontmatter(string(body)) || !sf.allowsRead(fm.EffectiveScopes()) {
-			return result
-		}
+	// Require BOTH persisted authorization and current frontmatter, just as
+	// single-note fetch does. Neither surface may become a bypass for the other.
+	if !fetchFileScopeAllowed(body, sf) {
+		return result
 	}
 	text, rerr := s.formatFetchDocument(ctx, g.ID, m.Path, string(body), g.Anchors)
 	if rerr != nil {
@@ -273,80 +267,15 @@ func (s *Server) fetchBatchGroup(ctx context.Context, g batchFetchGroup) batchFe
 	return result
 }
 
-var errBatchFileTooLarge = errors.New("batch file too large")
+var errBatchFileTooLarge = vault.ErrConfinedFileTooLarge
 
 func readBatchFile(ctx context.Context, root, rel string) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !filepath.IsLocal(rel) {
-		return nil, errors.New("file outside vault")
-	}
-	dir, err := os.OpenRoot(root)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { dir.Close() }()
-	parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
-	// Walk held directory handles. Refuse symlink components and compare each
-	// opened handle to its no-follow metadata so replacement cannot redirect an
-	// indexed public path onto a different private note before reindexing.
-	for _, part := range parts[:len(parts)-1] {
-		before, err := dir.Lstat(part)
-		if err != nil {
-			return nil, err
-		}
-		if !before.IsDir() {
-			return nil, errors.New("not a note directory")
-		}
-		next, err := dir.OpenRoot(part)
-		if err != nil {
-			return nil, err
-		}
-		after, err := next.Stat(".")
-		if err != nil || !os.SameFile(before, after) {
-			next.Close()
-			return nil, errors.New("note directory changed")
-		}
-		dir.Close()
-		dir = next
-	}
-	name := parts[len(parts)-1]
-	info, err := dir.Lstat(name)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("not a regular note")
-	}
-	if info.Size() > batchFetchFileBytes {
-		return nil, errBatchFileTooLarge
-	}
-	file, err := dir.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	opened, err := file.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
-		return nil, errors.New("note file changed")
-	}
-	var body []byte
-	buffer := make([]byte, 32<<10)
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		n, err := file.Read(buffer)
-		if len(body)+n > batchFetchFileBytes {
-			return nil, errBatchFileTooLarge
-		}
-		body = append(body, buffer[:n]...)
-		if err == io.EOF {
-			return body, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
+	return readFetchFile(ctx, root, rel, batchFetchFileBytes)
+}
+
+// readFetchFile confines reads to held vault directory handles and refuses
+// symlinks/non-regular files. maxBytes=0 retains single-fetch size compatibility;
+// batch fetch keeps its existing byte limit. No detached read worker is started.
+func readFetchFile(ctx context.Context, root, rel string, maxBytes int) ([]byte, error) {
+	return vault.ReadConfinedFile(ctx, root, rel, maxBytes)
 }

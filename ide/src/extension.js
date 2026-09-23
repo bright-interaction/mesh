@@ -37,7 +37,7 @@ function activate(context) {
     // page, never in the data-bearing graph/note renderer.
     panel.webview.html = '';
     panel.webview.options = { ...panel.webview.options, enableScripts: false, enableCommandUris: ['mesh.signIn', 'mesh.configureServer', 'mesh.configureStartup', 'mesh.refresh'] };
-    const help = isRemote(configured()) ? '<a href="command:mesh.signIn">Sign in to Mesh</a> with your Mesh access key.' : '<a href="command:mesh.configureStartup">Configure local viewer startup</a>.';
+    const help = isRemote(configured()) ? '<a href="command:mesh.signIn">Connect to Mesh</a> and approve your account permissions in the browser.' : '<a href="command:mesh.configureStartup">Configure local viewer startup</a>.';
     panel.webview.html = `<html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"></head><body style="font-family:var(--vscode-font-family);padding:24px"><h2>Mesh</h2><p role="status">${escape(state.detail)}</p><p>${escape(configured())}</p><p>${help}</p><p><a href="command:mesh.configureServer">Set viewer URL</a> · <a href="command:mesh.refresh">Retry connection</a></p></body></html>`;
   }
   function render() {
@@ -90,7 +90,7 @@ function activate(context) {
     const value = await vscode.window.showInputBox({ title: 'Mesh viewer URL', value: configured(), prompt: 'HTTPS server (for example https://mesh.cloudrebellion.tech/app), or a local HTTP loopback viewer. Not the MCP endpoint.', validateInput: value => { try { viewerURL(value); } catch (_) { return 'Use HTTPS or HTTP numeric loopback, without credentials, query or fragment.'; } } });
     if (value) await vscode.workspace.getConfiguration('mesh').update('viewerUrl', viewerURL(value), vscode.ConfigurationTarget.Global);
   }
-  async function signIn() {
+  async function signInKey() {
     if (!vscode.workspace.isTrusted || signingIn) return;
     const base = configured();
     if (!isRemote(base)) return vscode.window.showInformationMessage('Set an HTTPS URL with Mesh: Set Viewer URL before signing in.');
@@ -107,14 +107,41 @@ function activate(context) {
       if (!controller.signal.aborted) void vscode.window.showErrorMessage('Mesh sign-in failed. Check the viewer URL, Mesh access key and network. No new key was saved unless verification completed.');
     } finally { signingIn = false; if (signInController === controller) signInController = undefined; }
   }
+  async function signIn() {
+    if (!vscode.workspace.isTrusted || signingIn) return;
+    const base = configured();
+    if (!isRemote(base)) return vscode.window.showInformationMessage('Set your HTTPS Mesh viewer URL before connecting. Local viewers do not need browser approval.');
+    signingIn = true;
+    const controller = signInController = new AbortController();
+    try {
+      await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Connect to Mesh', cancellable: true }, async (progress, cancellation) => {
+        const subscription = cancellation.onCancellationRequested(() => controller.abort());
+        try {
+          await auth.signInBrowser(base, controller.signal, async request => {
+            progress.report({ message: `Code ${request.code}: approve your permissions in the browser.` });
+            const choice = await vscode.window.showInformationMessage(`Connect to ${request.server}. Check code ${request.code} in the browser, review your account and permissions, then click Connect.`, { modal: true }, 'Open approval page');
+            if (choice !== 'Open approval page' || controller.signal.aborted) { controller.abort(); throw new Error('Connection cancelled.'); }
+            if (!await vscode.env.openExternal(vscode.Uri.parse(request.url))) throw new Error('The browser could not open. Start Connect again.');
+          });
+        } finally { subscription.dispose(); }
+      });
+      if (controller.signal.aborted || configured() !== base) return;
+      disconnect(); newLifecycle(); if (panel?.visible) connect(); else open();
+      void vscode.window.showInformationMessage('Connected to Mesh. Your approved connection is saved in secure storage.');
+    } catch (err) {
+      if (!controller.signal.aborted) void vscode.window.showErrorMessage(err.message || 'Mesh could not connect. Try Connect again.');
+    } finally { signingIn = false; if (signInController === controller) signInController = undefined; }
+  }
   async function signOut() {
     const base = configured();
     if (!isRemote(base)) return;
     signInController?.abort();
     disconnect(); lifecycle.dispose();
-    await auth.signOut(base);
-    newLifecycle();
-    loading({ detail: 'Signed out. The saved key was removed from this IDE; the server key was not revoked.' });
+    try {
+      const result = await auth.signOut(base);
+      newLifecycle();
+      loading({ detail: result.revoked ? 'Disconnected. This connection was revoked on Mesh and removed from the IDE.' : 'Signed out. The saved access key was removed from this IDE; the server key was not revoked.' });
+    } catch (err) { loading({ detail: 'Disconnection was not confirmed. Retry or revoke this connection in your Mesh browser.' }); void vscode.window.showErrorMessage(err.message); }
   }
   async function configureStartup() {
     if (!vscode.workspace.isTrusted) return;
@@ -131,7 +158,7 @@ function activate(context) {
     if (answer === 'Enable Startup') await vscode.workspace.getConfiguration('mesh').update('startup', { enabled: true, binary, vault }, vscode.ConfigurationTarget.Global);
   }
   const safe = fn => () => Promise.resolve().then(fn).catch(() => { disconnect(); void vscode.window.showErrorMessage('Mesh could not open. Check Mesh: Set Viewer URL and the extension installation.'); });
-  for (const [name, fn] of Object.entries({ open, refresh: () => { if (!panel) open(); else connect(); }, configureServer, configureStartup, signIn, signOut })) context.subscriptions.push(vscode.commands.registerCommand('mesh.' + name, safe(fn)));
+  for (const [name, fn] of Object.entries({ open, refresh: () => { if (!panel) open(); else connect(); }, configureServer, configureStartup, signIn, signInKey, signOut })) context.subscriptions.push(vscode.commands.registerCommand('mesh.' + name, safe(fn)));
   context.subscriptions.push(vscode.window.registerWebviewPanelSerializer('mesh.workspace', { deserializeWebviewPanel: async restored => {
     if (!vscode.workspace.isTrusted) { restored.dispose(); return; } attach(restored);
   } }));

@@ -104,6 +104,9 @@ func TestAnswerGroundsAndCites(t *testing.T) {
 	if !strings.Contains(res.Answer, "Re-fetch") {
 		t.Fatalf("answer = %q", res.Answer)
 	}
+	if !strings.Contains(gotContext, "Incomplete guidance: missing do, dont, why; verify before relying on this note.") {
+		t.Fatalf("answer model lost the incomplete-guidance warning: %s", gotContext)
+	}
 	if len(res.Citations) == 0 || res.Citations[0].Kind != "note" {
 		t.Fatalf("expected a note citation, got %+v", res.Citations)
 	}

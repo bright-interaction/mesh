@@ -2,7 +2,7 @@
   "name": "mesh-workspace",
   "displayName": "Mesh",
   "description": "Your shared knowledge graph, search and notes inside the editor.",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "publisher": "bright-interaction",
   "license": "SEE LICENSE IN LICENSE",
   "engines": { "vscode": "^1.96.0" },
@@ -16,7 +16,8 @@
       { "command": "mesh.open", "title": "Open", "category": "Mesh", "icon": "$(symbol-misc)" },
       { "command": "mesh.refresh", "title": "Refresh View", "category": "Mesh" },
       { "command": "mesh.configureServer", "title": "Set Viewer URL", "category": "Mesh" },
-      { "command": "mesh.signIn", "title": "Sign In to Remote Viewer", "category": "Mesh" },
+      { "command": "mesh.signIn", "title": "Connect", "category": "Mesh" },
+      { "command": "mesh.signInKey", "title": "Sign In with Access Key", "category": "Mesh" },
       { "command": "mesh.signOut", "title": "Sign Out of Remote Viewer", "category": "Mesh" },
       { "command": "mesh.configureStartup", "title": "Configure Viewer Startup", "category": "Mesh" },
       { "command": "mesh.checkUpdates", "title": "Check for IDE Updates", "category": "Mesh" },
@@ -40,7 +41,7 @@
         },
         "mesh.viewerUrl": {
           "type": "string", "default": "http://127.0.0.1:7474", "scope": "machine",
-          "description": "Mesh viewer URL: HTTPS for remote servers, HTTP numeric loopback for local viewers. Root URLs also try /app on 404. Remote access keys use secure storage via Mesh: Sign In to Remote Viewer. Only the user-level value is used; workspace settings cannot redirect requests. Remote connections never launch a local process."
+          "description": "Mesh viewer URL: HTTPS for remote servers, HTTP numeric loopback for local viewers. Root URLs also try /app on 404. Use Mesh: Connect for browser approval; credentials remain in secure storage. Only the user-level value is used; workspace settings cannot redirect requests. Remote connections never launch a local process."
         }
       }
     }

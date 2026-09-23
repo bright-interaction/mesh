@@ -169,6 +169,19 @@ func isQuit(cmd tea.Cmd) bool {
 	return ok
 }
 
+func TestResultsMarkIncompleteGuidance(t *testing.T) {
+	a := NewApp(stubBackend{})
+	a.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	a.cards = []retrieve.Card{{Title: "Historical claim", Tier0: true, MissingGuidance: []string{"do", "why"}}}
+	if view := a.resultsView(); !strings.Contains(view, "[incomplete]") || !strings.Contains(view, "Historical") {
+		t.Fatalf("TUI lost incomplete marker: %q", view)
+	}
+	a.cards[0].MissingGuidance = nil
+	if view := a.resultsView(); strings.Contains(view, "[incomplete]") {
+		t.Fatalf("complete note marked incomplete: %q", view)
+	}
+}
+
 func TestCtrlCQuitsEverywhere(t *testing.T) {
 	be := stubBackend{notes: []NoteRef{{ID: "a", Title: "A"}}}
 	// In raw mode ctrl+c is a keystroke; it must quit from every mode.

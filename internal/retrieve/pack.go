@@ -35,7 +35,7 @@ func EstimateTokens(s string) int { return estimateTokens(s) }
 // marshaled 127 and a compact card at 29 against 81, i.e. 41% and 64% short. That is
 // not a safe degradation, it is the original overrun re-entering through the one path
 // meant to keep the packer moving. There is now one counter: the only field that can
-// fail to encode is a non-finite Score (everything else is a string or a bool), so
+// fail to encode is a non-finite Score (other fields are strings, string slices or a bool), so
 // that field is sanitized and the SAME wire shape is priced.
 func cardTokens(c Card) int {
 	if math.IsNaN(c.Score) || math.IsInf(c.Score, 0) {
@@ -74,6 +74,12 @@ func cardTokensNoMarshal(c Card) int {
 	if c.SupersededBy != "" {
 		n += estimateTokens(`,"SupersededBy":`)
 		if b, err := json.Marshal(c.SupersededBy); err == nil {
+			n += estimateTokens(string(b))
+		}
+	}
+	if len(c.MissingGuidance) > 0 {
+		n += estimateTokens(`,"MissingGuidance":`)
+		if b, err := json.Marshal(c.MissingGuidance); err == nil {
 			n += estimateTokens(string(b))
 		}
 	}

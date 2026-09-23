@@ -4,10 +4,10 @@
 package web
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -93,18 +93,20 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleNote returns one note's raw markdown by frontmatter id, the browser
-// equivalent of mesh_fetch. Path is resolved through the index (id -> rel path),
-// never from client input, so it cannot escape the vault.
+// equivalent of mesh_fetch. Indexed path/scope are read atomically, the file is
+// opened through confined directory handles, and its current scope is rechecked.
 func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	rel, err := s.store.NotePathContext(r.Context(), id)
-	if err != nil {
+	metadata, err := s.store.NoteMetadataFor(r.Context(), []string{"note:" + id})
+	m, ok := metadata["note:"+id]
+	if err != nil || !ok || !filepath.IsLocal(m.Path) {
 		if r.Context().Err() != nil {
 			return
 		}
 		http.Error(w, "unknown note id", http.StatusNotFound)
 		return
 	}
+	rel := m.Path
 	// Folder read check, before the scope one: the path is already resolved and a team
 	// can fence folders without defining a single scope, in which case the scope set is
 	// nil and this is the only boundary there is.
@@ -114,53 +116,21 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 	}
 	// Scope read check: opaque 404 (same as a missing note) so a scoped member cannot
 	// probe which ids exist outside their scope.
-	if allowed := s.allowedScopes(r); allowed != nil {
-		sc, serr := s.store.NoteScopeContext(r.Context(), id)
-		if r.Context().Err() != nil {
-			return
-		}
-		if serr != nil || !scopeIntersect(sc, allowed) {
-			http.Error(w, "unknown note id", http.StatusNotFound)
-			return
-		}
+	allowed := s.allowedScopes(r)
+	if allowed != nil && !vault.ScopeAllowsCSV(m.Scope, allowed) {
+		http.Error(w, "unknown note id", http.StatusNotFound)
+		return
 	}
-	fullPath := filepath.Join(s.vaultRoot, rel)
-	info, err := vault.LstatContext(r.Context(), fullPath)
+	data, err := vault.ReadConfinedFileContext(r.Context(), s.vaultRoot, rel, maxWebNoteBytes)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
 		}
-		http.Error(w, "read failed", http.StatusInternalServerError)
-		return
-	}
-	if !info.Mode().IsRegular() {
-		http.Error(w, "read failed", http.StatusInternalServerError)
-		return
-	}
-	if info.Size() > maxWebNoteBytes {
-		http.Error(w, "note is too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	data, err := vault.ReadFileHeadContext(r.Context(), fullPath, maxWebNoteBytes+1)
-	if err != nil {
-		if r.Context().Err() != nil {
-			return
+		if errors.Is(err, vault.ErrConfinedFileTooLarge) {
+			http.Error(w, "note is too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "read failed", http.StatusInternalServerError)
 		}
-		http.Error(w, "read failed", http.StatusInternalServerError)
-		return
-	}
-	if len(data) > maxWebNoteBytes {
-		http.Error(w, "note is too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	// Close the lstat/read race as far as portable path-based APIs permit: reject
-	// an entry replaced by a symlink or another inode while the bounded read ran.
-	after, err := vault.LstatContext(r.Context(), fullPath)
-	if err != nil || !after.Mode().IsRegular() || !os.SameFile(info, after) {
-		if r.Context().Err() != nil {
-			return
-		}
-		http.Error(w, "read failed", http.StatusInternalServerError)
 		return
 	}
 	if r.Context().Err() != nil {
@@ -169,11 +139,16 @@ func (s *Server) handleNote(w http.ResponseWriter, r *http.Request) {
 	// Split the YAML frontmatter off before rendering, so the reader only shows prose,
 	// not "id: ...\ntitle: ..." dumped as markdown text above the note. markdown stays
 	// the full raw file (unchanged) for any existing caller; body/meta are the new,
-	// separated pieces. A frontmatter parse error is logged and degrades to an empty
-	// meta rather than failing the whole note fetch.
+	// separated pieces. Unscoped local viewing keeps the tolerant parse behavior;
+	// scoped callers must also be authorized by this exact file's frontmatter.
 	fmYAML, body, _ := vault.SplitFrontmatter(string(data))
 	meta := map[string]any{}
-	if fm, _, ferr := vault.ParseFrontmatter([]byte(fmYAML)); ferr != nil {
+	fm, _, ferr := vault.ParseFrontmatter([]byte(fmYAML))
+	if allowed != nil && (ferr != nil || vault.UnterminatedFrontmatter(string(data)) || !scopeIntersect(fm.EffectiveScopes(), allowed)) {
+		http.Error(w, "unknown note id", http.StatusNotFound)
+		return
+	}
+	if ferr != nil {
 		slog.Warn("mesh ui: note frontmatter did not parse", "id", id, "path", rel, "error", ferr)
 	} else {
 		meta = map[string]any{

@@ -16,10 +16,13 @@
   function cardHTML(c) {
     const tier = c.Tier0 ? '<span class="t0">tier-0</span>' : "";
     const score = typeof c.Score === "number" ? c.Score.toFixed(2) : "";
+    const missing = Array.isArray(c.MissingGuidance) ? c.MissingGuidance : [];
+    const warning = missing.length ? "Incomplete guidance: missing " + missing.join(", ") + "; verify before relying on this note." : "";
     return (
       '<button class="rcard" data-id="' + esc(c.NoteID) + '">' +
       '<div class="rc-head"><span class="rc-title">' + esc(c.Title || c.NoteID) + "</span>" + tier + '<span class="rc-score">' + score + "</span></div>" +
       '<div class="rc-path">' + esc(c.Path) + "</div>" +
+      (warning ? '<div class="rc-warning">' + esc(warning) + "</div>" : "") +
       (c.Snippet ? '<div class="rc-snip">' + snippet(c.Snippet) + "</div>" : "") +
       (c.Reason ? '<div class="rc-reason">' + esc(c.Reason) + "</div>" : "") +
       "</button>"

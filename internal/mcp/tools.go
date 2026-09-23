@@ -41,7 +41,7 @@ func ToolSpecs() []map[string]any {
 	tools := []map[string]any{
 		{
 			"name":        "mesh_search",
-			"description": "Search notes with full-text, graph, and optional vector/subscription ranking; returns budget-packed cards (default budget 8000, limit 20, max 100).",
+			"description": "Search via text, graph and optional vector/subscription ranking. Defaults: budget 8000, limit 20 (max 100). MissingGuidance flags unfilled fields; Tier0 denotes type, not verification.",
 			"inputSchema": obj(map[string]any{
 				"type":       "object",
 				"required":   []string{"query"},
@@ -500,8 +500,10 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 	if err := s.store.CheckIntegrity(s.vaultRoot); err != nil {
 		if errors.Is(err, index.ErrIndexCorrupt) {
 			slog.Error("mesh mcp: health found a corrupt index", "err", err)
-			return nil, &rpcError{Code: codeInternalError, Message: "mesh_health cannot verify this vault because its derived index is corrupt. " +
-				"Your Markdown notes are safe. Run `mesh index <vault>` in a terminal to discard and rebuild the index."}
+			return nil, &rpcError{Code: codeInternalError, Message: "mesh_health cannot verify this vault because its index database is corrupt. " +
+				"Markdown notes are unchanged, but pending review notes, usage/reuse history and stored embeddings cannot be recovered from Markdown. " +
+				"Before repair, obtain approval to stop the vault services and preserve a consistent backup. Prefer a verified restore. " +
+				"Only after accepting database-only state loss, run `mesh index <vault>` in a terminal to discard and rebuild the index."}
 		}
 		return nil, internalErr(err)
 	}
@@ -559,8 +561,8 @@ func (s *Server) toolHealth(ctx context.Context, raw json.RawMessage) (any, *rpc
 		slog.Error("mesh mcp: health could not read the dropped-note record", "err", derr)
 		return nil, &rpcError{Code: codeInternalError, Message: "mesh_health cannot read which notes the index dropped, " +
 			"so it cannot tell you whether the vault is clean. The index was written by a different version of Mesh " +
-			"and no read-only surface can migrate it. Rebuild it: run `mesh index <vault>` in a terminal. " +
-			"Your notes are safe; the index is derived from the markdown."}
+			"and no read-only surface can migrate it. With a compatible binary and a consistent backup, run `mesh index <vault>` in a terminal. " +
+			"A supported schema rebuild preserves pending reviews; do not delete the database or downgrade a newer schema by hand."}
 	}
 	for _, d := range dropped {
 		detail := ""
@@ -924,29 +926,52 @@ func (s *Server) toolFetch(ctx context.Context, raw json.RawMessage) (any, *rpcE
 		Anchor string `json:"anchor"`
 	}
 	json.Unmarshal(raw, &a)
-	rel, err := s.store.NotePath(a.ID)
-	if err != nil {
+	if ctx.Err() != nil {
+		return nil, &rpcError{Code: codeInternalError, Message: "fetch canceled or timed out"}
+	}
+	// Path and indexed scope must describe the same SQL snapshot. Then require
+	// the current file's scope too: a note can become private before reindexing.
+	metadata, err := s.store.NoteMetadataFor(ctx, []string{"note:" + a.ID})
+	if err != nil && ctx.Err() != nil {
+		return nil, &rpcError{Code: codeInternalError, Message: "fetch canceled or timed out"}
+	}
+	m, ok := metadata["note:"+a.ID]
+	sf := scopeFromCtx(ctx)
+	if err != nil || !ok || !filepath.IsLocal(m.Path) || (sf != nil && !vault.ScopeAllowsCSV(m.Scope, sf.AllowedRead)) {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: a.ID}
 	}
-	// Scope read check: a direct fetch resolves id -> path -> file, bypassing the
-	// retriever's filter, so gate it here. Return the SAME opaque "unknown note id" a
-	// missing note returns, so a scoped caller can't probe which ids exist.
-	if sf := scopeFromCtx(ctx); sf != nil {
-		sc, serr := s.store.NoteScope(a.ID)
-		if serr != nil || !sf.allowsRead(sc) {
-			return nil, &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: a.ID}
-		}
+	// Share the batch reader's root/handle checks, without silently imposing its
+	// byte cap on the existing single-note contract. Never follow a replaced
+	// symlink to an unrelated note, whether inside or outside this vault.
+	data, err := readFetchFile(ctx, s.vaultRoot, m.Path, 0)
+	if ctx.Err() != nil {
+		return nil, &rpcError{Code: codeInternalError, Message: "fetch canceled or timed out"}
 	}
-	data, err := os.ReadFile(filepath.Join(s.vaultRoot, rel))
-	if err != nil {
-		return nil, internalErr(err)
+	if err != nil || !fetchFileScopeAllowed(data, sf) {
+		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown note id", Data: a.ID}
 	}
-	body, rerr := s.formatFetchDocument(ctx, a.ID, rel, string(data), []string{a.Anchor})
+	body, rerr := s.formatFetchDocument(ctx, a.ID, m.Path, string(data), []string{a.Anchor})
 	if rerr != nil {
 		return nil, rerr
 	}
-	s.recordFetch(ctx, a.ID, rel)
+	if ctx.Err() != nil {
+		return nil, &rpcError{Code: codeInternalError, Message: "fetch canceled or timed out"}
+	}
+	s.recordFetch(ctx, a.ID, m.Path)
 	return rawText(body), nil
+}
+
+// Both fetch surfaces must agree even while file edits are ahead of the index.
+// Missing, malformed or unterminated scope metadata is never permission to widen
+// a scoped caller's access. An unscoped local operator keeps its existing access.
+func fetchFileScopeAllowed(body []byte, sf *ScopeFilter) bool {
+	if sf == nil {
+		return true
+	}
+	text := string(body)
+	fmText, _, _ := vault.SplitFrontmatter(text)
+	fm, _, err := vault.ParseFrontmatter([]byte(fmText))
+	return err == nil && !vault.UnterminatedFrontmatter(text) && sf.allowsRead(fm.EffectiveScopes())
 }
 
 // Formatting is shared by single and batch fetch. Batch calls this once per
@@ -956,6 +981,14 @@ func (s *Server) formatFetchDocument(ctx context.Context, id, rel, body string, 
 	// fetch cuts the frontmatter off, and that is exactly the case where the agent
 	// would otherwise get a bare span of third-party prose with nothing saying so.
 	src, srcURL := frontmatterProvenance(body)
+	// Resolve import provenance before rendering any nested JSON safety context.
+	// Missing/edited source metadata retains the fail-safe imported-path fallback.
+	if !strings.HasPrefix(src, importSourcePrefix) {
+		if ps, ok := importedSource(rel); ok {
+			src = ps
+		}
+	}
+	imported := strings.HasPrefix(src, importSourcePrefix)
 	whole := len(anchors) == 0
 	for _, anchor := range anchors {
 		whole = whole || anchor == ""
@@ -992,7 +1025,7 @@ func (s *Server) formatFetchDocument(ctx context.Context, id, rel, body string, 
 				spans = append(kept, span{sec, start, end})
 			}
 		}
-		prefix, rerr := s.sectionContext(ctx, id, rel, body)
+		prefix, rerr := s.sectionContext(ctx, id, rel, body, imported)
 		if rerr != nil {
 			return "", rerr
 		}
@@ -1006,12 +1039,7 @@ func (s *Server) formatFetchDocument(ctx context.Context, id, rel, body string, 
 	// contract describes so the agent has an explicit boundary. The frontmatter source
 	// is authoritative (ingest stamps source: import:<connector>); the path check is
 	// the fallback for a note whose frontmatter was hand-edited away.
-	if !strings.HasPrefix(src, importSourcePrefix) {
-		if ps, ok := importedSource(rel); ok {
-			src = ps
-		}
-	}
-	if strings.HasPrefix(src, importSourcePrefix) {
+	if imported {
 		body = wrapUntrusted(src, srcURL, body)
 	}
 	return body, nil
@@ -1207,14 +1235,29 @@ func (s *Server) toolChangedSince(ctx context.Context, raw json.RawMessage) (any
 	return textResult(out), nil
 }
 
+// Keep reversible preparation below either HTTP server's write window, reserving
+// room for a read-only reader's separate 10s index acknowledgement. A socket
+// WriteTimeout does not cancel request work: without this deadline a stalled ID
+// scan could publish minutes after the client lost its response. Once publication
+// starts, the publisher still owns finishing or withdrawing its atomic claim;
+// never detach it to meet a response deadline. This does not bound owner indexing
+// or a publisher's filesystem/transaction work after its durable boundary.
+const writePreparationTimeout = 15 * time.Second
+
 func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType string) (any, *rpcError) {
 	trace := latency.Start("mcp_write", "validate")
 	defer trace.End()
+	budget := s.writePrepareTimeout
+	if budget <= 0 {
+		budget = writePreparationTimeout
+	}
+	prepareCtx, cancelPrepare := context.WithTimeout(ctx, budget)
+	defer cancelPrepare()
 	// Cancellation is still reversible until CreateNote starts. Once CreateNote returns,
 	// the note is durable and must receive a success-with-staleness receipt rather than
 	// an error that invites a duplicate retry. Refuse a request that was already cancelled
 	// before crossing that boundary.
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || prepareCtx.Err() != nil {
 		return nil, &rpcError{Code: codeInternalError, Message: "request cancelled before the note was written"}
 	}
 	var a struct {
@@ -1296,24 +1339,28 @@ func (s *Server) toolWrite(ctx context.Context, raw json.RawMessage, forceType s
 	trace.Phase("related")
 	if len(related) == 0 {
 		g, rt := s.snapshot()
-		related = relate.Derive(ctx, rt, g,
+		related = relate.Derive(prepareCtx, rt, g,
 			strings.TrimSpace(a.Title+"\n"+a.Do+"\n"+a.Why), "", a.Tags, 3)
 	}
 	// Preparation above is reversible and can include retrieval work. Cancellation may
 	// arrive after the entry check while it runs, so check once more at the exact durable
 	// boundary. There is deliberately no cancellation error after CreateNote returns:
 	// from that point the success-with-staleness receipt prevents duplicate retries.
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || prepareCtx.Err() != nil {
 		return nil, &rpcError{Code: codeInternalError, Message: "request cancelled before the note was written"}
 	}
 	writtenAt := time.Now()
 	trace.Phase("publish")
-	res, err := s.publishNote(ctx, vault.NewNoteSpec{
+	res, err := s.publishNote(prepareCtx, vault.NewNoteSpec{
 		Type: vault.NoteType(t), Title: a.Title, Do: a.Do, Dont: a.Dont, Why: a.Why,
 		Related: related, Tags: a.Tags, Status: a.Status, Severity: a.Severity,
 		Author: a.Author, Agent: agent, Source: source, SourceURL: a.SourceURL,
 		Confidence: a.Confidence, ReviewBy: a.ReviewBy, By: agent, Scope: noteScope,
 	})
+	// Release the preparation timer now. The original caller context governs the
+	// independent indexing acknowledgement; an expired preparation budget must not
+	// turn a publisher's confirmed durable result into a failed-write receipt.
+	cancelPrepare()
 	if err != nil {
 		// Do NOT echo a raw error here. Everything vault.CreateNote raises about the
 		// FILESYSTEM names the note's absolute path, so a too-long title came back as
@@ -1527,7 +1574,7 @@ type sectionContextEnvelope struct {
 	Fields            map[string]string `json:"fields"`
 }
 
-func (s *Server) sectionContext(ctx context.Context, id, rel, doc string) (string, *rpcError) {
+func (s *Server) sectionContext(ctx context.Context, id, rel, doc string, imported bool) (string, *rpcError) {
 	fmText, _, _ := vault.SplitFrontmatter(doc)
 	fm, _, err := vault.ParseFrontmatter([]byte(fmText))
 	if err != nil || vault.UnterminatedFrontmatter(doc) {
@@ -1560,6 +1607,14 @@ func (s *Server) sectionContext(ctx context.Context, id, rel, doc string) (strin
 		}
 	}
 	fields["preamble"] = strings.TrimSpace(strings.Join(lines[:end], "\n"))
+	if imported {
+		// Neutralize BEFORE JSON encoding: legacy angle-bracket markers would
+		// otherwise become \\u003c sequences invisible to the outer matcher.
+		// Do not rewrite the document before resolving headings or parsing YAML.
+		for key, value := range fields {
+			fields[key] = stripEnvelopeTags(value)
+		}
+	}
 	return encodeSectionContext(fields), nil
 }
 

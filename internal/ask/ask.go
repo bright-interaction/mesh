@@ -225,10 +225,14 @@ func Answer(ctx context.Context, rtr *retrieve.Retriever, store *index.Store, cl
 				continue
 			}
 			c.NoteID, c.Path, c.Type, c.Title, c.Scope = doc.NoteID, doc.Path, doc.Type, doc.Title, doc.Scope
+			c.MissingGuidance = doc.MissingGuidance
 			// %q on the title already escapes newlines; the body is raw note text
 			// written by anyone on the team, so it goes through sanitizeContent to
 			// strip forged source headers.
 			header := fmt.Sprintf("[%d] NOTE %q (%s)\n", n+1, c.Title, c.Path)
+			if warning := c.GuidanceWarning(); warning != "" {
+				header += warning + "\n"
+			}
 			body := sanitizeContent(bodyFor(c, map[string]string{c.NodeID: doc.Text}))
 			if body == "" {
 				// No body and no excerpt: skip it rather than cite a numbered source

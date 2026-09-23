@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bright-interaction/mesh/internal/index"
 )
 
 // TestHealthRefusesToCallAVaultCleanItCannotRead: mesh_health read the dropped-note record
@@ -60,5 +62,64 @@ func TestHealthRefusesToCallAVaultCleanItCannotRead(t *testing.T) {
 	}
 	if rerr.Message == "internal error" {
 		t.Errorf("the agent got the generic %q and the cause went to stderr, where the client hides it", rerr.Message)
+	}
+	if !strings.Contains(rerr.Message, "backup") || strings.Contains(rerr.Message, "the index is derived from the markdown") {
+		t.Fatalf("schema repair advice treats database-only work as disposable: %s", rerr.Message)
+	}
+}
+
+func TestHealthCorruptionAdviceDisclosesDatabaseOnlyLoss(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "good.md"), []byte("---\nid: good\ntype: note\n---\n# Good\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, dir)
+	dbPath := filepath.Join(dir, ".mesh", "mesh.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var pageSize, pageNo int
+	if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT pageno FROM dbstat WHERE name='notes' AND pagetype='leaf' ORDER BY pageno LIMIT 1`).Scan(&pageNo); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pageNo <= 1 || pageSize <= 0 {
+		t.Fatal("invalid fixture corruption offset")
+	}
+	f, err := os.OpenFile(dbPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(make([]byte, pageSize), int64(pageNo-1)*int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := index.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatalf("fixture schema must remain readable: %v", err)
+	}
+	defer store.Close()
+	srv := &Server{store: store, vaultRoot: dir}
+	_, rerr := srv.toolHealth(WithLocalOperator(context.Background()), json.RawMessage(`{}`))
+	if rerr == nil {
+		t.Fatal("corrupt fixture was reported healthy")
+	}
+	for _, want := range []string{"corrupt", "backup", "pending review notes", "usage/reuse history", "mesh index"} {
+		if !strings.Contains(rerr.Message, want) {
+			t.Errorf("agent-facing corruption advice missing %q: %s", want, rerr.Message)
+		}
+	}
+	if strings.Contains(rerr.Message, dir) {
+		t.Fatal("agent-facing corruption advice leaks the private vault path")
 	}
 }

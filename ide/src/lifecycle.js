@@ -72,7 +72,7 @@ class ViewerLifecycle {
       if (!current()) return;
       this.failures++;
       delay = Math.min(30000, 1000 * 2 ** Math.min(this.failures - 1, 5));
-      let detail = ({ AUTH_REQUIRED: 'Mesh requires an access key. Use Mesh: Sign In to Remote Viewer.', ACCESS_DENIED: 'Mesh denied access. Check the permissions of your Mesh access key.', WRONG_VAULT: 'Wrong vault. Check Mesh startup settings.', INCOMPATIBLE: 'Unsupported viewer API. Upgrade Mesh or change its URL.', UNSAFE_CHILD: 'Started viewer did not confirm read-only mode and was stopped.' })[error.code] || 'Viewer unavailable. Use Mesh: Refresh View to retry or Mesh: Set Viewer URL.';
+      let detail = ({ AUTH_REQUIRED: 'Mesh needs authorization. Use Mesh: Connect to approve access in your browser.', ACCESS_DENIED: 'Mesh denied access. Check your account and connection permissions.', WRONG_VAULT: 'Wrong vault. Check Mesh startup settings.', INCOMPATIBLE: 'Unsupported viewer API. Upgrade Mesh or change its URL.', UNSAFE_CHILD: 'Started viewer did not confirm read-only mode and was stopped.' })[error.code] || 'Viewer unavailable. Use Mesh: Refresh View to retry or Mesh: Set Viewer URL.';
       if (['AUTH_REQUIRED', 'ACCESS_DENIED'].includes(error.code)) delay = null;
       if (this.child && this.childDeadline && this.now() >= this.childDeadline) {
         this.stopChild(); detail = 'Viewer startup timed out. Check the binary and vault.';

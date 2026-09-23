@@ -57,3 +57,54 @@ func TestNoteRouteRejectsSymlink(t *testing.T) {
 		t.Fatalf("symlink note leaked target: status=%d body=%v", code, body)
 	}
 }
+
+func TestNoteRouteRechecksCurrentScope(t *testing.T) {
+	for name, body := range map[string]string{
+		"private":      "---\nid: n\ntype: note\nscope: [private]\n---\n# Secret\nnewly restricted bytes\n",
+		"malformed":    "---\nid: n\nscope: [private\n---\n# Secret\nnewly restricted bytes\n",
+		"unterminated": "---\nid: n\nscope: [dev]\n# Secret\nnewly restricted bytes\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, dir := cfgServer(t) // indexed with the default dev scope
+			s.SetScopeResolver(func(*http.Request) map[string]bool { return map[string]bool{"dev": true} })
+			if err := os.WriteFile(filepath.Join(dir, "n.md"), []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			code, reply := doJSON(t, s.Handler(), http.MethodGet, "/api/note/n", "")
+			if code != http.StatusNotFound || strings.Contains(fmt.Sprint(reply), "newly restricted") {
+				t.Fatalf("changed file did not receive opaque denial: status=%d", code)
+			}
+		})
+	}
+}
+
+func TestNoteRouteRejectsReplacedParentDirectory(t *testing.T) {
+	dir := t.TempDir()
+	group := filepath.Join(dir, "group")
+	if err := os.Mkdir(group, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(group, "n.md"), []byte("---\nid: n\ntype: note\n---\n# Original\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	seedIndex(t, dir)
+	s, err := NewServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "n.md"), []byte("# Outside\noutside-directory-marker\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(group, group+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, group); err != nil {
+		t.Fatal(err)
+	}
+	code, reply := doJSON(t, s.Handler(), http.MethodGet, "/api/note/n", "")
+	if code == http.StatusOK || strings.Contains(fmt.Sprint(reply), "outside-directory-marker") {
+		t.Fatalf("parent symlink escaped the vault: status=%d", code)
+	}
+}

@@ -5,7 +5,9 @@ package mcp
 
 import (
 	"path"
+	"regexp"
 	"strings"
+	"unicode"
 )
 
 // This file is the INSTRUCTION BOUNDARY for the LLM sink.
@@ -18,6 +20,8 @@ import (
 // here: an explicit envelope that says the enclosed span is DATA, plus the provenance
 // that says where it came from. The contract (contract.go) tells the agent what the
 // envelope means; this file decides what goes inside it.
+// These are model-facing provenance cues, not a proof against prompt injection;
+// authorization and data-access checks must remain independent of model behavior.
 //
 // It is deliberately cheap because it runs on the hot path of every search: a path
 // prefix test per card and, for the notes that ARE imported, one wrapper around the
@@ -26,9 +30,10 @@ import (
 const (
 	// untrustedOpenPrefix / untrustedClose delimit third-party content. The tag name
 	// is spelled out (not a bare fence) so it survives truncation and is unambiguous
-	// to the model even when a snippet lands mid-context.
-	untrustedOpenPrefix = "<untrusted-external-content"
-	untrustedClose      = "</untrusted-external-content>"
+	// to the model even when a snippet lands mid-context. Brackets stay literal in
+	// search/batch tool text even after nested JSON encoding with HTML escaping on.
+	untrustedOpenPrefix = "[[untrusted-external-content"
+	untrustedClose      = "[[/untrusted-external-content]]"
 
 	// importedPathPrefix is where connector ingest writes third-party notes:
 	// ingest.RenderDoc always renders to imported/<connector>/<id>.md, and it is the
@@ -74,10 +79,9 @@ func wrapUntrusted(source, url, text string) string {
 		b.WriteString(sanitizeAttr(u))
 		b.WriteString(`"`)
 	}
-	b.WriteString(">\n")
-	// Strip any envelope tag the ingested text itself contains, otherwise a hostile
-	// note can close the envelope early and continue OUTSIDE it, which is exactly the
-	// boundary escape this whole file exists to prevent.
+	b.WriteString("]]\n")
+	// Neutralize lookalike boundaries inside the data, including the legacy form.
+	// Do not let source-authored tags compete with Mesh's own provenance cues.
 	b.WriteString(stripEnvelopeTags(text))
 	b.WriteString("\n")
 	b.WriteString(untrustedClose)
@@ -87,23 +91,31 @@ func wrapUntrusted(source, url, text string) string {
 // sanitizeAttr keeps an attribute value on one line and free of the quote that would
 // end it, so provenance can never break out of the opening tag.
 func sanitizeAttr(v string) string {
-	repl := strings.NewReplacer(`"`, "'", "<", "(", ">", ")", "\n", " ", "\r", " ")
+	repl := strings.NewReplacer(`"`, "'", "<", "(", ">", ")", "[", "(", "]", ")")
+	v = strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return ' '
+		}
+		return r
+	}, v)
 	return strings.TrimSpace(repl.Replace(v))
 }
 
-// stripEnvelopeTags neutralises any literal envelope tag inside the payload by
-// breaking the angle bracket. It is a substring replace rather than a parse: the
-// payload is markdown, and the only thing that must not survive verbatim is a
-// sequence the agent would read as the boundary marker.
+// Match the recognizable prefix, not an entire well-formed tag: an excerpt may
+// end mid-tag. Accept case/spacing variants of current and legacy markers, using
+// the same whitespace repertoire as unicode.IsSpace. This is a linear-time RE2
+// match, compiled once; it never parses or decodes arbitrary source markup.
+const envelopeSpace = `[[:space:]\p{Z}\x{0085}]*`
+
+var envelopePrefix = regexp.MustCompile(`(?i)(?:<|\[` + envelopeSpace + `\[)` + envelopeSpace + `(/?)` + envelopeSpace + `untrusted-external-content`)
+
+// stripEnvelopeTags breaks marker prefixes while retaining the rest of the data.
+// Do not decode HTML/JSON escapes here: that would silently change source content.
 func stripEnvelopeTags(text string) string {
-	if !strings.Contains(text, untrustedOpenPrefix) && !strings.Contains(text, untrustedClose) {
+	if !strings.ContainsAny(text, "<[") {
 		return text
 	}
-	repl := strings.NewReplacer(
-		untrustedClose, "(/untrusted-external-content)",
-		untrustedOpenPrefix, "(untrusted-external-content",
-	)
-	return repl.Replace(text)
+	return envelopePrefix.ReplaceAllString(text, `(${1}untrusted-external-content`)
 }
 
 // frontmatterProvenance pulls source + source_url out of a note's leading YAML

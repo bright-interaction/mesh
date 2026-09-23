@@ -22,7 +22,11 @@ it is used.
    tags become graph edges. Mesh never rewrites your files; it only reads them.
 2. **The index** (`.mesh/mesh.db`, a single SQLite file) is built from the vault:
    full-text search, the link graph, optional embeddings, optional source-code
-   symbols. It is derived and disposable. Delete it and `mesh index` rebuilds it.
+   symbols. It also holds pending review notes and usage/reuse history that are
+   not in Markdown. Preserve a consistent backup before any recovery: `mesh index`
+   can rebuild search and links, not those database-only records. Other `.mesh/`
+   files can contain credentials, connection grants and sync state; do not delete
+   the directory as an index reset.
 3. **Retrieval** blends full-text, graph proximity, and (optional) semantic vectors
    into one ranked list, surfaces decisions/gotchas/post-mortems first, and packs the
    best answer into a token budget. See "How retrieval works".

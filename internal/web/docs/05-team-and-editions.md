@@ -33,6 +33,12 @@ A team hub is fail-closed and built for regulated teams:
 - **GDPR**: per-user export and "forget" (revoke, tombstone authored notes, purge the
   user's audit rows).
 - **SSO**: pluggable OIDC (Zitadel, Google, Okta, Entra, Auth0, any compliant issuer).
+  New-account enrollment is disabled until the operator explicitly configures
+  verified-domain admission, an existing access scope and a viewer/member role.
+  Provider identity is issuer+subject, not email. Removed identities stay denied;
+  restoring access requires explicit operator readmission. Existing subject-only
+  accounts need verified issuer binding during upgrade. See `docs/BROWSER-SIGN-IN.md`
+  in the Mesh source for setup and the `mesh-hub oidc-bind` recovery command.
 - **Per-member web login**: each teammate signs in with their own scoped account.
 
 Everything runs on your own hardware (or an EU-resident hosted hub). The members and

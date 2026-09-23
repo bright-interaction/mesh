@@ -79,14 +79,21 @@ func TestOpenOnCorruptIndexIsActionable(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		abs,                      // which file
-		"notes are safe",         // whether anything was lost
-		"mesh index",             // the repair command
-		"rm -f",                  // the manual repair
-		"file is not a database", // the driver cause is still there
+		abs,                            // which file
+		"Markdown notes are unchanged", // do not claim all database state is derived
+		"mesh index",                   // the repair command
+		"preserve a consistent backup", // preserve recovery options before replacement
+		"pending review notes",         // not yet in Markdown
+		"usage/reuse history",          // not re-derivable
+		"file is not a database",       // the driver cause is still there
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("corrupt-index error is missing %q\n  got: %s", want, msg)
+		}
+	}
+	for _, unsafe := range []string{"throwaway", "by hand:", "rm -f"} {
+		if strings.Contains(msg, unsafe) {
+			t.Errorf("corruption advice still suggests unguarded disposal: %q", unsafe)
 		}
 	}
 }
@@ -242,7 +249,7 @@ func TestPageCorruptIndexIsRecoveredToo(t *testing.T) {
 	if !errors.Is(openErr, ErrIndexCorrupt) {
 		t.Fatalf("a malformed page is corruption too, but the error does not match ErrIndexCorrupt: %v", openErr)
 	}
-	if !strings.Contains(openErr.Error(), "notes are safe") {
+	if !strings.Contains(openErr.Error(), "Markdown notes are unchanged") {
 		t.Errorf("page-corrupt error is not the actionable one:\n%s", openErr)
 	}
 

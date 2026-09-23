@@ -57,7 +57,8 @@ type Server struct {
 	pathResolver func(*http.Request) func(string) bool
 	// member, when set (mesh ui --hub-db), puts the app in per-member auth mode: each
 	// request authenticates as a hub client instead of the single shared token.
-	member *memberAuth
+	member      *memberAuth
+	connections *connectionService // independent credential store; never an index writer
 
 	mu    sync.RWMutex
 	graph *graph.Graph
@@ -465,7 +466,11 @@ func (s *Server) Close() error {
 		monitorErr = s.changeMonitor.Close()
 	}
 	release()
-	storeErr := errors.Join(monitorErr, s.store.Close())
+	var connectionsErr error
+	if s.connections != nil {
+		connectionsErr = s.connections.store.Close()
+	}
+	storeErr := errors.Join(connectionsErr, monitorErr, s.store.Close())
 	if s.owner == nil {
 		return storeErr
 	}
@@ -650,6 +655,15 @@ func (s *Server) routes() []route {
 		{"GET /assets/", s.handleAsset},
 		{"POST /api/login", s.handleLogin},
 		{"POST /api/logout", s.handleLogout},
+		{"GET /connect", s.handleConnectPage},
+		{"POST /api/connect/device", s.handleConnectDevice},
+		{"POST /api/connect/token", s.handleConnectToken},
+		{"POST /api/connect/cancel", s.handleConnectCancel},
+		{"POST /api/connect/revoke", s.handleConnectRevoke},
+		{"GET /api/connect/request", s.handleConnectRequest},
+		{"POST /api/connect/decision", s.handleConnectDecision},
+		{"GET /api/connect/connections", s.handleConnectList},
+		{"POST /api/connect/disconnect", s.handleConnectDisconnect},
 		{"GET /api/status", s.handleStatus},
 		{"GET /api/config", s.handleGetConfig},
 		{"PUT /api/config", s.handlePutConfig},
@@ -689,6 +703,7 @@ func (s *Server) Handler() http.Handler {
 	} else {
 		h = s.auth.guard(mux) // single shared token (standalone)
 	}
+	h = s.connectionGuard(h)
 	if s.basePath != "" {
 		// Serve the whole app under the path: strip it before the inner mux (so its
 		// root-relative routes match) and let the subtree pattern redirect /app -> /app/.
@@ -735,6 +750,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	html := strings.ReplaceAll(string(body), "__MESH_BASE__", s.baseHref())
 	html = strings.ReplaceAll(html, "__MESH_SOURCE__", buildinfo.FooterInline())
+	html = strings.ReplaceAll(html, "__MESH_SIGN_IN__", s.browserSignInAttribute(r))
 	body = []byte(html)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -971,7 +987,7 @@ func Serve(vaultRoot, addr, token, basePath string, ownIndex bool, verify func(s
 // reader of it. Only correct where nothing else writes that index (the mesh-ui
 // container); beside a `mesh watch` / `mesh sync --watch` it reintroduces the second
 // long-lived writer this whole split removed.
-func ServeContext(ctx context.Context, vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool)) (retErr error) {
+func ServeContext(ctx context.Context, vaultRoot, addr, token, basePath string, ownIndex bool, verify func(string) (int64, string, bool), scopesFor func(int64) map[string]bool, pathsFor func(int64) func(string) bool, roleFor func(int64) (string, int64, bool), browser ...*BrowserSignIn) (retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1031,7 +1047,28 @@ func ServeContext(ctx context.Context, vaultRoot, addr, token, basePath string, 
 	s.auth = auth
 	s.basePath = normalizeBasePath(basePath)
 	if memberMode {
+		s.auth.token = strings.TrimSpace(token) // bind delegated break-glass grants to token rotation
 		s.SetMemberAuth(verify, scopesFor, pathsFor, roleFor)
+	}
+	if publicURL := strings.TrimSpace(os.Getenv("MESH_UI_PUBLIC_URL")); publicURL != "" {
+		statePath := strings.TrimSpace(os.Getenv("MESH_UI_CONNECTIONS_DB"))
+		if statePath == "" {
+			statePath = filepath.Join(vaultRoot, ".mesh", "auth", "connections.db")
+		}
+		statePath, err = filepath.Abs(statePath)
+		if err != nil {
+			return err
+		}
+		if err = s.EnableConnections(publicURL, statePath); err != nil {
+			return err
+		}
+	}
+	for _, b := range browser {
+		if b != nil {
+			if err := s.SetBrowserSignIn(*b); err != nil {
+				return err
+			}
+		}
 	}
 	exp := BuildExport(s.graph, vaultRoot, nil, nil)
 	fmt.Printf("mesh ui: %d notes, %d links across %d communities\n", exp.Meta.NodeCount, exp.Meta.EdgeCount, len(exp.Communities))

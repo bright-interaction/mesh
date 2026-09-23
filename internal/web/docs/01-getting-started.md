@@ -2,7 +2,9 @@
 
 Mesh is a single binary that turns a folder of markdown notes into a knowledge
 graph plus token-cheap retrieval for coding agents. Your notes stay plain files;
-the `.mesh/` index is a derived, deletable artifact.
+search and links can be rebuilt. However, `.mesh/` also stores pending reviews,
+usage history, credentials and sync/connection state. Back it up securely; deleting
+it is not a lossless index reset.
 
 ## Import an existing vault (Obsidian, or any markdown folder)
 

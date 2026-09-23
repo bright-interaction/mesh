@@ -38,10 +38,11 @@ type authConfig struct {
 // non-loopback bind without a token is refused at startup, not silently opened.
 func newAuthConfig(addr, token string) (authConfig, error) {
 	lo := netaddr.IsLoopback(addr)
+	token = strings.TrimSpace(token)
 	if !lo && token == "" {
 		return authConfig{}, errRemoteNeedsToken
 	}
-	return authConfig{token: strings.TrimSpace(token), loopback: lo}, nil
+	return authConfig{token: token, loopback: lo}, nil
 }
 
 // guard wraps a handler, enforcing the bearer token when one is configured. Only
@@ -50,7 +51,7 @@ func newAuthConfig(addr, token string) (authConfig, error) {
 // and every /api route, is gated. So an exposed viewer never leaks vault data.
 func (a authConfig) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if a.token == "" || isOpenPath(r.URL.Path) {
+		if a.token == "" || isOpenPath(r.URL.Path) || connectionSharedIdentity(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -66,7 +67,8 @@ func (a authConfig) guard(next http.Handler) http.Handler {
 // isOpenPath is the unauthenticated allowlist: the shell, its assets, and the
 // login/logout endpoints (which must be reachable to obtain or drop a session).
 func isOpenPath(p string) bool {
-	return p == "/" || strings.HasPrefix(p, "/assets/") || p == "/api/login" || p == "/api/logout"
+	return p == "/" || strings.HasPrefix(p, "/assets/") || p == "/api/login" || p == "/api/logout" ||
+		p == "/connect" || p == "/api/connect/device" || p == "/api/connect/token" || p == "/api/connect/cancel" || p == "/api/connect/revoke"
 }
 
 // sessionValue derives the opaque session-cookie value from the token via HMAC, so

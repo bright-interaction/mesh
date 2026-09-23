@@ -12,7 +12,11 @@ Dashboard.
   actually indexes, so cross-repo or illustrative filenames never cry wolf.
 - **Overdue reviews.** A note with a `review_by` date in the past. Time-sensitive
   knowledge (a "current" status, a temporary workaround) can carry a review date so it
-  gets re-checked instead of silently aging.
+  is flagged for re-checking instead of silently aging. Use `YYYY-MM-DD` for a
+  deadline through the end of that UTC day, or an RFC3339 timestamp with an explicit
+  offset for an exact instant. Health checks and optional freshness ranking share
+  this rule. Empty, invalid or event-based text is not a scheduled deadline;
+  absence of an overdue finding is not evidence that the guidance is current.
 - **Contradictions.** Two tier-0 notes (decisions, gotchas, post-mortems) that share a
   tag where one note's "do" strongly overlaps another's "dont", i.e. one recommends
   what the other forbids. A dependency-free heuristic flags the pair; the optional

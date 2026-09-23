@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License -->
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><base href="{{.Base}}"><title>Connect to Mesh</title><link rel="stylesheet" href="assets/connect.css"><script defer src="assets/connect.js"></script></head>
+<body><main>
+<p class="brand">MESH · CONNECTIONS</p><h1 id="title">Connect to Mesh</h1>
+<p id="status" role="status" aria-live="polite">Checking your connection request…</p>
+<section id="signin" hidden><h2>Sign in once in this browser</h2><p>Mesh must verify who is approving access. Your existing browser session is reused when available. This request will stay here while you sign in.</p>
+<p id="account-signin" hidden><a id="signin-link" data-sign-in="{{.SignInURL}}">Continue with your account</a></p>
+<details id="key-signin" open><summary>Use an access key instead</summary><form id="login"><label for="key">Mesh access key (compatibility sign-in)</label><input id="key" type="password" autocomplete="current-password" required><button type="submit">Sign in</button></form></details></section>
+<section id="request" hidden>
+<dl><dt>Server</dt><dd id="server"></dd><dt>Account</dt><dd id="account"></dd><dt>Application</dt><dd id="client"></dd></dl>
+<p>Check that this code matches the one shown in your IDE or assistant:</p><p id="code" class="code"></p>
+<p class="warning">Only approve a request you started. Application names are public labels, not proof of who is requesting access.</p>
+<form id="consent"><fieldset><legend>Allow this connection to</legend>
+<label><input type="radio" name="scope" value="read"> Read my accessible Mesh knowledge</label>
+<label id="full-option"><input type="radio" name="scope" value="full"> Use my full current Mesh permissions</label>
+</fieldset><p id="rights">Full access never grants more rights than your account. Restricted knowledge stays restricted.</p>
+<label class="confirm"><input id="confirm-code" type="checkbox" required> I started this request and the code matches.</label>
+<div class="actions"><button id="approve" type="submit">Connect</button><button id="deny" type="button" class="secondary">Deny</button></div></form>
+</section>
+<section id="done" hidden><h2 id="result-title"></h2><p id="result-detail"></p></section>
+<section id="connections" hidden><h2>Your connections</h2><p>Disconnecting here revokes the connection on the server, including its renewal credentials.</p><ul id="connection-list"></ul></section>
+<p><a href="./">Open Mesh</a> · <a href="connect">Manage connections</a></p>
+</main></body></html>

@@ -123,7 +123,7 @@ type Frontmatter struct {
 	Source     string `yaml:"source,omitempty"`     // manual | agent | import:<connector>
 	SourceURL  string `yaml:"source_url,omitempty"` // upstream link for imported notes
 	Confidence string `yaml:"confidence,omitempty"` // low | med | high
-	ReviewBy   string `yaml:"review_by,omitempty"`  // YYYY-MM-DD; lifecycle re-check date
+	ReviewBy   string `yaml:"review_by,omitempty"`  // YYYY-MM-DD or RFC3339; lifecycle re-check deadline
 	ImportedAt string `yaml:"imported_at,omitempty"`
 	// Scope is the access-control partition(s) this note belongs to (dev, sales, ...).
 	// A note may carry several. ABSENCE means dev-only (the fail-safe): an unlabeled

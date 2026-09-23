@@ -118,10 +118,13 @@
     <form id="login-form" class="login-card" autocomplete="on">
       <span class="login-dot" aria-hidden="true"></span>
       <h1 class="login-title">mesh</h1>
-      <p class="login-sub">Enter your access key to continue.</p>
+      <p id="login-sub" class="login-sub">Enter your access key to continue.</p>
+      <p id="login-account" hidden><a class="login-btn" id="login-account-link" data-sign-in="__MESH_SIGN_IN__">Continue with your account</a></p>
+      <details id="login-key-option" open><summary>Use an access key instead</summary>
       <input id="login-key" name="password" type="password" placeholder="access key"
              autocomplete="current-password" spellcheck="false" autofocus>
       <button id="login-btn" type="submit" class="login-btn">Unlock</button>
+      </details>
       <p id="login-err" class="login-err" hidden></p>
     </form>
   </div>

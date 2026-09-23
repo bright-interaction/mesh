@@ -67,10 +67,12 @@ test('invalid keys and non-allowlisted routes cause zero credential egress', asy
   expect(h.gets).toHaveLength(0);
 });
 test('cancellation during secret lookup stops transport', async () => {
-  let resolve, calls = 0;
-  const auth = new RemoteAuth({ get: () => new Promise(done => { resolve = done; }) }, async () => { calls++; return status; });
+  let resolve, entered, calls = 0;
+  const reading = new Promise(done => { entered = done; });
+  const auth = new RemoteAuth({ get: key => key.startsWith('mesh.viewer-connection:') ? Promise.resolve(undefined) : new Promise(done => { resolve = done; entered(); }) }, async () => { calls++; return status; });
   const controller = new AbortController();
   const result = auth.client(base).connect(controller.signal);
+  await reading;
   controller.abort(); resolve('fixture-key');
   await expect(result).rejects.toThrow();
   expect(calls).toBe(0);

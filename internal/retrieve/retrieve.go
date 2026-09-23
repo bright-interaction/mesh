@@ -85,6 +85,17 @@ type Card struct {
 	// omitempty because this is empty on the overwhelming majority of cards and every
 	// card is priced against the caller's token budget.
 	SupersededBy string `json:",omitempty"`
+	// MissingGuidance identifies unfilled required fields, not a factual quality
+	// score. Tier0 remains a note-type classification, never a verification badge.
+	MissingGuidance []string `json:",omitempty"`
+}
+
+// GuidanceWarning is the human/prompt form of the compact structured card flag.
+func (c Card) GuidanceWarning() string {
+	if len(c.MissingGuidance) == 0 {
+		return ""
+	}
+	return "Incomplete guidance: missing " + strings.Join(c.MissingGuidance, ", ") + "; verify before relying on this note."
 }
 
 // Options tunes a retrieval. Zero values get sensible defaults.
@@ -1491,13 +1502,14 @@ func cardFromMetadata(m index.NoteMetadata) (Card, bool) {
 		return Card{NodeID: m.NodeID}, false
 	}
 	return Card{
-		NodeID: m.NodeID,
-		NoteID: m.NoteID,
-		Title:  m.Title,
-		Path:   m.Path,
-		Type:   m.Type,
-		Scope:  m.Scope,
-		Tier0:  tier0Types[m.Type],
+		NodeID:          m.NodeID,
+		NoteID:          m.NoteID,
+		Title:           m.Title,
+		Path:            m.Path,
+		Type:            m.Type,
+		Scope:           m.Scope,
+		Tier0:           tier0Types[m.Type],
+		MissingGuidance: m.MissingGuidance,
 	}, true
 }
 
@@ -1615,10 +1627,8 @@ func (r *Retriever) freshnessMult(c Card) float64 {
 		}
 	}
 	// Overdue review: a small nudge down regardless of type (it asked to be rechecked).
-	if d.ReviewBy != "" {
-		if t, err := time.Parse("2006-01-02", d.ReviewBy); err == nil && now.After(t) {
-			mult *= 0.85
-		}
+	if vault.ReviewOverdue(d.ReviewBy, now) {
+		mult *= 0.85
 	}
 	return mult
 }

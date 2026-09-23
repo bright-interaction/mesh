@@ -25,6 +25,9 @@ func TestNewAuthConfigFailsClosed(t *testing.T) {
 	if _, err := newAuthConfig(":7474", ""); err == nil {
 		t.Error("all-interfaces bind without a token must be refused")
 	}
+	if _, err := newAuthConfig(":7474", " \t\n"); err == nil {
+		t.Error("whitespace-only token must not bypass the remote authentication requirement")
+	}
 	// non-loopback WITH a token is allowed.
 	if _, err := newAuthConfig("0.0.0.0:7474", "secret"); err != nil {
 		t.Errorf("non-loopback with a token should be allowed: %v", err)

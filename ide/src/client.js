@@ -2,6 +2,7 @@
 'use strict';
 const http = require('node:http');
 const https = require('node:https');
+const { BrowserConnections } = require('./connections');
 const MAX_BYTES = 16 * 1024 * 1024;
 function viewerURL(value) {
   if (typeof value !== 'string' || value.length > 512 || /[\s\\]/.test(value)) throw new Error('Invalid viewer URL');
@@ -99,7 +100,7 @@ class MeshClient {
 // Credentials never enter settings or the webview. Bind each secret to the full
 // approved HTTPS base, including its path; never share with Stage or another vault.
 class RemoteAuth {
-  constructor(secrets, transport = getJSON) { this.secrets = secrets; this.transport = transport; this.writes = Promise.resolve(); }
+  constructor(secrets, transport = getJSON, connectionOptions) { this.secrets = secrets; this.transport = transport; this.writes = Promise.resolve(); this.connections = new BrowserConnections(secrets, connectionOptions); }
   write(action) { const result = this.writes.then(action); this.writes = result.catch(() => {}); return result; }
   key(base) { if (!isRemote(base)) throw new Error('Remote sign-in requires HTTPS'); return 'mesh.viewer-key:' + viewerURL(base); }
   client(base, candidate) {
@@ -112,7 +113,7 @@ class RemoteAuth {
       let route = url.slice(base.length);
       if (new URL(base).pathname === '/' && route.startsWith('/app/')) route = route.slice(4);
       readPath(route);
-      const token = candidate === undefined ? await this.secrets.get(key) : candidate;
+      const token = candidate === undefined ? await this.write(async () => (await this.connections.access(base, signal)) ?? await this.secrets.get(key)) : candidate;
       if (signal?.aborted) throw new Error('Viewer request aborted');
       return this.transport(url, signal, token === undefined ? {} : { token: accessKey(token) });
     });
@@ -123,9 +124,35 @@ class RemoteAuth {
     if (signal?.aborted) throw new Error('Viewer request aborted');
     await this.write(async () => {
       if (signal?.aborted) throw new Error('Viewer request aborted');
+      const previous = await this.connections.read(viewerURL(base));
+      if (previous) await this.connections.revoke(previous);
       await this.secrets.store(key, token);
+      await this.secrets.delete(this.connections.key(viewerURL(base)));
     });
   }
-  async signOut(base) { const key = this.key(base); await this.write(() => this.secrets.delete(key)); }
+  async signInBrowser(base, signal, showRequest) {
+    base = viewerURL(base); const key = this.key(base);
+    const record = await this.connections.authorize(base, signal, showRequest);
+    try {
+      await this.client(base, record.accessToken).connect(signal);
+      await this.write(async () => {
+        if (signal?.aborted) throw new Error('Connection cancelled.');
+        const previous = await this.connections.read(base);
+        if (previous) await this.connections.revoke(previous);
+        await this.secrets.store(this.connections.key(base), JSON.stringify(record));
+        await this.secrets.delete(key);
+      });
+    } catch (err) { await this.connections.revoke(record).catch(() => {}); throw err; }
+  }
+  async signOut(base) {
+    base = viewerURL(base); const key = this.key(base);
+    return this.write(async () => {
+      const record = await this.connections.read(base);
+      if (record) await this.connections.revoke(record);
+      await this.secrets.delete(this.connections.key(base));
+      await this.secrets.delete(key);
+      return { revoked: Boolean(record) };
+    });
+  }
 }
 module.exports = { MeshClient, RemoteAuth, viewerURL, isRemote, accessKey, readPath, getJSON };

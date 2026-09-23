@@ -23,6 +23,7 @@ import (
 // single shared MESH_UI_TOKEN so the graph/search/note surfaces can be scoped to the
 // signed-in member (via the Server's scopeResolver).
 type memberAuth struct {
+	browser *BrowserSignIn
 	// verify resolves a raw client token to its client id (ok=false for an unknown token).
 	verify func(token string) (clientID int64, user string, ok bool)
 	// scopesFor returns the member's readable scopes; nil = unrestricted (no scoping configured).
@@ -161,6 +162,18 @@ func (m *memberAuth) clientFromCookie(v string, createdAt int64) (int64, bool) {
 // instead of lingering until the 30-day cookie expires. ok=false when unauthenticated
 // or when the client has been revoked.
 func (m *memberAuth) member(r *http.Request) (id int64, role string, ok bool) {
+	if identity, valid := r.Context().Value(connectionContextKey{}).(connectionIdentity); valid {
+		role, created, exists := m.roleFor(identity.id)
+		return identity.id, role, exists && !identity.shared && created == identity.created && roleRank(role) > 0
+	}
+	// A fresh SSO identity must not be shadowed by an expired legacy viewer cookie.
+	if m.browser != nil {
+		if id, _, valid := m.browser.Resolve(r); valid && id > 0 {
+			if role, _, exists := m.roleFor(id); exists && roleRank(role) > 0 {
+				return id, role, true
+			}
+		}
+	}
 	if c, err := r.Cookie(memberCookie); err == nil && c.Value != "" {
 		// The claimed id is read first (unverified) purely to look up the createdAt the
 		// signature is bound to. Nothing is trusted until clientFromCookie verifies the
@@ -249,6 +262,12 @@ func (s *Server) memberGuard(next http.Handler) http.Handler {
 		if isOpenPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
+		}
+		if _, _, ok := s.browserAccount(r); ok {
+			if r.Host != s.connections.host || (r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get("Origin") != s.connections.origin) {
+				http.Error(w, "browser origin not allowed", http.StatusForbidden)
+				return
+			}
 		}
 		if _, ok := s.member.clientFromRequest(r); !ok {
 			w.Header().Set("WWW-Authenticate", "Bearer")

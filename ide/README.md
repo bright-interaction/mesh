@@ -6,11 +6,17 @@ This first version includes the existing Graph, Search, Dashboard and Docs views
 
 ## Remote setup (like Stage)
 
-Use **Mesh: Set Viewer URL** and enter `https://mesh.cloudrebellion.tech/app`, then **Mesh: Sign In to Remote Viewer**. Enter your **Mesh access key** in the native masked prompt, preferably a scoped member key. Mesh uses its own authentication, not your Stage account password or Stage MCP credential. Other HTTPS viewer hosts and base paths are supported.
+Use **Mesh: Set Viewer URL** and enter your HTTPS viewer URL (for example `https://mesh.cloudrebellion.tech/app`), then **Mesh: Connect**. The IDE shows a short code and opens Mesh's approval page. Check the matching code, your account and the requested permissions, then click **Connect**. Full access means your account's current permissions, never an administrator upgrade. You may narrow the request to read access.
 
-Keys are verified against the viewer status endpoint before being saved in VS Code SecretStorage, bound to the exact server and base path. They never enter settings or the webview. Only allowlisted read requests carry the key; redirects are never followed. **Mesh: Sign Out of Remote Viewer** removes the IDE's saved key, but does not revoke it on the server or sign out browser sessions. Server-side permissions still apply; the IDE does not turn a shared admin key into a scoped key.
+An existing Mesh browser session is reused. On a team hub configured for account sign-in, **Continue with your account** signs you in through the team's identity provider and returns to the same pending request. Sign-in does not approve it: check the matching code and click Connect. The viewer shows your account and current role. Access-key sign-in remains an explicit compatibility alternative. Stage credentials are not automatically Mesh credentials. Your team administrator must enable account sign-in; operator prerequisites are documented in `docs/BROWSER-SIGN-IN.md` in the Mesh source repository.
 
-Remote connections never start local processes and ignore local startup/vault settings. Authentication failures stop background retries until you sign in, refresh or reopen the view. No server installation, DNS change, new model or LLM service is needed. Browser-only VS Code is not supported.
+Approved access/renewal credentials are verified against the viewer and saved only in VS Code SecretStorage, bound to the exact server and base path. They never enter settings or the webview. Access lasts fifteen minutes and renews automatically while in use, within a thirty-day connection lifetime. Renewal is serialized; an interrupted/uncertain renewal requires reconnecting rather than replaying a potentially consumed token. **Mesh: Sign Out of Remote Viewer** revokes a browser-approved connection on the server before removing it locally. If the server cannot confirm revocation, credentials are retained for retry and the IDE reports that disconnection is unconfirmed. You can also revoke connections at the viewer's `/connect` page.
+
+Older servers can still use the explicitly separate **Mesh: Sign In with Access Key** command. Its native prompt is masked. Signing out removes that saved key only; it does not revoke the key itself or sign out browser sessions. Browser connection failures never silently fall back to a shared key.
+
+Server operators enable browser approval on Mesh v0.41.0 or later with `MESH_UI_PUBLIC_URL` set to the exact public HTTPS viewer URL, including `/app` when that is the configured base path. Existing member authentication or a standalone token is required. Connection state is stored separately in `<vault>/.mesh/auth/connections.db`, not the knowledge index. `MESH_UI_CONNECTIONS_DB` can select another absolute `connections.db` path in a private directory. Reverse proxies must preserve the public Host and Origin; untrusted forwarded headers never choose the approval URL. Back up this credential state privately. Changing the public URL requires new approval. Deploying this candidate and enabling it on a server are separate operator actions.
+
+Remote connections never start local processes and ignore local startup/vault settings. Authentication failures stop background retries until you connect, refresh or reopen the view. No DNS change, new model or LLM service is needed. Browser-only VS Code is not supported. The IDE renderer remains read-only even when the approved connection has full account permissions.
 
 ## Local setup
 
@@ -34,6 +40,8 @@ The shipped viewer assets are bundled in the extension. A bounded host bridge al
 
 The additional **`bun run test:https`** integration check requires `openssl` on PATH. It creates disposable certificates and loopback-only servers, checks trusted/untrusted TLS plus authenticated reads, redirects, cancellation and sign-out, then removes its fixture files. Trust is limited to its child process; system trust and production credentials are untouched. It runs with Bun by default. Set `MESH_IDE_NODE_BIN` to a Node-compatible executable (including VS Code's executable on desktop) to verify the extension's actual runtime: `MESH_IDE_NODE_BIN="/Applications/Visual Studio Code.app/Contents/MacOS/Code" bun run test:https` on macOS. This is separate from the default unit/package gate, whose CI image does not declare OpenSSL; fixture success is not a production sign-in receipt.
 
+From the Mesh module root, `MESH_CONNECT_E2E=1 go test -race ./internal/web -run '^TestConnectionIDEHTTPSJourney$'` tests this IDE client against the real Go HTTPS handlers in a disposable vault. It requires Bun and localhost-listener permissions. Certificate trust is restricted to the child process; no real account or system trust is changed. The rendered approval UI has a separate synthetic-API regression: run `bun integration/consent-browser.mjs` from this directory with an installed Playwright module (`PLAYWRIGHT_MODULE` can select it; `MESH_BROWSER_EXECUTABLE` can select a local Chromium executable). Neither fixture replaces the installed-user production acceptance gate.
+
 ```sh
 bun install --frozen-lockfile
 bun run build
@@ -42,7 +50,7 @@ bun run package
 bun run ci
 ```
 
-Install `release/mesh-workspace-0.2.4.vsix` with VS Code's **Extensions: Install from VSIX…** command. `media/source.json` records the bundled source revision, dirty state and asset hashes. Packaging includes the Mesh license. The server and editor extension are versioned independently; upgrading this viewer does not upgrade your installed Mesh binary.
+Install `release/mesh-workspace-0.3.0.vsix` with VS Code's **Extensions: Install from VSIX…** command. `media/source.json` records the bundled source revision, dirty state and asset hashes. Packaging includes the Mesh license. The server and editor extension are versioned independently; upgrading this viewer does not upgrade your installed Mesh binary.
 
 Packaging uses the committed lockfile, fixed ZIP timestamps/permissions and sorted entries. It checks the complete archive allowlist, identity, source revision, asset hashes and shipped contents against the build inputs. A release build refuses uncommitted IDE/shared-viewer changes. `bun run ci` audits dependencies, runs the unit suite and requires two packages to be byte-identical. For local development only, `bun run ci --allow-dirty` or `bun run package --allow-dirty` produces an explicitly dirty, non-release artifact. Signing-tool postinstall scripts need not be enabled for this unsigned VSIX workflow.
 

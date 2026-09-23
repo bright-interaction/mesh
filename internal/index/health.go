@@ -110,7 +110,6 @@ func (s *Store) scanHealthContext(ctx context.Context, vaultRoot string, now tim
 	if err != nil {
 		return nil, err
 	}
-	today := now.Format("2006-01-02")
 	// Directories we actually index. We only call a path dead when we index its
 	// directory but not the file (it moved/was deleted). A reference into a folder we
 	// do not index can't be judged and must NOT be flagged, or every cross-repo or
@@ -167,7 +166,7 @@ func (s *Store) scanHealthContext(ctx context.Context, vaultRoot string, now tim
 			}
 		}
 		// Overdue review_by.
-		if n.reviewBy != "" && n.reviewBy < today {
+		if vault.ReviewOverdue(n.reviewBy, now) {
 			findings = append(findings, HealthFinding{NoteID: n.id, Path: n.path, Issue: "overdue", Detail: "review_by " + n.reviewBy})
 		}
 	}

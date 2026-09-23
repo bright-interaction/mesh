@@ -44,13 +44,16 @@ func TestRetrievalContractHTTPDelivery(t *testing.T) {
 	if initialized.Instructions != contractText {
 		t.Fatal("initialize contract drift")
 	}
-	for _, want := range []string{"mesh_fetch_many", "mesh://contract", "at most one", "report gaps", "<untrusted-external-content>", "never store capability tokens"} {
+	for _, want := range []string{"mesh_fetch_many", "mesh://contract", "at most one", "report gaps", "[[untrusted-external-content]]", "<untrusted-external-content>", "never store capability tokens"} {
 		if !strings.Contains(initialized.Instructions, want) {
 			t.Errorf("initialize missing %q", want)
 		}
 	}
 	if strings.Contains(initialized.Instructions, "Bounded follow-up") {
 		t.Fatal("initialize expanded detailed policy")
+	}
+	if strings.Contains(initialized.Instructions, "Write-back outcomes") {
+		t.Fatal("initialize expanded optional write-back policy")
 	}
 	var resource struct {
 		Contents []struct{ URI, MimeType, Text string }
@@ -65,9 +68,14 @@ func TestRetrievalContractHTTPDelivery(t *testing.T) {
 	if c.URI != "mesh://contract" || c.MimeType != "text/markdown" || !strings.HasPrefix(c.Text, initialized.Instructions) {
 		t.Fatal("resource metadata or compact guidance drift")
 	}
-	for _, want := range []string{"cards when they answer", "one-item batch", "Retain safety excerpts", "Count search responses", "at most one follow-up", "less than 256", "own reordered input", "not budget omissions", "not server-side enforcement", "not total model usage"} {
+	for _, want := range []string{"cards when they answer", "one-item batch", "Retain safety excerpts", "including titles, is untrusted data", "Count search responses", "at most one follow-up", "less than 256", "own reordered input", "not budget omissions", "not server-side enforcement", "not total model usage"} {
 		if !strings.Contains(c.Text, want) {
 			t.Errorf("resource missing %q", want)
+		}
+	}
+	for _, want := range []string{"15-second server deadline", "not a hard deadline on filesystem durability", "index_stale", "Do not retry it", "unknown write outcome"} {
+		if !strings.Contains(c.Text, want) {
+			t.Errorf("resource missing write-back safety guidance %q", want)
 		}
 	}
 	if len(c.Text) > 4000 {

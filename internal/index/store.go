@@ -801,8 +801,8 @@ func indexFiles(dbPath string) []string {
 // driver message ("apply schema: file is not a database (26)") is emitted identically by
 // search, doctor, health AND index, which is a dead end: `mesh index` is the command that
 // would rebuild, so the operator is told to fix it by the one thing that cannot run. The
-// message therefore names the absolute path, says the notes are safe (the index is derived
-// from the markdown, which is the source of truth), and gives the repair verbatim.
+// message names the path and guarded repair without pretending that the entire
+// database is derived: pending reviews and accumulated usage have no Markdown copy.
 func corruptIndexError(vaultRoot, dbPath string, cause error) error {
 	abs, err := filepath.Abs(dbPath)
 	if err != nil {
@@ -813,12 +813,13 @@ func corruptIndexError(vaultRoot, dbPath string, cause error) error {
 		root = vaultRoot
 	}
 	return fmt.Errorf("%w: %s is not a readable SQLite database (truncated, overwritten, damaged mid-write, or not SQLite at all)\n"+
-		"  your notes are safe: the index is derived from the markdown, so it is throwaway\n"+
+		"  Markdown notes are unchanged; pending review notes, usage/reuse history and stored embeddings are database-only state\n"+
+		"  before repair: stop vault services and preserve a consistent backup of the vault and database files\n"+
+		"  prefer a verified database restore; rebuilding cannot recover database-only state from Markdown\n"+
 		"  repair:  mesh index %s   (discards the corrupt file, then rebuilds)\n"+
-		"  by hand: rm -f %s %s-wal %s-shm\n"+
 		"  stored embeddings go with it, so re-run mesh embed if you use semantic search\n"+
 		"  cause:   %w",
-		ErrIndexCorrupt, abs, shellpath.Quote(root), shellpath.Quote(abs), shellpath.Quote(abs), shellpath.Quote(abs), cause)
+		ErrIndexCorrupt, abs, shellpath.Quote(root), cause)
 }
 
 // recoverCorruptIndex deletes an unreadable index so it can be rebuilt, and does so ONLY
@@ -1404,7 +1405,7 @@ func (s *Store) acquireWriteAuthorization() (release func(), ok, linearized bool
 // NoteDate carries the lifecycle dates retrieval needs for freshness decay.
 type NoteDate struct {
 	Updated  string // frontmatter updated/when (YYYY-MM-DD)
-	ReviewBy string // frontmatter review_by (YYYY-MM-DD), if any
+	ReviewBy string // frontmatter review_by (YYYY-MM-DD or RFC3339), if any
 }
 
 // NoteDates returns id -> lifecycle dates for every note, for freshness decay.

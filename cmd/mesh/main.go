@@ -503,6 +503,9 @@ func searchCmd() *cobra.Command {
 					tier = " [tier-0]"
 				}
 				fmt.Printf("%d. %s%s  (%s)\n", i+1, c.Title, tier, c.Path)
+				if warning := c.GuidanceWarning(); warning != "" {
+					fmt.Printf("   ! %s\n", warning)
+				}
 				if sn := strings.TrimSpace(c.Snippet); sn != "" {
 					fmt.Printf("   %s\n", sn)
 				}
@@ -1473,7 +1476,8 @@ func indexCmd() *cobra.Command {
 				defer closeStore()
 				if recovered {
 					fmt.Fprintf(os.Stderr, "warning: %s was corrupt and unreadable; removed it and rebuilt from the markdown. "+
-						"Notes are intact. Any stored embeddings went with it, so re-run mesh embed if you use semantic search.\n",
+						"Markdown notes are unchanged. Any pending review notes, usage/reuse history and stored embeddings in the discarded database are not recovered from Markdown. "+
+						"Restore a verified backup to recover database-only state; re-run mesh embed only if you need to regenerate embeddings.\n",
 						filepath.Join(root, ".mesh", "mesh.db"))
 				}
 				if owners, ierr := store.IDOwners(); ierr == nil {
@@ -2718,12 +2722,12 @@ func uiCmd() *cobra.Command {
 			// the open core returns a clear "needs the pro build" error here. Break-glass
 			// (the shared MESH_UI_TOKEN as an unrestricted admin login) is preserved by
 			// the pro impl so flipping a live app to member mode never locks anyone out.
-			verify, scopesFor, pathsFor, roleFor, closeHub, err := openHubTeam(hubDB, token)
+			verify, scopesFor, pathsFor, roleFor, browser, closeHub, err := openHubTeam(hubDB, token)
 			if err != nil {
 				return err
 			}
 			defer closeHub()
-			return web.ServeContext(ctx, vaultArg(args), addr, token, basePath, ownIndex, verify, scopesFor, pathsFor, roleFor)
+			return web.ServeContext(ctx, vaultArg(args), addr, token, basePath, ownIndex, verify, scopesFor, pathsFor, roleFor, browser)
 		},
 	}
 	c.Flags().StringVar(&addr, "addr", "127.0.0.1:7474", "host:port to bind the local viewer")

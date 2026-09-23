@@ -22,6 +22,10 @@ import (
 // peer and every rejection is logged. Without that, an internet-reachable mesh ui hands
 // out unlimited, silent guesses at a full-vault admin credential.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if s.member != nil && s.member.browser != nil && (r.Host != s.connections.host || r.Header.Get("Origin") != s.connections.origin) {
+		http.Error(w, "browser origin not allowed", http.StatusForbidden)
+		return
+	}
 	peer := peerKey(r)
 	if !s.logins.allow(peer) {
 		slog.Warn("mesh ui: login rate limit hit", "peer", peer)
@@ -84,6 +88,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 // handleLogout clears the session cookie (both the shared-token and member cookies).
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if s.member != nil && s.member.browser != nil {
+		if r.Host != s.connections.host || r.Header.Get("Origin") != s.connections.origin {
+			http.Error(w, "browser origin not allowed", http.StatusForbidden)
+			return
+		}
+		s.member.browser.Clear(w)
+	}
 	name := sessionCookie
 	if s.member != nil {
 		name = memberCookie
