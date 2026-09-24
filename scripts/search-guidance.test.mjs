@@ -23,18 +23,27 @@ test("search view displays and escapes guidance warnings, including compact card
     },
   };
   const window = {};
-  vm.runInNewContext(readFileSync(new URL("../internal/web/assets/search.js", import.meta.url), "utf8"), { window, document });
+  vm.runInNewContext(readFileSync(new URL("../internal/web/assets/search.js", import.meta.url), "utf8"), { window, document, clearTimeout });
   let cards = [
-    { NoteID: "incomplete", Title: "Historical claim", Tier0: true, Snippet: "", MissingGuidance: ["do", "why"] },
+    { NoteID: "incomplete", Title: "Historical claim", Tier0: true, Snippet: "", MissingGuidance: ["do", "why"], SupersededBy: "replacement" },
     { NoteID: "complete", Title: "Authored guidance", Tier0: true },
   ];
   window.Mesh.views.search({ replaceChildren() {} }, { searchOnSubmit: true, api: async () => ({ cards, tokens: 123 }) });
   await run();
   assert.match(results.innerHTML, /Incomplete guidance: missing do, why; verify before relying on this note\./);
-  assert.equal((results.innerHTML.match(/rc-warning/g) || []).length, 1);
+  assert.equal((results.innerHTML.match(/rc-warning/g) || []).length, 2);
+  assert.equal((results.innerHTML.match(/rc-superseded/g) || []).length, 1);
+  assert.match(results.innerHTML, /Superseded: historical note/);
+  assert.match(results.innerHTML, /data-id="replacement">Read replacement<\/button>/);
   assert.match(results.innerHTML, /data-id="complete"/);
-  cards = [{ NoteID: "x", MissingGuidance: ['<img src=x onerror="boom">'] }];
+  cards = [{ NoteID: "x", MissingGuidance: ['<img src=x onerror="boom">'], SupersededBy: '\"><img src=x onerror="boom">' }];
   await run();
   assert.doesNotMatch(results.innerHTML, /<img/);
   assert.match(results.innerHTML, /&lt;img/);
+  assert.match(results.innerHTML, /data-id="&quot;&gt;&lt;img/);
+  for (const pointer of [undefined, null, "", 123, {}, []]) {
+    cards = [{ NoteID: "x", SupersededBy: pointer }];
+    await run();
+    assert.doesNotMatch(results.innerHTML, /rc-superseded|rc-replacement/);
+  }
 });

@@ -13,19 +13,37 @@
   // the retriever wraps matched terms in [brackets]; render them as marks.
   function snippet(s) { return esc(s).replace(/\[([^\]]+)\]/g, "<mark>$1</mark>"); }
 
+  // Only use the reader-authorized pointer on the card, never infer one from
+  // titles/prose/graph data. A missing pointer must not reveal a fenced note.
+  function replacementID(c) {
+    return c && typeof c.SupersededBy === "string" ? c.SupersededBy : "";
+  }
+
+  function guidanceHTML(c) {
+    const missing = c && Array.isArray(c.MissingGuidance) ? c.MissingGuidance : [];
+    return missing.length ? '<div class="rc-warning">Incomplete guidance: missing ' + esc(missing.join(", ")) + '; verify before relying on this note.</div>' : "";
+  }
+
+  function supersededHTML(c) {
+    return replacementID(c) ? '<div class="rc-warning rc-superseded"><strong>Superseded: historical note.</strong> Review the replacement before relying on this guidance.</div>' : "";
+  }
+
+  function replacementHTML(c) {
+    const id = replacementID(c);
+    return id ? '<button type="button" class="btn ghost rc-replacement" data-id="' + esc(id) + '">Read replacement</button>' : "";
+  }
+
   function cardHTML(c) {
     const tier = c.Tier0 ? '<span class="t0">tier-0</span>' : "";
     const score = typeof c.Score === "number" ? c.Score.toFixed(2) : "";
-    const missing = Array.isArray(c.MissingGuidance) ? c.MissingGuidance : [];
-    const warning = missing.length ? "Incomplete guidance: missing " + missing.join(", ") + "; verify before relying on this note." : "";
     return (
-      '<button class="rcard" data-id="' + esc(c.NoteID) + '">' +
+      '<div class="rc-result"><button type="button" class="rcard" data-id="' + esc(c.NoteID) + '">' +
       '<div class="rc-head"><span class="rc-title">' + esc(c.Title || c.NoteID) + "</span>" + tier + '<span class="rc-score">' + score + "</span></div>" +
       '<div class="rc-path">' + esc(c.Path) + "</div>" +
-      (warning ? '<div class="rc-warning">' + esc(warning) + "</div>" : "") +
+      supersededHTML(c) + guidanceHTML(c) +
       (c.Snippet ? '<div class="rc-snip">' + snippet(c.Snippet) + "</div>" : "") +
       (c.Reason ? '<div class="rc-reason">' + esc(c.Reason) + "</div>" : "") +
-      "</button>"
+      "</button>" + replacementHTML(c) + "</div>"
     );
   }
 
@@ -52,42 +70,69 @@
       results.textContent = "Press Enter or Search. Your existing Mesh retrieval settings apply.";
     }
     let timer, lastSeq = 0;
+    let visibleCards = [];
+
+    function bindReplacements() {
+      results.querySelectorAll(".rc-replacement").forEach((b) => b.addEventListener("click", () => openNote(b.dataset.id, true)));
+    }
 
     async function run() {
+      clearTimeout(timer);
+      const seq = ++lastSeq;
       const term = q.value.trim();
+      visibleCards = [];
       if (!term) {
         results.innerHTML = '<p class="srch-hint">Type to search.</p>';
         return;
       }
-      const seq = ++lastSeq;
       results.innerHTML = '<p class="srch-hint">Searching...</p>';
       try {
         const data = await M.api("/api/search?q=" + encodeURIComponent(term) + "&limit=15");
         if (seq !== lastSeq) return; // a newer query superseded this one
         const cards = data.cards || [];
+        visibleCards = cards;
         if (!cards.length) {
           results.innerHTML = '<p class="srch-hint">No matches for "' + esc(term) + '".</p>';
           return;
         }
         results.innerHTML = '<p class="srch-count">' + cards.length + " results &middot; " + (data.tokens || 0) + " tokens</p>" + cards.map(cardHTML).join("");
         results.querySelectorAll(".rcard").forEach((b) => b.addEventListener("click", () => openNote(b.dataset.id)));
+        bindReplacements();
       } catch (e) {
         if (seq === lastSeq) results.innerHTML = '<p class="srch-hint">Search failed: ' + esc(e.message) + "</p>";
       }
     }
 
-    async function openNote(id) {
+    async function openNote(id, isReplacement = false) {
+      clearTimeout(timer);
+      const seq = ++lastSeq;
+      const card = visibleCards.find(c => c.NoteID === id);
       results.innerHTML = '<p class="srch-hint">Loading...</p>';
       try {
+        // Fetch on click through the normal authorized endpoint. Search-time
+        // permission is not a grant: revocation/deletion may have happened since.
         const n = await M.api("/api/note/" + encodeURIComponent(id));
+        if (seq !== lastSeq) return;
         const bodyHTML = n.html || ('<pre class="note-md">' + esc(n.markdown) + "</pre>");
+        // /api/note authorizes the current read, but does not supply fresh
+        // retrieval-status metadata. Never call an unlisted replacement current
+        // or silently transfer the historical note's status onto it.
+        const statusHTML = card
+          ? '<p class="srch-hint">Guidance status is from the last search. Search this note again to refresh it.</p>' + supersededHTML(card) + guidanceHTML(card) + replacementHTML(card)
+          : '<p class="rc-warning">Guidance status not checked for this note. Search for it before relying on it.</p>';
         results.innerHTML =
           '<div class="note-pane">' +
           '<div class="note-bar"><button class="btn ghost" id="note-back">&larr; results</button>' +
           '<span class="note-path">' + esc(n.path) + "</span>" +
           '<button class="btn ghost" id="note-graph">show in graph</button></div>' +
+          statusHTML + '<button type="button" class="btn ghost rc-replacement-search" id="note-search">Search this note</button>' +
           '<div class="note-body prose">' + bodyHTML + "</div></div>";
         results.querySelector("#note-back").addEventListener("click", run);
+        results.querySelector("#note-search").addEventListener("click", () => {
+          q.value = (n.meta && typeof n.meta.title === "string" && n.meta.title.trim()) || id;
+          run();
+        });
+        bindReplacements();
         results.querySelector("#note-graph").addEventListener("click", () => {
           if (Mesh.route) Mesh.route("graph");
           location.hash = "";
@@ -95,7 +140,10 @@
           if (gq) { gq.value = id; gq.dispatchEvent(new Event("input", { bubbles: true })); }
         });
       } catch (e) {
-        results.innerHTML = '<p class="srch-hint">Could not open note: ' + esc(e.message) + "</p>";
+        if (seq !== lastSeq) return;
+        const message = isReplacement ? "Replacement unavailable. It may have changed or you may no longer have access. Return to results and search again." : "Could not open note: " + e.message;
+        results.innerHTML = '<p class="srch-hint">' + esc(message) + '</p><button type="button" class="btn ghost" id="note-back">&larr; results</button>';
+        results.querySelector("#note-back").addEventListener("click", run);
       }
     }
 
