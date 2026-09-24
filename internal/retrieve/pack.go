@@ -192,7 +192,7 @@ func tier0Reserve(cards []Card, budget int, cost CardCost) int {
 		if !c.Tier0 {
 			continue
 		}
-		// Cards arrive sorted by score desc, so this is the best tier-0 card that can
+		// Cards arrive in priority order, so this is the first tier-0 card that can
 		// fit at all. Price the full form first and fall back to the compact one, which
 		// is what pass A will place when the full form overruns the whole budget. A
 		// card whose compact form still does not fit cannot be reserved for at all.
@@ -234,10 +234,10 @@ type CardCost func(Card) int
 // the bytes the packer priced.
 func packToBudget(cards []Card, budget int) []Card { return PackToBudget(cards, budget, nil) }
 
-// PackToBudget selects the highest-scoring cards that fit the token budget,
+// PackToBudget selects the highest-ranked cards that fit the token budget,
 // reserving part of it (see tier0Reserve) for the institutional-memory tier so
 // decisions, gotchas, and post-mortems are never crowded out by ordinary notes.
-// Input is assumed sorted by score desc; output preserves that order.
+// Input is already ranked (including explicit navigation); output preserves that order.
 // cost prices a card (nil = cardTokens); see CardCost.
 func PackToBudget(cards []Card, budget int, cost CardCost) []Card {
 	if budget <= 0 {
@@ -272,7 +272,7 @@ func PackToBudget(cards []Card, budget int, cost CardCost) []Card {
 			taken[i] = true
 		}
 	}
-	// Pass B: fill the rest by score. When a full card will not fit, degrade it
+	// Pass B: fill the rest by rank. When a full card will not fit, degrade it
 	// to a compact (no-snippet) form rather than skipping to a lower-ranked
 	// card, so the best results always win the budget.
 	for i, c := range cards {

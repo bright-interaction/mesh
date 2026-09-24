@@ -193,6 +193,11 @@ func subscriptionRoute(query string, cards []Card, policy string) (bool, string)
 	if len(cards) < 2 {
 		return false, "too_few"
 	}
+	// Use the same Unicode case folding as local title navigation. Tokenized
+	// identity matching below is deliberately lossy and can differ (e.g. Σ/ς).
+	if graph.MatchesFullTitle(query, cards[0].Title) {
+		return false, "local_exact"
+	}
 	q := normalizedLookup(query)
 	if q != "" {
 		c := cards[0]

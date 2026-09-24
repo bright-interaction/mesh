@@ -22,6 +22,15 @@ const (
 	labelWeight = 2
 )
 
+// MatchesFullTitle recognizes explicit navigation without query tokenization:
+// preserve punctuation, stopwords, version components and the complete suffix.
+// Only case and outer whitespace are ignored. Shared by candidate selection and
+// final retrieval so SQLite's ASCII-only NOCASE cannot disagree with Go.
+func MatchesFullTitle(query, title string) bool {
+	query = strings.TrimSpace(query)
+	return query != "" && strings.EqualFold(query, strings.TrimSpace(title))
+}
+
 // ScoredNode pairs a node with its BM25 relevance (higher is better).
 type ScoredNode struct {
 	Node  *Node

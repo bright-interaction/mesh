@@ -5,6 +5,7 @@ package index
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"sort"
@@ -14,7 +15,22 @@ import (
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/vault"
+	"modernc.org/sqlite"
 )
+
+func init() {
+	// Register for every subsequently opened reader/writer connection. This is
+	// query-time navigation, not a schema function or a new persisted index.
+	sqlite.MustRegisterDeterministicScalarFunction("mesh_full_title_match", 2,
+		func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			query, queryOK := args[0].(string)
+			title, titleOK := args[1].(string)
+			if queryOK && titleOK && graph.MatchesFullTitle(query, title) {
+				return int64(1), nil
+			}
+			return int64(0), nil
+		})
+}
 
 // SearchTimeout is the server-side deadline applied to an FTS read whose caller
 // brought no deadline of its own (the CLI, the TUI, the eval harness). It exists so
@@ -124,7 +140,8 @@ func (s *Store) SearchScopedPaths(ctx context.Context, query string, limit int, 
 	// window is what made one repetitive note hang the whole product. substr runs in
 	// SQLite so a multi-megabyte body is never carried into Go, and it counts
 	// characters, so it cannot cut a rune in half. MATCH and bm25 still see the WHOLE
-	// body, so recall and ranking are unchanged; only the excerpt is bounded.
+	// body; only the excerpt is bounded. An explicit full-title candidate precedes
+	// BM25 candidates before LIMIT without changing its numerical relevance score.
 	q := `
 SELECT si.node_id, si.title,
        COALESCE(n.path, ''),
@@ -133,10 +150,11 @@ SELECT si.node_id, si.title,
 FROM search_index si
 LEFT JOIN notes n ON n.id = substr(si.node_id, 6)
 WHERE search_index MATCH ?` + scopeSQL + `
-ORDER BY bm25(search_index), si.node_id`
-	args := make([]any, 0, len(scopeArgs)+2)
+ORDER BY mesh_full_title_match(?, n.title) DESC, bm25(search_index), si.node_id`
+	args := make([]any, 0, len(scopeArgs)+3)
 	args = append(args, match)
 	args = append(args, scopeArgs...)
+	args = append(args, strings.TrimSpace(query))
 	if allowPath == nil {
 		q += `
 LIMIT ?`

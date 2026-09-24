@@ -75,7 +75,7 @@ type Card struct {
 	Type    string
 	Scope   string // access-control scope(s), comma-joined (for the scope read filter)
 	Snippet string
-	Score   float64
+	Score   float64 // relevance; explicit title navigation can take precedence in result order
 	Tier0   bool
 	Reason  string
 	// SupersededBy is the id of the note that formally retired this one, empty when
@@ -910,11 +910,20 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 			return nil, fmt.Errorf("read current graph-candidate metadata: %w", err)
 		}
 		graphHits := make([]graph.ScoredNode, 0, fetchLimit)
-		for _, h := range all {
-			if _, ok := readable[h.Node.ID]; !ok {
-				continue
+		// Keep explicit full-title navigation BEFORE the cap, just like FTS.
+		// Two stable passes preserve BM25 order within each group and consult
+		// current authorized metadata rather than the stale graph label.
+		for _, exact := range []bool{true, false} {
+			for _, h := range all {
+				c, ok := readable[h.Node.ID]
+				if !ok || graph.MatchesFullTitle(query, c.Title) != exact {
+					continue
+				}
+				graphHits = append(graphHits, h)
+				if len(graphHits) >= fetchLimit {
+					break
+				}
 			}
-			graphHits = append(graphHits, h)
 			if len(graphHits) >= fetchLimit {
 				break
 			}
@@ -1041,6 +1050,9 @@ func (r *Retriever) Retrieve(ctx context.Context, query string, opt Options) ([]
 		cards = append(cards, c)
 	}
 	sortCards(cards)
+	if wFTS > 0 || wGraph > 0 {
+		prioritizeTitleLookup(query, cards, seedIDs)
+	}
 	if opt.Economics != nil {
 		localView := cards
 		if opt.Limit > 0 && len(localView) > opt.Limit {
@@ -1237,6 +1249,30 @@ func sortCards(cards []Card) {
 			return cards[i].Score > cards[j].Score
 		}
 		return cards[i].NodeID < cards[j].NodeID
+	})
+}
+
+// prioritizeTitleLookup prefers explicit navigation after ordinary relevance
+// sorting. Scores remain relevance scores, not navigation priority; the ordered
+// result slice is authoritative. Only CURRENT authorized non-superseded direct
+// candidates qualify. Other direct matches and linked warnings remain in their
+// existing relative order. Configured rerankers retain final authority.
+func prioritizeTitleLookup(query string, cards []Card, directIDs []string) {
+	direct := make(map[string]bool, len(directIDs))
+	for _, id := range directIDs {
+		direct[id] = true
+	}
+	exact := make(map[string]bool)
+	for _, c := range cards {
+		if direct[c.NodeID] && c.SupersededBy == "" && graph.MatchesFullTitle(query, c.Title) {
+			exact[c.NodeID] = true
+		}
+	}
+	if len(exact) == 0 {
+		return
+	}
+	sort.SliceStable(cards, func(i, j int) bool {
+		return exact[cards[i].NodeID] && !exact[cards[j].NodeID]
 	})
 }
 
@@ -1763,9 +1799,9 @@ func minMax(xs []float64) []float64 {
 // from that signal's slice, so the floor lifts weak MATCHES only, never non-matches.
 const normFloor = 0.02
 
-// minMaxFloored is minMax lifted off zero by normFloor. Every fused signal and both
-// halves of the rerank blend go through it, so the multiplicative boosts always have
-// a positive quantity to move.
+// minMaxFloored is minMax lifted off zero by normFloor. The lexical signals and
+// both halves of the rerank blend use it so multiplicative boosts always have a
+// positive quantity to move. Vector scores keep their fixed cosine scale.
 func minMaxFloored(xs []float64) []float64 {
 	out := minMax(xs)
 	for i, v := range out {
