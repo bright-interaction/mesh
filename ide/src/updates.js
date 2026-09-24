@@ -4,7 +4,7 @@ const { createHash } = require('node:crypto');
 const REPO = 'bright-interaction/mesh';
 const RELEASES = `https://api.github.com/repos/${REPO}/releases`;
 const MAX_VSIX = 16 * 1024 * 1024;
-const stable = value => typeof value === 'string' && /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/.test(value);
+const stable = value => typeof value === 'string' && value === value.trim() && /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/.test(value);
 function compare(a, b) {
   if (!stable(a) || !stable(b)) throw new Error('Invalid stable IDE version');
   const x = a.split('.').map(Number), y = b.split('.').map(Number);
@@ -14,9 +14,15 @@ function compare(a, b) {
 function assetURL(tag, name) { return `https://github.com/${REPO}/releases/download/${tag}/${name}`; }
 function manifest(value, version) {
   if (!stable(version) || !value || value.schema !== 1 || value.extension !== 'bright-interaction.mesh-workspace' ||
-      value.version !== version || value.dirty !== false || typeof value.source_commit !== 'string' || !/^[a-f0-9]{40}$/.test(value.source_commit) ||
+      value.version !== version || value.dirty !== false || typeof value.source_commit !== 'string' || value.source_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(value.source_commit) ||
       value.file !== `mesh-workspace-${version}.vsix` || !Number.isSafeInteger(value.bytes) || value.bytes < 1 || value.bytes > MAX_VSIX ||
-      typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)) throw new Error('Invalid IDE release manifest');
+      typeof value.sha256 !== 'string' || value.sha256.length !== 64 || !/^[a-f0-9]{64}$/.test(value.sha256)) throw new Error('Invalid IDE release manifest');
+  // Schema 1 releases predating coordinated updates omit both fields. New
+  // releases bind their bundled viewer to a core release and supported API.
+  if (value.mesh_release !== undefined || value.viewer_api !== undefined) {
+    if (typeof value.mesh_release !== 'string' || !value.mesh_release.startsWith('v') ||
+        !stable(value.mesh_release.slice(1)) || value.viewer_api !== 1) throw new Error('Invalid Mesh release pairing');
+  }
   return value;
 }
 function verifyBytes(bytes, info) {

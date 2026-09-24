@@ -28,7 +28,11 @@ function updateCommand(vscode, version, dependencies = {}) {
     if (active || disposed || !vscode.workspace.isTrusted) return;
     active = true; controller = new AbortController();
     const signal = controller.signal;
-    const stopped = () => signal.aborted || disposed || !vscode.workspace.isTrusted;
+    let context;
+    const stopped = () => {
+      if (signal.aborted || disposed || !vscode.workspace.isTrusted) return true;
+      try { return dependencies.context?.() !== context; } catch (_) { return true; }
+    };
     let staged, phase = 'download';
     const reload = async () => {
       if (stopped()) return;
@@ -39,18 +43,28 @@ function updateCommand(vscode, version, dependencies = {}) {
       }
     };
     try {
+      context = dependencies.context?.();
       if (installedVersion) { phase = 'installed'; await reload(); return; }
       const progress = (title, fn) => vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title, cancellable: true }, async (_, token) => {
         const subscription = token.onCancellationRequested(() => controller.abort());
         if (token.isCancellationRequested) controller.abort();
         try { return await fn(); } finally { subscription.dispose(); }
       });
-      const info = await progress('Checking public Mesh IDE releases…', () => check(version, { signal }));
+      const overview = dependencies.overview ? await progress('Checking Mesh components…', () => dependencies.overview(signal)) : null;
+      const info = overview ? overview.info : await progress('Checking public Mesh IDE releases…', () => check(version, { signal }));
       if (stopped()) return;
-      if (!info) { await vscode.window.showInformationMessage('No newer stable Mesh IDE release found in the most recent 300 public releases.'); return; }
-      manifest(info, info.version);
-      if (compare(info.version, version) <= 0) throw new Error('Update must be newer');
-      const choice = await vscode.window.showInformationMessage(`Mesh IDE ${info.version} is available (installed: ${version}). Update now downloads from bright-interaction/mesh, verifies SHA-256 and installs the extension. Reload is offered separately; your Mesh server/core is not upgraded.`, { modal: true }, 'Update now', 'Download VSIX');
+      if (!info && !overview) { await vscode.window.showInformationMessage('No newer stable Mesh IDE release found in the most recent 300 public releases.'); return; }
+      if (info) {
+        manifest(info, info.version);
+        if (compare(info.version, version) <= 0) throw new Error('Update must be newer');
+      }
+      const buttons = [...(info ? ['Update now', 'Download VSIX'] : []), ...(overview ? ['Server update steps'] : [])];
+      const choice = await vscode.window.showInformationMessage(overview?.message || `Mesh IDE ${info.version} is available (installed: ${version}). Update now downloads from bright-interaction/mesh, verifies SHA-256 and installs the extension. Reload is offered separately; your Mesh server/core is not upgraded.`, { modal: true }, ...buttons);
+      if (choice === 'Server update steps' && overview && !stopped()) {
+        await vscode.window.showInformationMessage(overview.serverInstructions, { modal: true }, 'Done');
+        return;
+      }
+      if (!info) return;
       if (!['Update now', 'Download VSIX'].includes(choice) || stopped()) return;
       if (choice === 'Update now') {
         const bytes = await progress('Downloading and verifying Mesh IDE…', () => download(info, { signal }));
@@ -92,6 +106,6 @@ function updateCommand(vscode, version, dependencies = {}) {
       active = false; controller = undefined;
     }
   };
-  return { run, dispose: () => { disposed = true; controller?.abort(); } };
+  return { run, cancel: () => controller?.abort(), dispose: () => { disposed = true; controller?.abort(); } };
 }
 module.exports = { updateCommand, stageUpdate };

@@ -12,6 +12,7 @@ function setup() {
   let choice = 'Open approval page', currentTime = 100000;
   const globals = { viewerUrl: 'https://mesh.example/app', startup: { enabled: true, vault: '/old/vault', binary: '/old/mesh' } };
   let configurationChanged, input = 'fixture-key';
+  const updater = { cancelled: 0, disposed: false, dependencies: null, snapshots: [], sources: [] };
   const disposable = () => ({ dispose() {} });
   const panel = { visible: true, webview: { options: {}, html: '', cspSource: 'vscode-test:', onDidReceiveMessage: disposable, postMessage() {}, asWebviewUri: uri => uri }, onDidDispose: disposable, onDidChangeViewState: disposable, reveal() {}, dispose() {} };
   const vscode = {
@@ -39,11 +40,17 @@ function setup() {
       constructor(client, options, onState) { Object.assign(this, { client, options, onState, state: { kind: 'idle' } }); lifecycles.push(this); }
       dispose() { this.disposed = true; } setVisible() {} retry() {}
     } };
-    if (name === './update-command') return { updateCommand: () => ({ dispose() {}, run() {} }) };
+    if (name === './update-command') return { updateCommand: (_, version, dependencies) => {
+      updater.dependencies = dependencies;
+      return { dispose() { updater.disposed = true; }, cancel() { updater.cancelled++; }, run: () => dependencies.overview(new AbortController().signal) };
+    } };
+    if (name === './coordinated-updates') return { coordinatedOverview: async (_, source, serverStatus, { signal }) => {
+      updater.sources.push(source); const snapshot = await serverStatus(signal); updater.snapshots.push(snapshot); return snapshot;
+    } };
     return name.startsWith('./') ? require('../src/' + name.slice(2)) : require(name);
   } });
   exported.exports.activate(context);
-  return { commands, secrets, prompts, calls, lifecycles, globals, panel, vscode, messages, external, connectionCalls, progress, choose: value => { choice = value; }, dispose: exported.exports.deactivate, input: value => { input = value; } };
+  return { updater, commands, secrets, prompts, calls, lifecycles, globals, panel, vscode, messages, external, connectionCalls, progress, choose: value => { choice = value; }, dispose: exported.exports.deactivate, input: value => { input = value; } };
 }
 test('native remote sign-in uses masked input, secure storage and no local startup settings', async () => {
   const h = setup();
@@ -107,5 +114,24 @@ test('cancelled prompts and untrusted workspaces never send or save a key', asyn
     expect(h.calls).toEqual([]);
     expect(h.secrets.size).toBe(0);
     expect(h.prompts).toHaveLength(1);
+  } finally { h.dispose(); }
+});
+test('coordinated update status uses only the approved viewer and existing auth without process startup', async () => {
+  const h = setup();
+  try {
+    expect(h.calls).toHaveLength(0);
+    h.secrets.set('mesh.viewer-key:https://mesh.example/app', 'fixture-key');
+    await h.commands.get('mesh.updateNow')();
+    expect(h.calls).toEqual([{ url: 'https://mesh.example/app/api/status', opts: { token: 'fixture-key' } }]);
+    expect(h.updater.snapshots).toEqual([{ remote: true, status: { counts: {} } }]);
+    expect(h.updater.sources[0].mesh_release).toBe(fs.readFileSync(path.resolve(__dirname, '../../VERSION'), 'utf8').trim());
+    expect(h.connectionCalls).toHaveLength(0); expect(h.external).toHaveLength(0);
+    expect(h.lifecycles).toHaveLength(1);
+    await h.vscode.workspace.getConfiguration().update('viewerUrl', 'https://mesh.other/app');
+    expect(h.updater.cancelled).toBe(1);
+    expect(h.updater.dependencies.context()).toBe('https://mesh.other/app');
+    await h.commands.get('mesh.signOut')();
+    expect(h.updater.cancelled).toBe(2);
+    h.dispose(); expect(h.updater.disposed).toBe(true);
   } finally { h.dispose(); }
 });

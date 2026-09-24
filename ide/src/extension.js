@@ -9,17 +9,31 @@ const { ViewerLifecycle, launchSpec } = require('./lifecycle');
 const { Broker } = require('./broker');
 const { renderView } = require('./view');
 const { updateCommand } = require('./update-command');
+const { coordinatedOverview } = require('./coordinated-updates');
 const DEFAULT = 'http://127.0.0.1:7474';
 let deactivateCurrent;
 function activate(context) {
-  const updates = updateCommand(vscode, context.extension.packageJSON.version);
-  context.subscriptions.push(updates, vscode.commands.registerCommand('mesh.checkUpdates', updates.run), vscode.commands.registerCommand('mesh.updateNow', updates.run));
   let panel, broker, listener, lifecycle, ready = false;
   const auth = new RemoteAuth(context.secrets);
   let signInController, signingIn = false;
   const deliveredReads = new Set();
   const global = key => vscode.workspace.getConfiguration('mesh').inspect(key)?.globalValue;
   const configured = () => viewerURL(global('viewerUrl') || DEFAULT);
+  const source = JSON.parse(fs.readFileSync(path.join(context.extensionPath, 'media/source.json'), 'utf8'));
+  const version = context.extension.packageJSON.version;
+  const updates = updateCommand(vscode, version, {
+    context: configured,
+    overview: signal => {
+      const base = configured();
+      return coordinatedOverview(version, source, async requestSignal => {
+        // Read using the exact user-approved endpoint and existing secure auth.
+        // This creates no viewer process or approval request.
+        const response = await auth.client(base).connect(requestSignal);
+        return { status: JSON.parse(response.body), remote: isRemote(base) };
+      }, { signal });
+    }
+  });
+  context.subscriptions.push(updates, vscode.commands.registerCommand('mesh.checkUpdates', updates.run), vscode.commands.registerCommand('mesh.updateNow', updates.run));
   const options = () => {
     const startup = global('startup') || {};
     if (isRemote(configured())) return { url: configured(), autoStart: false };
@@ -135,7 +149,7 @@ function activate(context) {
   async function signOut() {
     const base = configured();
     if (!isRemote(base)) return;
-    signInController?.abort();
+    signInController?.abort(); updates.cancel();
     disconnect(); lifecycle.dispose();
     try {
       const result = await auth.signOut(base);
@@ -164,9 +178,10 @@ function activate(context) {
   } }));
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
     if (!event.affectsConfiguration('mesh.viewerUrl') && !event.affectsConfiguration('mesh.startup')) return;
+    updates.cancel();
     try { const next = JSON.stringify(options()); if (next === previous) return; previous = next; signInController?.abort(); disconnect(); newLifecycle(); if (panel?.visible) connect(); } catch (_) { signInController?.abort(); disconnect(); lifecycle.dispose(); panel?.dispose(); }
   }));
-  deactivateCurrent = () => { signInController?.abort(); disconnect(); lifecycle.dispose(); };
+  deactivateCurrent = () => { updates.dispose(); signInController?.abort(); disconnect(); lifecycle.dispose(); };
   context.subscriptions.push(status, { dispose: deactivateCurrent });
   return { diagnostics: () => ({ viewReady: ready, open: Boolean(panel), pending: broker?.pending.size || 0, deliveredReads: [...deliveredReads], connection: lifecycle.state.kind, ownedChild: Boolean(lifecycle.child), ownedChildPID: lifecycle.child?.pid }) };
 }

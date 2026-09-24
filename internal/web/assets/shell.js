@@ -210,21 +210,93 @@
     return m ? m[1] : "graph";
   }
 
-  // live status in the rail foot.
-  function renderUpdate(u) {
+  // Release strings are data, not commands or URLs. Build the only external
+  // update link from a validated semver and our fixed official source origin.
+  function releaseVersion(value) {
+    if (typeof value !== "string" || value.length > 128) return "";
+    const match = value.match(/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/);
+    if (!match || (match[4] && match[4].split(".").some(v => /^\d+$/.test(v) && /^0\d/.test(v)))) return "";
+    return value;
+  }
+
+  // Inputs have already passed releaseVersion. Compare arbitrary-size numeric
+  // identifiers without rounding, and ignore build metadata as semver requires.
+  function compareRelease(a, b) {
+    const parts = v => v.slice(1).split("+", 1)[0].match(/^([0-9.]+)(?:-(.*))?$/);
+    const aa = parts(a), bb = parts(b);
+    const ac = aa[1].split("."), bc = bb[1].split(".");
+    for (let i = 0; i < 3; i++) {
+      if (BigInt(ac[i]) !== BigInt(bc[i])) return BigInt(ac[i]) > BigInt(bc[i]) ? 1 : -1;
+    }
+    if (!aa[2] || !bb[2]) return aa[2] ? -1 : bb[2] ? 1 : 0;
+    const ap = aa[2].split("."), bp = bb[2].split(".");
+    for (let i = 0; i < Math.max(ap.length, bp.length); i++) {
+      if (ap[i] === bp[i]) continue;
+      if (ap[i] === undefined) return -1;
+      if (bp[i] === undefined) return 1;
+      const an = /^\d+$/.test(ap[i]), bn = /^\d+$/.test(bp[i]);
+      if (an !== bn) return an ? -1 : 1;
+      return (an ? BigInt(ap[i]) > BigInt(bp[i]) : ap[i] > bp[i]) ? 1 : -1;
+    }
+    return 0;
+  }
+
+  const updateDialog = document.getElementById("mesh-update-dialog");
+  const updateRefresh = document.getElementById("mesh-update-refresh");
+  let updateOpener;
+  function openUpdates(event) {
+    if (!updateDialog || updateDialog.open) return;
+    updateOpener = event.currentTarget;
+    updateDialog.showModal();
+  }
+  for (const id of ["mesh-update-open", "update-details"]) {
+    const button = document.getElementById(id);
+    if (button) button.addEventListener("click", openUpdates);
+  }
+  if (updateDialog) {
+    document.getElementById("mesh-update-close").addEventListener("click", () => updateDialog.close());
+    updateDialog.addEventListener("close", () => { if (updateOpener) updateOpener.focus(); });
+  }
+  if (updateRefresh) updateRefresh.addEventListener("click", loadStatus);
+
+  // The top-level release identifies the actual server independently of update
+  // discovery. Fall back to the notice only for old servers without that field.
+  function renderUpdate(status) {
+    // The IDE owns its coordinated native updater. Its bundled browser controls
+    // are hidden, so do not reserve banner space in that read-only surface.
+    if (Mesh.readOnlyViewer) {
+      const banner = document.getElementById("update-banner");
+      if (banner) banner.hidden = true;
+      document.body.classList.remove("update-available");
+      return;
+    }
+    const u = status && status.update;
+    const current = releaseVersion(status && Object.prototype.hasOwnProperty.call(status, "release") ? status.release : u && u.current);
+    const latest = releaseVersion(u && u.latest);
+    const checked = Boolean(current && latest && releaseVersion(u && u.current) === current && typeof u.available === "boolean" && u.available === (compareRelease(latest, current) > 0));
+    const available = checked && u.available === true;
+    if (updateDialog) {
+      document.getElementById("mesh-update-current").textContent = current || "Unknown";
+      document.getElementById("mesh-update-latest").textContent = latest || "Unknown";
+      document.getElementById("mesh-update-summary").textContent = available
+        ? "A newer server release is available. Operator approval is required."
+        : checked ? "No newer server release is reported by the last check."
+          : "Release status unknown. Checks may be disabled, unavailable, or unsupported by this server.";
+      const link = document.getElementById("mesh-update-release");
+      link.hidden = !latest;
+      if (latest) link.href = "https://github.com/bright-interaction/mesh/tree/" + encodeURIComponent(latest);
+      else link.removeAttribute("href");
+    }
     const banner = document.getElementById("update-banner");
-    if (!banner || !u || !u.available || !u.latest) return;
+    if (!banner) return;
+    banner.hidden = true;
+    document.body.classList.remove("update-available");
+    if (!available) return;
     let dismissed = "";
     try { dismissed = sessionStorage.getItem("mesh-update-dismissed") || ""; } catch (_) {}
-    if (dismissed === u.latest) return;
+    if (dismissed === latest) return;
     const copy = document.getElementById("update-copy");
-    const prebuilt = document.getElementById("update-prebuilt");
-    const command = document.getElementById("update-command");
-    const release = document.getElementById("update-release");
-    if (copy) copy.textContent = "Mesh " + u.latest + " is available (you have " + u.current + ").";
-    if (prebuilt) prebuilt.textContent = u.prebuilt_command || "mesh upgrade";
-    if (command) command.textContent = u.command || "";
-    if (release) release.href = u.url || "https://github.com/bright-interaction/mesh";
+    if (copy) copy.textContent = "Mesh " + latest + " is available (server " + current + ").";
     banner.hidden = false;
     document.body.classList.add("update-available");
   }
@@ -241,10 +313,12 @@
   async function loadStatus() {
     const foot = document.getElementById("rail-status");
     if (!foot) return;
+    if (updateRefresh && updateRefresh.disabled) return;
+    if (updateRefresh) { updateRefresh.disabled = true; updateRefresh.textContent = "Checking..."; }
     try {
       const s = await Mesh.api("/api/status");
       Mesh.status = s;
-      renderUpdate(s.update);
+      renderUpdate(s);
       const c = s.counts || {};
       const sig = s.signals || {};
       const dot = (k) => '<span class="sig ' + (sig[k] ? "on" : "") + '" title="' + k + (sig[k] ? " on" : " off") + '"></span>';
@@ -257,6 +331,12 @@
       if (empty) empty.classList.toggle("hidden", (c.notes || 0) > 1);
     } catch (e) {
       foot.textContent = "";
+      Mesh.status = null;
+      renderUpdate(null);
+      const login = document.getElementById("login");
+      if (updateDialog && updateDialog.open && login && !login.classList.contains("hidden")) updateDialog.close();
+    } finally {
+      if (updateRefresh) { updateRefresh.disabled = false; updateRefresh.textContent = "Refresh status"; }
     }
   }
   Mesh.refreshStatus = loadStatus;

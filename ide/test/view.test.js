@@ -10,6 +10,7 @@ test('packaged document uses nonce bridge first, local assets, no write surfaces
   expect(html).not.toMatch(/data-view="(?:ask|review|settings|api)"/);
   expect(html).not.toContain('id="login-form"');
   expect(html).not.toContain('__MESH_SOURCE__');
+  expect(fs.readFileSync('src/view.css', 'utf8')).toMatch(/\.mesh-update-web\s*\{\s*display:\s*none\s*!important/);
   const scripts = [...html.matchAll(/<script nonce="([^"]+)" src="([^"]+)" defer><\/script>/g)];
   expect(scripts.length).toBe(7);
   expect(new Set(scripts.map(s => s[1])).size).toBe(1);

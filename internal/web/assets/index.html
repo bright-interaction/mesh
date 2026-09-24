@@ -13,13 +13,28 @@
   <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
-  <aside id="update-banner" class="update-banner" role="status" aria-live="polite" hidden>
+  <aside id="update-banner" class="update-banner mesh-update-web" role="status" aria-live="polite" hidden>
     <span id="update-copy"></span>
-    <code id="update-prebuilt"></code>
-    <code id="update-command"></code>
-    <a id="update-release" target="_blank" rel="noopener noreferrer">release</a>
+    <button id="update-details" type="button">Update Mesh</button>
     <button id="update-dismiss" type="button" aria-label="Dismiss update notice">&times;</button>
   </aside>
+
+  <dialog id="mesh-update-dialog" class="mesh-update-dialog mesh-update-web" aria-labelledby="mesh-update-title" aria-describedby="mesh-update-ownership">
+    <h1 id="mesh-update-title">Update Mesh</h1>
+    <p id="mesh-update-summary" role="status" aria-live="polite">Release status unknown.</p>
+    <dl class="mesh-update-versions">
+      <dt>Running server</dt><dd id="mesh-update-current">Unknown</dd>
+      <dt>Latest known release</dt><dd id="mesh-update-latest">Unknown</dd>
+    </dl>
+    <p id="mesh-update-ownership">The server operator manages this Mesh server and its web viewer. Ask them to approve and deploy an update using their normal backup and rollback process.</p>
+    <p>This browser cannot install software or restart the server. Upgrading a local Mesh command does not update a hosted server. The IDE extension is managed separately through its own Update Mesh action.</p>
+    <p id="mesh-update-check-note">Release checks may use a cached result. Unknown does not mean up to date.</p>
+    <div class="mesh-update-actions">
+      <a id="mesh-update-release" target="_blank" rel="noopener noreferrer" hidden>View official release</a>
+      <button id="mesh-update-refresh" type="button">Refresh status</button>
+      <button id="mesh-update-close" type="button" autofocus>Close</button>
+    </div>
+  </dialog>
 
   <!-- Graph engine canvases (full-window; app.js owns these, IDs unchanged) -->
   <canvas id="stage"></canvas>
@@ -41,7 +56,10 @@
       <li><button class="nav" data-view="docs">Docs</button></li>
       <li><button class="nav" data-view="api">API</button></li>
     </ul>
-    <div class="rail-foot" id="rail-status" aria-live="polite"></div>
+    <div class="rail-bottom">
+      <button id="mesh-update-open" class="mesh-update-entry mesh-update-web" type="button">Update Mesh</button>
+      <div class="rail-foot" id="rail-status" aria-live="polite"></div>
+    </div>
   </nav>
 
   <!-- Graph view chrome (only visible in the Graph section; IDs unchanged for app.js) -->

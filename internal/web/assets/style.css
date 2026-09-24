@@ -65,24 +65,49 @@ html, body {
   white-space: nowrap;
 }
 .update-banner[hidden] { display: none; }
-.update-banner code {
-  padding: 3px 7px;
-  color: #21180f;
-  background: rgba(255,255,255,.3);
-  border-radius: 5px;
-  font: 10.5px/1.4 var(--mono);
-  user-select: all;
-}
-.update-banner a { color: inherit; font-weight: 650; }
 .update-banner button {
-  position: absolute;
-  right: 10px;
   border: 0;
   color: inherit;
   background: transparent;
-  font-size: 20px;
+  font: inherit;
+  font-weight: 650;
+  text-decoration: underline;
   cursor: pointer;
 }
+#update-dismiss { position: absolute; right: 10px; font-size: 20px; text-decoration: none; }
+.mesh-update-entry {
+  width: calc(100% - 20px);
+  margin: 0 10px;
+  padding: 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.mesh-update-dialog {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  padding: 24px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--fg);
+  line-height: 1.6;
+}
+.mesh-update-dialog::backdrop { background: rgba(0,0,0,.7); }
+.mesh-update-dialog h1 { margin-top: 0; font-size: 24px; }
+.mesh-update-dialog p { color: var(--muted); }
+.mesh-update-versions { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; }
+.mesh-update-versions dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); }
+.mesh-update-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.mesh-update-actions a { color: var(--fg); }
+.mesh-update-actions button { padding: 7px 12px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--bg-2); color: var(--fg); font: inherit; cursor: pointer; }
+.mesh-update-actions button:disabled { opacity: .6; cursor: wait; }
+.mesh-update-web :focus-visible, .mesh-update-entry:focus-visible { outline: 2px solid var(--fg); outline-offset: 3px; }
 body.update-available #bar { top: 58px; }
 body.update-available .explorer { top: 110px; }
 body.update-available .panel-inner { padding-top: 72px; }
@@ -424,8 +449,9 @@ body.update-available .panel-inner { padding-top: 72px; }
 }
 .rail-nav .nav:hover { color: var(--fg); background: var(--bg-2); }
 .rail-nav .nav.active { color: var(--fg); background: var(--bg-2); box-shadow: inset 0 0 0 1px var(--border); }
+.rail-bottom { margin-top: auto; }
 .rail-foot {
-  margin-top: auto;
+  margin-top: 0;
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--faint);

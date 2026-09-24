@@ -853,9 +853,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		update, _ = s.updateCheck(r.Context(), buildinfo.ReleaseVer())
 	}
 	writeJSON(w, map[string]any{
-		"vault":  s.exposedVaultRoot(),
-		"viewer": s.viewerReadiness(r),
-		"counts": map[string]int{"notes": notes, "nodes": nodes, "edges": edges, "vectors": vectors},
+		// Release identity belongs to the running process, not the optional public
+		// update check. Keep it available when checks are disabled or unavailable.
+		"release": buildinfo.ReleaseVer(),
+		"vault":   s.exposedVaultRoot(),
+		"viewer":  s.viewerReadiness(r),
+		"counts":  map[string]int{"notes": notes, "nodes": nodes, "edges": edges, "vectors": vectors},
 		"signals": map[string]bool{
 			"fts":    true,
 			"graph":  true,

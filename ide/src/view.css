@@ -12,3 +12,5 @@
   #bar { flex-wrap: wrap; gap: 8px; }
   #bar .stats { display: none; }
 }
+/* Updates run in the native host, never via data-bearing renderer messages. */
+.mesh-update-web { display: none !important; }

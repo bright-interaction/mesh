@@ -2,7 +2,7 @@
   "name": "mesh-workspace",
   "displayName": "Mesh",
   "description": "Your shared knowledge graph, search and notes inside the editor.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "bright-interaction",
   "license": "SEE LICENSE IN LICENSE",
   "engines": { "vscode": "^1.96.0" },
@@ -20,8 +20,8 @@
       { "command": "mesh.signInKey", "title": "Sign In with Access Key", "category": "Mesh" },
       { "command": "mesh.signOut", "title": "Sign Out of Remote Viewer", "category": "Mesh" },
       { "command": "mesh.configureStartup", "title": "Configure Viewer Startup", "category": "Mesh" },
-      { "command": "mesh.checkUpdates", "title": "Check for IDE Updates", "category": "Mesh" },
-      { "command": "mesh.updateNow", "title": "Update Now", "category": "Mesh", "icon": "$(cloud-download)", "enablement": "isWorkspaceTrusted" }
+      { "command": "mesh.checkUpdates", "title": "Check for Mesh Updates", "category": "Mesh" },
+      { "command": "mesh.updateNow", "title": "Update Mesh", "category": "Mesh", "icon": "$(cloud-download)", "enablement": "isWorkspaceTrusted" }
     ],
     "menus": {
       "editor/title": [{ "command": "mesh.updateNow", "when": "activeWebviewPanelId == 'mesh.workspace'", "group": "navigation" }]
