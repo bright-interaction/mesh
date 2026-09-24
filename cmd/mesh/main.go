@@ -700,16 +700,19 @@ func tuneCmd() *cobra.Command {
 				return err
 			}
 			defer store.Close()
-			g, err := store.LoadGraph()
+			g, err := store.LoadGraphContext(cmd.Context())
 			if err != nil {
 				return err
 			}
-			r := retrieve.NewFromEnv(store, g)
-			vectors := r.VectorsActive()
-			if step <= 0 || step > 0.5 {
-				step = 0.05
+			r, err := retrieve.NewFromEnvContext(cmd.Context(), store, g)
+			if err != nil {
+				return err
 			}
-			rep := eval.TuneWeights(r, train, test, step, vectors)
+			vectors := r.VectorsActive()
+			rep, err := eval.TuneWeights(cmd.Context(), r, train, test, step, vectors)
+			if err != nil {
+				return err
+			}
 
 			fmt.Printf("mesh tune (vault %s, vectors %v, %d candidates, step %.2f)\n", vaultDir, vectors, rep.Candidates, step)
 			fmt.Printf("  train %d cases, test %d cases (held-out)\n", len(train), len(test))
@@ -2016,7 +2019,7 @@ check that cannot fail meaningfully is worse than no check.`,
 			if len(errorsList) > 0 {
 				return fmt.Errorf("%d error(s) break retrieval", len(errorsList))
 			}
-			fmt.Println("\nno errors: retrieval is healthy")
+			fmt.Println("\nno lint errors: index freshness, database health and factual accuracy were not checked")
 			return nil
 		},
 	}

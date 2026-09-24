@@ -76,8 +76,13 @@ type Graph struct {
 	nodes   map[string]*Node
 	adj     map[string][]Edge
 	rev     map[string][]Edge
-	edgeSet map[string]bool
+	edgeSet map[edgeKey]struct{}
 }
+
+// edgeKey matches the exact SQL (source, target, relation) identity. Keeping
+// string headers avoids another combined-string allocation per edge, and does
+// not confuse field boundaries when an identifier or relation contains NUL.
+type edgeKey struct{ source, target, relation string }
 
 func New() *Graph { return NewSized(0) }
 
@@ -90,7 +95,7 @@ func NewWithCapacity(nodes, edges int) *Graph {
 		nodes:   make(map[string]*Node, nodes),
 		adj:     make(map[string][]Edge, min(nodes, edges)),
 		rev:     make(map[string][]Edge, min(nodes, edges)),
-		edgeSet: make(map[string]bool, edges),
+		edgeSet: make(map[edgeKey]struct{}, edges),
 	}
 }
 
@@ -105,14 +110,14 @@ func NewSized(n int) *Graph {
 			nodes:   make(map[string]*Node),
 			adj:     make(map[string][]Edge),
 			rev:     make(map[string][]Edge),
-			edgeSet: make(map[string]bool),
+			edgeSet: make(map[edgeKey]struct{}),
 		}
 	}
 	return &Graph{
 		nodes:   make(map[string]*Node, n*3),
 		adj:     make(map[string][]Edge, n*2),
 		rev:     make(map[string][]Edge, n*2),
-		edgeSet: make(map[string]bool, n*3),
+		edgeSet: make(map[edgeKey]struct{}, n*3),
 	}
 }
 
@@ -157,11 +162,11 @@ func (g *Graph) SetNodeAttr(id, key string, val any) bool {
 func (g *Graph) AddEdge(e Edge) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	key := e.Source + "\x00" + e.Target + "\x00" + e.Relation
-	if g.edgeSet[key] {
+	key := edgeKey{e.Source, e.Target, e.Relation}
+	if _, exists := g.edgeSet[key]; exists {
 		return
 	}
-	g.edgeSet[key] = true
+	g.edgeSet[key] = struct{}{}
 	g.adj[e.Source] = append(g.adj[e.Source], e)
 	g.rev[e.Target] = append(g.rev[e.Target], e)
 	if n, ok := g.nodes[e.Source]; ok {

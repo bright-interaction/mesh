@@ -688,7 +688,8 @@ func (s *Server) installRefreshedGraph(ctx context.Context, g *graph.Graph, in *
 		return index.Reconciliation{}, err
 	}
 	trace.Phase("retriever")
-	r, err := retrieve.NewFromInputsContext(ctx, s.store, g, in)
+	_, previous := s.snapshot()
+	r, err := retrieve.NewFromInputsReusingContext(ctx, s.store, g, in, previous)
 	if err != nil {
 		return index.Reconciliation{}, err
 	}
@@ -891,7 +892,9 @@ func (s *Server) awaitOwnerCaughtUp(ctx context.Context) (index.Reconciliation, 
 	// The counts come from the refresh, not from the drift we waited on: what a caller
 	// gets out of this call is what entered THIS server's view, and on the stale path
 	// that is whatever the owner did manage to index, never what is still missing.
-	rec, err := s.refresh()
+	// Preserve caller cancellation through the reader lock and construction too;
+	// refresh() substitutes Background and can outlive the request after the wait.
+	rec, err := s.refreshContext(ctx)
 	if err != nil {
 		return index.Reconciliation{}, err
 	}

@@ -172,10 +172,14 @@ func New(store *index.Store, g *graph.Graph) *Retriever {
 
 // NewContext is New with cooperative cancellation of the graph ranker build.
 func NewContext(ctx context.Context, store *index.Store, g *graph.Graph) (*Retriever, error) {
+	return newContext(ctx, store, g, nil)
+}
+
+func newContext(ctx context.Context, store *index.Store, g *graph.Graph, previous *graph.Ranker) (*Retriever, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ranker, err := g.NewRankerContext(ctx)
+	ranker, err := g.NewRankerReusingContext(ctx, previous)
 	if err != nil {
 		return nil, err
 	}
@@ -222,12 +226,24 @@ func NewFromEnvContext(ctx context.Context, store *index.Store, g *graph.Graph) 
 // NewFromInputsContext consumes exactly the configuration previously sampled by
 // the reader's freshness gate. It does not reread config or the environment.
 func NewFromInputsContext(ctx context.Context, store *index.Store, g *graph.Graph, in *ConfigInputs) (*Retriever, error) {
+	return NewFromInputsReusingContext(ctx, store, g, in, nil)
+}
+
+// NewFromInputsReusingContext may reuse only the previous ranker's immutable
+// term counts for exactly unchanged searchable inputs. It does not retain the
+// previous retriever: configuration, vectors, freshness/query caches and all
+// current read boundaries are constructed afresh, as with NewFromInputsContext.
+func NewFromInputsReusingContext(ctx context.Context, store *index.Store, g *graph.Graph, in *ConfigInputs, previous *Retriever) (*Retriever, error) {
 	trace := latency.Start("retriever_build", "ranker")
 	defer trace.End()
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	r, err := NewContext(ctx, store, g)
+	var priorRanker *graph.Ranker
+	if previous != nil {
+		priorRanker = previous.ranker
+	}
+	r, err := newContext(ctx, store, g, priorRanker)
 	if err != nil {
 		return nil, err
 	}

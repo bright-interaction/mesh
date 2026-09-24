@@ -32,11 +32,54 @@ type ScoredNode struct {
 // per-query scoring is O(queryTerms x candidates) instead of O(corpus) per call. Rebuild it whenever the graph changes.
 type Ranker struct {
 	node   map[string]*Node
-	tf     map[string]map[string]int
-	docLen map[string]int
+	docs   map[string]*rankerDocument
 	df     map[string]int
 	avgLen float64
 	n      float64
+}
+
+// A document owns immutable searchable inputs and term counts. In particular,
+// it does not retain a Node or its mutable Attrs map: comparing an old Node to
+// itself after an in-place edit could otherwise bless stale term counts.
+type rankerDocument struct {
+	label  string
+	attrs  map[string]string
+	tf     map[string]int
+	length int
+}
+
+func (d *rankerDocument) matches(n *Node) bool {
+	if d.label != n.Label {
+		return false
+	}
+	count := 0
+	for key, value := range n.Attrs {
+		if key == "superseded_by" {
+			continue
+		}
+		if text, ok := value.(string); ok {
+			previous, found := d.attrs[key]
+			if !found || previous != text {
+				return false
+			}
+			count++
+		}
+	}
+	return count == len(d.attrs)
+}
+
+func newRankerDocument(n *Node) *rankerDocument {
+	tokens := nodeText(n)
+	d := &rankerDocument{label: n.Label, tf: termFreq(tokens), length: len(tokens)}
+	for key, value := range n.Attrs {
+		if text, ok := value.(string); ok && key != "superseded_by" {
+			if d.attrs == nil {
+				d.attrs = make(map[string]string)
+			}
+			d.attrs[key] = text
+		}
+	}
+	return d
 }
 
 // NewRanker builds the inverted statistics over every note node's label+attrs.
@@ -49,6 +92,15 @@ func (g *Graph) NewRanker() *Ranker {
 // corpus maps remain private until the whole pass succeeds, so a caller can
 // never observe partially built statistics.
 func (g *Graph) NewRankerContext(ctx context.Context) (*Ranker, error) {
+	return g.NewRankerReusingContext(ctx, nil)
+}
+
+// NewRankerReusingContext skips tokenization only when exact searchable inputs
+// match a previous ranker's private immutable document. Every node pointer and
+// corpus statistic is still rebuilt from this graph, including scope, document
+// frequency and average length after edits/deletions. A nil previous ranker is
+// a full build. Neither the previous ranker nor graph is mutated or retained.
+func (g *Graph) NewRankerReusingContext(ctx context.Context, previous *Ranker) (*Ranker, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -58,10 +110,9 @@ func (g *Graph) NewRankerContext(ctx context.Context) (*Ranker, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	r := &Ranker{
-		node:   map[string]*Node{},
-		tf:     map[string]map[string]int{},
-		docLen: map[string]int{},
-		df:     map[string]int{},
+		node: map[string]*Node{},
+		docs: map[string]*rankerDocument{},
+		df:   map[string]int{},
 	}
 	total := 0
 	for id, nd := range g.nodes {
@@ -71,13 +122,19 @@ func (g *Graph) NewRankerContext(ctx context.Context) (*Ranker, error) {
 		if nd.Kind != "note" {
 			continue
 		}
-		toks := nodeText(nd)
-		tf := termFreq(toks)
+		var doc *rankerDocument
+		if previous != nil {
+			if old := previous.docs[id]; old != nil && old.matches(nd) {
+				doc = old
+			}
+		}
+		if doc == nil {
+			doc = newRankerDocument(nd)
+		}
 		r.node[id] = nd
-		r.tf[id] = tf
-		r.docLen[id] = len(toks)
-		total += len(toks)
-		for term := range tf {
+		r.docs[id] = doc
+		total += doc.length
+		for term := range doc.tf {
 			if err := contextCause(ctx); err != nil {
 				return nil, err
 			}
@@ -123,14 +180,14 @@ func (r *Ranker) ScoreScoped(query string, limit int, allowed map[string]bool) [
 		return nil
 	}
 	var out []ScoredNode
-	for id, tf := range r.tf {
+	for id, doc := range r.docs {
 		if !nodeScopeAllowed(r.node[id], allowed) {
 			continue
 		}
-		dl := float64(r.docLen[id])
+		dl := float64(doc.length)
 		score := 0.0
 		for _, term := range qterms {
-			f, ok := tf[term]
+			f, ok := doc.tf[term]
 			if !ok {
 				continue
 			}

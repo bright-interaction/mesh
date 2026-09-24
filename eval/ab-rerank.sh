@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: LicenseRef-Mesh-Sustainable-Use-License
 # Copyright (C) 2026 Bright Interaction AB
-# Deterministic A/B for the BYOAI cross-encoder rerank stage.
+# Paired evaluation for the BYOAI cross-encoder rerank stage.
 #
-# Runs `mesh eval` twice on a labelled case set, rerank OFF then ON, with only
-# the MESH_RERANK_* env vars toggled, so the cross-encoder's effect on answer@1
-# is reproducible from a committed artifact (not a manual two-run toggle).
+# Uses one `mesh eval` invocation's explicit NoRerank local arm and configured
+# endpoint arm. Unsetting endpoint variables cannot disable persisted config or
+# a user-local subscription, so it is not a valid OFF control. Pin HTTP routing
+# even when an inherited MESH_RERANK_AGENT selects a subscription CLI.
 # Budget is pinned to 0 so packToBudget never runs and cannot perturb cards[0].
+# Keep the complete accounting and failure status. This measures retrieval, not
+# whole-task savings; query embeddings can still run in either arm. Use frozen
+# cases/vault snapshots and separately approve endpoint use and quota/spend.
 #
 # Prerequisites:
 #   - a built `mesh` on PATH (or set $MESH to its path)
@@ -24,9 +28,6 @@ CASES="${2:?usage: ab-rerank.sh <vault> <cases.json>}"
 : "${MESH_RERANK_ENDPOINT:?set MESH_RERANK_ENDPOINT (e.g. http://127.0.0.1:8787/rerank)}"
 : "${MESH_RERANK_MODEL:?set MESH_RERANK_MODEL (e.g. Xenova/ms-marco-MiniLM-L-6-v2)}"
 
-echo "== rerank OFF =="
-env -u MESH_RERANK_ENDPOINT -u MESH_RERANK_MODEL \
-  "$MESH" eval "$CASES" --vault "$VAULT" --budget 0 | grep -E "recall|answer@1"
-
-echo "== rerank ON  (cross-encoder ${MESH_RERANK_MODEL}) =="
-"$MESH" eval "$CASES" --vault "$VAULT" --budget 0 | grep -E "recall|answer@1"
+echo "== local ranking vs configured HTTP rerank (one paired evaluation) =="
+exec env MESH_RERANK_AGENT=http \
+  "$MESH" eval "$CASES" --vault "$VAULT" --budget 0 --require-rerank-win
