@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 
 	"github.com/bright-interaction/mesh/internal/graph"
 	"github.com/bright-interaction/mesh/internal/latency"
@@ -84,7 +85,12 @@ func diffGraphNodes(ctx context.Context, tx *sql.Tx, wanted map[string]graphNode
 	}
 	defer rows.Close()
 	var removed []string
-	// Scan replaces every field. Only owned strings/values escape into removed;
+	type communityUpdate struct {
+		id        string
+		community sql.NullInt64
+	}
+	var communities []communityUpdate
+	// Scan replaces every field. Only owned strings/values escape into the deltas;
 	// no retained row points at this reusable scratch record.
 	var old graphNodeRow
 	for rows.Next() {
@@ -98,6 +104,15 @@ func diffGraphNodes(ctx context.Context, tx *sql.Tx, wanted map[string]graphNode
 			removed = append(removed, old.id)
 		} else if next == old {
 			delete(wanted, old.id)
+		} else {
+			// Global community renumbering also relabels each note's headings.
+			// If every other value (including SQL NULL state) is unchanged,
+			// avoid the full upsert's unrelated indexed-column assignments.
+			old.community = next.community
+			if next == old {
+				communities = append(communities, communityUpdate{next.id, next.community})
+				delete(wanted, old.id)
+			}
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -116,6 +131,29 @@ func diffGraphNodes(ctx context.Context, tx *sql.Tx, wanted map[string]graphNode
 	for _, id := range removed {
 		if _, err := del.ExecContext(ctx, id); err != nil {
 			return err
+		}
+	}
+	trace.Phase("community")
+	if len(communities) > 0 {
+		// The writer transaction owns the baseline; no concurrent writer can
+		// remove a classified row. Keep the regular UPDATE revision trigger.
+		putCommunity, err := tx.PrepareContext(ctx, `UPDATE nodes SET community=? WHERE id=?`)
+		if err != nil {
+			return err
+		}
+		defer putCommunity.Close()
+		for _, n := range communities {
+			result, err := putCommunity.ExecContext(ctx, n.community, n.id)
+			if err != nil {
+				return err
+			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if count != 1 {
+				return fmt.Errorf("graph community update affected %d rows, want 1", count)
+			}
 		}
 	}
 	trace.Phase("upsert")
