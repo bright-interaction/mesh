@@ -253,9 +253,11 @@ func nodeText(n *Node) []string {
 }
 
 // Tokenize lowercases and splits on non-alphanumeric runs, dropping tokens
-// shorter than 2 runes and stopwords. The unicode boundaries match FTS5's
-// unicode61 tokenizer so the two keyword signals share term shape.
+// shorter than 2 runes and stopwords. Bounded, complete dotted versions are also
+// retained as literal terms: otherwise v0.41.1 and v0.41.2 both become [v0, 41].
+// FTS5 consumes those additional terms as quoted token phrases, not operators.
 func Tokenize(s string) []string {
+	s = strings.ToLower(norm.NFC.String(s))
 	var out []string
 	var cur strings.Builder
 	flush := func() {
@@ -267,7 +269,7 @@ func Tokenize(s string) []string {
 			cur.Reset()
 		}
 	}
-	for _, r := range strings.ToLower(norm.NFC.String(s)) {
+	for _, r := range s {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			cur.WriteRune(r)
 			continue
@@ -275,19 +277,19 @@ func Tokenize(s string) []string {
 		flush()
 	}
 	flush()
-	return out
+	return appendVersionLiterals(out, s)
 }
 
-// MaxQueryTerms bounds how many distinct terms one query may contribute to a
-// keyword signal. Both signals cost time linear in the term count (FTS5 evaluates
-// one phrase per term, graph-BM25 walks the corpus per term), so an uncapped query
+// MaxQueryTerms bounds query work: one unit per ordinary distinct term and one
+// per component of an additional version phrase. Both keyword signals consume
+// these bounded terms, so an uncapped query
 // is an uncapped amount of work on every surface that takes one. 64 is generous:
 // no real question, in English or Swedish, carries more than a couple of dozen
 // content words once stopwords are dropped.
 const MaxQueryTerms = 64
 
 // TokenizeQuery is Tokenize for the QUERY side of retrieval. It additionally drops
-// repeated terms and truncates at MaxQueryTerms.
+// repeated terms and truncates at MaxQueryTerms work units.
 //
 // Deduplicating first matters as much as the cap: a query that repeats one word ten
 // thousand times collapses to a single term instead of filling the whole budget with
@@ -301,10 +303,18 @@ func TokenizeQuery(s string) []string {
 	toks := Tokenize(s)
 	seen := make(map[string]bool, len(toks))
 	out := make([]string, 0, MaxQueryTerms)
+	work := 0
 	for _, t := range toks {
 		if seen[t] {
 			continue
 		}
+		// A quoted version is one OR phrase but several FTS tokens. Charge each
+		// component against the same work cap; compound input cannot evade it.
+		cost := literalTokenCount(t)
+		if work+cost > MaxQueryTerms {
+			break
+		}
+		work += cost
 		seen[t] = true
 		out = append(out, t)
 		if len(out) == MaxQueryTerms {

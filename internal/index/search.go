@@ -162,7 +162,7 @@ LIMIT ?`
 		if allowPath != nil && (h.Path == "" || !allowPath(h.Path)) {
 			continue
 		}
-		h.Snippet = buildExcerpt(body, terms, searchExcerptTokens)
+		h.Snippet = buildExcerpt(trimExcerptScanTail(body), terms, searchExcerptTokens)
 		// FTS5 bm25 returns lower-is-better; negate so the fuser (M1 step 3)
 		// can treat all signals as higher-is-better.
 		h.Score = -rank
@@ -216,7 +216,11 @@ func scopePredicate(allowed map[string]bool) (sql string, args []any, readable b
 // same terms, then joins them with OR: an agent's natural-language query ("how do we
 // store data") should recall any note that matches a content word and let bm25 rank,
 // not require that every word be present AND-style. Reserved FTS grammar can't leak
-// because each token is a quoted alphanumeric literal. Empty input returns "" so the
+// because each term is quoted: an alphanumeric token or a bounded version phrase.
+// Phrases retain component order (including one-digit patches) with the existing
+// unicode61 index. They are token-exact, not punctuation-exact or SemVer filters;
+// ordinary OR terms still recall related warnings and absent-version context.
+// Empty input returns "" so the
 // caller short-circuits.
 //
 // The cap is load-bearing, not hygiene: FTS5 evaluates one phrase per OR term, so a
