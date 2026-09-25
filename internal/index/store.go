@@ -911,8 +911,18 @@ func OpenRebuildOwned(vaultRoot string, owner *OwnerLock) (*Store, bool, error) 
 // it is healthy. Only genuine SQLite corruption is wrapped with ErrIndexCorrupt; busy
 // and I/O failures never authorize deletion.
 func (s *Store) CheckIntegrity(vaultRoot string) error {
+	// Do not borrow a connection from readDB here. With the bundled SQLite driver,
+	// repeated FTS5 integrity checks on a reused connection can report a checksum
+	// mismatch after another connection commits perfectly valid FTS updates. A fresh
+	// read-only connection verifies the actual database without recycling readers,
+	// taking ownership, changing the schema, or rebuilding any data.
+	db, err := sql.Open("sqlite", dsnReadOnly(s.dbPath))
+	if err != nil {
+		return fmt.Errorf("open index integrity reader: %w", err)
+	}
+	defer db.Close()
 	var result string
-	err := s.readDB.QueryRow(`PRAGMA quick_check(1)`).Scan(&result)
+	err = db.QueryRow(`PRAGMA quick_check(1)`).Scan(&result)
 	if err != nil {
 		if isUnreadableDB(err) {
 			return corruptIndexError(vaultRoot, s.dbPath, err)
