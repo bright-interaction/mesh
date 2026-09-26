@@ -718,7 +718,7 @@ failing exit; doctor fails when the index has drifted with no owner to catch it 
 
 Share a vault across a team with no git on any client. The sync **client** is part
 of the open core; the **team-sync hub** is the commercial / pro product (hosted at
-mesh.brightinteraction.com, or self-host under a commercial license, see
+mesh-sync.cloudrebellion.tech, or self-host under a commercial license, see
 [LICENSING.md](LICENSING.md)). Clients pull-reconcile against it:
 
 ```
@@ -913,7 +913,8 @@ service.
 
 The **team-sync hub** and **BYOAI sync-curator** are a commercial product:
 
-- **Hosted** at mesh.brightinteraction.com (managed team sync).
+- **Hosted** at mesh-sync.cloudrebellion.tech (managed team sync; operator UI at
+  mesh.cloudrebellion.tech).
 - **Sovereign self-host** under a commercial license + support, for EU / regulated
   orgs running the hub on their own infrastructure.
 
